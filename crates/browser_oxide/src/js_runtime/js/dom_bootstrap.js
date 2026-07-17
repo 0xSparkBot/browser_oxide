@@ -2473,15 +2473,9 @@
                     const _pOrig = _xOrigin((globalThis.location && globalThis.location.href) || "");
                     const _sOrig = _xOrigin(_cSrc);
                     if (_sOrig !== _pOrig) {
-                        const _xM = 'Blocked a frame with origin "' + _pOrig + '" from accessing a cross-origin frame.';
-                        const _xo2 = new Proxy({}, {
-                            get(t, p) { if (typeof p === 'symbol') return undefined; throw new DOMException(_xM, 'SecurityError'); },
-                            set() { throw new DOMException(_xM, 'SecurityError'); },
-                            has() { return false; },
-                        });
-                        const _xoS2 = { contentWindow: _xo2, contentDocument: null, _realmId: undefined, _processedSrcdoc: '' };
-                        _iframeState.set(el, _xoS2);
-                        return _xo2;
+                        // Src changed to cross-origin — rebuild the child realm
+                        _iframeState.delete(el);
+                        state = undefined;
                     }
                 }
             } catch (_) {}
@@ -2509,10 +2503,9 @@
         }
 
         // ── Cross-origin iframe detection ────────────────────
-        // Some scripts create an iframe with a different origin (e.g. a
-        // data: URI or cross-origin https URL) and expect a SecurityError
-        // when accessing contentWindow.document. Return a Proxy that throws
-        // SecurityError on any property read — matches real Chrome behaviour.
+        // Detect cross-origin but fall through to child realm creation
+        // so postMessage works across origins.
+        let _isCrossOrigin = false;
         try {
             const _iSrc = (el && typeof el.getAttribute === "function")
                 ? (el.getAttribute("src") || el.src || "")
@@ -2521,19 +2514,7 @@
                 const _pOrigin = _xOrigin((globalThis.location && globalThis.location.href) || "");
                 const _srcOrigin = _xOrigin(_iSrc);
                 if (_srcOrigin !== _pOrigin) {
-                    const _xMsg = 'Blocked a frame with origin "' + _pOrigin + '" from accessing a cross-origin frame.';
-                    const _xo = new Proxy({}, {
-                        get(t, p) {
-                            if (typeof p === 'symbol') return undefined;
-                            throw new DOMException(_xMsg, 'SecurityError');
-                        },
-                        set() { throw new DOMException(_xMsg, 'SecurityError'); },
-                        has() { return false; },
-                    });
-                    const _xoState = { contentWindow: _xo, contentDocument: null, _realmId: undefined, _processedSrcdoc: '' };
-                    _iframeState.set(el, _xoState);
-                    _registerFrame(_xo, el);
-                    return _xo;
+                    _isCrossOrigin = true;
                 }
             }
         } catch (_) {}
@@ -2863,6 +2844,10 @@
                 });
             } catch (_) { _msgSource = { postMessage: _postToParent }; }
             _sp("__msgSource", _msgSource);
+            // Re-set parent/top to the reply proxy so child iframe's
+            // parent.postMessage() delivers with correct event.source
+            _sp("parent", _msgSource);
+            _sp("top", _msgSource);
 
             // parent→child: cw.postMessage(...) (and the framed doc's own
             // window.postMessage) deliver a 'message' INTO the child realm. Data

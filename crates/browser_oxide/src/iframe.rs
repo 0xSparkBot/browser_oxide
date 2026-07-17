@@ -242,6 +242,20 @@ impl ChildIframe {
         self.event_loop.execute_script(js)
     }
 
+    /// Run the child's event loop until idle or timeout.
+    pub async fn pump(&mut self, timeout: Duration) -> Result<(), deno_core::error::AnyError> {
+        self.event_loop.run_until_idle(timeout).await.map(|_| ())
+    }
+
+    /// Execute JS then run the event loop until idle or timeout.
+    pub async fn execute_and_run(
+        &mut self,
+        js: &str,
+        timeout: Duration,
+    ) -> Result<(), deno_core::error::AnyError> {
+        self.event_loop.execute_and_run(js, timeout).await.map(|_| ())
+    }
+
     /// Query the child's DOM for text content of a selector match.
     pub fn query_text(&mut self, selector: &str) -> Option<String> {
         self.evaluate(&format!(

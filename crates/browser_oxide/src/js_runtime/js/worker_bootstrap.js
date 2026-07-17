@@ -347,4 +347,52 @@
             }
         };
     }
+
+    // crypto.subtle for Workers (digest only, rest are stubs)
+    if (!globalThis.crypto || !globalThis.crypto.subtle) {
+        const _toBytes = (src) => {
+            if (src == null) return new Uint8Array(0);
+            if (src instanceof Uint8Array) return src;
+            if (src instanceof ArrayBuffer) return new Uint8Array(src);
+            if (ArrayBuffer.isView(src)) return new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+            return new Uint8Array(src);
+        };
+        const _subtleStub = (name) => function() {
+            return Promise.reject(new DOMException(name + " not implemented", "NotSupportedError"));
+        };
+        const subtle = {
+            digest: function(algorithm, data) {
+                try {
+                    const algName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name) || "";
+                    const bytes = _toBytes(data);
+                    const out = ops.op_crypto_digest(String(algName), bytes);
+                    return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+                } catch (e) {
+                    return Promise.reject(e);
+                }
+            },
+        };
+        for (const m of ['sign','verify','encrypt','decrypt','generateKey','importKey','exportKey','deriveKey','deriveBits','wrapKey','unwrapKey']) {
+            subtle[m] = _subtleStub(m);
+        }
+        if (!globalThis.crypto) {
+            globalThis.crypto = {
+                subtle: subtle,
+                getRandomValues: function(arr) {
+                    ops.op_crypto_random_fill(arr);
+                    return arr;
+                },
+                randomUUID: function() {
+                    const b = new Uint8Array(16);
+                    ops.op_crypto_random_fill(b);
+                    b[6] = (b[6] & 0x0f) | 0x40;
+                    b[8] = (b[8] & 0x3f) | 0x80;
+                    const h = Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+                    return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
+                }
+            };
+        } else {
+            globalThis.crypto.subtle = subtle;
+        }
+    }
 })(globalThis);
