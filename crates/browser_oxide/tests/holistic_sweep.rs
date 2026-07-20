@@ -897,8 +897,8 @@ fn classify(html: &str) -> String {
 mod classifier_tests {
     use super::classify;
 
-    #[test]
-    fn sensor_bootstrap_tag_in_rendered_page_is_not_chl() {
+    #[tokio::test]
+    async fn sensor_bootstrap_tag_in_rendered_page_is_not_chl() {
         // storefront homepage shape — multi-KB body containing the
         // legitimate sensor bootstrap script. This must NOT be
         // classified as a challenge page.
@@ -916,15 +916,15 @@ mod classifier_tests {
         assert_eq!(classify(&html), "L3-RENDERED");
     }
 
-    #[test]
-    fn sensor_interstitial_title_is_chl() {
+    #[tokio::test]
+    async fn sensor_interstitial_title_is_chl() {
         let html =
             "<html><head><title>Pardon Our Interruption</title></head><body>...</body></html>";
         assert_eq!(classify(html), "SensorChallenge-CHL");
     }
 
-    #[test]
-    fn small_body_with_akam13_is_chl() {
+    #[tokio::test]
+    async fn small_body_with_akam13_is_chl() {
         // <30 KB body that's only the sensor bootstrap and a sentinel form.
         let html = r#"<html><head><script src="/akam/13/abc"></script></head>
             <body><form id="bm-verify"></form></body></html>"#;
@@ -932,20 +932,20 @@ mod classifier_tests {
         assert_eq!(classify(html), "SensorChallenge-CHL");
     }
 
-    #[test]
-    fn managed_interstitial_is_chl() {
+    #[tokio::test]
+    async fn managed_interstitial_is_chl() {
         let html = "<html><body>Just a moment...</body></html>";
         assert_eq!(classify(html), "ManagedChallenge-CHL");
     }
 
-    #[test]
-    fn interstitial_vendor_is_chl() {
+    #[tokio::test]
+    async fn interstitial_vendor_is_chl() {
         let html = r#"<html><body><script src="https://geo.captcha-delivery.com/captcha/check"></script></body></html>"#;
         assert_eq!(classify(html), "Interstitial-CHL");
     }
 
-    #[test]
-    fn large_rendered_page_with_just_a_moment_phrase_is_not_chl() {
+    #[tokio::test]
+    async fn large_rendered_page_with_just_a_moment_phrase_is_not_chl() {
         // news-site shape (2026-05-14): 1.1 MB rendered news home page
         // containing the phrase "just a moment" somewhere in article
         // copy / embedded loading widget text. Pre-fix the classifier
@@ -961,8 +961,8 @@ mod classifier_tests {
         assert_eq!(classify(&html), "L3-RENDERED");
     }
 
-    #[test]
-    fn large_rendered_page_with_checking_your_browser_phrase_is_not_chl() {
+    #[tokio::test]
+    async fn large_rendered_page_with_checking_your_browser_phrase_is_not_chl() {
         let mut html = String::from("<html><body>");
         html.push_str("<p>We are checking your browser for compatibility.</p>");
         for _ in 0..30000 {
@@ -973,8 +973,8 @@ mod classifier_tests {
         assert_eq!(classify(&html), "L3-RENDERED");
     }
 
-    #[test]
-    fn rendered_page_mentioning_grecaptcha_in_config_is_not_chl() {
+    #[tokio::test]
+    async fn rendered_page_mentioning_grecaptcha_in_config_is_not_chl() {
         // streaming / store shape — multi-MB body that mentions
         // recaptcha in config metadata. Must classify as L3-RENDERED.
         let mut html = String::from("<html><body>");
@@ -989,13 +989,13 @@ mod classifier_tests {
         assert_eq!(classify(&html), "L3-RENDERED");
     }
 
-    #[test]
-    fn empty_body_is_thin() {
+    #[tokio::test]
+    async fn empty_body_is_thin() {
         assert_eq!(classify("<html></html>"), "THIN-BODY");
     }
 
-    #[test]
-    fn medium_body_with_pxhd_substring_is_not_chl() {
+    #[tokio::test]
+    async fn medium_body_with_pxhd_substring_is_not_chl() {
         // large-store shape — 1 MB body with `_pxhd` mentioned in inline
         // challenge-vendor SDK code. Should NOT classify as a challenge page
         // unless the page is challenge-sized.

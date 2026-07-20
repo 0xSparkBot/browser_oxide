@@ -5864,7 +5864,7 @@ async fn canvas_hash_for(profile: browser_oxide::stealth::StealthProfile) -> Str
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(data_url.as_bytes());
-    format!("{:x}", h.finalize())
+    h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 #[tokio::test]
@@ -6089,10 +6089,7 @@ async fn message_channel_paired_routing() {
     // so it fires across SUBSEQUENT run_until_idle invocations, not one.
     // Pump a few short drains with real time so the unref'd timer lands.
     for _ in 0..10 {
-        let _ = page
-            .event_loop()
-            .run_until_idle(std::time::Duration::from_millis(10))
-            .await;
+        let _ = page.event_loop().run_until_idle().await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let result = page
@@ -6136,10 +6133,7 @@ async fn message_channel_queue_then_start() {
     // start() flushes the queued messages as unref'd macrotasks — pump several
     // short drains with real time so they land (see paired_routing note).
     for _ in 0..10 {
-        let _ = page
-            .event_loop()
-            .run_until_idle(std::time::Duration::from_millis(10))
-            .await;
+        let _ = page.event_loop().run_until_idle().await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let post = page

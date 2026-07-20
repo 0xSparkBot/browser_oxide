@@ -124,10 +124,7 @@ async fn run_probe(_url_label: &str) -> HashMap<String, String> {
     let mut page = Page::from_html_with_url(PROBE_HTML, PROBE_URL, Some(chrome_148_macos()))
         .await
         .unwrap();
-    let _ = page
-        .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(3))
-        .await;
+    let _ = page.event_loop().run_until_idle().await;
 
     // Pull each key one at a time using the same `pull(page, expr)`
     // pattern other Phase parity tests use — avoids the round-trip
@@ -387,10 +384,7 @@ async fn phase7_d2_secure_context_gating() {
     )
     .await
     .unwrap();
-    let _ = p
-        .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(2))
-        .await;
+    let _ = p.event_loop().run_until_idle().await;
 
     let undef_keys = [
         // Navigator getters
@@ -445,10 +439,7 @@ async fn phase7_d2_secure_context_gating() {
     )
     .await
     .unwrap();
-    let _ = p
-        .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(2))
-        .await;
+    let _ = p.event_loop().run_until_idle().await;
 
     let present = [
         ("typeof navigator.mediaDevices", "object"),

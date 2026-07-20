@@ -1030,3 +1030,175 @@ async fn test_media_devices_pre_permission() {
         );
     }
 }
+
+// MessageChannel/MessagePort delivery is a refed macrotask — React 18's
+// scheduler posts a port message and does nothing else until it fires, so an
+// unref'd delivery would let the loop go idle first and deadlock the render.
+#[tokio::test]
+async fn message_channel_delivers() {
+    let mut page = page_with("").await;
+    page.evaluate(
+        r#"globalThis.__got = 'no';
+           const mc = new MessageChannel();
+           mc.port1.onmessage = (e) => { globalThis.__got = 'fired:' + e.data; };
+           mc.port2.postMessage('hi');"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", Duration::from_millis(300))
+        .await
+        .ok();
+    assert_eq!(page.evaluate("globalThis.__got").unwrap(), "fired:hi");
+}
+
+#[tokio::test]
+async fn message_channel_self_rescheduling_loop() {
+    let mut page = page_with("").await;
+    page.evaluate(
+        r#"globalThis.__n = 0;
+           const ch = new MessageChannel();
+           ch.port1.onmessage = function work(){
+               globalThis.__n++;
+               if (globalThis.__n < 5) ch.port2.postMessage(null);
+           };
+           ch.port2.postMessage(null);"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", Duration::from_millis(500))
+        .await
+        .ok();
+    assert_eq!(page.evaluate("String(globalThis.__n)").unwrap(), "5");
+}
+
+// ================================================================
+// Element IDL reflection (regressions: empty element classes that
+// returned `undefined` for reflected properties real apps read —
+// each one blocked Stripe checkout from rendering)
+// ================================================================
+
+#[tokio::test]
+async fn meta_element_reflects_content() {
+    // HTMLMetaElement.content returned undefined; Stripe Elements does
+    // `viewportMeta.content.match(...)` and threw, so React never mounted.
+    let mut page = page_with("").await;
+    page.evaluate(
+        "var m=document.createElement('meta');m.setAttribute('name','viewport');\
+         m.setAttribute('content','width=device-width');document.head.appendChild(m);",
+    )
+    .unwrap();
+    let m = "document.querySelector('meta')";
+    assert_eq!(
+        page.evaluate(&format!("{m} instanceof HTMLMetaElement"))
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(
+        page.evaluate(&format!("{m}.content")).unwrap(),
+        "width=device-width"
+    );
+    assert_eq!(page.evaluate(&format!("{m}.name")).unwrap(), "viewport");
+    // property setter reflects to the attribute
+    page.evaluate(&format!("{m}.content='foo'")).unwrap();
+    assert_eq!(
+        page.evaluate(&format!("{m}.getAttribute('content')"))
+            .unwrap(),
+        "foo"
+    );
+    // httpEquiv reflects the hyphenated attribute
+    page.evaluate(&format!("{m}.httpEquiv='refresh'")).unwrap();
+    assert_eq!(
+        page.evaluate(&format!("{m}.getAttribute('http-equiv')"))
+            .unwrap(),
+        "refresh"
+    );
+}
+
+#[tokio::test]
+async fn select_element_options_collection() {
+    // HTMLSelectElement.options returned undefined; React DOM's <select>
+    // value handler does `select.options.length` and threw the whole render.
+    let mut page = page_with(
+        "<select id='s'><option value='a'>A</option>\
+         <option value='b' selected>B</option><option value='c'>C</option></select>",
+    )
+    .await;
+    let s = "document.getElementById('s')";
+    assert_eq!(
+        page.evaluate(&format!("typeof {s}.options")).unwrap(),
+        "object"
+    );
+    assert_eq!(page.evaluate(&format!("{s}.options.length")).unwrap(), "3");
+    assert_eq!(
+        page.evaluate(&format!("{s}.options[0].value")).unwrap(),
+        "a"
+    );
+    assert_eq!(
+        page.evaluate(&format!("{s}.options.item(2).value"))
+            .unwrap(),
+        "c"
+    );
+    // initial selection comes from the `selected` attribute
+    assert_eq!(page.evaluate(&format!("{s}.value")).unwrap(), "b");
+    assert_eq!(page.evaluate(&format!("{s}.selectedIndex")).unwrap(), "1");
+}
+
+#[tokio::test]
+async fn select_value_selects_matching_option() {
+    let mut page = page_with(
+        "<select id='s'><option value='a'>A</option><option value='b'>B</option></select>",
+    )
+    .await;
+    let s = "document.getElementById('s')";
+    page.evaluate(&format!("{s}.value='b'")).unwrap();
+    assert_eq!(page.evaluate(&format!("{s}.value")).unwrap(), "b");
+    assert_eq!(page.evaluate(&format!("{s}.selectedIndex")).unwrap(), "1");
+    assert_eq!(
+        page.evaluate(&format!("{s}.options[1].selected")).unwrap(),
+        "true"
+    );
+    assert_eq!(
+        page.evaluate(&format!("{s}.options[0].selected")).unwrap(),
+        "false"
+    );
+}
+
+#[tokio::test]
+async fn option_value_falls_back_to_text() {
+    let mut page = page_with("<select id='s'><option>Hello</option></select>").await;
+    // With no `value` attribute, HTMLOptionElement.value is the text content.
+    assert_eq!(
+        page.evaluate("document.getElementById('s').options[0].value")
+            .unwrap(),
+        "Hello"
+    );
+}
+
+#[tokio::test]
+async fn global_event_handlers_on_document_and_elements() {
+    // React's ChangeEventPlugin feature-detects native input support via
+    // `'oninput' in document`; when absent it falls back to a legacy path that
+    // never fires, silently breaking onChange on every controlled input. The
+    // GlobalEventHandlers on* mixin must exist on Document + HTMLElement, not
+    // just window.
+    let mut page = page_with("").await;
+    assert_eq!(page.evaluate("'oninput' in document").unwrap(), "true");
+    assert_eq!(page.evaluate("'onchange' in document").unwrap(), "true");
+    assert_eq!(page.evaluate("'onclick' in document.body").unwrap(), "true");
+    assert_eq!(
+        page.evaluate("'oninput' in document.createElement('input')")
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(page.evaluate("'oninput' in window").unwrap(), "true");
+}
+
+#[tokio::test]
+async fn oninput_handler_fires_on_dispatch() {
+    let mut page = page_with("<input id='i'>").await;
+    page.evaluate(
+        "globalThis.__fired=0;var i=document.getElementById('i');\
+         i.oninput=function(){globalThis.__fired++;};\
+         i.dispatchEvent(new Event('input',{bubbles:true}));",
+    )
+    .unwrap();
+    assert_eq!(page.evaluate("String(globalThis.__fired)").unwrap(), "1");
+}

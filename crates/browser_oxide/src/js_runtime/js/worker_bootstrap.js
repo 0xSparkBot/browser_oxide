@@ -238,54 +238,45 @@
         ops.op_worker_self_post(payload);
     };
 
-    // --- close: terminate this worker ---
+    // --- close: stop this worker's message pump ---
     // Terminating a worker from inside is rare; the parent handles cleanup.
-    // We DO stop the message-pump interval here so a self-closed worker stops
-    // holding `pending_intervals > 0` forever (06_ENGINE_CORRECTNESS #8) — a
-    // closed DedicatedWorkerGlobalScope must not keep a live 5 ms poll.
-    let _pumpId = 0;
+    let _closed = false;
     self.close = function () {
-        if (_pumpId) {
-            try { clearInterval(_pumpId); } catch (_e) {}
-            _pumpId = 0;
-        }
-        // parent.terminate() still drives real shutdown via AtomicBool.
+        _closed = true;
+        // parent.terminate() drives real shutdown via the terminate flag +
+        // notify_worker, which resolves the awaited recv and ends the pump.
     };
 
-    // --- Poll loop: drain parent→worker messages and fire message events ---
-    function drainOnce() {
-        while (true) {
-            const s = ops.op_worker_self_recv();
-            if (!s) break;
-            let payload;
-            try {
-                payload = JSON.parse(s);
-            } catch (e) {
-                continue;
-            }
-            const deserializer =
-                _browser_oxide && _browser_oxide.deserializeFromWire;
-            const data = deserializer
-                ? deserializer(payload && payload.data)
-                : payload && payload.data;
-            const event = {
-                type: "message",
-                data,
-                origin: "",
-                lastEventId: "",
-                source: null,
-                ports: [],
-                timeStamp: Date.now(),
-            };
-            // Use Event constructor from interfaces_bootstrap
-            const ev = new MessageEvent("message", { data });
-            self.dispatchEvent(ev);
+    function _dispatchWorkerMessage(s) {
+        let payload;
+        try {
+            payload = JSON.parse(s);
+        } catch (_e) {
+            return;
         }
+        const deserializer =
+            _browser_oxide && _browser_oxide.deserializeFromWire;
+        const data = deserializer
+            ? deserializer(payload && payload.data)
+            : payload && payload.data;
+        self.dispatchEvent(new MessageEvent("message", { data }));
     }
-    // Prime the pump every 5ms. In a later pass this can be driven by the
-    // event loop directly instead of setInterval. Capture the id so
-    // self.close() can clear it (see above).
-    _pumpId = setInterval(drainOnce, 5);
+
+    // --- Pump: event-driven parent→worker message delivery ---
+    // Parks on the worker's Notify via `op_worker_self_await_message`, which
+    // resolves with "" once the worker is terminated to end the loop.
+    (async function _workerPump() {
+        while (!_closed) {
+            let s;
+            try {
+                s = await ops.op_worker_self_await_message();
+            } catch (_e) {
+                break;
+            }
+            if (!s) break; // "" ⇒ terminated
+            _dispatchWorkerMessage(s);
+        }
+    })();
 
     // --- importScripts: classic-worker synchronous script loader ---
     self.importScripts = function importScripts(...urls) {

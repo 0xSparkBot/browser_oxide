@@ -171,3 +171,160 @@ async fn fp_e1_post_js_injected_iframe_is_materialized() {
         .await;
     assert_eq!(n2, 0, "rematerialize must be idempotent");
 }
+
+// A child that runs `parent.postMessage(...)` from INSIDE its own realm must
+// land on the parent window with event.source === iframe.contentWindow
+// (regression for the Stripe checkout cross-origin frame handshake). The parent
+// pings the child first so its `message` listener is registered before the reply
+// arrives; delivery is an async task (like a real browser), so drive the loop.
+#[tokio::test]
+async fn cross_realm_post_message_to_parent() {
+    let mut page = Page::from_html(
+        r#"<!DOCTYPE html><html><body>
+        <iframe id="f" srcdoc="<html><body><script>
+            addEventListener('message', function(e){
+                if (e.data === 'ping') parent.postMessage({ hello: 'world' }, '*');
+            });
+        </script></body></html>"></iframe>
+        </body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    page.evaluate(
+        r#"(function(){
+            globalThis.__msg = null;
+            const iframe = document.getElementById('f');
+            const cw = iframe.contentWindow;
+            globalThis.__cw = cw;
+            // `contentWindow.parent === window`: the parent-side view of the
+            // child's parent is the real parent window (WindowProxy identity).
+            globalThis.__parentIsWindow = (cw.parent === window);
+            window.addEventListener('message', function(e){
+                if (e.data && e.data.hello) {
+                    globalThis.__msg = { data: e.data, sameSource: e.source === globalThis.__cw };
+                }
+            });
+            cw.postMessage('ping', '*');
+        })()"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(200))
+        .await
+        .ok();
+    let r = page.evaluate("JSON.stringify(globalThis.__msg)").unwrap();
+    let parent_is_window = page
+        .evaluate("String(globalThis.__parentIsWindow)")
+        .unwrap();
+
+    assert_eq!(
+        parent_is_window, "true",
+        "iframe.contentWindow.parent must === window"
+    );
+    assert!(
+        r.contains("hello"),
+        "parent must receive child postMessage: {r}"
+    );
+    assert!(
+        r.contains("\"sameSource\":true"),
+        "event.source must be the iframe contentWindow: {r}"
+    );
+}
+
+// F1 frame-tree foundation: a script that inserts an `<iframe src>` fires
+// `op_frame_pending`; `drive_frame_tree` (gated on BROWSER_OXIDE_FRAME_TREE)
+// materializes it as a REAL child context (own isolate + DOM + event loop) and
+// the frame's own document executes. Network test — run with `--ignored`.
+#[ignore = "network: materializes a real cross-origin iframe via the frame tree"]
+#[tokio::test]
+async fn frame_tree_materializes_src_iframe() {
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let client = browser_oxide::net::HttpClient::shared(&profile).unwrap();
+    let mut page = Page::from_html(
+        "<!DOCTYPE html><html><body><div id=root></div></body></html>",
+        Some(profile.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.frame_tree_count(), 0);
+
+    page.evaluate(
+        r#"const f = document.createElement('iframe');
+        f.src = 'https://example.com/';
+        document.body.appendChild(f);"#,
+    )
+    .unwrap();
+
+    page.drive_frame_tree(&client, &profile).await;
+
+    assert_eq!(
+        page.frame_tree_count(),
+        1,
+        "frame tree must materialize the script-inserted src iframe"
+    );
+    // The frame is a real executing context with its own document.
+    let title = page
+        .frame_tree_evaluate(0, "document.title")
+        .unwrap_or_default();
+    assert!(
+        title.contains("Example"),
+        "materialized frame must run its own document (title={title:?})"
+    );
+}
+
+// F2 cross-frame postMessage: a materialized child frame (separate isolate)
+// posts to `parent`; the top page's `message` listener receives it, routed
+// through the frame-message registry. Network test — run with `--ignored`.
+#[ignore = "network: cross-frame postMessage via the frame tree"]
+#[tokio::test]
+async fn frame_tree_child_to_parent_postmessage() {
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let client = browser_oxide::net::HttpClient::shared(&profile).unwrap();
+    let mut page = Page::from_html(
+        r#"<!DOCTYPE html><html><body><script>
+        globalThis.__got = 'none';
+        window.addEventListener('message', function(e){ globalThis.__got = JSON.stringify(e.data); });
+        </script></body></html>"#,
+        Some(profile.clone()),
+    )
+    .await
+    .unwrap();
+
+    page.evaluate(
+        "const f=document.createElement('iframe');f.src='https://example.com/';document.body.appendChild(f);",
+    )
+    .unwrap();
+    page.drive_frame_tree(&client, &profile).await;
+    assert_eq!(page.frame_tree_count(), 1, "child frame must materialize");
+
+    // Give the child a listener, then post parent -> child via contentWindow.
+    page.frame_tree_evaluate(
+        0,
+        "globalThis.__cgot='none'; window.addEventListener('message', function(e){ globalThis.__cgot = JSON.stringify(e.data); });",
+    );
+    page.evaluate(
+        "document.querySelector('iframe').contentWindow.postMessage({toChild:'hi'}, '*')",
+    )
+    .unwrap();
+    // Child posts child -> parent via `parent`.
+    page.frame_tree_evaluate(0, "parent.postMessage({relayed:'yes'}, '*')");
+
+    // Drive to deliver both queued messages.
+    page.drive_frame_tree(&client, &profile).await;
+
+    let got = page
+        .evaluate("String(globalThis.__got)")
+        .unwrap_or_default();
+    assert!(
+        got.contains("relayed") && got.contains("yes"),
+        "top page must receive the child frame's postMessage: {got}"
+    );
+    let cgot = page
+        .frame_tree_evaluate(0, "String(globalThis.__cgot)")
+        .unwrap_or_default();
+    assert!(
+        cgot.contains("toChild") && cgot.contains("hi"),
+        "child frame must receive the parent's postMessage: {cgot}"
+    );
+}

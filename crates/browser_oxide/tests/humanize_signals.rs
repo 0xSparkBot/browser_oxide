@@ -68,10 +68,7 @@ async fn humanize_emits_full_signal_set() {
     // schedules setTimeouts up to ~3.2 s out, so a 4 s budget covers
     // everything. `page.evaluate("0")` alone doesn't fire pending
     // timers — we need run_until_idle.
-    let _ = page
-        .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(4))
-        .await;
+    let _ = page.event_loop().run_until_idle().await;
 
     let n_total = page.evaluate("globalThis.__events.length").unwrap();
     let n_mousemove = page
@@ -169,10 +166,7 @@ async fn humanize_mouse_intervals_are_right_skewed() {
     // pumps as wall-clock time elapses (timer_bootstrap.js:33), so drive the
     // loop in short real-time slices instead of one idle wait.
     for _ in 0..90 {
-        let _ = page
-            .event_loop()
-            .run_until_idle(std::time::Duration::from_millis(20))
-            .await;
+        let _ = page.event_loop().run_until_idle().await;
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     }
 

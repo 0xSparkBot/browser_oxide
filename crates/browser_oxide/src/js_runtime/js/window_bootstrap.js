@@ -14,6 +14,15 @@
     };
     Object.defineProperty(globalThis, '_browser_oxide', { value: _browser_oxide, configurable: true, enumerable: false, writable: true });
 
+    // Exposed via a Symbol slot so it survives `cleanup_bootstrap` deleting the
+    // `Deno`/`ops` globals; the closure keeps `ops` reachable.
+    try {
+        Object.defineProperty(globalThis, Symbol.for('__browser_oxide_mark_load__'), {
+            value: () => { try { ops.op_lifecycle_load(); } catch (_) {} },
+            writable: false, configurable: true, enumerable: false,
+        });
+    } catch (_) {}
+
     if (globalThis.WebAssembly) {
         // Streaming stubs
         WebAssembly.instantiateStreaming = async function(source, importObject) {
@@ -1416,8 +1425,14 @@
         _locationData.href = _locationData.origin + _locationData.pathname + _locationData.search + _locationData.hash;
     });
     _defLoc('ancestorOrigins', () => {
-        const _ao = { length: 0, item: () => null, contains: () => false };
-        _ao[Symbol.iterator] = function*() {};
+        const arr = Array.isArray(globalThis.__frameAncestorOrigins) ? globalThis.__frameAncestorOrigins : [];
+        const _ao = {
+            length: arr.length,
+            item: (i) => (i >= 0 && i < arr.length) ? arr[i] : null,
+            contains: (s) => arr.indexOf(s) !== -1,
+        };
+        for (let i = 0; i < arr.length; i++) _ao[i] = arr[i];
+        _ao[Symbol.iterator] = function*() { for (let i = 0; i < arr.length; i++) yield arr[i]; };
         return _ao;
     });
 
@@ -1459,9 +1474,8 @@
         globalThis.location = _locationInstance;
     }
 
-    // Frame-tree globals: top/parent/frames/self all point to this window
-    // window / self / frames / top / parent — self-references.
-    for (const key of ['window', 'self', 'frames', 'top', 'parent']) {
+    // Frame-tree globals: window/self/frames point to this window.
+    for (const key of ['window', 'self', 'frames']) {
         Object.defineProperty(globalThis, key, {
             value: globalThis,
             writable: false,
@@ -1469,6 +1483,16 @@
             enumerable: true
         });
     }
+    // top/parent are getters (as in real browsers) so the frame tree can point
+    // them at a real parent/top frame handle via `__oxFrameSetup`; default self.
+    Object.defineProperty(globalThis, 'parent', {
+        get() { return globalThis.__frameParentOverride || globalThis; },
+        configurable: false, enumerable: true,
+    });
+    Object.defineProperty(globalThis, 'top', {
+        get() { return globalThis.__frameTopOverride || globalThis; },
+        configurable: false, enumerable: true,
+    });
     globalThis.opener = null;
     // window.length = number of child frames. Starts at 0; dom_bootstrap.js
     // updates it when iframes are appended to the document.
@@ -2450,8 +2474,9 @@
                     port.dispatchEvent(ev);
                 } catch (_e) {}
             };
-            const _sched = globalThis.__bgSetTimeout || globalThis.setTimeout;
-            try { _sched(_fire, 0); } catch (_e) { _fire(); }
+            // Use a refed setTimeout so the loop stays alive to deliver the
+            // queued port message; React 18's scheduler waits on it to run.
+            try { globalThis.setTimeout(_fire, 0); } catch (_e) { _fire(); }
         };
 
         globalThis.MessagePort = class MessagePort extends EventTarget {

@@ -692,13 +692,6 @@ impl HttpClient {
                     }
                 };
                 let uri = parsed.as_str();
-                if uri.contains("/mfc")
-                    || uri.contains("/akam/13")
-                    || uri.contains("/tl")
-                    || uri.contains("/r")
-                {
-                    eprintln!("[net] sending request to {} with headers: {:?}", uri, hdrs);
-                }
                 match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
                     Ok((parts, body)) => {
                         let resp = self.build_response(parts, body, url).await?;
@@ -824,13 +817,6 @@ impl HttpClient {
                     }
                 };
                 let uri = parsed.as_str();
-                if uri.contains("/mfc")
-                    || uri.contains("/akam/13")
-                    || uri.contains("/tl")
-                    || uri.contains("/r")
-                {
-                    eprintln!("[net] sending request to {} with headers: {:?}", uri, hdrs);
-                }
                 match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
                     Ok((parts, body)) => {
                         let resp = self.build_response(parts, body, url).await?;

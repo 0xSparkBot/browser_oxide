@@ -121,6 +121,9 @@ impl ModuleLoader for BrowserModuleLoader {
         }
 
         let fut = async move {
+            // Count this dynamic-import chunk fetch as in-flight so the page
+            // isn't reported settled while the chunk is still downloading.
+            let _net = crate::js_runtime::readiness::RequestGuard::new();
             let client = client.ok_or_else(|| {
                 ModuleLoaderError::generic("module loader: shared HTTP client unavailable")
             })?;

@@ -11,7 +11,6 @@
 
 #![cfg(feature = "webgl-render")]
 
-use browser_oxide::stealth;
 use browser_oxide::Page;
 
 fn html(body: &str) -> String {

@@ -4,8 +4,6 @@
 //!
 //! Run: cargo test -p browser --test worker_page_integration -- --test-threads=1 --nocapture
 
-use std::time::Duration;
-
 #[tokio::test]
 async fn worker_works_in_page_bootstrap() {
     use browser_oxide::event_loop::BrowserEventLoop;
@@ -61,10 +59,7 @@ async fn worker_works_in_page_bootstrap() {
         )
         .unwrap();
 
-    evloop
-        .run_until_idle(Duration::from_millis(2000))
-        .await
-        .unwrap();
+    evloop.run_until_idle().await.unwrap();
 
     let out = evloop
         .execute_script("document.querySelector('#out').textContent")

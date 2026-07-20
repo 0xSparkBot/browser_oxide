@@ -190,6 +190,9 @@ struct WorkerSlot {
     /// polling. Drives the W5b-deep fix: SPA pages stop pinning the
     /// V8 event loop with a 5ms setInterval.
     notify_parent: Arc<Notify>,
+    /// Wakes the worker's event-loop pump and `op_worker_self_await_message`
+    /// on a parent post or terminate, so an idle worker parks instead of polling.
+    notify_worker: Arc<Notify>,
 }
 
 fn worker_registry() -> &'static Mutex<HashMap<u32, WorkerSlot>> {
@@ -210,6 +213,12 @@ struct WorkerSelf {
     /// signals after every send so the parent's awaiting promise wakes
     /// up without polling.
     notify_parent: Arc<Notify>,
+    /// Same Arc as the parent's `WorkerSlot.notify_worker`; the worker's
+    /// `op_worker_self_await_message` parks on it, the parent signals on post/terminate.
+    notify_worker: Arc<Notify>,
+    /// Same Arc as the parent's `WorkerSlot.terminate`. Lets the worker's
+    /// `op_worker_self_await_message` return "" (stop) once terminated.
+    terminate: Arc<AtomicBool>,
     /// URL the worker was constructed with (`new Worker(url)`). Drives
     /// `self.location.href` in the worker realm via `op_worker_self_url`.
     /// Some workers read `self.location.origin` to verify they were
@@ -263,6 +272,7 @@ pub fn op_worker_spawn(
     let (to_parent_tx, to_parent_rx) = std::sync::mpsc::channel::<String>();
     let terminate = Arc::new(AtomicBool::new(false));
     let notify_parent = Arc::new(Notify::new());
+    let notify_worker = Arc::new(Notify::new());
     let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
     // op_worker_spawn previously logged only on failure, so a missing
     // spawn and a silent spawn were indistinguishable when diagnosing a
@@ -287,6 +297,7 @@ pub fn op_worker_spawn(
                 from_worker: to_parent_rx,
                 terminate: terminate.clone(),
                 notify_parent: notify_parent.clone(),
+                notify_worker: notify_worker.clone(),
             },
         );
     }
@@ -301,7 +312,7 @@ pub fn op_worker_spawn(
     // because our shim adds more JS frames per native call.
     let thread_result = std::thread::Builder::new()
         .name(format!("worker-{worker_id}"))
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(crate::js_runtime::V8_THREAD_STACK)
         .spawn(move || {
             // Install per-thread worker state BEFORE any ops run.
             WORKER_SELF.with(|w| {
@@ -309,6 +320,8 @@ pub fn op_worker_spawn(
                     to_parent: to_parent_tx,
                     from_parent: to_worker_rx,
                     notify_parent: notify_parent.clone(),
+                    notify_worker: notify_worker.clone(),
+                    terminate: terminate.clone(),
                     url,
                 });
             });
@@ -376,28 +389,22 @@ pub fn op_worker_spawn(
                     tracing::warn!(worker_id = worker_id, error = %e, "worker script error");
                 }
 
-                // Drive the event loop until terminated. A small polling
-                // cadence lets us observe both parent messages and terminate
-                // signals.
+                // When the event loop drains (worker idle), park on `notify_worker`
+                // instead of polling; a parent post or terminate wakes it.
                 while !terminate.load(Ordering::Acquire) {
-                    let fut = Box::pin(
-                        runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-                    );
-                    let tick =
-                        tokio::time::timeout(std::time::Duration::from_millis(25), fut).await;
-                    match tick {
-                        Ok(Ok(())) => {
-                            // All pending work done — yield briefly and check
-                            // again for incoming parent messages / terminate.
-                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    match runtime
+                        .run_event_loop(deno_core::PollEventLoopOptions::default())
+                        .await
+                    {
+                        Ok(()) => {
+                            if terminate.load(Ordering::Acquire) {
+                                break;
+                            }
+                            notify_worker.notified().await;
                         }
-                        Ok(Err(e)) => {
+                        Err(e) => {
                             tracing::warn!(worker_id = worker_id, error = %e, "worker event loop error");
                             break;
-                        }
-                        Err(_) => {
-                            // Tick timeout — event loop still has work.
-                            continue;
                         }
                     }
                 }
@@ -424,6 +431,8 @@ pub fn op_worker_post_to_worker(#[smi] worker_id: i32, #[string] data: String) {
     let reg = worker_registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = reg.get(&(worker_id as u32)) {
         let _ = slot.to_worker.send(data);
+        // Wake the worker's parked pump / `op_worker_self_await_message`.
+        slot.notify_worker.notify_one();
     }
 }
 
@@ -461,6 +470,9 @@ pub fn terminate_worker_inner(worker_id: u32) {
         // Wake any in-flight `op_worker_await_message` so it can return
         // empty and the JS-side pump can stop chaining.
         slot.notify_parent.notify_waiters();
+        // notify_one stores a permit, so a terminate raised while the worker
+        // isn't parked isn't lost — the next `notified()` consumes it and exits.
+        slot.notify_worker.notify_one();
     }
     reg.remove(&worker_id);
 }
@@ -573,6 +585,44 @@ pub fn op_worker_self_recv() -> String {
     })
 }
 
+/// Worker-side recv that parks on the worker's Notify instead of polling.
+/// Returns "" once terminated so the JS pump can stop chaining.
+#[op2(async(lazy), fast)]
+#[string]
+pub async fn op_worker_self_await_message() -> String {
+    // Clone the Notify + terminate flag and try a fast drain, dropping the
+    // WORKER_SELF borrow before any await.
+    let (notify, terminate, fast) = WORKER_SELF.with(|w| match w.borrow().as_ref() {
+        Some(s) => (
+            Some(s.notify_worker.clone()),
+            Some(s.terminate.clone()),
+            s.from_parent.try_recv().ok(),
+        ),
+        None => (None, None, None),
+    });
+    if let Some(msg) = fast {
+        return msg;
+    }
+    let (Some(notify), Some(terminate)) = (notify, terminate) else {
+        return String::new();
+    };
+    // Notified is edge-triggered, so re-check the queue after each wake.
+    loop {
+        if terminate.load(Ordering::Acquire) {
+            return String::new();
+        }
+        notify.notified().await;
+        let msg = WORKER_SELF.with(|w| {
+            w.borrow()
+                .as_ref()
+                .and_then(|s| s.from_parent.try_recv().ok())
+        });
+        if let Some(msg) = msg {
+            return msg;
+        }
+    }
+}
+
 /// Return the URL the current worker was constructed
 /// with (`new Worker(url)`). Used by `worker_bootstrap.js` to install
 /// `self.location` — real Chrome's `WorkerLocation` reports the
@@ -607,5 +657,6 @@ deno_core::extension!(
         op_worker_self_post,
         op_worker_self_url,
         op_worker_self_recv,
+        op_worker_self_await_message,
     ],
 );

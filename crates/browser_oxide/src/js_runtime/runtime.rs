@@ -5,6 +5,7 @@ use crate::js_runtime::extensions::console_ext::console_extension;
 use crate::js_runtime::extensions::crypto_ext::crypto_extension;
 use crate::js_runtime::extensions::dom_ext::dom_extension;
 use crate::js_runtime::extensions::fetch_ext::{fetch_extension, FetchState};
+use crate::js_runtime::extensions::frame_ext::{frame_extension, IframeSignal};
 use crate::js_runtime::extensions::input_ext::input_extension;
 use crate::js_runtime::extensions::layout_ext::layout_extension;
 use crate::js_runtime::extensions::nav_ext::{nav_extension, NavSignal};
@@ -15,11 +16,16 @@ use crate::js_runtime::extensions::timer_ext::{timer_extension, TimerState};
 use crate::js_runtime::extensions::webgl_ext::{webgl_extension, WebGLState};
 use crate::js_runtime::extensions::websocket_ext::{websocket_extension, WebSocketState};
 use crate::js_runtime::extensions::worker_ext::worker_extension;
+use crate::js_runtime::readiness::readiness_extension;
 use crate::js_runtime::state::DomState;
 use crate::stealth::StealthProfile;
 use deno_core::{v8, JsRuntime, RuntimeOptions, SharedArrayBufferStore};
 
 use std::collections::HashMap;
+
+/// Set once the first `BROWSER_OXIDE_INSPECT` runtime has claimed the debug
+/// port, so its later-created iframes/workers don't fight over it.
+static INSPECTOR_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Options for creating a BrowserJsRuntime.
 #[derive(Default)]
@@ -50,6 +56,9 @@ pub struct BrowserRuntimeOptions {
     /// `[SecureContext]` extended attribute. Phase 7 fix. Default false —
     /// callers (e.g. Page::from_html_with_url) classify the URL scheme.
     pub is_secure_context: bool,
+    /// Start the V8 inspector so a Chrome DevTools Protocol frontend can attach
+    /// for breakpoint/step debugging. Off by default. See `js_runtime::inspector`.
+    pub inspector: bool,
 }
 
 /// Create a deno_core JsRuntime configured with browser extensions.
@@ -123,6 +132,19 @@ pub fn create_runtime_with_signals(
     const HEAP_MAX: usize = 4 * 1024 * 1024 * 1024; // 4 GB max
     let create_params = deno_core::v8::CreateParams::default().heap_limits(HEAP_INITIAL, HEAP_MAX);
 
+    // Enable the inspector on caller opt-in or `BROWSER_OXIDE_INSPECT`. The env
+    // path is claim-once so only the first runtime grabs the debug port.
+    let inspector_enabled = options.inspector
+        || (std::env::var_os("BROWSER_OXIDE_INSPECT").is_some()
+            && INSPECTOR_CLAIMED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok());
+
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![
             console_extension::init(),
@@ -141,6 +163,8 @@ pub fn create_runtime_with_signals(
             audio_extension::init(),
             perf_extension::init(),
             nav_extension::init(),
+            frame_extension::init(),
+            readiness_extension::init(),
         ],
         startup_snapshot: options.startup_snapshot,
         create_params: Some(create_params),
@@ -149,6 +173,8 @@ pub fn create_runtime_with_signals(
         // separately on `cross_origin_isolated`.
         shared_array_buffer_store: Some(SharedArrayBufferStore::default()),
         module_loader,
+        inspector: inspector_enabled,
+        is_main: inspector_enabled,
         ..Default::default()
     });
 
@@ -165,6 +191,7 @@ pub fn create_runtime_with_signals(
         .borrow_mut()
         .put(crate::js_runtime::extensions::input_ext::BehaviorRngState::from_env_or_random());
     runtime.op_state().borrow_mut().put(nav_signal.clone());
+    runtime.op_state().borrow_mut().put(IframeSignal::new());
     runtime.op_state().borrow_mut().put(stealth_state);
     runtime.op_state().borrow_mut().put(fetch_state);
     runtime.op_state().borrow_mut().put(CanvasState::new());
@@ -238,18 +265,26 @@ pub fn create_runtime_with_signals(
             include_str!("js/structured_clone.js"),
         );
 
+        let _bt0 = std::time::Instant::now();
         runtime
             .execute_script("<anonymous>", BOOTSTRAP_JS)
             .expect("bootstrap failed");
+        if std::env::var_os("BROWSER_OXIDE_BOOTSTRAP_PROFILE").is_some() {
+            eprintln!("[boot] BOOTSTRAP_JS exec: {:?}", _bt0.elapsed());
+        }
     }
 
     // All bootstrap scripts run with name "<anonymous>" so V8 stack
     // frames don't leak browser_oxide-specific tags — real Chrome's
     // Error.stack does not reference internal bootstrap scripts.
     // Always run cleanup to hide internals, even when restoring from snapshot.
+    let _ct0 = std::time::Instant::now();
     runtime
         .execute_script("<anonymous>", include_str!("js/cleanup_bootstrap.js"))
         .expect("cleanup failed");
+    if std::env::var_os("BROWSER_OXIDE_BOOTSTRAP_PROFILE").is_some() {
+        eprintln!("[boot] cleanup exec: {:?}", _ct0.elapsed());
+    }
 
     // Capture Symbol.for('__browser_oxide_native__') from the JS global registry
     // AFTER bootstrap runs (stealth_bootstrap.js creates it at startup).
@@ -318,6 +353,23 @@ pub fn create_runtime_with_signals(
     for code in options.init_scripts.iter() {
         if let Err(e) = runtime.execute_script("<anonymous>", code.clone()) {
             tracing::warn!(error = %e, "init script failed");
+        }
+    }
+
+    // Bridge the inspector over a WebSocket. Keep the server in OpState so it
+    // lives with the runtime and drops with it; `run_event_loop` pumps sessions.
+    if inspector_enabled {
+        let port = std::env::var("BROWSER_OXIDE_INSPECT_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(9229);
+        let sender = runtime.inspector().get_session_sender();
+        match crate::js_runtime::inspector::InspectorServer::start(sender, port) {
+            Ok(server) => {
+                eprintln!("[inspector] CDP endpoint: {}", server.ws_url());
+                runtime.op_state().borrow_mut().put(server);
+            }
+            Err(e) => tracing::warn!(error = %e, "inspector server failed to start"),
         }
     }
 

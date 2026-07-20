@@ -357,6 +357,189 @@ pub fn op_dom_get_elements_by_class_name(
         .collect()
 }
 
+#[op2]
+#[serde]
+pub fn op_dom_collect_insert_targets(state: &mut OpState, #[smi] node_id: i32) -> Vec<i32> {
+    let state = state.borrow::<DomState>();
+    state
+        .dom
+        .collect_insert_targets(NodeId::from_raw(node_id as u32))
+        .iter()
+        .map(|id| id.to_raw() as i32)
+        .collect()
+}
+
+#[op2(fast)]
+pub fn op_dom_matches(state: &mut OpState, #[smi] node_id: i32, #[string] selector: &str) -> bool {
+    let state = state.borrow::<DomState>();
+    let el = match DomElement::new(&state.dom, NodeId::from_raw(node_id as u32)) {
+        Some(e) => e,
+        None => return false,
+    };
+    match crate::css_selectors::parse_selector_list(selector) {
+        Ok(list) => crate::css_selectors::matches_any(&el, &list),
+        Err(_) => false,
+    }
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_dom_closest(state: &mut OpState, #[smi] node_id: i32, #[string] selector: &str) -> i32 {
+    let state = state.borrow::<DomState>();
+    let list = match crate::css_selectors::parse_selector_list(selector) {
+        Ok(l) => l,
+        Err(_) => return -1,
+    };
+    let mut cur = Some(NodeId::from_raw(node_id as u32));
+    while let Some(id) = cur {
+        if let Some(el) = DomElement::new(&state.dom, id) {
+            if crate::css_selectors::matches_any(&el, &list) {
+                return id.to_raw() as i32;
+            }
+        }
+        cur = state.dom.get(id).and_then(|n| n.parent);
+    }
+    -1
+}
+
+#[op2(fast)]
+pub fn op_dom_contains(state: &mut OpState, #[smi] ancestor: i32, #[smi] descendant: i32) -> bool {
+    if ancestor == descendant {
+        return true;
+    }
+    let state = state.borrow::<DomState>();
+    let anc = NodeId::from_raw(ancestor as u32);
+    let mut cur = state
+        .dom
+        .get(NodeId::from_raw(descendant as u32))
+        .and_then(|n| n.parent);
+    while let Some(id) = cur {
+        if id == anc {
+            return true;
+        }
+        cur = state.dom.get(id).and_then(|n| n.parent);
+    }
+    false
+}
+
+#[op2(fast)]
+pub fn op_dom_is_connected(state: &mut OpState, #[smi] node_id: i32) -> bool {
+    let state = state.borrow::<DomState>();
+    let mut cur = Some(NodeId::from_raw(node_id as u32));
+    while let Some(id) = cur {
+        if id == NodeId::DOCUMENT {
+            return true;
+        }
+        cur = state.dom.get(id).and_then(|n| n.parent);
+    }
+    false
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_dom_get_first_element_child(state: &mut OpState, #[smi] node_id: i32) -> i32 {
+    let state = state.borrow::<DomState>();
+    let mut cur = state
+        .dom
+        .get(NodeId::from_raw(node_id as u32))
+        .and_then(|n| n.first_child);
+    while let Some(id) = cur {
+        let node = match state.dom.get(id) {
+            Some(n) => n,
+            None => return -1,
+        };
+        if node.is_element() {
+            return id.to_raw() as i32;
+        }
+        cur = node.next_sibling;
+    }
+    -1
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_dom_get_last_element_child(state: &mut OpState, #[smi] node_id: i32) -> i32 {
+    let state = state.borrow::<DomState>();
+    let mut cur = state
+        .dom
+        .get(NodeId::from_raw(node_id as u32))
+        .and_then(|n| n.last_child);
+    while let Some(id) = cur {
+        let node = match state.dom.get(id) {
+            Some(n) => n,
+            None => return -1,
+        };
+        if node.is_element() {
+            return id.to_raw() as i32;
+        }
+        cur = node.prev_sibling;
+    }
+    -1
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_dom_get_next_element_sibling(state: &mut OpState, #[smi] node_id: i32) -> i32 {
+    let state = state.borrow::<DomState>();
+    let mut cur = state
+        .dom
+        .get(NodeId::from_raw(node_id as u32))
+        .and_then(|n| n.next_sibling);
+    while let Some(id) = cur {
+        let node = match state.dom.get(id) {
+            Some(n) => n,
+            None => return -1,
+        };
+        if node.is_element() {
+            return id.to_raw() as i32;
+        }
+        cur = node.next_sibling;
+    }
+    -1
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_dom_get_prev_element_sibling(state: &mut OpState, #[smi] node_id: i32) -> i32 {
+    let state = state.borrow::<DomState>();
+    let mut cur = state
+        .dom
+        .get(NodeId::from_raw(node_id as u32))
+        .and_then(|n| n.prev_sibling);
+    while let Some(id) = cur {
+        let node = match state.dom.get(id) {
+            Some(n) => n,
+            None => return -1,
+        };
+        if node.is_element() {
+            return id.to_raw() as i32;
+        }
+        cur = node.prev_sibling;
+    }
+    -1
+}
+
+#[op2(fast)]
+pub fn op_dom_get_child_element_count(state: &mut OpState, #[smi] node_id: i32) -> u32 {
+    let state = state.borrow::<DomState>();
+    let mut count = 0u32;
+    let mut cur = state
+        .dom
+        .get(NodeId::from_raw(node_id as u32))
+        .and_then(|n| n.first_child);
+    while let Some(id) = cur {
+        let node = match state.dom.get(id) {
+            Some(n) => n,
+            None => break,
+        };
+        if node.is_element() {
+            count += 1;
+        }
+        cur = node.next_sibling;
+    }
+    count
+}
+
 // --- Mutation ops ---
 
 #[op2(fast)]
@@ -391,6 +574,7 @@ pub fn op_dom_append_child(state: &mut OpState, #[smi] parent: i32, #[smi] child
         NodeId::from_raw(child as u32),
     );
     state.layout_engine.mark_dirty();
+    crate::js_runtime::readiness::bump_mutation();
 }
 
 #[op2(fast)]
@@ -407,6 +591,7 @@ pub fn op_dom_insert_before(
         NodeId::from_raw(reference as u32),
     );
     state.layout_engine.mark_dirty();
+    crate::js_runtime::readiness::bump_mutation();
 }
 
 #[op2(fast)]
@@ -414,6 +599,7 @@ pub fn op_dom_remove_child(state: &mut OpState, #[smi] _parent: i32, #[smi] chil
     let state = state.borrow_mut::<DomState>();
     state.dom.detach(NodeId::from_raw(child as u32));
     state.layout_engine.mark_dirty();
+    crate::js_runtime::readiness::bump_mutation();
 }
 
 #[op2(fast)]
@@ -468,6 +654,7 @@ pub fn op_dom_set_text_content(state: &mut OpState, #[smi] node_id: i32, #[strin
         .dom
         .set_text_content(NodeId::from_raw(node_id as u32), text);
     state.layout_engine.mark_dirty();
+    crate::js_runtime::readiness::bump_mutation();
 }
 
 #[op2(fast)]
@@ -494,6 +681,7 @@ pub fn op_dom_set_inner_html(state: &mut OpState, #[smi] node_id: i32, #[string]
         }
     }
     state.layout_engine.mark_dirty();
+    crate::js_runtime::readiness::bump_mutation();
 }
 
 /// Clone a node. If deep=true, clone all descendants too.
@@ -667,6 +855,7 @@ pub fn op_dom_insert_adjacent_html(
         _ => {}
     }
     state.layout_engine.mark_dirty();
+    crate::js_runtime::readiness::bump_mutation();
 }
 
 #[op2]
@@ -696,6 +885,7 @@ pub fn op_dom_document_write(state: &mut OpState, #[string] html: &str) -> Vec<i
         }
     }
     state.layout_engine.mark_dirty();
+    crate::js_runtime::readiness::bump_mutation();
     new_ids
 }
 
@@ -1206,6 +1396,17 @@ pub fn op_create_child_realm<'s>(
     let parent_tok = parent_ctx.get_security_token(scope);
     child_ctx.set_security_token(parent_tok);
 
+    // Child realm slots 1/2 (ContextState, ModuleMap) are unset; deno_core's
+    // promise-reject callback reads them and would segfault, so borrow the parent's.
+    // SAFETY: parent_ctx is a live deno_core context whose slots 1/2 hold valid
+    // pointers; we copy them without taking ownership, so no double-free.
+    unsafe {
+        let cs_ptr = parent_ctx.get_aligned_pointer_from_embedder_data(1);
+        let mm_ptr = parent_ctx.get_aligned_pointer_from_embedder_data(2);
+        child_ctx.set_aligned_pointer_in_embedder_data(1, cs_ptr);
+        child_ctx.set_aligned_pointer_in_embedder_data(2, mm_ptr);
+    }
+
     // Set up the child context.  Returns None on any fatal V8 allocation
     // failure (extremely rare); the outer code falls back to undefined.
     let child_global_g: Option<v8::Global<v8::Object>> = {
@@ -1354,13 +1555,85 @@ pub fn op_set_child_realm_prop<'s>(
     v8::undefined(cs).into()
 }
 
+/// Getter for a child realm's `parent`/`top`: returns `data[0]` (parent WindowProxy)
+/// from the parent realm, `data[1]` (postMessage proxy) from inside the child realm.
+fn frame_parent_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _key: v8::Local<'s, v8::Name>,
+    args: v8::PropertyCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Ok(arr) = v8::Local::<v8::Array>::try_from(args.data()) else {
+        return;
+    };
+    let current = scope.get_current_context();
+    let child_ctxs: Vec<v8::Global<v8::Context>> = {
+        let op_state_rc = JsRuntime::op_state_from(scope);
+        let op_state = op_state_rc.borrow();
+        op_state
+            .try_borrow::<IframeRealmStore>()
+            .map(|s| s.contexts.values().cloned().collect())
+            .unwrap_or_default()
+    };
+    let in_child = child_ctxs
+        .iter()
+        .any(|g| v8::Local::new(scope, g) == current);
+    let idx = if in_child { 1 } else { 0 };
+    if let Some(v) = arr.get_index(scope, idx) {
+        rv.set(v);
+    }
+}
+
+/// Install `parent`/`top` as context-aware accessors on a child realm: `real_window`
+/// is the parent's WindowProxy, `msg_source`/`top_source` the postMessage proxies.
+#[op2]
+pub fn op_install_frame_parent<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+    real_window: v8::Local<v8::Value>,
+    msg_source: v8::Local<v8::Value>,
+    top_source: v8::Local<v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    let rid = realm_id as u32;
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let child_ctx_g: Option<v8::Global<v8::Context>> = {
+        let op_state = op_state_rc.borrow();
+        op_state.try_borrow::<IframeRealmStore>().and_then(|store| {
+            store.contexts.get(&rid).map(|g| {
+                let local = v8::Local::new(scope, g);
+                v8::Global::new(scope, local)
+            })
+        })
+    };
+    let Some(child_ctx_g) = child_ctx_g else {
+        return v8::undefined(scope).into();
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let child_proxy = child_ctx.global(cs);
+
+    for (key, source) in [("parent", msg_source), ("top", top_source)] {
+        let Some(k) = v8::String::new(cs, key) else {
+            continue;
+        };
+        let arr = v8::Array::new(cs, 2);
+        arr.set_index(cs, 0, real_window);
+        arr.set_index(cs, 1, source);
+        let name: v8::Local<v8::Name> = k.into();
+        let cfg = v8::AccessorConfiguration::new(frame_parent_getter).data(arr.into());
+        child_proxy.set_accessor_with_configuration(cs, name, cfg);
+    }
+    v8::undefined(cs).into()
+}
+
 /// Execute a JavaScript string inside a child realm's context.
 ///
 /// Compiles and runs `code` in the child context scope. Returns the result
 /// (coerced to string) or `undefined` on compile/runtime error. Used for
 /// cases where `op_set_child_realm_prop` cannot express the required
 /// descriptor shape (e.g. accessor properties with a getter function).
-#[op2]
+/// Reentrant: child code runs synchronously and may call DOM ops.
+#[op2(reentrant)]
 #[string]
 pub fn op_eval_in_child_realm<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1434,6 +1707,16 @@ deno_core::extension!(
         op_dom_get_element_by_id,
         op_dom_get_elements_by_tag_name,
         op_dom_get_elements_by_class_name,
+        op_dom_collect_insert_targets,
+        op_dom_matches,
+        op_dom_closest,
+        op_dom_contains,
+        op_dom_is_connected,
+        op_dom_get_first_element_child,
+        op_dom_get_last_element_child,
+        op_dom_get_next_element_sibling,
+        op_dom_get_prev_element_sibling,
+        op_dom_get_child_element_count,
         op_dom_create_element,
         op_dom_create_text_node,
         op_dom_create_document_fragment,
@@ -1463,6 +1746,7 @@ deno_core::extension!(
         op_dom_storage_keys,
         op_create_child_realm,
         op_set_child_realm_prop,
+        op_install_frame_parent,
         op_eval_in_child_realm,
     ],
 );

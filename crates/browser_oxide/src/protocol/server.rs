@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::Message;
 /// A running CDP server. Stops when dropped.
 pub struct CdpServer {
     port: u16,
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: std::sync::Arc<tokio::sync::Notify>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -27,11 +27,11 @@ impl CdpServer {
     /// that thread.
     pub fn start(html: &str, port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let html = html.to_string();
-        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let shutdown_clone = shutdown.clone();
         let (port_tx, port_rx) = std::sync::mpsc::channel();
 
-        let thread = std::thread::spawn(move || {
+        let thread = crate::js_runtime::spawn_v8_thread("cdp-server", move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -100,11 +100,11 @@ impl CdpServer {
         port: u16,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let url = url.to_string();
-        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let shutdown_clone = shutdown.clone();
         let (port_tx, port_rx) = std::sync::mpsc::channel();
 
-        let thread = std::thread::spawn(move || {
+        let thread = crate::js_runtime::spawn_v8_thread("cdp-server", move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -195,11 +195,11 @@ impl CdpServer {
     /// The client sends `Page.navigate` via CDP to load pages, and the same
     /// server instance can navigate to multiple URLs without restarting.
     pub fn start_navigable(port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let shutdown_clone = shutdown.clone();
         let (port_tx, port_rx) = std::sync::mpsc::channel();
 
-        let thread = std::thread::spawn(move || {
+        let thread = crate::js_runtime::spawn_v8_thread("cdp-server", move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -292,8 +292,9 @@ impl CdpServer {
 
 impl Drop for CdpServer {
     fn drop(&mut self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // notify_one stores a permit even if the loop isn't waiting yet, so a
+        // stop still wakes it and join returns promptly.
+        self.shutdown.notify_one();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -304,18 +305,19 @@ async fn accept_loop(
     listener: TcpListener,
     page: Rc<RefCell<crate::Page>>,
     http_client: Option<Rc<crate::net::HttpClient>>,
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: std::sync::Arc<tokio::sync::Notify>,
 ) {
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-
-        let accept =
-            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
+        // biased checks shutdown first, so a pending stop wins over an incoming
+        // connection.
+        let accept = tokio::select! {
+            biased;
+            _ = shutdown.notified() => break,
+            r = listener.accept() => r,
+        };
 
         match accept {
-            Ok(Ok((stream, addr))) => {
+            Ok((stream, addr)) => {
                 let page = page.clone();
                 let client = http_client.clone();
                 tokio::task::spawn_local(async move {
@@ -324,11 +326,8 @@ async fn accept_loop(
                     }
                 });
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 tracing::warn!("CDP accept error: {}", e);
-            }
-            Err(_) => {
-                // Timeout — check shutdown flag again
             }
         }
     }

@@ -491,7 +491,8 @@ impl CdpSession {
 
                             // Real-time delay between points (8ms sample rate in model)
                             if i < pts.len() - 1 {
-                                tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+                                crate::stealth::stealth_delay(std::time::Duration::from_millis(8))
+                                    .await;
                             }
                         }
                     } else {
@@ -602,7 +603,7 @@ impl CdpSession {
                     for (i, t) in timings.iter().enumerate() {
                         // Flight time (delay before this key)
                         if i > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(
+                            crate::stealth::stealth_delay(std::time::Duration::from_millis(
                                 t.flight_ms as u64,
                             ))
                             .await;
@@ -621,8 +622,10 @@ impl CdpSession {
                         let _ = page.evaluate(&kd_script);
 
                         // Dwell time (delay while key is down)
-                        tokio::time::sleep(std::time::Duration::from_millis(t.dwell_ms as u64))
-                            .await;
+                        crate::stealth::stealth_delay(std::time::Duration::from_millis(
+                            t.dwell_ms as u64,
+                        ))
+                        .await;
 
                         // Insert character + fire 'input'
                         let script = format!(

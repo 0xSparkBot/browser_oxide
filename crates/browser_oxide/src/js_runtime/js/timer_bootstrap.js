@@ -77,7 +77,7 @@
         }
         const ms = Math.max(0, delay | 0);
         const id = ops.op_set_timeout(ms);
-        // Async ops in deno_core 0.311 are called directly and return Promise
+        // Async ops in deno_core 0.311 are called directly and return Promise.
         const p = ops.op_timer_sleep(ms);
         _maybeUnref(p, ms);
         const myGen = _timerGen;
@@ -199,10 +199,9 @@
     globalThis.requestAnimationFrame = function requestAnimationFrame(callback) {
         const id = ++_rafId;
         _rafCallbacks.set(id, callback);
-        // Fire near 60 Hz via real timer, not microtask. Some scripts
-        // measure RAF timing; a perfect-grid cadence (`set(diffs).size
-        // === 1`) differs from real Chrome.
-        setTimeout(() => {
+        // Fire near 60 Hz via a background timer, not a microtask: scripts measure rAF
+        // timing (a perfect grid differs from real Chrome), and a rAF loop must not block readiness.
+        globalThis.__bgSetTimeout(() => {
             const cb = _rafCallbacks.get(id);
             if (cb) {
                 _rafCallbacks.delete(id);

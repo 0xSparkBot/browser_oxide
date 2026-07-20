@@ -61,7 +61,7 @@ impl ChildIframe {
         }
 
         // Run child event loop
-        event_loop.run_until_idle(Duration::from_secs(5)).await?;
+        event_loop.run_until_settled().await?;
 
         Ok(Self {
             node_id,
@@ -75,26 +75,34 @@ impl ChildIframe {
         url: &str,
         client: &crate::net::HttpClient,
         stealth_profile: Option<&crate::stealth::StealthProfile>,
+        frame_ids: Option<(u32, u32, u32)>,
+        name: &str,
+        referrer: &str,
+        ancestor_origins: &[String],
     ) -> Result<Self, deno_core::error::AnyError> {
         // CSP `frame-src` enforcement (falls back to child-src then
         // default-src). Real Chrome refuses to navigate iframes whose
         // src violates the parent's CSP, surfacing the same network-
         // error shape we return on op_fetch blocks.
-        if let Ok(parsed_url) = url::Url::parse(url) {
-            if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_csp(
-                crate::net::csp::Directive::FrameSrc,
-                &parsed_url,
-                None,
-                false,
-            ) {
-                eprintln!(
+        // Skipped when `frame_ids` is set: check_csp reads the top page's CSP,
+        // but a nested frame's frame-src belongs to its parent, which we don't track.
+        if frame_ids.is_none() {
+            if let Ok(parsed_url) = url::Url::parse(url) {
+                if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_csp(
+                    crate::net::csp::Directive::FrameSrc,
+                    &parsed_url,
+                    None,
+                    false,
+                ) {
+                    eprintln!(
                     "[csp] Refused to frame '{}' because it violates the following Content Security Policy directive: \"{}\".",
                     url, violated
                 );
-                return Err(deno_core::error::AnyError::msg(format!(
-                    "iframe blocked by CSP: {}",
-                    url
-                )));
+                    return Err(deno_core::error::AnyError::msg(format!(
+                        "iframe blocked by CSP: {}",
+                        url
+                    )));
+                }
             }
         }
 
@@ -179,6 +187,43 @@ impl ChildIframe {
             .execute_script(&format!("location.href = '{}';", url_js))
             .ok();
 
+        // The frame reads `window.name` on init, so set it before its scripts run.
+        if !name.is_empty() {
+            let name_js = name.replace('\\', "\\\\").replace('\'', "\\'");
+            event_loop
+                .execute_script(&format!(
+                    "try{{globalThis.name='{}';}}catch(_){{}}",
+                    name_js
+                ))
+                .ok();
+        }
+
+        // Wire id/parent/top before its scripts run, so a nested iframe it inserts
+        // is queued for the frame tree instead of materialized as a child realm.
+        if let Some((frame_id, parent_id, top_id)) = frame_ids {
+            event_loop
+                .execute_script(&format!(
+                    "globalThis.__oxFrameSetup && globalThis.__oxFrameSetup({frame_id},{parent_id},{top_id});"
+                ))
+                .ok();
+        }
+
+        // A cross-origin iframe's `document.referrer` and `location.ancestorOrigins`
+        // reflect the embedding chain; set them before its scripts run.
+        let ref_js = referrer.replace('\\', "\\\\").replace('\'', "\\'");
+        let ao_js: String = {
+            let items: Vec<String> = ancestor_origins
+                .iter()
+                .map(|o| format!("'{}'", o.replace('\\', "\\\\").replace('\'', "\\'")))
+                .collect();
+            format!("[{}]", items.join(","))
+        };
+        event_loop
+            .execute_script(&format!(
+                "try{{globalThis.__frameReferrer='{ref_js}';globalThis.__frameAncestorOrigins={ao_js};}}catch(_){{}}"
+            ))
+            .ok();
+
         // Execute scripts, fetching external ones
         for (i, script) in scripts.iter().enumerate() {
             let code = if let Some(src) = &script.src {
@@ -228,8 +273,9 @@ impl ChildIframe {
             }
         }
 
-        // Run child event loop (shorter timeout for iframes)
-        event_loop.run_until_idle(Duration::from_secs(10)).await?;
+        // `run_until_settled` returns once the frame has loaded with no in-flight
+        // fetch, ignoring the perpetual short timers a live frame keeps running.
+        event_loop.run_until_settled().await?;
 
         Ok(Self {
             node_id,
@@ -242,9 +288,10 @@ impl ChildIframe {
         self.event_loop.execute_script(js)
     }
 
-    /// Run the child's event loop until idle or timeout.
+    /// Run the child's event loop until idle or the caller's deadline.
     pub async fn pump(&mut self, timeout: Duration) -> Result<(), deno_core::error::AnyError> {
-        self.event_loop.run_until_idle(timeout).await.map(|_| ())
+        let _ = tokio::time::timeout(timeout, self.event_loop.run_until_idle()).await;
+        Ok(())
     }
 
     /// Execute JS then run the event loop until idle or timeout.
@@ -253,7 +300,10 @@ impl ChildIframe {
         js: &str,
         timeout: Duration,
     ) -> Result<(), deno_core::error::AnyError> {
-        self.event_loop.execute_and_run(js, timeout).await.map(|_| ())
+        self.event_loop
+            .execute_and_run(js, timeout)
+            .await
+            .map(|_| ())
     }
 
     /// Query the child's DOM for text content of a selector match.

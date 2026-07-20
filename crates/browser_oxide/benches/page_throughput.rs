@@ -110,7 +110,7 @@ fn bench_content_roundtrip(c: &mut Criterion) {
     c.bench_function("content_roundtrip", |b| {
         b.iter(|| {
             let s = page.content();
-            criterion::black_box(s);
+            std::hint::black_box(s);
         });
     });
 }
@@ -148,7 +148,7 @@ fn bench_pooled_render_js(c: &mut Criterion) {
                 page.reload_html(js_html(), "http://bench/page");
                 let _ = page.evaluate_async("", Duration::from_secs(2)).await;
                 let s = page.content();
-                criterion::black_box(s);
+                std::hint::black_box(s);
             });
         });
     });

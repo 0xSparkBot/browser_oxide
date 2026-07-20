@@ -4,6 +4,7 @@ pub mod console_ext;
 pub mod crypto_ext;
 pub mod dom_ext;
 pub mod fetch_ext;
+pub mod frame_ext;
 pub mod input_ext;
 pub mod layout_ext;
 pub mod nav_ext;

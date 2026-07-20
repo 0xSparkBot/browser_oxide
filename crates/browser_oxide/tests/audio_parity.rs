@@ -47,10 +47,7 @@ async fn audio_compressor_in_blink_range() {
     // Drive the event loop so the async OfflineAudioContext render completes and
     // its `.then()` (which sets __audioSum) runs. A bare microtask drain isn't
     // enough under deno_core 0.403 — startRendering resolves via the event loop.
-    let _ = page
-        .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(3))
-        .await;
+    let _ = page.event_loop().run_until_idle().await;
     let r = page
         .evaluate("String(globalThis.__audioSum)")
         .unwrap_or_default();

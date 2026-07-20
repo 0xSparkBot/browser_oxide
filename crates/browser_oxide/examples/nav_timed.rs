@@ -65,7 +65,7 @@ async fn main() {
             let t_drain_a = Instant::now();
             let _ = warm_page
                 .event_loop()
-                .run_until_idle(std::time::Duration::from_secs(8))
+                .run_until_idle()
                 .await;
             let t_drain_ms = t_drain_a.elapsed().as_millis() as u64;
 

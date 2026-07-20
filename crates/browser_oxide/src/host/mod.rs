@@ -82,10 +82,8 @@ impl EngineHandle {
     /// Spawn the dedicated engine thread and return a handle to it.
     pub fn spawn() -> Self {
         let (tx, rx) = channel::<Cmd>();
-        let thread = std::thread::Builder::new()
-            .name("browser-oxide-engine".into())
-            .spawn(move || engine_loop(rx))
-            .expect("failed to spawn browser_oxide engine thread");
+        let thread =
+            crate::js_runtime::spawn_v8_thread("browser-oxide-engine", move || engine_loop(rx));
         EngineHandle {
             tx: Mutex::new(tx),
             thread: Some(thread),
