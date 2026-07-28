@@ -10,8 +10,10 @@
 
 pub mod arena;
 pub mod element;
+pub mod links;
 pub mod node;
 
 pub use arena::Dom;
 pub use element::DomElement;
+pub use links::{classify, link_target, LinkKind, LinkTarget};
 pub use node::*;

@@ -478,6 +478,23 @@ impl Drop for Page {
     }
 }
 
+/// A link a click resolved to.
+///
+/// `url` is absolute for [`crate::dom::LinkKind::Navigable`] and left exactly
+/// as authored for a fragment or an external scheme, because there is nothing
+/// meaningful to resolve those against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLink {
+    pub url: String,
+    pub kind: crate::dom::LinkKind,
+    /// `target="_blank"` and friends, lowercased.
+    pub target: Option<String>,
+    /// The `download` attribute was present.
+    pub download: bool,
+    /// The `<a>` element, for a shell that wants to style what it is following.
+    pub anchor: crate::dom::NodeId,
+}
+
 impl Page {
     /// Simulate a user switching to another tab and then coming back.
     /// This defeats macro-behavioral heuristics that flag sessions
@@ -1061,6 +1078,49 @@ impl Page {
             return None;
         }
         Some(f(&dom_state.dom))
+    }
+
+    /// Resolve a hit-tested node to the link a click on it should follow.
+    ///
+    /// This is the second half of link clicking; `render::hit_test` is the
+    /// first. It exists on `Page` rather than next to `link_target` because
+    /// resolution needs the document's own URL, which only the page knows —
+    /// and getting that wrong is how a browser fetches `https://host/#top`.
+    ///
+    /// Returns `None` when the node is not inside a link, when the anchor has
+    /// no `href`, and when the href is `javascript:`. That last one is a
+    /// refusal rather than an omission: running author script because the user
+    /// clicked is precisely the capability this engine should not hand out by
+    /// accident, and a shell that received the string would either execute it
+    /// or show its source, both wrong.
+    ///
+    /// A shell should treat the result as *what the user asked for*, not as
+    /// permission to navigate — `kind` says whether to load it, scroll to it,
+    /// or hand it to the operating system.
+    pub fn link_for(&mut self, node: crate::dom::NodeId) -> Option<ResolvedLink> {
+        let target = self.with_dom(|dom| crate::dom::link_target(dom, node))??;
+        let kind = crate::dom::classify(&target.href);
+        if kind == crate::dom::LinkKind::Refused {
+            return None;
+        }
+
+        // A fragment and an external scheme are both handed back unresolved:
+        // there is nothing to join a `#top` or a `mailto:` against, and
+        // running them through the URL joiner would only invent a base.
+        let url = match kind {
+            crate::dom::LinkKind::Navigable => {
+                Self::resolve_url(&self.url, &target.href).unwrap_or_else(|| target.href.clone())
+            }
+            _ => target.href.clone(),
+        };
+
+        Some(ResolvedLink {
+            url,
+            kind,
+            target: target.target,
+            download: target.download,
+            anchor: target.anchor,
+        })
     }
 
     /// The stylesheets the navigation collected, for a caller building its own
@@ -4556,6 +4616,88 @@ mod tests {
         assert_eq!(
             Page::resolve_url("https://iphey.com/", "https://other.example/foo"),
             Some("https://other.example/foo".to_string())
+        );
+    }
+
+    /// The whole link-click chain, end to end: lay a real document out, hit-test
+    /// a point inside the link's text, and resolve what came back.
+    ///
+    /// The unit tests in `dom::links` cover the walk and the classification
+    /// against a hand-built tree. This one is the part they cannot prove — that
+    /// the node `hit_test` actually returns for a painted glyph is a node the
+    /// walk can get from to the anchor. Those are different claims, and the
+    /// second is the one a shell depends on.
+    #[tokio::test]
+    async fn a_click_on_link_text_resolves_to_an_absolute_url() {
+        use crate::layout::inline::InlineLayout;
+        use crate::layout::{LayoutEngine, Viewport};
+
+        let mut page = Page::from_html_with_url(
+            "<html><body style='margin:0'>             <p style='font-size:20px'><a href='/about'><b>About us</b></a></p>             </body></html>",
+            "https://example.com/docs/index.html",
+            None::<crate::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+
+        let mut layout = LayoutEngine::new(Viewport::new(800.0, 600.0));
+        let mut inline = InlineLayout::new();
+        let regions = page
+            .with_dom(|dom| {
+                layout.compute(dom);
+                let (_, hit, _) =
+                    crate::render::build_layer_tree(dom, &mut layout, &mut inline, 800.0, 600.0);
+                hit
+            })
+            .expect("the document laid out");
+
+        assert!(!regions.is_empty(), "something was painted");
+
+        // Walk every region and find one that resolves to the link. Not a
+        // single hard-coded coordinate: that would encode this month's font
+        // metrics into the test and fail on a machine with different fonts,
+        // which is a false alarm about the thing being tested.
+        let mut resolved = None;
+        for region in &regions {
+            let x = region.rect.x + region.rect.width / 2.0;
+            let y = region.rect.y + region.rect.height / 2.0;
+            if let Some(node) = crate::render::hit_test(&regions, x, y) {
+                if let Some(link) = page.link_for(node) {
+                    resolved = Some(link);
+                    break;
+                }
+            }
+        }
+
+        let link = resolved.expect("a point inside the link resolved to it");
+        assert_eq!(
+            link.url, "https://example.com/about",
+            "the href is root-relative, so it resolves against the origin and              not against /docs/"
+        );
+        assert_eq!(link.kind, crate::dom::LinkKind::Navigable);
+        assert!(!link.download);
+    }
+
+    #[tokio::test]
+    async fn a_javascript_link_resolves_to_nothing() {
+        // The refusal has to survive the real parser, not just the classifier:
+        // an attribute value arrives here having been through HTML entity
+        // decoding, which is where several historical bypasses lived.
+        let mut page = Page::from_html_with_url(
+            "<html><body><a id='x' href='java&#115;cript:alert(1)'>click</a></body></html>",
+            "https://example.com/",
+            None::<crate::stealth::StealthProfile>,
+        )
+        .await
+        .unwrap();
+
+        let node = page
+            .with_dom(|dom| dom.get_element_by_id("x"))
+            .flatten()
+            .expect("the anchor parsed");
+        assert!(
+            page.link_for(node).is_none(),
+            "an entity-encoded javascript: URL is still a javascript: URL"
         );
     }
 

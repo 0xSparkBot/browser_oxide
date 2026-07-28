@@ -35,6 +35,6 @@ pub mod stylesheet_collector;
 
 pub use challenge::{ChallengeKind, ChallengeSolver, SolveOutcome};
 pub use classify::{engine_classify, EngineClass};
-pub use page::{ChallengeVerdict, Page};
+pub use page::{ChallengeVerdict, Page, ResolvedLink};
 pub use parallel::{NavigateResult, ParallelPager};
 pub use pool::PagePool;
