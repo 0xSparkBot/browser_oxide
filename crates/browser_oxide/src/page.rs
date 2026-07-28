@@ -1045,6 +1045,36 @@ impl Page {
         })
     }
 
+    /// Run `f` against the live DOM.
+    ///
+    /// The DOM lives inside the JS runtime's op state, which is where V8 needs
+    /// it; `take_dom` consumes the whole `Page` to get it out, which is no use
+    /// to a caller that wants to keep browsing. This borrows instead.
+    ///
+    /// Returns `None` if the page has no document yet.
+    pub fn with_dom<T>(&mut self, f: impl FnOnce(&crate::dom::Dom) -> T) -> Option<T> {
+        let runtime = self.event_loop.runtime_mut().inner();
+        let op_state = runtime.op_state();
+        let state = op_state.borrow();
+        let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
+        if dom_state.dom.is_empty() {
+            return None;
+        }
+        Some(f(&dom_state.dom))
+    }
+
+    /// The stylesheets the navigation collected, for a caller building its own
+    /// `LayoutEngine`.
+    pub fn stylesheets(&mut self) -> Vec<String> {
+        let runtime = self.event_loop.runtime_mut().inner();
+        let op_state = runtime.op_state();
+        let state = op_state.borrow();
+        state
+            .borrow::<crate::js_runtime::state::DomState>()
+            .stylesheets
+            .clone()
+    }
+
     /// Borrow the DOM and layout engine out of the JS runtime's op state and
     /// run `f` against them.
     ///
