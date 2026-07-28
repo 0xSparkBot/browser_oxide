@@ -13,6 +13,7 @@ pub mod h1_client;
 pub mod h2_client;
 pub mod h3_request;
 pub mod headers;
+pub mod mixed_content;
 // JA4H is patent-pending under FoxIO License 1.1 (non-commercial). The
 // computer is test-gated so it never reaches a release binary, fitting the
 // "internal testing/evaluation" carve-out. See ja4h.rs and LICENSE-NOTE.md.

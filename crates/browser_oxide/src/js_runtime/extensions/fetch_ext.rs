@@ -191,6 +191,70 @@ pub fn op_drain_csp_violations() -> Vec<CspViolation> {
     CSP_VIOLATIONS.with(|q| std::mem::take(&mut *q.borrow_mut()))
 }
 
+// ---------------------------------------------------------------------
+// Mixed-content gate — the fetch path's half of `net::mixed_content`.
+// The module decides; this decides what the two call sites do about it,
+// and is a named function rather than inline code at each site so both
+// stay reachable from a test (an `#[op2]` body is generated inside a
+// `const fn` and cannot be called directly).
+// ---------------------------------------------------------------------
+
+/// What a call site should do once the mixed-content check has spoken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MixedContentGate {
+    /// Go ahead, using this URL — which may have been upgraded from `http:`
+    /// to `https:` and is therefore not always the URL that was asked for.
+    Proceed(String),
+    /// Do not fetch. Each call site returns whatever "nothing loaded" looks
+    /// like in its own shape; the two differ, so the gate does not decide it.
+    Refuse,
+}
+
+/// The page URL to judge a `window.fetch()` against.
+///
+/// `fetch_bootstrap.js` stamps `x-browser-oxide-origin` from
+/// `location.origin` so the net layer can compute `sec-fetch-site`; an origin
+/// is all `mixed_content::check` inspects, so it doubles as the document URL
+/// here. It is absent only where there is no `location` to read — the worker
+/// bootstrap, and `about:blank` — and there `check` sees an empty page URL
+/// and allows.
+///
+/// That residual gap is real. Nothing else in `op_fetch` can supply the
+/// document URL: an `op2(async)` future cannot borrow `OpState` to reach
+/// `DomState::base_url` (the same limitation that leaves
+/// `record_resource_timing` uncalled there), and `ACTIVE_CSP.origin` is
+/// cleared on every page that ships no policy, so leaning on it would
+/// silently stop protecting most of the web while looking like it worked.
+fn document_origin_hint(headers: &HashMap<String, String>) -> &str {
+    headers
+        .get("x-browser-oxide-origin")
+        .map(|s| s.as_str())
+        .unwrap_or("")
+}
+
+/// Apply `net::mixed_content` to one request. `label` names the call site in
+/// the console line, because "which of the two fetch paths refused this" is
+/// the first thing anyone debugging a missing subresource wants to know.
+fn mixed_content_gate(
+    page_url: &str,
+    url: &str,
+    request_type: &str,
+    label: &str,
+) -> MixedContentGate {
+    match crate::net::mixed_content::check(page_url, url, request_type) {
+        crate::net::mixed_content::Verdict::Allow => MixedContentGate::Proceed(url.to_string()),
+        crate::net::mixed_content::Verdict::Upgrade => {
+            MixedContentGate::Proceed(crate::net::mixed_content::upgrade(url))
+        }
+        crate::net::mixed_content::Verdict::Block => {
+            eprintln!(
+                "[mixed-content] Blocked loading mixed active content '{url}' ({label}) on secure page '{page_url}'."
+            );
+            MixedContentGate::Refuse
+        }
+    }
+}
+
 /// Initialize the shared fetch client from a profile.
 /// Call this once during runtime setup.
 pub fn init_fetch_client(profile: &crate::stealth::StealthProfile) {
@@ -292,6 +356,27 @@ pub async fn op_fetch(
             ok: true,
         });
     }
+
+    // Mixed content — decided before any TLS work, because the whole point is
+    // that the plaintext hop must never happen.
+    let url = match mixed_content_gate(document_origin_hint(&headers), &url, request_type, "fetch")
+    {
+        MixedContentGate::Proceed(u) => u,
+        MixedContentGate::Refuse => {
+            // Same empty-but-OK shape the blocker returns above, not the
+            // 0-status CSP shape: what a page can observe of a refused
+            // subresource should not be richer than what Chrome's opaque
+            // network-error response tells it.
+            return Ok(FetchResponse {
+                status: 200,
+                status_text: "OK".to_string(),
+                headers: HashMap::new(),
+                body: String::new(),
+                url,
+                ok: true,
+            });
+        }
+    };
 
     // Clone the thread-local client out so we don't hold the RefCell borrow
     // across awaits below. Each ParallelPager worker has its own slot.
@@ -496,13 +581,28 @@ pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> St
     // doing any HTTP work. Tracker JS that loads via <script src=…>
     // (gtm.js, gpt.js, doubleclick) is the dominant time sink on
     // news/store sites; blocking these saves 1-3 s per site on average.
-    if crate::net::blocker::should_block(
-        &url,
-        &referer,
-        crate::net::blocker::classify_request_type(&url, Some("script")),
-    ) {
+    let request_type = crate::net::blocker::classify_request_type(&url, Some("script"));
+    if crate::net::blocker::should_block(&url, &referer, request_type) {
         return String::new();
     }
+
+    // Mixed content — decided before the chain counter and before any client
+    // is built, so a refused script costs nothing and does not burn one of the
+    // page's MAX_SYNC_FETCH_PER_PAGE slots.
+    //
+    // `referer` is the document that ran the `document.write('<script src>')`
+    // or `appendChild(script)`, so unlike the async op the page URL is
+    // unambiguous here. This path is also the sharpest instance of the
+    // problem: everything arriving through it is script, an attacker who
+    // rewrites it in flight owns the document, and it executes synchronously
+    // the moment it lands.
+    let url = match mixed_content_gate(&referer, &url, request_type, "sync-fetch") {
+        MixedContentGate::Proceed(u) => u,
+        // Empty body, exactly as the blocker returns above — the caller
+        // evaluates the result as script, so "" is a script that does nothing
+        // rather than a parse error.
+        MixedContentGate::Refuse => return String::new(),
+    };
 
     // Per-page chain ceiling — see MAX_SYNC_FETCH_PER_PAGE.
     let n = SYNC_FETCH_COUNT.with(|c| {
@@ -788,3 +888,106 @@ deno_core::extension!(
         op_drain_csp_violations
     ],
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduce `op_fetch`'s own request-type derivation rather than naming a
+    /// type by hand. The point of these tests is the wiring, so a test that
+    /// hard-coded `"script"` would keep passing if the call site started
+    /// classifying differently.
+    fn async_fetch_gate(page_origin: Option<&str>, url: &str) -> MixedContentGate {
+        let headers: HashMap<String, String> = page_origin
+            .map(|o| {
+                // Exactly the pseudo header fetch_bootstrap.js sends.
+                HashMap::from([("x-browser-oxide-origin".to_string(), o.to_string())])
+            })
+            .unwrap_or_default();
+        let request_type = crate::net::blocker::classify_request_type(
+            url,
+            headers
+                .get("x-browser-oxide-request-type")
+                .map(|s| s.as_str()),
+        );
+        mixed_content_gate(document_origin_hint(&headers), url, request_type, "fetch")
+    }
+
+    /// The `document.write('<script src=…>')` / `appendChild(script)` path,
+    /// which always classifies its load as script.
+    fn sync_fetch_gate(referer: &str, url: &str) -> MixedContentGate {
+        let request_type = crate::net::blocker::classify_request_type(url, Some("script"));
+        mixed_content_gate(referer, url, request_type, "sync-fetch")
+    }
+
+    #[test]
+    fn a_plaintext_script_written_by_a_secure_page_never_loads() {
+        // The headline case. Without this, a user on https://bank.example
+        // executes whatever the café wifi chose to return, padlock intact.
+        assert_eq!(
+            sync_fetch_gate(
+                "https://bank.example/account",
+                "http://cdn.example/widget.js"
+            ),
+            MixedContentGate::Refuse
+        );
+        // Not upgraded, refused: silently retrying over HTTPS would run a
+        // *different* script than the page asked for, which is its own bug.
+        assert_eq!(
+            sync_fetch_gate(
+                "https://bank.example/account",
+                "https://cdn.example/widget.js"
+            ),
+            MixedContentGate::Proceed("https://cdn.example/widget.js".to_string())
+        );
+    }
+
+    #[test]
+    fn fetch_from_a_secure_document_refuses_a_plaintext_url() {
+        // `window.fetch('http://…')` on an HTTPS page. The URL has no
+        // extension, so the call site classifies it `xmlhttprequest` — active,
+        // and refused. A user notices this as a request that returns nothing
+        // instead of one an attacker on the path could read and rewrite.
+        assert_eq!(
+            async_fetch_gate(Some("https://bank.example"), "http://api.example/balance"),
+            MixedContentGate::Refuse
+        );
+        // A page served over plaintext has nothing left to protect, so the
+        // same request there is left alone rather than broken.
+        assert_eq!(
+            async_fetch_gate(Some("http://old.example"), "http://api.example/balance"),
+            MixedContentGate::Proceed("http://api.example/balance".to_string())
+        );
+        // No `location` to read (worker bootstrap, about:blank) — the gate
+        // does not invent an origin. This is the known gap, asserted so it is
+        // a decision on the record rather than an accident.
+        assert_eq!(
+            async_fetch_gate(None, "http://api.example/balance"),
+            MixedContentGate::Proceed("http://api.example/balance".to_string())
+        );
+    }
+
+    #[test]
+    fn a_secure_page_gets_its_images_upgraded_and_its_dev_server_untouched() {
+        // Passive content is rewritten, not refused: the user sees the image,
+        // over HTTPS, instead of a hole in the page. The call site classifies
+        // by extension, which is what makes `.png` passive here.
+        assert_eq!(
+            async_fetch_gate(Some("https://shop.example"), "http://cdn.example/logo.png"),
+            MixedContentGate::Proceed("https://cdn.example/logo.png".to_string())
+        );
+        // And the carve-out that decides whether this is shippable at all: a
+        // developer's plaintext loopback server keeps working, unrewritten,
+        // even when the page claims an HTTPS origin.
+        for dev in [
+            "http://localhost:3000/bundle.js",
+            "http://127.0.0.1:8080/bundle.js",
+        ] {
+            assert_eq!(
+                sync_fetch_gate("https://app.example/", dev),
+                MixedContentGate::Proceed(dev.to_string()),
+                "{dev} was treated as mixed content; the local dev server is broken"
+            );
+        }
+    }
+}
