@@ -18,12 +18,14 @@
 
 pub mod breaks;
 pub mod metrics;
+pub mod runs;
 pub mod shape;
 
 use rustybuzz::Face as HbFace;
 use unicode_script::UnicodeScript;
 
 pub use metrics::{FontMetrics, MetricsProfile};
+pub use runs::{InlineFlow, InlineRun};
 pub use shape::{CacheStats, ShapeCache};
 
 use crate::canvas::text::font_database::FontDatabase;
@@ -116,6 +118,14 @@ pub struct PositionedGlyph {
     pub id: u16,
     pub x: f32,
     pub y: f32,
+    /// Index of the run within the inline formatting context this glyph came
+    /// from. Always 0 on the single-style path.
+    pub run: u16,
+    /// The run's caller-supplied `source` — the DOM node, in practice — so the
+    /// painter can find the colour and decoration without a second lookup.
+    /// A line can carry several fonts at several sizes, and by the time the
+    /// display list is built there is nothing else left to tell them apart.
+    pub source: u32,
 }
 
 /// Measures and breaks text. Holds the shaping cache, so keep one per document
@@ -333,6 +343,8 @@ impl InlineLayout {
                         id: g.id,
                         x: x + g.x_offset,
                         y: -g.y_offset,
+                        run: 0,
+                        source: 0,
                     };
                     x += g.x_advance;
                     p
