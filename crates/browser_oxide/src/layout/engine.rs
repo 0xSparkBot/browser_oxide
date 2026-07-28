@@ -18,8 +18,19 @@ use taffy::prelude::*;
 const LAYOUT_BUILD_LIMIT: usize = 100_000;
 
 /// The layout engine. Converts a DOM + styles into positioned elements.
+/// What a text leaf carries into taffy's measure function.
+///
+/// taffy solves boxes; text is the one thing it cannot size on its own, so it
+/// hands the node back and asks. This is the seam through which real shaped,
+/// wrapped text reaches a layout that is otherwise entirely block/flex/grid.
+#[derive(Debug, Clone)]
+pub struct TextContext {
+    pub text: String,
+    pub style: crate::layout::inline::TextStyle,
+}
+
 pub struct LayoutEngine {
-    tree: TaffyTree,
+    tree: TaffyTree<TextContext>,
     dom_to_taffy: HashMap<u32, taffy::NodeId>,
     viewport: Viewport,
     dirty: bool,
@@ -31,6 +42,17 @@ pub struct LayoutEngine {
     /// on geometry. Styles are now resolved once by `crate::style` and read
     /// from here, which is also what makes `font-size` inherit.
     styles: crate::style::StyleTree,
+    /// Shaping cache and the inline breaker. Lives on the engine so it
+    /// survives across relayouts — the cache is worth 17-75x there and close
+    /// to nothing on a first pass.
+    inline: crate::layout::inline::InlineLayout,
+    /// Which platform's text-metric convention to follow, and the OS name the
+    /// font database uses for family aliasing. Both come from the identity the
+    /// engine is presenting, not from the build host — a profile claiming
+    /// Chrome on Linux while reporting Windows text metrics is exactly the
+    /// internal inconsistency the fingerprint design exists to avoid.
+    metrics_profile: crate::layout::inline::MetricsProfile,
+    os_name: String,
     /// Author CSS the caller fetched (external `<link>` sheets). `<style>`
     /// blocks are found in the DOM and do not need to be passed in.
     extra_css: Vec<String>,
@@ -45,6 +67,9 @@ impl LayoutEngine {
             dirty: true,
             root_taffy: None,
             styles: crate::style::StyleTree::default(),
+            inline: crate::layout::inline::InlineLayout::new(),
+            metrics_profile: crate::layout::inline::MetricsProfile::default(),
+            os_name: "linux".to_string(),
             extra_css: Vec::new(),
         }
     }
@@ -54,6 +79,16 @@ impl LayoutEngine {
     /// layout dirty.
     pub fn set_extra_css(&mut self, css: Vec<String>) {
         self.extra_css = css;
+        self.dirty = true;
+    }
+
+    /// Follow `os_name`'s text-metric convention and font aliasing.
+    ///
+    /// Call this with the active stealth profile's OS so laid-out geometry and
+    /// the claimed identity agree.
+    pub fn set_os_name(&mut self, os_name: &str) {
+        self.metrics_profile = crate::layout::inline::MetricsProfile::for_os(os_name);
+        self.os_name = os_name.to_string();
         self.dirty = true;
     }
 
@@ -94,7 +129,19 @@ impl LayoutEngine {
                 width: AvailableSpace::Definite(self.viewport.width),
                 height: AvailableSpace::Definite(self.viewport.height),
             };
-            self.tree.compute_layout(root_id, avail).ok();
+            // Text is measured by shaping it, not by assuming 0.6em a glyph.
+            // taffy calls back per text leaf with the width available to it,
+            // which is what makes wrapping possible at all.
+            let inline = &mut self.inline;
+            self.tree
+                .compute_layout_with_measure(
+                    root_id,
+                    avail,
+                    |known, available, _node, context, _style| {
+                        measure_text_leaf(inline, known, available, context)
+                    },
+                )
+                .ok();
         }
 
         self.dirty = false;
@@ -277,21 +324,18 @@ impl LayoutEngine {
                     return;
                 }
 
-                let font_size = self.font_size_of(&parent_style, ctx);
-                // Still the 0.6em-per-glyph placeholder: this measures nothing
-                // real and is what `browser_oxide_render`'s inline layout
-                // replaces. Only the *inputs* are fixed here.
-                let char_count = collapsed.chars().count() as f32;
-                let width = char_count * font_size * 0.6;
-                let height = font_size * 1.2;
-                let style = taffy::Style {
-                    size: taffy::Size {
-                        width: Dimension::length(width),
-                        height: Dimension::length(height),
-                    },
-                    ..Default::default()
+                // A measured leaf: taffy asks how big this text is once it
+                // knows how much width the box has, and the answer comes from
+                // shaping it. This replaces `char_count * font_size * 0.6`,
+                // which gave every glyph the same width and never wrapped.
+                let context = TextContext {
+                    text: collapsed,
+                    style: self.text_style_of(&parent_style, ctx),
                 };
-                match self.tree.new_leaf(style) {
+                match self
+                    .tree
+                    .new_leaf_with_context(taffy::Style::default(), context)
+                {
                     Ok(id) => id,
                     Err(_) => return,
                 }
@@ -299,6 +343,79 @@ impl LayoutEngine {
             _ => return,
         };
         self.dom_to_taffy.insert(node_id.to_raw(), taffy_id);
+    }
+
+    /// Build the inline layout style for text inheriting `computed`.
+    fn text_style_of(
+        &self,
+        computed: &ComputedStyle,
+        ctx: &ResolveContext,
+    ) -> crate::layout::inline::TextStyle {
+        use crate::css_values::types::display::WhiteSpace;
+        use crate::css_values::types::font::{FontFamily, FontStyle, FontWeight};
+
+        let mut families: Vec<String> = Vec::new();
+        if let Some(CssValue::FontFamily(list)) = computed.get(&PropertyId::FontFamily) {
+            for f in list {
+                match f {
+                    FontFamily::Named(name) => families.push(name.clone()),
+                    FontFamily::Generic(g) => families.push(generic_family_name(*g).to_string()),
+                }
+            }
+        }
+        if families.is_empty() {
+            families.push("sans-serif".to_string());
+        }
+
+        let size_px = self.font_size_of(computed, ctx);
+
+        let weight = match computed.get(&PropertyId::FontWeight) {
+            Some(CssValue::FontWeight(FontWeight::Numeric(w))) => (*w).clamp(1.0, 1000.0) as u16,
+            Some(CssValue::FontWeight(FontWeight::Bold)) => 700,
+            // `bolder`/`lighter` are relative to the parent's weight, which
+            // ComputedStyle does not resolve yet. 400 is the honest answer
+            // until it does.
+            _ => 400,
+        };
+        let italic = matches!(
+            computed.get(&PropertyId::FontStyle),
+            Some(CssValue::FontStyle(
+                FontStyle::Italic | FontStyle::Oblique(_)
+            ))
+        );
+
+        // `line-height: normal` stays `None` so the font's own metrics decide.
+        let line_height = match computed.get(&PropertyId::LineHeight) {
+            Some(CssValue::LineHeight(crate::css_values::property::LineHeight::Length(l))) => {
+                Some(crate::layout::resolve::resolve_length(l, ctx))
+            }
+            Some(CssValue::LineHeight(crate::css_values::property::LineHeight::Number(n))) => {
+                Some(size_px * (*n as f32))
+            }
+            _ => None,
+        };
+
+        let ws = match computed.get(&PropertyId::WhiteSpace) {
+            Some(CssValue::WhiteSpace(w)) => *w,
+            _ => WhiteSpace::Normal,
+        };
+
+        crate::layout::inline::TextStyle {
+            families,
+            size_px,
+            weight,
+            italic,
+            line_height,
+            // `overflow-wrap` is not a property the engine has yet; CSS's
+            // default is `normal`, which does not break inside a word.
+            break_word: false,
+            wraps: matches!(
+                ws,
+                WhiteSpace::Normal | WhiteSpace::PreWrap | WhiteSpace::PreLine
+            ),
+            metrics: self.metrics_profile,
+            os_name: self.os_name.clone(),
+        }
     }
 
     /// The used `font-size` for an element, in px.
@@ -683,5 +800,215 @@ mod render_regressions {
         );
         let rect = rect_of(&dom, &mut engine, "div");
         assert_eq!((rect.width, rect.height), (0.0, 0.0));
+    }
+}
+
+/// taffy's measure callback for a text leaf.
+///
+/// `known` is any dimension already decided by the box's own style; `available`
+/// is how much room there is. The distinction matters: taffy asks twice during
+/// intrinsic sizing — once with `MinContent` and once with `MaxContent` — and
+/// answering those with the wrapped width would make a text box size itself to
+/// whatever it last wrapped to.
+fn measure_text_leaf(
+    inline: &mut crate::layout::inline::InlineLayout,
+    known: taffy::Size<Option<f32>>,
+    available: taffy::Size<AvailableSpace>,
+    context: Option<&mut TextContext>,
+) -> taffy::Size<f32> {
+    let Some(context) = context else {
+        return taffy::Size::ZERO;
+    };
+    if context.text.is_empty() {
+        return taffy::Size::ZERO;
+    }
+
+    let width_constraint = match (known.width, available.width) {
+        (Some(w), _) => Some(w),
+        (None, AvailableSpace::Definite(w)) => Some(w),
+        // MinContent: break at every opportunity — the widest single word.
+        // MaxContent: never break.
+        (None, AvailableSpace::MinContent) => Some(0.0),
+        (None, AvailableSpace::MaxContent) => None,
+    };
+
+    let laid_out = inline.layout(&context.text, &context.style, width_constraint);
+    taffy::Size {
+        width: known.width.unwrap_or(laid_out.width),
+        height: known.height.unwrap_or(laid_out.height),
+    }
+}
+
+/// CSS generic family names, as the font database's alias table spells them.
+fn generic_family_name(g: crate::css_values::types::font::GenericFamily) -> &'static str {
+    use crate::css_values::types::font::GenericFamily as G;
+    match g {
+        G::Serif => "serif",
+        G::SansSerif => "sans-serif",
+        G::Monospace => "monospace",
+        G::Cursive => "cursive",
+        G::Fantasy => "fantasy",
+        // The remaining generics have no alias configured; sans-serif is the
+        // engine's global fallback and what the database resolves them to
+        // anyway.
+        _ => "sans-serif",
+    }
+}
+
+/// Inline layout, through the full stack: HTML → cascade → taffy → geometry.
+///
+/// `layout::inline`'s own tests cover shaping and breaking in isolation. These
+/// check the seam — that a text node reaches the shaper at all, with the right
+/// style, and that taffy's answer comes back as a box of the right size.
+#[cfg(test)]
+mod inline_integration {
+    use super::*;
+    use crate::layout::viewport::Viewport;
+
+    fn laid_out(html: &str, width: f32) -> (Dom, LayoutEngine) {
+        let dom = crate::html_parser::parse_html(html);
+        let mut engine = LayoutEngine::new(Viewport::new(width, 600.0));
+        engine.compute(&dom);
+        (dom, engine)
+    }
+
+    fn rect(dom: &Dom, engine: &mut LayoutEngine, tag: &str) -> crate::layout::query::DOMRect {
+        let id = *dom
+            .get_elements_by_tag_name(NodeId::DOCUMENT, tag)
+            .first()
+            .unwrap_or_else(|| panic!("no <{tag}>"));
+        engine.get_bounding_rect(dom, id)
+    }
+
+    const PROSE: &str = "Every real page is mostly inline text, which is why an engine \
+                         that cannot wrap a paragraph cannot render anything at all.";
+
+    #[test]
+    fn a_paragraph_wraps_and_grows_taller() {
+        // The defining behaviour of inline layout, and the one the placeholder
+        // could not do at any width: text gets taller as its box gets narrower.
+        let (wide_dom, mut wide) = laid_out(
+            &format!("<html><body><p style='width:600px'>{PROSE}</p></body></html>"),
+            800.0,
+        );
+        let (narrow_dom, mut narrow) = laid_out(
+            &format!("<html><body><p style='width:200px'>{PROSE}</p></body></html>"),
+            800.0,
+        );
+        let wide_rect = rect(&wide_dom, &mut wide, "p");
+        let narrow_rect = rect(&narrow_dom, &mut narrow, "p");
+        assert!(
+            narrow_rect.height > wide_rect.height * 2.0,
+            "a 200px paragraph must be much taller than a 600px one: {} vs {}",
+            narrow_rect.height,
+            wide_rect.height
+        );
+    }
+
+    #[test]
+    fn text_does_not_overflow_its_block() {
+        // The placeholder made a paragraph one box thousands of pixels wide.
+        let (dom, mut engine) = laid_out(
+            &format!("<html><body><p style='width:300px'>{PROSE}</p></body></html>"),
+            800.0,
+        );
+        let p = rect(&dom, &mut engine, "p");
+        assert!(
+            p.width <= 300.5,
+            "the paragraph must respect its width, got {}",
+            p.width
+        );
+        assert!(p.height > 0.0, "and must still have height");
+    }
+
+    #[test]
+    fn text_is_measured_by_shaping_not_by_character_count() {
+        // 0.6em per glyph made "iiii…" and "WWWW…" identical widths. They are
+        // not, so at the same box width the wide-glyph string must wrap onto
+        // more lines.
+        //
+        // Asserted through *height* rather than width on purpose: `display:
+        // inline` still maps to a taffy block, so an inline box stretches to
+        // its parent instead of shrinking to its content. Real inline flow is
+        // ADR-010 and comes next; until it does, height is the honest handle
+        // on how wide the shaper thinks the text is.
+        let narrow_glyphs = "iiiiiiiiii iiiiiiiiii iiiiiiiiii iiiiiiiiii";
+        let wide_glyphs = "WWWWWWWWWW WWWWWWWWWW WWWWWWWWWW WWWWWWWWWW";
+
+        let (nd, mut ne) = laid_out(
+            &format!("<html><body><p style='width:200px'>{narrow_glyphs}</p></body></html>"),
+            800.0,
+        );
+        let (wd, mut we) = laid_out(
+            &format!("<html><body><p style='width:200px'>{wide_glyphs}</p></body></html>"),
+            800.0,
+        );
+        let narrow_h = rect(&nd, &mut ne, "p").height;
+        let wide_h = rect(&wd, &mut we, "p").height;
+        assert!(
+            wide_h > narrow_h,
+            "W is wider than i, so the same text must need more lines:              {wide_h} vs {narrow_h}"
+        );
+    }
+
+    #[test]
+    fn font_size_reaches_the_shaper() {
+        // Same trick: bigger text needs more lines in the same box.
+        let text = "measured by shaping the actual glyphs of the actual face";
+        let (sd, mut se) = laid_out(
+            &format!("<html><body><p style='width:200px; font-size:10px'>{text}</p></body></html>"),
+            800.0,
+        );
+        let (ld, mut le) = laid_out(
+            &format!("<html><body><p style='width:200px; font-size:30px'>{text}</p></body></html>"),
+            800.0,
+        );
+        let small_h = rect(&sd, &mut se, "p").height;
+        let large_h = rect(&ld, &mut le, "p").height;
+        assert!(
+            large_h > small_h * 2.0,
+            "30px text must need far more height than 10px: {large_h} vs {small_h}"
+        );
+    }
+
+    #[test]
+    fn an_inline_box_still_stretches() {
+        // Records a known gap rather than asserting correctness. `display:
+        // inline` maps to a taffy block, so a <span> fills its parent instead
+        // of hugging its text. Chrome would give this the width of the word.
+        // When real inline flow lands (ADR-010) this test should start failing
+        // and be replaced by its opposite.
+        let (dom, mut engine) = laid_out("<html><body><span>short</span></body></html>", 400.0);
+        let span = rect(&dom, &mut engine, "span");
+        assert!(
+            span.width > 300.0,
+            "expected the current stretch-to-fill behaviour, got {}",
+            span.width
+        );
+    }
+
+    #[test]
+    fn nowrap_keeps_one_line() {
+        let (dom, mut engine) = laid_out(
+            &format!(
+                "<html><body><p style='width:100px; white-space:nowrap'>{PROSE}</p></body></html>"
+            ),
+            800.0,
+        );
+        let p = rect(&dom, &mut engine, "p");
+        // The block is still 100px, but its single text line overflows it —
+        // which is what `nowrap` means.
+        assert!(
+            p.height < 40.0,
+            "nowrap must not wrap, got height {}",
+            p.height
+        );
+    }
+
+    #[test]
+    fn an_empty_paragraph_has_no_text_height() {
+        let (dom, mut engine) = laid_out("<html><body><p></p></body></html>", 800.0);
+        let p = rect(&dom, &mut engine, "p");
+        assert_eq!(p.height, 0.0);
     }
 }

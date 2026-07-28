@@ -4,6 +4,7 @@
 //! Provides getBoundingClientRect(), offsetWidth, getComputedStyle, etc.
 
 pub mod engine;
+pub mod inline;
 pub mod layout_unit;
 pub mod query;
 pub mod resolve;
@@ -11,6 +12,7 @@ pub mod style_map;
 pub mod viewport;
 
 pub use engine::LayoutEngine;
+pub use inline::{InlineLayout, MetricsProfile, TextLayout, TextStyle};
 pub use layout_unit::LayoutUnit;
 pub use query::DOMRect;
 pub use viewport::Viewport;

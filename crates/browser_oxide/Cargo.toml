@@ -88,6 +88,12 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 fontdb = { version = "0.23", default-features = false }
 rustybuzz = "0.20"
+# Inline layout. All MIT OR Apache-2.0, so deny.toml needs no exception.
+unicode-bidi = "0.3"
+unicode-linebreak = "0.1"
+unicode-segmentation = "1"
+unicode-script = "0.5"
+ttf-parser = "0.25"
 swash = "0.2"
 rustfft = "6"
 glow = { version = "0.18", optional = true }

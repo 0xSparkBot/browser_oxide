@@ -79,10 +79,51 @@ the newline-and-indent between two tags collapses to nothing and produces no
 box. Without it every such text node became a full line box and an ordinary
 document gained one per element.
 
-Measurement itself is still the placeholder: `char_count × font_size × 0.6`,
-one line, no wrapping. That is what the renderer replaces — see
-[`browser_oxide_app/docs/POC1_RESULTS.md`](https://github.com/yfedoseev/browser_oxide_app)
-for the shaped, Chrome-parity implementation that is being lifted in.
+Measurement itself is `layout::inline`: text is shaped with `rustybuzz`, broken
+at UAX #14 opportunities tailored to match Chrome, and fitted greedily. taffy
+cannot size text on its own, so a text node becomes a leaf *with context* and
+taffy calls back once it knows how much width the box has:
+
+```
+taffy asks  ─► measure_text_leaf(available_width)
+                     │
+                     ├─ shape (cached per word where that is safe)
+                     ├─ break (UAX #14 + tailorings)
+                     └─ fit   (greedy first-fit, like Chrome)
+                     │
+              ◄──────┴─ Size { width, height }
+```
+
+`AvailableSpace::MinContent` and `MaxContent` are answered as the widest single
+word and the unwrapped width respectively, so intrinsic sizing works.
+
+The algorithms are the ones measured against Chrome 150 in
+[`browser_oxide_app/docs/POC1_RESULTS.md`](https://github.com/yfedoseev/browser_oxide_app):
+12/12 fixtures matching Chrome's line count with a worst geometric error of
+0.03 px against a 2 px budget.
+
+**Not yet an inline formatting context.** An inline box that wraps still
+produces one box rather than several fragments, and `display: inline` maps to a
+taffy block, so a `<span>` stretches to its parent instead of hugging its text.
+Owning block+inline flow is the next step.
+
+### Font metrics are a platform convention
+
+`line-height: normal` comes out of font tables, but which tables and how the
+result is rounded differs per platform by whole pixels. `layout::inline::metrics`
+implements three conventions and selects between them with
+`LayoutEngine::set_os_name` — driven by the **stealth profile's** OS, not the
+build host. A profile claiming Chrome on Linux while reporting Windows text
+metrics is exactly the internal inconsistency the fingerprint design exists to
+avoid. The default is Linux/FreeType, matching the bundled Liberation faces.
+
+### Shaping cache
+
+Keyed per *word* where splitting on spaces cannot change the result, and per
+whole run where it can — RTL, joining scripts, combining marks. The obvious
+run-granular key was measured first and gave 0–1 cache hits out of 1–19 lookups
+on first paint, because an itemised run is usually the whole paragraph. Blink
+caches per word for the same reason.
 
 ## Architecture
 
