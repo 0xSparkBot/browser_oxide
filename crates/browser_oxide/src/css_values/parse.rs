@@ -89,6 +89,7 @@ pub fn parse_property(
         "color" | "background-color" => parse_color(value_trimmed)?,
         "visibility" => parse_visibility(value_trimmed)?,
         "opacity" => parse_number(value_trimmed)?,
+        "transform" => parse_transform(value_trimmed)?,
         "z-index" => parse_z_index(value_trimmed)?,
         "content-visibility" => parse_content_visibility(value_trimmed)?,
         _ if name_lower.starts_with("--") => {
@@ -1524,4 +1525,143 @@ fn parse_border_style(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueErr
         return Ok(CssValue::BorderStyle(style));
     }
     Err(ValueError::InvalidValue("expected border-style".into()))
+}
+
+/// `transform: translateX(20px) rotate(45deg) scale(2)`.
+///
+/// `PropertyId::Transform`, `CssValue::Transform` and `TransformFunction` all
+/// existed; nothing parsed into them, so `transform` was silently dropped on
+/// every page that used it. Compositing found that, because a transform is one
+/// of the few reasons to promote a layer and no page ever produced one.
+///
+/// `none` is the initial value and parses to an empty list rather than an
+/// error, so `transform: none` correctly un-does an inherited-looking value.
+fn parse_transform(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    use crate::css_values::types::transform::TransformFunction as T;
+
+    if let Some(ident) = single_ident(value) {
+        if ident.eq_ignore_ascii_case("none") {
+            return Ok(CssValue::Transform(Vec::new()));
+        }
+    }
+
+    let mut out = Vec::new();
+    for group in split_on_whitespace(value) {
+        for cv in &group {
+            let ComponentValue::Function(f) = cv else {
+                return Err(ValueError::InvalidValue("transform takes functions".into()));
+            };
+            let args = split_on_comma(&f.arguments);
+            let name = f.name.to_ascii_lowercase();
+
+            let lp = |i: usize| -> Option<LengthPercentage> {
+                args.get(i)
+                    .and_then(|g| g.first().and_then(try_length_percentage))
+            };
+            let num = |i: usize| -> Option<f64> {
+                args.get(i)
+                    .and_then(|g| g.first().and_then(try_number_value))
+            };
+            let ang = |i: usize| -> Option<Angle> {
+                args.get(i).and_then(|g| g.first().and_then(try_angle))
+            };
+            let zero = LengthPercentage::Length(Length::Zero);
+
+            let parsed = match name.as_str() {
+                "translate" => T::Translate(
+                    lp(0).ok_or_else(|| bad("translate"))?,
+                    lp(1).unwrap_or(zero),
+                ),
+                "translatex" => T::TranslateX(lp(0).ok_or_else(|| bad("translateX"))?),
+                "translatey" => T::TranslateY(lp(0).ok_or_else(|| bad("translateY"))?),
+                "scale" => {
+                    let x = num(0).ok_or_else(|| bad("scale"))?;
+                    // `scale(2)` is uniform; `scale(2, 3)` is not.
+                    T::Scale(x, num(1).unwrap_or(x))
+                }
+                "scalex" => T::ScaleX(num(0).ok_or_else(|| bad("scaleX"))?),
+                "scaley" => T::ScaleY(num(0).ok_or_else(|| bad("scaleY"))?),
+                "rotate" => T::Rotate(ang(0).ok_or_else(|| bad("rotate"))?),
+                "skewx" => T::SkewX(ang(0).ok_or_else(|| bad("skewX"))?),
+                "skewy" => T::SkewY(ang(0).ok_or_else(|| bad("skewY"))?),
+                "matrix" => {
+                    let mut m = [0.0f64; 6];
+                    for (i, slot) in m.iter_mut().enumerate() {
+                        *slot = num(i).ok_or_else(|| bad("matrix"))?;
+                    }
+                    T::Matrix(m[0], m[1], m[2], m[3], m[4], m[5])
+                }
+                other => {
+                    // An unknown or 3D function makes the whole declaration
+                    // invalid, per CSS. Dropping just the one function would
+                    // apply a transform the author did not write.
+                    return Err(ValueError::InvalidValue(format!(
+                        "unsupported transform function {other}()"
+                    )));
+                }
+            };
+            out.push(parsed);
+        }
+    }
+
+    if out.is_empty() {
+        return Err(ValueError::InvalidValue("empty transform".into()));
+    }
+    Ok(CssValue::Transform(out))
+}
+
+fn bad(name: &str) -> ValueError {
+    ValueError::InvalidValue(format!("invalid arguments to {name}()"))
+}
+
+fn try_number_value(cv: &ComponentValue<'_>) -> Option<f64> {
+    match cv {
+        ComponentValue::Token(Token {
+            kind: TokenKind::Number { value, .. },
+            ..
+        }) => Some(*value),
+        _ => None,
+    }
+}
+
+fn try_angle(cv: &ComponentValue<'_>) -> Option<Angle> {
+    match cv {
+        ComponentValue::Token(Token {
+            kind: TokenKind::Dimension { value, unit, .. },
+            ..
+        }) => match unit.to_ascii_lowercase().as_str() {
+            "deg" => Some(Angle::Deg(*value)),
+            "rad" => Some(Angle::Rad(*value)),
+            "grad" => Some(Angle::Grad(*value)),
+            "turn" => Some(Angle::Turn(*value)),
+            _ => None,
+        },
+        // `rotate(0)` is legal.
+        ComponentValue::Token(Token {
+            kind: TokenKind::Number { value, .. },
+            ..
+        }) if *value == 0.0 => Some(Angle::Deg(0.0)),
+        _ => None,
+    }
+}
+
+/// Split a function's arguments on commas.
+fn split_on_comma<'a>(value: &[ComponentValue<'a>]) -> Vec<Vec<ComponentValue<'a>>> {
+    let mut groups = Vec::new();
+    let mut current: Vec<ComponentValue<'a>> = Vec::new();
+    for cv in value {
+        match cv {
+            ComponentValue::Token(Token {
+                kind: TokenKind::Comma,
+                ..
+            }) => groups.push(std::mem::take(&mut current)),
+            ComponentValue::Token(Token {
+                kind: TokenKind::Whitespace,
+                ..
+            }) => {}
+            other => current.push(other.clone()),
+        }
+    }
+    groups.push(current);
+    groups
 }

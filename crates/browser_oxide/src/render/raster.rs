@@ -38,6 +38,17 @@ impl Target {
     /// Returns false if Skia would not wrap the buffer — a zero dimension, or a
     /// size that overflows.
     pub fn paint(&mut self, list: &DisplayList) -> bool {
+        self.paint_translated(list, 0.0, 0.0)
+    }
+
+    /// Paint a display list shifted by `(dx, dy)`.
+    ///
+    /// Compositing layers need this. A layer's display list holds *page*
+    /// coordinates — that is what makes hit regions and damage comparison work
+    /// without every layer rebasing them — but its surface is only as big as
+    /// its own bounds. Translating by `-bounds.origin` puts the content where
+    /// the surface can hold it, and the compositor puts the surface back.
+    pub fn paint_translated(&mut self, list: &DisplayList, dx: f32, dy: f32) -> bool {
         if self.width == 0 || self.height == 0 {
             return false;
         }
@@ -53,7 +64,11 @@ impl Target {
         else {
             return false;
         };
-        replay(surface.canvas(), list);
+        let canvas = surface.canvas();
+        if dx != 0.0 || dy != 0.0 {
+            canvas.translate((dx, dy));
+        }
+        replay(canvas, list);
         true
     }
 

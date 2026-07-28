@@ -27,6 +27,70 @@ references, which is what makes it cacheable and diffable — repainting a scrol
 should replay a diff, not re-run layout. Nothing exploits that yet; the
 structure exists so that it can.
 
+## Compositing
+
+A fourth stage, for anything that moves:
+
+```
+painter ──► LayerTree ──► Compositor ──► RGBA8
+```
+
+The compositor keeps each layer's rasterized surface between frames. A scroll
+changes no layer's *content*, so the next frame is a blit at a new offset — no
+paint, no shaping, no Skia. Without it every scroll frame re-rasterizes the
+page, which on a CPU surface is ~90% of the frame budget spent redrawing pixels
+that did not change.
+
+`render_to_png` does not use it — a one-off screenshot has nothing to reuse —
+but anything scrolling or animating should.
+
+### Promotion
+
+Every layer is a separate surface and separate memory, so the list of reasons is
+short on purpose:
+
+| Reason | Why |
+|---|---|
+| `Root` | The document. Always present, always first |
+| `Opacity` | `opacity < 1`. The subtree must composite as a unit, or overlapping children show through each other |
+| `Transform` | A non-identity `transform` |
+| `Fixed` | `position: fixed`. Not an optimisation — a fixed element must *not* move when the page scrolls, and the only way to say that to a compositor that scrolls by translating surfaces is to give it a surface of its own |
+
+`will-change` is not here because the engine has no such property yet. When it
+arrives it belongs in `promotion_reason` and nowhere else.
+
+### Damage
+
+A layer is re-rasterized when its display list differs from the one it was last
+rasterized from — a **structural** comparison, not pointer identity. A relayout
+rebuilds the list from scratch even when nothing changed, and treating that as
+damage would defeat the cache entirely.
+
+That comparison is only cheap because the display list is flat and holds no DOM
+references, which is the reason it is structured that way.
+
+Layers entirely outside the viewport are culled before rasterization, and
+surfaces for layers that no longer exist are dropped, so a long-lived compositor
+over a changing document does not grow without bound.
+
+### Coordinates
+
+A layer's display list holds **page** coordinates — that is what lets hit
+regions and damage comparison work without every layer rebasing them — while its
+surface is only as big as its own bounds. Rasterization translates by
+`-bounds.origin`; the compositor puts the surface back.
+
+## Hit-testing
+
+`painter::paint_layered` returns hit regions alongside the layer tree, and
+`render::hit_test(&regions, x, y)` returns the topmost element at a point in
+page coordinates. Regions are recorded in paint order, so the last one
+containing the point wins — which is what `document.elementFromPoint` means.
+
+The display list itself holds no DOM references, so this is a parallel list.
+`RENDERER_DESIGN.md` says hit-testing should reuse the fragment tree; there is
+no fragment tree yet, and this is the honest interim.
+
 ## Entry points
 
 ```rust
@@ -80,10 +144,15 @@ specified width would draw outside the box.
 
 ## What is not here
 
-- **No compositing.** No layer tree, no damage tracking, no incremental
-  invalidation. A screenshot rasterizes the whole page every time.
-- **No GPU surface.** CPU raster only. On a small page rasterization is ~90% of
-  the frame, so this is the first thing to change if anything needs to animate.
+- **No GPU surface.** CPU raster only. Compositing removes the repaint cost of
+  scrolling, but the final blit is still CPU.
+- **No damage *rectangles*.** Damage is per layer, not per region: a one-pixel
+  change re-rasterizes its whole layer.
+- **No scroll containers.** Only the document scrolls; `overflow: scroll` on an
+  element clips but does not scroll.
+- **No 3D transforms.** `rotate3d`, `matrix3d` and perspective are rejected at
+  parse time rather than silently flattened — wrong and visible beats wrong and
+  invisible.
 - **No stacking contexts or `z-index`.** Paint order is tree order. Getting
   paint order wrong is the most common source of "looks subtly broken", so this
   is a known gap rather than a discovered one.
