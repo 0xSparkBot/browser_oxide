@@ -13,10 +13,34 @@ pub struct MediaFeatures {
     pub scripting: Scripting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which colour scheme `@media (prefers-color-scheme: …)` reports.
+///
+/// `Light` is the `Default` on purpose, and it is a privacy decision rather
+/// than an arbitrary pick: the engine never reads the host's theme by itself.
+/// See `LayoutEngine::set_color_scheme` for the full reasoning — in short, this
+/// is one bit of fingerprinting entropy, and a library that varied with the
+/// machine it happened to be running on would contradict the fixed canvas
+/// fingerprint the rest of the stack maintains. An interactive shell that has a
+/// human looking at the screen opts in explicitly; nothing else does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorScheme {
+    #[default]
     Light,
     Dark,
+}
+
+impl ColorScheme {
+    /// The CSS keyword, which is also the string the stealth profile's
+    /// `prefers_color_scheme` field and therefore `matchMedia` use. Having one
+    /// function produce both is what keeps the CSS answer and the JS answer
+    /// from ever drifting apart — a disagreement between them is a stronger
+    /// fingerprinting signal than the bit itself.
+    pub fn as_keyword(self) -> &'static str {
+        match self {
+            ColorScheme::Light => "light",
+            ColorScheme::Dark => "dark",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,12 +266,23 @@ mod tests {
     }
 
     fn eval(css: &str) -> bool {
+        eval_with(css, &features())
+    }
+
+    fn eval_with(css: &str, features: &MediaFeatures) -> bool {
         let input = format!("@media {} {{}}", css);
         let (stylesheet, _) = crate::css_parser::parse_stylesheet(&input);
         if let Some(crate::css_parser::Rule::At(at)) = stylesheet.rules.first() {
-            evaluate_media_query(&at.prelude, &features())
+            evaluate_media_query(&at.prelude, features)
         } else {
             panic!("Expected @media rule");
+        }
+    }
+
+    fn dark() -> MediaFeatures {
+        MediaFeatures {
+            prefers_color_scheme: ColorScheme::Dark,
+            ..MediaFeatures::default()
         }
     }
 
@@ -289,5 +324,42 @@ mod tests {
     #[test]
     fn range_syntax() {
         assert!(eval("(width > 768px)"));
+    }
+
+    #[test]
+    fn prefers_color_scheme_dark_matches_when_dark() {
+        assert!(eval_with("(prefers-color-scheme: dark)", &dark()));
+        assert!(!eval_with("(prefers-color-scheme: light)", &dark()));
+    }
+
+    #[test]
+    fn prefers_color_scheme_combines_with_other_features() {
+        // The compound form is what real sites ship; a dark rule gated behind a
+        // breakpoint must satisfy both halves, not just whichever one is parsed
+        // first.
+        assert!(eval_with(
+            "screen and (prefers-color-scheme: dark)",
+            &dark()
+        ));
+        assert!(!eval_with(
+            "screen and (prefers-color-scheme: dark)",
+            &features()
+        ));
+    }
+
+    #[test]
+    fn prefers_color_scheme_negated() {
+        assert!(eval_with("not (prefers-color-scheme: dark)", &features()));
+        assert!(!eval_with("not (prefers-color-scheme: dark)", &dark()));
+    }
+
+    #[test]
+    fn keyword_round_trips() {
+        // The stealth profile stores this as a string for `matchMedia`; if the
+        // keyword here ever stopped matching what the profile carries, CSS and
+        // JS would answer differently for the same document.
+        assert_eq!(ColorScheme::Light.as_keyword(), "light");
+        assert_eq!(ColorScheme::Dark.as_keyword(), "dark");
+        assert_eq!(ColorScheme::default(), ColorScheme::Light);
     }
 }

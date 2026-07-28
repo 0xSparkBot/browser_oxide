@@ -46,7 +46,7 @@ Must evaluate against the virtual viewport from the stealth profile:
 |---|---|
 | `width`, `height` | Viewport (default 1920x1080) |
 | `device-pixel-ratio` / `resolution` | StealthProfile |
-| `prefers-color-scheme` | StealthProfile (default `light`) |
+| `prefers-color-scheme` | `LayoutEngine::set_color_scheme` for CSS, StealthProfile for `matchMedia` — both default `light`, and callers that change one must change the other (see LAYOUT.md) |
 | `prefers-reduced-motion` | StealthProfile (default `no-preference`) |
 | `pointer`, `hover` | StealthProfile (`fine`/`hover` for desktop) |
 | `orientation` | Derived from viewport w/h |

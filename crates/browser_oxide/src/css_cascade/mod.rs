@@ -14,4 +14,4 @@ pub use computed::ComputedStyle;
 pub use inheritance::is_inherited;
 pub use initial::initial_value;
 pub use layers::{LayerId, LayerOrder};
-pub use media::{evaluate_media_query, MediaFeatures};
+pub use media::{evaluate_media_query, ColorScheme, MediaFeatures};

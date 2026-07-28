@@ -117,6 +117,28 @@ build host. A profile claiming Chrome on Linux while reporting Windows text
 metrics is exactly the internal inconsistency the fingerprint design exists to
 avoid. The default is Linux/FreeType, matching the bundled Liberation faces.
 
+### Colour scheme is a per-document knob, not a host read
+
+`LayoutEngine::set_color_scheme` decides what
+`@media (prefers-color-scheme: …)` resolves to; `style::compute_styles` takes
+the same value as its third argument. It defaults to `Light` and **nothing in
+the engine ever changes that by reading the host's theme.**
+
+The preference is one bit of fingerprinting entropy readable by any page, so
+declining to answer is not the safe option — every mainstream browser supports
+the feature, and a client matching neither `dark` nor `light` would stand out
+more than one reporting a value. Reporting `light` unconditionally leaks
+nothing and sits in the largest bucket, which is why it is the default and why
+headless and scraping embedders should leave it alone.
+
+An interactive shell may opt in, and `browser_oxide_app`'s does: a dark window
+around a full-white page is an accessibility failure, and a privacy browser
+people abandon protects nobody. A caller that opts in **must also set the
+stealth profile's `prefers_color_scheme`** (from `ColorScheme::as_keyword`),
+because `matchMedia` answers from the profile and a document whose CSS says
+dark while its `matchMedia` says light carries a sharper signal than the
+preference ever did.
+
 ### Shaping cache
 
 Keyed per *word* where splitting on spaces cannot change the result, and per

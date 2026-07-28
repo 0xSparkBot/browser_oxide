@@ -64,6 +64,8 @@ pub struct LayoutEngine {
     /// Author CSS the caller fetched (external `<link>` sheets). `<style>`
     /// blocks are found in the DOM and do not need to be passed in.
     extra_css: Vec<String>,
+    /// What `@media (prefers-color-scheme: …)` resolves to for this document.
+    color_scheme: crate::css_cascade::ColorScheme,
 }
 
 impl LayoutEngine {
@@ -80,6 +82,7 @@ impl LayoutEngine {
             metrics_profile: crate::layout::inline::MetricsProfile::default(),
             os_name: "linux".to_string(),
             extra_css: Vec::new(),
+            color_scheme: crate::css_cascade::ColorScheme::Light,
         }
     }
 
@@ -101,6 +104,46 @@ impl LayoutEngine {
         self.dirty = true;
     }
 
+    /// Resolve `@media (prefers-color-scheme: …)` against `scheme`.
+    ///
+    /// Defaults to `Light`, and the engine never reads the host's theme to
+    /// change that. That default is a privacy position, so it is worth stating
+    /// why rather than leaving it to look like an oversight.
+    ///
+    /// `prefers-color-scheme` is a fingerprinting surface — one bit, readable
+    /// by any page with a `@media` block and a `getComputedStyle` call, no
+    /// permission involved. The argument for exposing it anyway is that the bit
+    /// is cheap and refusing it is not free either: every mainstream browser
+    /// supports the feature, so a client where *neither* `dark` nor `light`
+    /// matched would stand out far more than one that reports a value. But that
+    /// argument only justifies *answering*; it does not justify answering with
+    /// the host's real setting. Reporting `light` unconditionally still puts
+    /// the client in the largest single bucket and leaks nothing, which is why
+    /// it is the default here and why nothing in the engine changes it.
+    ///
+    /// A shell may still opt in, and for an interactive browser it should: the
+    /// alternative is rendering a dark chrome around a blinding white page,
+    /// which is a real accessibility failure, and a privacy browser people stop
+    /// using protects nobody. That is a trade a UI with a human in front of it
+    /// gets to make. A headless or scraping embedder — which is most of this
+    /// engine's use — makes no such trade and keeps the default, so the one bit
+    /// is spent only where it buys something.
+    ///
+    /// **Callers that opt in must keep JS in step.** `matchMedia` answers from
+    /// the stealth profile's `prefers_color_scheme` field, and a document whose
+    /// CSS says dark while its `matchMedia` says light is an
+    /// inconsistency-class signal worth considerably more than the bit it was
+    /// trying to protect. Set both from `ColorScheme::as_keyword`.
+    pub fn set_color_scheme(&mut self, scheme: crate::css_cascade::ColorScheme) {
+        self.color_scheme = scheme;
+        self.dirty = true;
+    }
+
+    /// What `@media (prefers-color-scheme: …)` currently resolves to.
+    pub fn color_scheme(&self) -> crate::css_cascade::ColorScheme {
+        self.color_scheme
+    }
+
     /// The computed styles from the last `compute`. Empty before the first one.
     pub fn styles(&self) -> &crate::style::StyleTree {
         &self.styles
@@ -120,7 +163,7 @@ impl LayoutEngine {
 
         // Resolve the cascade before building boxes. Everything below reads
         // styles out of `self.styles`; nothing re-resolves them.
-        self.styles = crate::style::compute_styles(dom, &self.extra_css);
+        self.styles = crate::style::compute_styles(dom, &self.extra_css, self.color_scheme);
 
         let ctx = ResolveContext {
             font_size: 16.0,
@@ -1346,5 +1389,89 @@ mod inline_integration {
         let (dom, mut engine) = laid_out("<html><body><p></p></body></html>", 800.0);
         let p = rect(&dom, &mut engine, "p");
         assert_eq!(p.height, 0.0);
+    }
+}
+
+/// `prefers-color-scheme`, end to end through the engine rather than through
+/// the media-query evaluator.
+///
+/// The evaluator always handled the feature; what did not exist was any way for
+/// a caller to say which value it should be evaluated against, so a dark rule
+/// was unreachable no matter how the page was written.
+#[cfg(test)]
+mod colour_scheme {
+    use super::*;
+    use crate::css_cascade::ColorScheme;
+    use crate::layout::viewport::Viewport;
+
+    const THEMED: &str = "<html><head><style>\
+         body { background-color: white }\
+         @media (prefers-color-scheme: dark) { body { background-color: black; width: 123px } }\
+         </style></head><body>x</body></html>";
+
+    fn body_of(dom: &Dom) -> NodeId {
+        *dom.get_elements_by_tag_name(NodeId::DOCUMENT, "body")
+            .first()
+            .expect("parsed document has a <body>")
+    }
+
+    fn background(engine: &LayoutEngine, dom: &Dom) -> Option<CssValue> {
+        engine
+            .styles()
+            .get(body_of(dom))
+            .and_then(|s| s.get(&PropertyId::BackgroundColor))
+            .cloned()
+    }
+
+    fn black() -> CssValue {
+        CssValue::Color(crate::css_values::types::color::Color::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 1.0,
+        })
+    }
+
+    #[test]
+    fn the_engine_defaults_to_light() {
+        let dom = crate::html_parser::parse_html(THEMED);
+        let mut engine = LayoutEngine::new(Viewport::new(800.0, 600.0));
+        engine.compute(&dom);
+        assert_eq!(engine.color_scheme(), ColorScheme::Light);
+        assert_ne!(
+            background(&engine, &dom),
+            Some(black()),
+            "a fresh engine must not follow the host's theme"
+        );
+    }
+
+    #[test]
+    fn a_dark_preference_reaches_the_computed_style() {
+        let dom = crate::html_parser::parse_html(THEMED);
+        let mut engine = LayoutEngine::new(Viewport::new(800.0, 600.0));
+        engine.set_color_scheme(ColorScheme::Dark);
+        engine.compute(&dom);
+        assert_eq!(background(&engine, &dom), Some(black()));
+    }
+
+    #[test]
+    fn changing_the_preference_after_a_layout_takes_effect() {
+        // `set_color_scheme` has to mark the tree dirty. Without that the shell
+        // would apply the user's theme, see the previous frame's styles, and
+        // look like the feature simply did not work.
+        let dom = crate::html_parser::parse_html(THEMED);
+        let mut engine = LayoutEngine::new(Viewport::new(800.0, 600.0));
+        engine.compute(&dom);
+        let light_width = engine.get_bounding_rect(&dom, body_of(&dom)).width;
+
+        engine.set_color_scheme(ColorScheme::Dark);
+        let dark_width = engine.get_bounding_rect(&dom, body_of(&dom)).width;
+
+        assert_eq!(background(&engine, &dom), Some(black()));
+        assert!(
+            (dark_width - light_width).abs() > 1.0,
+            "the dark rule sets width:123px, so geometry must move: \
+             {light_width} -> {dark_width}"
+        );
     }
 }

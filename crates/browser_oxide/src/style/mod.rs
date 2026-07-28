@@ -21,7 +21,9 @@
 
 use std::collections::HashMap;
 
-use crate::css_cascade::{cascade_sort, CascadeEntry, ComputedStyle, Origin};
+use crate::css_cascade::{
+    cascade_sort, CascadeEntry, ColorScheme, ComputedStyle, MediaFeatures, Origin,
+};
 use crate::css_parser::ast::{Block, ComponentValue, Declaration, Rule};
 use crate::css_selectors::{
     compute_specificity, matches_selector, parse_selector_list, Selector, Specificity,
@@ -87,22 +89,45 @@ impl StyleTree {
 /// `extra_css` is author CSS the caller already has in hand — external
 /// stylesheets it fetched, or a sheet injected by a test. `<style>` blocks in
 /// the document are found here and do not need to be passed in.
-pub fn compute_styles(dom: &Dom, extra_css: &[String]) -> StyleTree {
+///
+/// `color_scheme` decides which side of a `@media (prefers-color-scheme: …)`
+/// block survives collection. It is a parameter rather than a global because it
+/// is a property of the document being styled — a shell may want its own UI
+/// pages light while a tab follows the user — and because a global read of the
+/// host's theme is exactly the fingerprinting leak this engine avoids
+/// elsewhere.
+pub fn compute_styles(dom: &Dom, extra_css: &[String], color_scheme: ColorScheme) -> StyleTree {
     let mut rules = Vec::new();
     let mut order = 0u32;
 
-    collect_rules(UA_STYLESHEET, Origin::UserAgent, &mut order, &mut rules);
+    // Only the colour scheme is caller-supplied so far. Width and height stay
+    // at the 1920x1080 default even when the viewport differs, which is a
+    // separate (pre-existing) gap: wiring the real viewport in would silently
+    // move every `min-width` breakpoint the engine has ever matched, so it is
+    // deliberately not done here.
+    let features = MediaFeatures {
+        prefers_color_scheme: color_scheme,
+        ..MediaFeatures::default()
+    };
+
+    collect_rules(
+        UA_STYLESHEET,
+        Origin::UserAgent,
+        &features,
+        &mut order,
+        &mut rules,
+    );
 
     for entry in crate::stylesheet_collector::find_stylesheets(dom) {
         if let crate::stylesheet_collector::StylesheetEntry::Inline(css) = entry {
-            collect_rules(&css, Origin::Author, &mut order, &mut rules);
+            collect_rules(&css, Origin::Author, &features, &mut order, &mut rules);
         }
         // External sheets are the caller's job to fetch; they arrive via
         // `extra_css`. Silently ignoring them here is what the engine already
         // does elsewhere, and pretending otherwise would be worse.
     }
     for css in extra_css {
-        collect_rules(css, Origin::Author, &mut order, &mut rules);
+        collect_rules(css, Origin::Author, &features, &mut order, &mut rules);
     }
 
     let mut tree = StyleTree::default();
@@ -113,18 +138,24 @@ pub fn compute_styles(dom: &Dom, extra_css: &[String]) -> StyleTree {
 
 /// Parse one stylesheet's qualified rules, descending through `@media` blocks
 /// whose queries currently evaluate true.
-fn collect_rules(css: &str, origin: Origin, order: &mut u32, out: &mut Vec<StyleRule>) {
+fn collect_rules(
+    css: &str,
+    origin: Origin,
+    features: &MediaFeatures,
+    order: &mut u32,
+    out: &mut Vec<StyleRule>,
+) {
     let (stylesheet, _errors) = crate::css_parser::parse_stylesheet(css);
-    collect_from_rules(&stylesheet.rules, origin, order, out);
+    collect_from_rules(&stylesheet.rules, origin, features, order, out);
 }
 
 fn collect_from_rules(
     rules: &[Rule<'_>],
     origin: Origin,
+    features: &MediaFeatures,
     order: &mut u32,
     out: &mut Vec<StyleRule>,
 ) {
-    let features = crate::css_cascade::MediaFeatures::default();
     for rule in rules {
         match rule {
             Rule::Qualified(qr) => {
@@ -155,7 +186,7 @@ fn collect_from_rules(
                 // modelled here — `css_cascade::layers` exists for that and is
                 // not yet wired up.
                 let applies = if at.name.eq_ignore_ascii_case("media") {
-                    crate::css_cascade::evaluate_media_query(&at.prelude, &features)
+                    crate::css_cascade::evaluate_media_query(&at.prelude, features)
                 } else {
                     true
                 };
@@ -163,9 +194,11 @@ fn collect_from_rules(
                     continue;
                 }
                 match &at.block {
-                    Some(Block::RuleList(inner)) => collect_from_rules(inner, origin, order, out),
+                    Some(Block::RuleList(inner)) => {
+                        collect_from_rules(inner, origin, features, order, out)
+                    }
                     Some(Block::DeclarationBlock { rules: inner, .. }) => {
-                        collect_from_rules(inner, origin, order, out)
+                        collect_from_rules(inner, origin, features, order, out)
                     }
                     None => {}
                 }
@@ -292,11 +325,16 @@ pub fn selector_text(prelude: &[ComponentValue<'_>]) -> String {
 mod tests {
     use super::*;
     use crate::css_values::property::{CssValue, PropertyId};
+    use crate::css_values::types::color::Color;
     use crate::css_values::types::display::Display;
 
     fn styles_for(html: &str) -> (Dom, StyleTree) {
+        styles_for_scheme(html, ColorScheme::Light)
+    }
+
+    fn styles_for_scheme(html: &str, scheme: ColorScheme) -> (Dom, StyleTree) {
         let dom = crate::html_parser::parse_html(html);
-        let tree = compute_styles(&dom, &[]);
+        let tree = compute_styles(&dom, &[], scheme);
         (dom, tree)
     }
 
@@ -364,6 +402,90 @@ mod tests {
             format!("{color:?}").contains('1'),
             "color must inherit from body through div, got {color:?}"
         );
+    }
+
+    /// `background: black` cannot be used here even though it is the natural
+    /// way to write this: `css_values::parse_property` has no `background`
+    /// shorthand, so the declaration is dropped and the test would pass no
+    /// matter what the media query did. `background-color` is the longhand that
+    /// actually reaches the cascade.
+    const THEMED: &str = "<html><head><style>\
+         body { background-color: white }\
+         @media (prefers-color-scheme: dark) { body { background-color: black } }\
+         </style></head><body>x</body></html>";
+
+    fn body_background(tree: &StyleTree, dom: &Dom) -> Option<CssValue> {
+        tree.get(first(dom, "body"))
+            .and_then(|s| s.get(&PropertyId::BackgroundColor))
+            .cloned()
+    }
+
+    fn rgba(r: u8, g: u8, b: u8) -> CssValue {
+        CssValue::Color(Color::Rgba { r, g, b, a: 1.0 })
+    }
+
+    #[test]
+    fn dark_media_block_wins_only_under_a_dark_preference() {
+        // Asserted through the computed style, not the parser: the defect this
+        // fixes was never that `@media` failed to parse — it parsed fine and
+        // was then evaluated against a hardcoded light default, so a dark rule
+        // could never reach an element.
+        let (dom, tree) = styles_for_scheme(THEMED, ColorScheme::Dark);
+        assert_eq!(
+            body_background(&tree, &dom),
+            Some(rgba(0, 0, 0)),
+            "a dark preference must let the @media block override the base rule"
+        );
+    }
+
+    #[test]
+    fn dark_media_block_is_ignored_under_a_light_preference() {
+        let (dom, tree) = styles_for_scheme(THEMED, ColorScheme::Light);
+        assert_eq!(
+            body_background(&tree, &dom),
+            Some(rgba(255, 255, 255)),
+            "a light preference must leave the base rule standing"
+        );
+    }
+
+    #[test]
+    fn light_is_the_default_preference() {
+        // The privacy default: `compute_styles` never consults the host, so the
+        // two-argument-era behaviour is what a caller that says nothing gets.
+        let (dom, tree) = styles_for(THEMED);
+        assert_eq!(body_background(&tree, &dom), Some(rgba(255, 255, 255)));
+    }
+
+    #[test]
+    fn an_explicit_light_media_block_resolves_too() {
+        // Sites that write the light branch as a query rather than as the base
+        // rule are common, and getting `dark` right while `light` matched
+        // nothing would be half a fix.
+        let html = "<html><head><style>\
+             @media (prefers-color-scheme: light) { body { background-color: white } }\
+             @media (prefers-color-scheme: dark) { body { background-color: black } }\
+             </style></head><body>x</body></html>";
+        let (light_dom, light) = styles_for_scheme(html, ColorScheme::Light);
+        let (dark_dom, dark) = styles_for_scheme(html, ColorScheme::Dark);
+        assert_eq!(
+            body_background(&light, &light_dom),
+            Some(rgba(255, 255, 255))
+        );
+        assert_eq!(body_background(&dark, &dark_dom), Some(rgba(0, 0, 0)));
+    }
+
+    #[test]
+    fn colour_scheme_reaches_rules_nested_below_another_at_rule() {
+        // `collect_from_rules` recurses through `@layer`/`@supports`; the
+        // features must recurse with it, or a dark rule inside a layer — which
+        // is how most design systems ship one — would be evaluated against
+        // whatever a fresh default happened to be.
+        let html = "<html><head><style>\
+             @supports (display: grid) {\
+               @media (prefers-color-scheme: dark) { body { background-color: black } }\
+             }</style></head><body>x</body></html>";
+        let (dom, tree) = styles_for_scheme(html, ColorScheme::Dark);
+        assert_eq!(body_background(&tree, &dom), Some(rgba(0, 0, 0)));
     }
 
     #[test]
