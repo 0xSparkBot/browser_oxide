@@ -1020,6 +1020,64 @@ impl Page {
             .unwrap_or_default()
     }
 
+    /// Render the current page to a PNG.
+    ///
+    /// The engine could not do this at all until the render module existed —
+    /// Skia was a dependency used only by `<canvas>`, and the CDP surface
+    /// implemented 48 methods of which `Page.captureScreenshot` was not one.
+    ///
+    /// Renders the current DOM at `width` x `height` CSS pixels. This is a full
+    /// layout and a full rasterization every call: there is no damage tracking
+    /// and no cached surface, so calling it per frame is not what it is for.
+    ///
+    /// Returns `None` if the page has no DOM yet, or if encoding fails.
+    pub fn screenshot_png(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
+        self.render_with(width, height, |dom, layout| {
+            crate::render::render_to_png(dom, layout, width, height)
+        })
+    }
+
+    /// Render to premultiplied RGBA8, for a caller that does not want PNG.
+    pub fn screenshot_rgba(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
+        self.render_with(width, height, |dom, layout| {
+            let (target, _) = crate::render::render_to_target(dom, layout, width, height);
+            Some(target.to_rgba8())
+        })
+    }
+
+    /// Borrow the DOM and layout engine out of the JS runtime's op state and
+    /// run `f` against them.
+    ///
+    /// The viewport is set to the requested size first so layout wraps text to
+    /// the width being captured rather than to whatever the page was last laid
+    /// out at.
+    fn render_with<T>(
+        &mut self,
+        width: u32,
+        height: u32,
+        f: impl FnOnce(&crate::dom::Dom, &mut crate::layout::LayoutEngine) -> Option<T>,
+    ) -> Option<T> {
+        let runtime = self.event_loop.runtime_mut().inner();
+        let op_state = runtime.op_state();
+        let mut state = op_state.borrow_mut();
+        let dom_state = state.borrow_mut::<crate::js_runtime::state::DomState>();
+        if dom_state.dom.is_empty() {
+            return None;
+        }
+
+        let mut layout = crate::layout::LayoutEngine::new(crate::layout::Viewport::new(
+            width as f32,
+            height as f32,
+        ));
+        // External stylesheets the navigation already fetched. `<style>` blocks
+        // are found in the DOM and do not need passing.
+        layout.set_extra_css(dom_state.stylesheets.clone());
+        if let Some(profile) = &dom_state.stealth_profile {
+            layout.set_os_name(&profile.os_name);
+        }
+        f(&dom_state.dom, &mut layout)
+    }
+
     /// Get text content of the body.
     pub fn text_content(&mut self) -> String {
         self.evaluate("document.body ? document.body.textContent : ''")

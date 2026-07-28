@@ -330,7 +330,7 @@ impl LayoutEngine {
                 // which gave every glyph the same width and never wrapped.
                 let context = TextContext {
                     text: collapsed,
-                    style: self.text_style_of(&parent_style, ctx),
+                    style: self.text_style_for(&parent_style, ctx),
                 };
                 match self
                     .tree
@@ -346,7 +346,8 @@ impl LayoutEngine {
     }
 
     /// Build the inline layout style for text inheriting `computed`.
-    fn text_style_of(
+    /// Public so the painter can build exactly the style layout measured with.
+    pub fn text_style_for(
         &self,
         computed: &ComputedStyle,
         ctx: &ResolveContext,
@@ -602,7 +603,10 @@ mod tests {
 /// between `</div>` and `<div>` holds a newline and some indentation, collapses
 /// to a single space, and — because it is the whole node — to nothing at all.
 /// Measuring it unprocessed gave every one of them a full line box.
-pub(crate) fn collapse_white_space(text: &str, style: &ComputedStyle) -> String {
+/// Public because [`crate::render::painter`] must collapse identically — if
+/// the painter drew a different string from the one measured, the text would
+/// not fit the box reserved for it.
+pub fn collapse_white_space(text: &str, style: &ComputedStyle) -> String {
     use crate::css_values::types::display::WhiteSpace;
 
     let ws = match style.get(&PropertyId::WhiteSpace) {

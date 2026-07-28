@@ -219,6 +219,45 @@ impl CdpSession {
                     "identifier": format!("script-{}", self.scripts_on_new_document.len())
                 }))
             }
+            // The method whose absence gave the CDP surface away: a server
+            // implementing 48 methods but unable to screenshot is a server with
+            // no rasterizer behind it. It has one now.
+            "Page.captureScreenshot" => {
+                // Chrome defaults to the viewport; a `clip` may narrow it. Only
+                // width and height are honoured here — `x`/`y` scrolling and
+                // `scale` need a compositor, which does not exist yet.
+                let clip = req.params.get("clip");
+                let width = clip
+                    .and_then(|c| c.get("width"))
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(1280.0)
+                    .clamp(1.0, 16384.0) as u32;
+                let height = clip
+                    .and_then(|c| c.get("height"))
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(800.0)
+                    .clamp(1.0, 16384.0) as u32;
+
+                let format = req
+                    .params
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("png");
+                if format != "png" {
+                    Err(format!(
+                        "unsupported screenshot format {format:?}: only png is implemented"
+                    ))
+                } else {
+                    match page.screenshot_png(width, height) {
+                        Some(png) => {
+                            use base64::Engine as _;
+                            let data = base64::engine::general_purpose::STANDARD.encode(&png);
+                            Ok(serde_json::json!({ "data": data }))
+                        }
+                        None => Err("nothing to capture: the page has no document".to_string()),
+                    }
+                }
+            }
             "Page.setLifecycleEventsEnabled" => Ok(serde_json::json!({})),
             "Page.createIsolatedWorld" => Ok(serde_json::json!({ "executionContextId": 2 })),
 
@@ -714,6 +753,56 @@ fn js_type(value: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn page_capture_screenshot_returns_a_png() {
+        // The method whose absence gave the CDP surface away. This is the whole
+        // path: HTML -> cascade -> layout -> display list -> Skia -> PNG ->
+        // base64 -> CDP result.
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            "<html><body style='margin:0'>             <div style='width:50px;height:50px;background-color:#ff0000'></div>             </body></html>",
+            None,
+        )
+        .await
+        .unwrap();
+        let req = CdpRequest {
+            id: 1,
+            method: "Page.captureScreenshot".to_string(),
+            params: serde_json::json!({ "clip": { "width": 100, "height": 100 } }),
+        };
+        let (resp, _) = session.handle_request(&mut page, &req, None).await;
+        let value: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let data = value["result"]["data"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no screenshot data in {resp}"));
+
+        use base64::Engine as _;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("valid base64");
+        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "PNG magic");
+        assert!(png.len() > 100, "a 100x100 screenshot should not be tiny");
+    }
+
+    #[tokio::test]
+    async fn page_capture_screenshot_rejects_jpeg() {
+        // Better an explicit error than a PNG labelled as a JPEG.
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html("<html><body>x</body></html>", None)
+            .await
+            .unwrap();
+        let req = CdpRequest {
+            id: 1,
+            method: "Page.captureScreenshot".to_string(),
+            params: serde_json::json!({ "format": "jpeg" }),
+        };
+        let (resp, _) = session.handle_request(&mut page, &req, None).await;
+        assert!(
+            resp.contains("error") || resp.contains("unsupported"),
+            "expected an error for an unimplemented format, got {resp}"
+        );
+    }
 
     #[tokio::test]
     async fn handle_page_enable() {

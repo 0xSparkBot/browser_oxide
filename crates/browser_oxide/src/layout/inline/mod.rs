@@ -83,6 +83,41 @@ pub struct TextLayout {
     pub min_content_width: f32,
 }
 
+/// One line after fitting: the byte range it covers and how wide it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FittedLine {
+    start: usize,
+    end: usize,
+    width: f32,
+}
+
+/// A laid-out line, with the glyphs to draw it.
+///
+/// This is what paint consumes. It carries positioned glyphs rather than a
+/// string, because a display list that held strings would have to reshape on
+/// every replay and shaping is the expensive half.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineBox {
+    /// Top of this line box, relative to the first line's top.
+    pub y: f32,
+    /// Baseline offset from this line box's top.
+    pub baseline: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Byte range of the source text this line covers.
+    pub start: usize,
+    pub end: usize,
+    pub glyphs: Vec<PositionedGlyph>,
+}
+
+/// A glyph placed on a line, relative to the line's start and baseline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionedGlyph {
+    pub id: u16,
+    pub x: f32,
+    pub y: f32,
+}
+
 /// Measures and breaks text. Holds the shaping cache, so keep one per document
 /// and reuse it across relayouts — that is where the cache pays.
 pub struct InlineLayout {
@@ -165,15 +200,19 @@ impl InlineLayout {
         let ops = breaks::opportunities(text);
         let min_content = self.min_content(text, &ops, &hb, face_key, style, script, rtl);
 
-        let (line_count, widest) = match (available_width, style.wraps) {
-            (Some(avail), true) => self.fit(text, &ops, avail, &hb, face_key, style, script, rtl),
-            _ => {
-                // No wrapping: only forced breaks split lines.
-                let mandatory = ops.iter().filter(|o| o.mandatory).count();
-                let lines = mandatory.max(1);
-                (lines, max_content)
-            }
-        };
+        let fitted = self.fitted_lines(
+            text,
+            &ops,
+            available_width,
+            style,
+            &hb,
+            face_key,
+            script,
+            rtl,
+            max_content,
+        );
+        let line_count = fitted.len();
+        let widest = fitted.iter().map(|l| l.width).fold(0.0f32, f32::max);
 
         TextLayout {
             width: widest,
@@ -184,6 +223,133 @@ impl InlineLayout {
             max_content_width: max_content,
             min_content_width: min_content,
         }
+    }
+
+    /// Fit into `available_width`, or into one line per forced break when the
+    /// text does not wrap.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "threading shaping state, not a public API"
+    )]
+    fn fitted_lines(
+        &mut self,
+        text: &str,
+        ops: &[breaks::Opportunity],
+        available_width: Option<f32>,
+        style: &TextStyle,
+        hb: &HbFace<'_>,
+        face_key: u64,
+        script: rustybuzz::Script,
+        rtl: bool,
+        max_content: f32,
+    ) -> Vec<FittedLine> {
+        match (available_width, style.wraps) {
+            (Some(avail), true) => self.fit(text, ops, avail, hb, face_key, style, script, rtl),
+            _ => {
+                // No wrapping: only forced breaks split lines.
+                let mut lines = Vec::new();
+                let mut start = 0usize;
+                for op in ops.iter().filter(|o| o.mandatory) {
+                    let end = trim_trailing_spaces(text, op.offset);
+                    let width = self.cache.measure(
+                        hb,
+                        face_key,
+                        style.size_px,
+                        script,
+                        rtl,
+                        &text[start..end],
+                    );
+                    lines.push(FittedLine { start, end, width });
+                    start = op.offset;
+                }
+                if lines.is_empty() {
+                    lines.push(FittedLine {
+                        start: 0,
+                        end: trim_trailing_spaces(text, text.len()),
+                        width: max_content,
+                    });
+                }
+                lines
+            }
+        }
+    }
+
+    /// Lay out text and return the lines with their glyphs, ready to paint.
+    ///
+    /// Same breaking as [`Self::layout`] — it is the same code path — plus the
+    /// shaping needed to draw each line.
+    pub fn layout_lines(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        available_width: Option<f32>,
+    ) -> (TextLayout, Vec<LineBox>) {
+        let summary = self.layout(text, style, available_width);
+        if text.is_empty() || summary.line_count == 0 {
+            return (summary, Vec::new());
+        }
+
+        let db = FontDatabase::get();
+        let Some(face_id) =
+            db.query_chain(&style.families, style.weight, style.italic, &style.os_name)
+        else {
+            return (summary, Vec::new());
+        };
+        let Some((data, index)) = db.face_data(face_id) else {
+            return (summary, Vec::new());
+        };
+        let Some(hb) = HbFace::from_slice(data, index) else {
+            return (summary, Vec::new());
+        };
+
+        let face_key = data.as_ptr() as u64 ^ u64::from(index);
+        let script = dominant_script(text);
+        let rtl = is_rtl(text);
+        let ops = breaks::opportunities(text);
+        let fitted = self.fitted_lines(
+            text,
+            &ops,
+            available_width,
+            style,
+            &hb,
+            face_key,
+            script,
+            rtl,
+            summary.max_content_width,
+        );
+
+        let mut boxes = Vec::with_capacity(fitted.len());
+        let mut y = 0.0f32;
+        for line in &fitted {
+            let slice = &text[line.start..line.end.max(line.start)];
+            let glyphs = self
+                .cache
+                .shape(&hb, face_key, style.size_px, script, rtl, slice);
+            let mut x = 0.0f32;
+            let positioned = glyphs
+                .iter()
+                .map(|g| {
+                    let p = PositionedGlyph {
+                        id: g.id,
+                        x: x + g.x_offset,
+                        y: -g.y_offset,
+                    };
+                    x += g.x_advance;
+                    p
+                })
+                .collect();
+            boxes.push(LineBox {
+                y,
+                baseline: summary.first_baseline,
+                width: line.width,
+                height: summary.line_height,
+                start: line.start,
+                end: line.end,
+                glyphs: positioned,
+            });
+            y += summary.line_height;
+        }
+        (summary, boxes)
     }
 
     fn empty(&self, style: &TextStyle, width: f32) -> TextLayout {
@@ -252,12 +418,12 @@ impl InlineLayout {
         style: &TextStyle,
         script: rustybuzz::Script,
         rtl: bool,
-    ) -> (usize, f32) {
+    ) -> Vec<FittedLine> {
         // Sub-pixel slack. Without it a line whose width lands on
         // `avail + 1e-4` wraps a word early and every line below it is wrong.
         const EPS: f32 = 0.01;
 
-        let mut lines: Vec<f32> = Vec::new();
+        let mut lines: Vec<FittedLine> = Vec::new();
         // The line under construction runs from `start` to `committed`, and
         // `committed_width` is its width. `committed == start` means empty.
         let mut start = 0usize;
@@ -281,7 +447,11 @@ impl InlineLayout {
             if width > avail + EPS && committed > start {
                 // Take the last opportunity that fitted, then reconsider this
                 // segment at the head of a fresh line.
-                lines.push(committed_width);
+                lines.push(FittedLine {
+                    start,
+                    end: trim_trailing_spaces(text, committed),
+                    width: committed_width,
+                });
                 start = skip_leading_spaces(text, committed);
                 trimmed = trim_trailing_spaces(text, op.offset);
                 width = self.cache.measure(
@@ -302,7 +472,11 @@ impl InlineLayout {
                 for (cut, cut_width) in self.break_inside(
                     text, start, trimmed, avail, hb, face_key, style, script, rtl,
                 ) {
-                    lines.push(cut_width);
+                    lines.push(FittedLine {
+                        start,
+                        end: cut,
+                        width: cut_width,
+                    });
                     start = cut;
                 }
                 width = self.cache.measure(
@@ -319,7 +493,11 @@ impl InlineLayout {
             committed_width = width;
 
             if op.mandatory {
-                lines.push(committed_width);
+                lines.push(FittedLine {
+                    start,
+                    end: trim_trailing_spaces(text, committed),
+                    width: committed_width,
+                });
                 start = op.offset;
                 committed = op.offset;
                 committed_width = 0.0;
@@ -327,11 +505,13 @@ impl InlineLayout {
         }
 
         if committed > start || lines.is_empty() {
-            lines.push(committed_width);
+            lines.push(FittedLine {
+                start,
+                end: trim_trailing_spaces(text, committed.max(start)),
+                width: committed_width,
+            });
         }
-
-        let widest = lines.iter().copied().fold(0.0f32, f32::max);
-        (lines.len().max(1), widest)
+        lines
     }
 
     /// Cut an over-long segment at the last grapheme that fits, repeatedly.

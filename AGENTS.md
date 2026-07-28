@@ -33,8 +33,8 @@ reasoned allow only when the lint is a genuine false positive.
   single `browser_oxide` crate (`crates/browser_oxide`), organized into
   modules — `dom`, `html_parser`, `js_runtime`, `event_loop`, `net`,
   `stealth`, `canvas`, `workers`, `css_parser`/`css_selectors`/
-  `css_values`/`css_cascade`, `layout`, `protocol`, `host` — each with a
-  single responsibility (see `docs/ARCHITECTURE.md`). The workspace
+  `css_values`/`css_cascade`, `style`, `layout`, `render`, `protocol`, `host` —
+  each with a single responsibility (see `docs/ARCHITECTURE.md`). The workspace
   publishes exactly two crates: `browser_oxide` and the `browser_oxide_mcp`
   server. `browser_oxide_py` is a standalone (PyPI) workspace.
 - **Per-vendor challenge solving is out of scope here.** The engine

@@ -16,6 +16,8 @@ pub mod js_runtime;
 pub mod layout;
 pub mod net;
 pub mod protocol;
+/// Rendering: box tree -> display list -> pixels.
+pub mod render;
 pub mod stealth;
 /// Style resolution: DOM + stylesheets -> a ComputedStyle per element.
 pub mod style;
