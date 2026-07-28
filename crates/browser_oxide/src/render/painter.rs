@@ -354,61 +354,93 @@ impl Painter<'_> {
         }
     }
 
+    /// Draw the inline formatting context anchored at `node_id`.
+    ///
+    /// One call per *context*, not per text node. Layout folded a run of inline
+    /// siblings into a single measured leaf keyed by the first of them, so this
+    /// draws from that node and returns immediately for every other member —
+    /// otherwise a paragraph containing a link would be painted once for the
+    /// text before it, once for the link and once for the text after, three
+    /// times over the same box.
     fn text(&mut self, node_id: NodeId) {
-        let Some(node) = self.dom.get(node_id) else {
-            return;
-        };
-        let NodeData::Text(raw) = &node.data else {
-            return;
-        };
-
-        let parent_style = node
-            .parent
-            .map(|p| self.layout.styles().get_or_initial(p))
-            .unwrap_or_else(|| ComputedStyle::resolve(&std::collections::HashMap::new(), None));
-
-        // The same white-space processing layout applied. If the painter drew a
-        // different string from the one that was measured, the text would not
-        // fit the box reserved for it.
-        let collapsed = crate::layout::engine::collapse_white_space(raw, &parent_style);
-        if collapsed.is_empty() {
-            return;
+        // Absorbed, but not the anchor: layout already accounted for these
+        // glyphs in the context drawn from the anchor.
+        match self.layout.ifc_anchor_of(node_id) {
+            Some(anchor) if anchor != node_id => return,
+            Some(_) => {}
+            // Not part of any context — a text node layout dropped, usually
+            // because white-space collapsing left nothing.
+            None => return,
         }
 
         let rect = self.rect_of(node_id);
-        let text_style = self.layout.text_style_for(&parent_style, &self.ctx);
-        let (_summary, lines) =
-            self.inline
-                .layout_lines(&collapsed, &text_style, Some(rect.width.max(0.0)));
-        if lines.is_empty() {
+        let Some(runs) = self.layout.runs_of(node_id).map(<[_]>::to_vec) else {
+            return;
+        };
+        if runs.is_empty() {
             return;
         }
 
-        let Some(font) = resolve_font(&text_style) else {
-            self.stats.unresolved_fonts += 1;
+        let Some(flow) = self.inline.layout_runs(&runs, Some(rect.width.max(0.0))) else {
             return;
         };
-        let color = color_of(&parent_style, PropertyId::Color, Rgba::BLACK);
 
-        for line in &lines {
+        // Resolve each run's font and colour once. A line can carry glyphs from
+        // several runs, so this is indexed by run rather than looked up per
+        // glyph — and the colour comes from the element that styled the run,
+        // which is why `source` is the parent element and not the text node.
+        let mut per_run = Vec::with_capacity(runs.len());
+        for run in &runs {
+            let style = self
+                .dom
+                .get(NodeId::from_raw(run.source))
+                .map(|_| {
+                    self.layout
+                        .styles()
+                        .get_or_initial(NodeId::from_raw(run.source))
+                })
+                .unwrap_or_else(|| ComputedStyle::resolve(&std::collections::HashMap::new(), None));
+            per_run.push((
+                resolve_font(&run.style),
+                color_of(&style, PropertyId::Color, Rgba::BLACK),
+            ));
+        }
+
+        for line in &flow.lines {
             if line.glyphs.is_empty() {
                 continue;
             }
-            self.stats.text_runs += 1;
-            self.list.push(DisplayItem::Text {
-                origin: (rect.x, rect.y + line.y + line.baseline),
-                glyphs: line
-                    .glyphs
-                    .iter()
-                    .map(|g| Glyph {
-                        id: g.id,
-                        x: g.x,
-                        y: g.y,
-                    })
-                    .collect(),
-                font,
-                color,
-            });
+            // Glyphs are already positioned along the line across all runs, so
+            // splitting into display items by run keeps the geometry and only
+            // changes which font and colour each piece is drawn with.
+            let mut index = 0usize;
+            while index < line.glyphs.len() {
+                let run = line.glyphs[index].run as usize;
+                let mut upto = index;
+                while upto < line.glyphs.len() && line.glyphs[upto].run as usize == run {
+                    upto += 1;
+                }
+                let Some((Some(font), color)) = per_run.get(run).copied() else {
+                    self.stats.unresolved_fonts += 1;
+                    index = upto;
+                    continue;
+                };
+                self.stats.text_runs += 1;
+                self.list.push(DisplayItem::Text {
+                    origin: (rect.x, rect.y + line.y + line.baseline),
+                    glyphs: line.glyphs[index..upto]
+                        .iter()
+                        .map(|g| Glyph {
+                            id: g.id,
+                            x: g.x,
+                            y: g.y,
+                        })
+                        .collect(),
+                    font,
+                    color,
+                });
+                index = upto;
+            }
         }
     }
 

@@ -24,14 +24,22 @@ const LAYOUT_BUILD_LIMIT: usize = 100_000;
 /// hands the node back and asks. This is the seam through which real shaped,
 /// wrapped text reaches a layout that is otherwise entirely block/flex/grid.
 #[derive(Debug, Clone)]
+/// The inline formatting context a measured leaf holds.
+///
+/// One leaf per *context*, not per text node. A paragraph containing a link and
+/// a bold word is one context of five runs sharing line boxes; giving each
+/// piece its own leaf is what made inline elements start new lines.
 pub struct TextContext {
-    pub text: String,
-    pub style: crate::layout::inline::TextStyle,
+    pub runs: Vec<crate::layout::inline::InlineRun>,
 }
 
 pub struct LayoutEngine {
     tree: TaffyTree<TextContext>,
     dom_to_taffy: HashMap<u32, taffy::NodeId>,
+    /// Every inline node folded into a context, mapped to the node that context
+    /// is keyed by. Members other than the anchor have no box of their own, so
+    /// the painter needs this to know not to look for one.
+    ifc_anchor: HashMap<u32, u32>,
     viewport: Viewport,
     dirty: bool,
     root_taffy: Option<taffy::NodeId>,
@@ -63,6 +71,7 @@ impl LayoutEngine {
         Self {
             tree: TaffyTree::new(),
             dom_to_taffy: HashMap::new(),
+            ifc_anchor: HashMap::new(),
             viewport,
             dirty: true,
             root_taffy: None,
@@ -107,6 +116,7 @@ impl LayoutEngine {
         // Clear previous tree
         self.tree = TaffyTree::new();
         self.dom_to_taffy.clear();
+        self.ifc_anchor.clear();
 
         // Resolve the cascade before building boxes. Everything below reads
         // styles out of `self.styles`; nothing re-resolves them.
@@ -243,9 +253,17 @@ impl LayoutEngine {
                     }
                     // Schedule Finish first so it pops after all children.
                     stack.push(Work::Finish(node_id));
-                    // Push children in reverse for document order on pop.
+                    // Push children in reverse for document order on pop —
+                    // except inline-level ones, which get no boxes of their own.
+                    // They are gathered into one inline formatting context at
+                    // Finish, which is the whole point: a link inside a sentence
+                    // has to share the sentence's line boxes, and a child with
+                    // its own taffy node cannot.
                     let kids = dom.children(node_id);
                     for c in kids.into_iter().rev() {
+                        if self.is_inline_level(dom, c) {
+                            continue;
+                        }
                         stack.push(Work::Visit(c));
                     }
                 }
@@ -257,6 +275,202 @@ impl LayoutEngine {
         self.dom_to_taffy.get(&root.to_raw()).copied()
     }
 
+    /// Is this node inline-level — does it flow into its parent's lines rather
+    /// than take a box of its own?
+    ///
+    /// Text always is. An element is when its computed `display` says so.
+    /// `inline-block` is deliberately absent: it joins its parent's line as an
+    /// atomic box, which needs an inline-level box containing a block
+    /// formatting context, and that does not exist yet. Better it keeps
+    /// behaving as it did than be silently flattened into text it is not.
+    fn is_inline_level(&self, dom: &Dom, node_id: NodeId) -> bool {
+        let Some(node) = dom.get(node_id) else {
+            return false;
+        };
+        match &node.data {
+            NodeData::Text(_) => true,
+            NodeData::Element(_) => {
+                let computed = self.styles.get_or_initial(node_id);
+                matches!(
+                    computed.get(&PropertyId::Display),
+                    Some(CssValue::Display(Display::Inline))
+                )
+            }
+            _ => false,
+        }
+    }
+
+    /// Children in document order, runs of inline-level siblings merged into
+    /// one measured leaf each.
+    fn children_with_inline_grouping(
+        &mut self,
+        dom: &Dom,
+        node_id: NodeId,
+        ctx: &ResolveContext,
+    ) -> Vec<taffy::NodeId> {
+        let kids = dom.children(node_id);
+        let mut out: Vec<taffy::NodeId> = Vec::with_capacity(kids.len());
+        let mut group: Vec<NodeId> = Vec::new();
+
+        for cid in kids {
+            if self.is_inline_level(dom, cid) {
+                group.push(cid);
+                continue;
+            }
+            if let Some(leaf) = self.build_ifc(dom, &group, ctx) {
+                out.push(leaf);
+            }
+            group.clear();
+            if let Some(id) = self.dom_to_taffy.get(&cid.to_raw()).copied() {
+                out.push(id);
+            }
+        }
+        if let Some(leaf) = self.build_ifc(dom, &group, ctx) {
+            out.push(leaf);
+        }
+        out
+    }
+
+    /// Turn a run of inline-level siblings into one measured leaf.
+    ///
+    /// Keyed in `dom_to_taffy` by the group's first node, so
+    /// `get_bounding_rect` on that node returns the context's box and the
+    /// painter has something to anchor on. Every other member goes into
+    /// `ifc_anchor`, so the painter knows it was absorbed and must not draw it
+    /// a second time.
+    fn build_ifc(
+        &mut self,
+        dom: &Dom,
+        group: &[NodeId],
+        ctx: &ResolveContext,
+    ) -> Option<taffy::NodeId> {
+        if group.is_empty() {
+            return None;
+        }
+        let runs = self.collect_runs(dom, group, ctx);
+        if runs.is_empty() {
+            return None;
+        }
+        let anchor = group[0];
+        let leaf = self
+            .tree
+            .new_leaf_with_context(taffy::Style::default(), TextContext { runs })
+            .ok()?;
+        self.dom_to_taffy.insert(anchor.to_raw(), leaf);
+        for member in group {
+            self.ifc_anchor.insert(member.to_raw(), anchor.to_raw());
+        }
+        Some(leaf)
+    }
+
+    /// Flatten an inline subtree into styled runs, in document order.
+    ///
+    /// White-space collapsing happens *across* the context, not per text node.
+    /// `a <b>b</b> c` has a space at the end of one run and the start of the
+    /// next; collapsing each separately keeps both, and the sentence gains a
+    /// double space at every tag boundary.
+    fn collect_runs(
+        &mut self,
+        dom: &Dom,
+        group: &[NodeId],
+        ctx: &ResolveContext,
+    ) -> Vec<crate::layout::inline::InlineRun> {
+        let mut runs: Vec<crate::layout::inline::InlineRun> = Vec::new();
+        for root in group {
+            self.collect_runs_from(dom, *root, ctx, &mut runs);
+        }
+        // A collapsible space at the very end of the context is dropped: it is
+        // the seam to nothing.
+        while let Some(last) = runs.last_mut() {
+            if last.text.ends_with(' ') {
+                last.text.pop();
+            }
+            if last.text.is_empty() {
+                runs.pop();
+                continue;
+            }
+            break;
+        }
+        runs
+    }
+
+    fn collect_runs_from(
+        &mut self,
+        dom: &Dom,
+        node_id: NodeId,
+        ctx: &ResolveContext,
+        out: &mut Vec<crate::layout::inline::InlineRun>,
+    ) {
+        let Some(node) = dom.get(node_id) else {
+            return;
+        };
+        match &node.data {
+            NodeData::Text(text) => {
+                let parent_style = node
+                    .parent
+                    .map(|p| self.styles.get_or_initial(p))
+                    .unwrap_or_else(|| ComputedStyle::resolve(&HashMap::new(), None));
+                let mut collapsed = collapse_white_space_inline(text, &parent_style);
+                if collapsed.is_empty() {
+                    return;
+                }
+                // Two collapsible spaces meeting at a seam are one space, and a
+                // space at the very start of the context is dropped entirely —
+                // the same rule a browser applies, just applied across the
+                // context rather than inside a single node.
+                let previous_ends_with_space = out.last().is_some_and(|r| r.text.ends_with(' '));
+                if (out.is_empty() || previous_ends_with_space) && collapsed.starts_with(' ') {
+                    collapsed.remove(0);
+                }
+                if collapsed.is_empty() {
+                    return;
+                }
+                let font_ctx = ResolveContext {
+                    font_size: self.font_size_of(&parent_style, ctx),
+                    ..*ctx
+                };
+                out.push(crate::layout::inline::InlineRun {
+                    text: collapsed,
+                    style: self.text_style_for(&parent_style, &font_ctx),
+                    // The *parent* element, not the text node: the painter wants
+                    // the colour and decoration, and those live on the element
+                    // that styled this run.
+                    source: node.parent.map(|p| p.to_raw()).unwrap_or(0),
+                });
+            }
+            NodeData::Element(_) => {
+                let computed = self.styles.get_or_initial(node_id);
+                if let Some(CssValue::Display(Display::None)) = computed.get(&PropertyId::Display) {
+                    return;
+                }
+                for child in dom.children(node_id) {
+                    self.collect_runs_from(dom, child, ctx, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The node owning the inline formatting context `node_id` was folded into,
+    /// if it was folded into one.
+    ///
+    /// The painter uses this twice: to find the one node a context should be
+    /// drawn from, and to skip every other member so the text is not drawn once
+    /// per run.
+    pub fn ifc_anchor_of(&self, node_id: NodeId) -> Option<NodeId> {
+        self.ifc_anchor
+            .get(&node_id.to_raw())
+            .map(|raw| NodeId::from_raw(*raw))
+    }
+
+    /// The runs of the context anchored at `node_id`.
+    pub fn runs_of(&self, node_id: NodeId) -> Option<&[crate::layout::inline::InlineRun]> {
+        let taffy_id = self.dom_to_taffy.get(&node_id.to_raw())?;
+        self.tree
+            .get_node_context(*taffy_id)
+            .map(|c| c.runs.as_slice())
+    }
+
     /// Build the taffy node for `node_id` using already-built children
     /// recorded in `self.dom_to_taffy` (set by prior Finish calls in
     /// post-order). Returns nothing — the result lives in `dom_to_taffy`.
@@ -266,14 +480,12 @@ impl LayoutEngine {
             None => return,
         };
 
-        // Collect already-built children's taffy IDs in document order.
-        // Children that returned None (e.g. display:none, unsupported node
-        // type) are absent from dom_to_taffy and naturally filtered out.
-        let children: Vec<taffy::NodeId> = dom
-            .children(node_id)
-            .into_iter()
-            .filter_map(|cid| self.dom_to_taffy.get(&cid.to_raw()).copied())
-            .collect();
+        // Children in document order, with each maximal run of inline-level
+        // siblings turned into ONE anonymous inline formatting context.
+        // Block-level children keep the node they built on their own pass;
+        // children that returned None (display:none, unsupported node type) are
+        // absent from dom_to_taffy and drop out naturally.
+        let children = self.children_with_inline_grouping(dom, node_id, ctx);
 
         let taffy_id = match &node.data {
             NodeData::Document | NodeData::DocumentFragment => {
@@ -308,38 +520,12 @@ impl LayoutEngine {
                     Err(_) => return,
                 }
             }
-            NodeData::Text(text) => {
-                // CSS white-space processing, before measurement. A text node
-                // holding only the newline and indentation between two tags
-                // collapses to nothing and must not produce a box — without
-                // this every such node became a full line box, and an ordinary
-                // document gained one per element.
-                let parent_style = dom
-                    .get(node_id)
-                    .and_then(|n| n.parent)
-                    .map(|p| self.styles.get_or_initial(p))
-                    .unwrap_or_else(|| ComputedStyle::resolve(&HashMap::new(), None));
-                let collapsed = collapse_white_space(text, &parent_style);
-                if collapsed.is_empty() {
-                    return;
-                }
-
-                // A measured leaf: taffy asks how big this text is once it
-                // knows how much width the box has, and the answer comes from
-                // shaping it. This replaces `char_count * font_size * 0.6`,
-                // which gave every glyph the same width and never wrapped.
-                let context = TextContext {
-                    text: collapsed,
-                    style: self.text_style_for(&parent_style, ctx),
-                };
-                match self
-                    .tree
-                    .new_leaf_with_context(taffy::Style::default(), context)
-                {
-                    Ok(id) => id,
-                    Err(_) => return,
-                }
-            }
+            // Text never reaches here any more. Every text node is
+            // inline-level, so `build_node` no longer schedules one, and its
+            // content arrives through `collect_runs` as part of the inline
+            // formatting context its siblings share. A text node with a box of
+            // its own is precisely the bug the context exists to fix.
+            NodeData::Text(_) => return,
             _ => return,
         };
         self.dom_to_taffy.insert(node_id.to_raw(), taffy_id);
@@ -606,6 +792,64 @@ mod tests {
 /// Public because [`crate::render::painter`] must collapse identically — if
 /// the painter drew a different string from the one measured, the text would
 /// not fit the box reserved for it.
+/// White-space collapsing for a text node *inside* an inline formatting
+/// context, where a space at the edge of the node may be a real space between
+/// two inline boxes.
+///
+/// [`collapse_white_space`] drops a trailing collapsible space, and its own
+/// comment said why that was wrong and why it was tolerable: "a space between
+/// two inline boxes survives as one space in a real inline formatting context —
+/// but this layout has no inline formatting context to survive into." It has
+/// one now, and the first render through it printed `Read moreabout the
+/// project` and `withbold runs`, because every space before a tag had been
+/// eaten.
+///
+/// So this keeps the edge spaces and leaves the trimming to the caller, which
+/// is the only place that knows whether a given edge is the start or end of the
+/// whole context or just the seam between two runs.
+pub fn collapse_white_space_inline(text: &str, style: &ComputedStyle) -> String {
+    use crate::css_values::types::display::WhiteSpace;
+
+    let ws = match style.get(&PropertyId::WhiteSpace) {
+        Some(CssValue::WhiteSpace(w)) => *w,
+        _ => WhiteSpace::Normal,
+    };
+    let collapses = matches!(
+        ws,
+        WhiteSpace::Normal | WhiteSpace::Nowrap | WhiteSpace::PreLine
+    );
+    if !collapses {
+        return text.to_string();
+    }
+    let keeps_newlines = matches!(ws, WhiteSpace::PreLine);
+
+    let mut out = String::with_capacity(text.len());
+    let mut pending = false;
+    for c in text.chars() {
+        match c {
+            '\n' if keeps_newlines => {
+                pending = false;
+                out.push('\n');
+            }
+            ' ' | '\t' | '\n' | '\r' => pending = true,
+            _ => {
+                if pending {
+                    out.push(' ');
+                }
+                pending = false;
+                out.push(c);
+            }
+        }
+    }
+    // The difference from `collapse_white_space`: an edge space survives, both
+    // at the start (handled by the loop above pushing before the first glyph)
+    // and here at the end.
+    if pending {
+        out.push(' ');
+    }
+    out
+}
+
 pub fn collapse_white_space(text: &str, style: &ComputedStyle) -> String {
     use crate::css_values::types::display::WhiteSpace;
 
@@ -823,7 +1067,7 @@ fn measure_text_leaf(
     let Some(context) = context else {
         return taffy::Size::ZERO;
     };
-    if context.text.is_empty() {
+    if context.runs.is_empty() {
         return taffy::Size::ZERO;
     }
 
@@ -836,10 +1080,12 @@ fn measure_text_leaf(
         (None, AvailableSpace::MaxContent) => None,
     };
 
-    let laid_out = inline.layout(&context.text, &context.style, width_constraint);
+    let Some(flow) = inline.layout_runs(&context.runs, width_constraint) else {
+        return taffy::Size::ZERO;
+    };
     taffy::Size {
-        width: known.width.unwrap_or(laid_out.width),
-        height: known.height.unwrap_or(laid_out.height),
+        width: known.width.unwrap_or(flow.summary.width),
+        height: known.height.unwrap_or(flow.summary.height),
     }
 }
 
@@ -868,6 +1114,92 @@ fn generic_family_name(g: crate::css_values::types::font::GenericFamily) -> &'st
 mod inline_integration {
     use super::*;
     use crate::layout::viewport::Viewport;
+
+    /// The defect a screenshot of the running Windows app found, as a test.
+    ///
+    /// A paragraph with a link in it is ONE inline formatting context. Before
+    /// this, every text node and every inline element took a box of its own and
+    /// the block parent stacked them, so the paragraph rendered as six lines
+    /// with the comma and the full stop alone on lines of their own.
+    ///
+    /// The viewport is wide enough for the whole sentence, so a correct engine
+    /// puts it on one line. Height is the check: one line box, not six.
+    #[test]
+    fn a_paragraph_with_a_link_is_one_line() {
+        let html = "<html><body style='margin:0'>\
+                    <p id='p' style='font-size:16px'>Read more <a href='/x'>about it</a>, \
+                    or see the <b>benchmarks</b>.</p></body></html>";
+        let (dom, mut engine) = laid_out(html, 1200.0);
+        let box_ = rect(&dom, &mut engine, "p");
+
+        // One 16px line is ~18-19px tall. Six would be over 100.
+        assert!(
+            box_.height < 40.0,
+            "the paragraph is {}px tall — inline children are still taking boxes of their own",
+            box_.height
+        );
+    }
+
+    /// The bug the first fix exposed: `Read moreabout it`.
+    ///
+    /// A collapsible space at the end of a text node is a real space between
+    /// two inline boxes, and dropping it welds the words together. It has to
+    /// survive to the seam and be collapsed against the next run, not thrown
+    /// away by whichever node happened to hold it.
+    #[test]
+    fn a_space_before_an_inline_tag_survives_into_the_context() {
+        let html = "<html><body><p id='p'>Read more <a href='/x'>about it</a> and \
+                    <b>more</b> still</p></body></html>";
+        let dom = crate::html_parser::parse_html(html);
+        let mut engine = LayoutEngine::new(Viewport::new(1200.0, 600.0));
+        engine.compute(&dom);
+
+        let p = *dom
+            .get_elements_by_tag_name(dom.document(), "p")
+            .first()
+            .expect("the paragraph parsed");
+        // The context is anchored on the paragraph's first inline child.
+        let first = dom.children(p)[0];
+        let runs = engine.runs_of(first).expect("the paragraph is one context");
+        let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+
+        assert_eq!(joined, "Read more about it and more still");
+        assert!(
+            !joined.contains("  "),
+            "two collapsible spaces met at a seam and both survived: {joined:?}"
+        );
+    }
+
+    /// Every run keeps the element that styled it, so the painter can colour a
+    /// link differently from the text around it without a second tree walk.
+    #[test]
+    fn runs_carry_the_element_that_styled_them() {
+        let html = "<html><body><p id='p'>plain <a href='/x'>linked</a></p></body></html>";
+        let dom = crate::html_parser::parse_html(html);
+        let mut engine = LayoutEngine::new(Viewport::new(1200.0, 600.0));
+        engine.compute(&dom);
+
+        let p = *dom
+            .get_elements_by_tag_name(dom.document(), "p")
+            .first()
+            .expect("the paragraph parsed");
+        let a = *dom
+            .get_elements_by_tag_name(dom.document(), "a")
+            .first()
+            .expect("the anchor parsed");
+        let first = dom.children(p)[0];
+        let runs = engine.runs_of(first).expect("one context");
+
+        let sources: Vec<u32> = runs.iter().map(|r| r.source).collect();
+        assert!(
+            sources.contains(&p.to_raw()),
+            "the plain text is attributed to the paragraph"
+        );
+        assert!(
+            sources.contains(&a.to_raw()),
+            "and the link text to the anchor, not to the paragraph"
+        );
+    }
 
     fn laid_out(html: &str, width: f32) -> (Dom, LayoutEngine) {
         let dom = crate::html_parser::parse_html(html);
