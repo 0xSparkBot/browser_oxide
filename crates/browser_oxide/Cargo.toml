@@ -82,9 +82,14 @@ rand_distr = "0.6"
 # --- canvas / graphics / fonts ---
 skia-safe = "0.99"
 png = "0.17"
+# `ico` (which implies `bmp`) is on for favicons: `/favicon.ico` is still the
+# convention most sites serve, and without it the fallback path would decode
+# nothing on the majority of origins. Both decoders are pure Rust and in-crate,
+# so this widens no dependency graph and links no C.
 image = { version = "0.25", default-features = false, features = [
   "png",
   "jpeg",
+  "ico",
 ] }
 fontdb = { version = "0.23", default-features = false }
 rustybuzz = "0.20"

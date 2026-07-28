@@ -26,6 +26,8 @@ pub mod workers;
 pub mod challenge;
 pub mod classify;
 pub mod csp_collector;
+/// Favicons: discovery in the DOM, one fetch per origin, decode to RGBA.
+pub mod favicon;
 pub mod iframe;
 mod page;
 pub mod parallel;
