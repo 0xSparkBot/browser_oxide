@@ -32,6 +32,58 @@ If these return `0` or `undefined`, sites break or flag us as a bot.
 
 taffy takes a tree of nodes with `Style` structs and computes `Layout` (position + size) for each node.
 
+## Style resolution
+
+Layout does not resolve styles itself. `crate::style` does, once per `compute`,
+and layout reads the result:
+
+```
+DOM ──┬─► style::compute_styles ──► StyleTree (ComputedStyle per element)
+      │        ▲   ▲   ▲                        │
+      │        │   │   └── style="…" attributes │
+      │        │   └────── <style> blocks       │
+      │        └────────── style/ua.css         ▼
+      └──────────────────────────────► LayoutEngine::compute ──► taffy tree
+```
+
+`style/ua.css` is the user-agent stylesheet, compiled in with `include_str!`.
+It is small on purpose — it covers what is *observable through geometry*: which
+elements do not render (`head`, `script`, `style`, `title`, …), which are
+block-level, and the default margins Chrome applies. Without it, `head` and
+`title` are laid out as visible blocks and `body` starts several tens of pixels
+down the page.
+
+Cascade order is user-agent → author → `style` attribute, with the attribute
+given an unreachable specificity because `css_cascade` has no separate tier
+for it.
+
+> **History.** Until this was written, `LayoutEngine` resolved each element from
+> an *empty* cascaded map plus its `style` attribute — so `<style>` blocks and
+> stylesheets had no effect on geometry at all, and `font-size` did not inherit
+> (every `em` resolved against a fixed 16px). `getComputedStyle` had its own
+> separate path in `js_runtime::state`, which is why the gap was easy to miss:
+> the *reported* style was right while the *laid out* style was not.
+
+## Borders
+
+The used width of a border is zero unless `border-style` says it draws. This
+matters more than it sounds: `border-width`'s initial value is `medium` (3px)
+and `border-style`'s is `none`, so applying width unconditionally gives every
+element on every page a 3px border — which is what happened before
+`border-style` existed as a property.
+
+## Text measurement
+
+Text nodes go through CSS white-space processing before they are measured, so
+the newline-and-indent between two tags collapses to nothing and produces no
+box. Without it every such text node became a full line box and an ordinary
+document gained one per element.
+
+Measurement itself is still the placeholder: `char_count × font_size × 0.6`,
+one line, no wrapping. That is what the renderer replaces — see
+[`browser_oxide_app/docs/POC1_RESULTS.md`](https://github.com/yfedoseev/browser_oxide_app)
+for the shaped, Chrome-parity implementation that is being lifted in.
+
 ## Architecture
 
 ```

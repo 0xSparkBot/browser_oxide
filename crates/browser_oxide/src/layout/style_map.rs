@@ -48,10 +48,30 @@ pub fn computed_to_taffy(style: &ComputedStyle, ctx: &ResolveContext) -> taffy::
     ts.padding.left = css_to_lp(style, &PropertyId::PaddingLeft, ctx);
 
     // Border
-    ts.border.top = css_to_border(style, &PropertyId::BorderTopWidth, ctx);
-    ts.border.right = css_to_border(style, &PropertyId::BorderRightWidth, ctx);
-    ts.border.bottom = css_to_border(style, &PropertyId::BorderBottomWidth, ctx);
-    ts.border.left = css_to_border(style, &PropertyId::BorderLeftWidth, ctx);
+    ts.border.top = css_to_border(
+        style,
+        &PropertyId::BorderTopWidth,
+        &PropertyId::BorderTopStyle,
+        ctx,
+    );
+    ts.border.right = css_to_border(
+        style,
+        &PropertyId::BorderRightWidth,
+        &PropertyId::BorderRightStyle,
+        ctx,
+    );
+    ts.border.bottom = css_to_border(
+        style,
+        &PropertyId::BorderBottomWidth,
+        &PropertyId::BorderBottomStyle,
+        ctx,
+    );
+    ts.border.left = css_to_border(
+        style,
+        &PropertyId::BorderLeftWidth,
+        &PropertyId::BorderLeftStyle,
+        ctx,
+    );
 
     // Flex
     if let Some(CssValue::FlexDirection(fd)) = style.get(&PropertyId::FlexDirection) {
@@ -159,12 +179,28 @@ fn css_to_lp(
     }
 }
 
+/// The *used* border width for one side.
+///
+/// CSS: a border whose style is `none` or `hidden` has a used width of zero,
+/// whatever `border-width` says. The initial `border-width` is `medium` (3px)
+/// and the initial `border-style` is `none`, so without this gate every
+/// element in every document carries a 3px border on all four sides — which is
+/// exactly what the engine did, and it moved every box on every page.
 fn css_to_border(
     style: &ComputedStyle,
-    prop: &PropertyId,
+    width_prop: &PropertyId,
+    style_prop: &PropertyId,
     ctx: &ResolveContext,
 ) -> taffy::LengthPercentage {
-    match style.get(prop) {
+    let draws = match style.get(style_prop) {
+        Some(CssValue::BorderStyle(s)) => s.is_visible(),
+        // No border-style at all: treat as `none`, matching the initial value.
+        _ => false,
+    };
+    if !draws {
+        return taffy::LengthPercentage::length(0.0);
+    }
+    match style.get(width_prop) {
         Some(CssValue::Length(l)) => taffy::LengthPercentage::length(resolve_length(l, ctx)),
         _ => taffy::LengthPercentage::length(0.0),
     }

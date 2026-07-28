@@ -102,6 +102,33 @@ pub enum WhiteSpace {
     BreakSpaces,
 }
 
+/// CSS `border-style` property values.
+///
+/// The engine had no such property, and the consequence was not subtle: CSS
+/// says a border's *used* width is zero unless its style is set, so applying
+/// the initial `border-width: medium` unconditionally gave every element in
+/// every document a 3px border on all four sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderStyle {
+    None,
+    Hidden,
+    Dotted,
+    Dashed,
+    Solid,
+    Double,
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+}
+
+impl BorderStyle {
+    /// Does this style draw a border, and therefore give it a used width?
+    pub fn is_visible(self) -> bool {
+        !matches!(self, Self::None | Self::Hidden)
+    }
+}
+
 /// CSS `flex-direction` property values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexDirection {

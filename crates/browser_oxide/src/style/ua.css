@@ -1,0 +1,83 @@
+/* Minimal user-agent stylesheet.
+ *
+ * The engine had none. That is invisible while it is headless — taffy's default
+ * display is block, which makes documents look approximately sane — but it
+ * means `head`, `title`, `meta`, `script` and `style` are laid out as ordinary
+ * visible blocks, and `getBoundingClientRect()` on a body element reports a
+ * position that no real browser would report. An anti-bot script comparing
+ * geometry against a real Chrome is reading a difference here.
+ *
+ * Deliberately not the whole of html.css. This covers the elements whose
+ * *absence* is observable: what does not render, what is block, and the default
+ * margins that decide where everything sits. Fonts, colours, form controls and
+ * table defaults come later with the features that need them.
+ */
+
+/* --- not rendered ------------------------------------------------------- */
+
+head, meta, title, script, style, link, base, noscript, template,
+datalist, param, source, track, area, col, colgroup {
+  display: none;
+}
+
+/* --- block-level -------------------------------------------------------- */
+
+html, body, div, p, h1, h2, h3, h4, h5, h6,
+section, article, aside, nav, header, footer, main, figure, figcaption,
+blockquote, pre, address, hr, dl, dd, dt, ol, ul, li,
+form, fieldset, legend, details, summary, dialog, hgroup, search {
+  display: block;
+}
+
+li { display: list-item; }
+
+table { display: table; }
+thead { display: table-header-group; }
+tbody { display: table-row-group; }
+tfoot { display: table-footer-group; }
+tr { display: table-row; }
+td, th { display: table-cell; }
+caption { display: table-caption; }
+
+/* --- default margins ---------------------------------------------------- */
+/* The numbers Chrome uses. They are load-bearing: `body { margin: 8px }` alone
+ * shifts every element on an unstyled page by 8px in both axes. */
+
+body { margin: 8px; }
+
+p, blockquote, figure, dl, ol, ul, pre {
+  margin-top: 1em;
+  margin-bottom: 1em;
+}
+
+h1 { font-size: 2em;    margin-top: 0.67em; margin-bottom: 0.67em; }
+h2 { font-size: 1.5em;  margin-top: 0.83em; margin-bottom: 0.83em; }
+h3 { font-size: 1.17em; margin-top: 1em;    margin-bottom: 1em; }
+h4 { font-size: 1em;    margin-top: 1.33em; margin-bottom: 1.33em; }
+h5 { font-size: 0.83em; margin-top: 1.67em; margin-bottom: 1.67em; }
+h6 { font-size: 0.67em; margin-top: 2.33em; margin-bottom: 2.33em; }
+
+blockquote { margin-left: 40px; margin-right: 40px; }
+figure     { margin-left: 40px; margin-right: 40px; }
+
+ol, ul { padding-left: 40px; }
+
+/* --- inline ------------------------------------------------------------- */
+
+span, a, em, strong, b, i, u, s, small, big, code, kbd, samp, var, cite,
+abbr, dfn, q, sub, sup, mark, time, label, br, wbr, bdi, bdo, ruby, rt, rp {
+  display: inline;
+}
+
+img, video, audio, canvas, iframe, embed, object, svg, picture, progress, meter {
+  display: inline-block;
+}
+
+button, input, select, textarea { display: inline-block; }
+
+/* --- typography --------------------------------------------------------- */
+
+h1, h2, h3, h4, h5, h6, strong, b, th { font-weight: bold; }
+em, i, cite, dfn, var, address { font-style: italic; }
+pre, code, kbd, samp { font-family: monospace; }
+small { font-size: 0.83em; }

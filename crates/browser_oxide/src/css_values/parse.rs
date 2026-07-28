@@ -30,6 +30,18 @@ pub fn parse_property(
         "margin" => return parse_box_shorthand(value_trimmed, important, "margin"),
         "padding" => return parse_box_shorthand(value_trimmed, important, "padding"),
         "overflow" => return parse_overflow_shorthand(value_trimmed, important),
+        "border-width" => {
+            return parse_border_side_shorthand(value_trimmed, important, BorderSide::Width)
+        }
+        "border-style" => {
+            return parse_border_side_shorthand(value_trimmed, important, BorderSide::Style)
+        }
+        "border-color" => {
+            return parse_border_side_shorthand(value_trimmed, important, BorderSide::Color)
+        }
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            return parse_border_shorthand(&name_lower, value_trimmed, important)
+        }
         _ => {}
     }
 
@@ -49,6 +61,12 @@ pub fn parse_property(
         }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             parse_border_width(value_trimmed)?
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            parse_border_style(value_trimmed)?
+        }
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
+            parse_color(value_trimmed)?
         }
         "box-sizing" => parse_box_sizing(value_trimmed)?,
         "overflow-x" | "overflow-y" => parse_overflow(value_trimmed)?,
@@ -1262,4 +1280,248 @@ mod tests {
         let decls = parse_decl("margin: 0");
         assert_eq!(decls.len(), 4);
     }
+}
+
+/// Split a value list into whitespace-separated groups, each a slice of the
+/// original so the existing single-value parsers can be reused unchanged.
+fn split_on_whitespace<'a, 'b>(value: &'b [ComponentValue<'a>]) -> Vec<Vec<ComponentValue<'a>>> {
+    let mut groups: Vec<Vec<ComponentValue<'a>>> = Vec::new();
+    let mut current: Vec<ComponentValue<'a>> = Vec::new();
+    for v in value {
+        if matches!(
+            v,
+            ComponentValue::Token(Token {
+                kind: TokenKind::Whitespace,
+                ..
+            })
+        ) {
+            if !current.is_empty() {
+                groups.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(v.clone());
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+fn single_ident(value: &[ComponentValue<'_>]) -> Option<String> {
+    expect_single_ident(value).ok()
+}
+
+/// Which longhand family a box-style shorthand expands into.
+#[derive(Clone, Copy)]
+enum BorderSide {
+    Width,
+    Style,
+    Color,
+}
+
+impl BorderSide {
+    fn ids(self) -> [PropertyId; 4] {
+        match self {
+            Self::Width => [
+                PropertyId::BorderTopWidth,
+                PropertyId::BorderRightWidth,
+                PropertyId::BorderBottomWidth,
+                PropertyId::BorderLeftWidth,
+            ],
+            Self::Style => [
+                PropertyId::BorderTopStyle,
+                PropertyId::BorderRightStyle,
+                PropertyId::BorderBottomStyle,
+                PropertyId::BorderLeftStyle,
+            ],
+            Self::Color => [
+                PropertyId::BorderTopColor,
+                PropertyId::BorderRightColor,
+                PropertyId::BorderBottomColor,
+                PropertyId::BorderLeftColor,
+            ],
+        }
+    }
+
+    fn parse_one(self, value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+        match self {
+            Self::Width => parse_border_width(value),
+            Self::Style => parse_border_style(value),
+            Self::Color => parse_color(value),
+        }
+    }
+}
+
+/// `border-style: solid dashed` and friends — one to four values, applied in
+/// the usual top / right / bottom / left order.
+fn parse_border_side_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+    side: BorderSide,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let groups = split_on_whitespace(value);
+    if groups.is_empty() || groups.len() > 4 {
+        return Err(ValueError::InvalidValue(
+            "expected one to four values".into(),
+        ));
+    }
+    let parsed: Vec<CssValue> = groups
+        .iter()
+        .map(|g| side.parse_one(g))
+        .collect::<Result<_, _>>()?;
+
+    let (top, right, bottom, left) = match parsed.len() {
+        1 => (
+            parsed[0].clone(),
+            parsed[0].clone(),
+            parsed[0].clone(),
+            parsed[0].clone(),
+        ),
+        2 => (
+            parsed[0].clone(),
+            parsed[1].clone(),
+            parsed[0].clone(),
+            parsed[1].clone(),
+        ),
+        3 => (
+            parsed[0].clone(),
+            parsed[1].clone(),
+            parsed[2].clone(),
+            parsed[1].clone(),
+        ),
+        _ => (
+            parsed[0].clone(),
+            parsed[1].clone(),
+            parsed[2].clone(),
+            parsed[3].clone(),
+        ),
+    };
+
+    let ids = side.ids();
+    Ok(vec![
+        PropertyDeclaration {
+            property: ids[0].clone(),
+            value: top,
+            important,
+        },
+        PropertyDeclaration {
+            property: ids[1].clone(),
+            value: right,
+            important,
+        },
+        PropertyDeclaration {
+            property: ids[2].clone(),
+            value: bottom,
+            important,
+        },
+        PropertyDeclaration {
+            property: ids[3].clone(),
+            value: left,
+            important,
+        },
+    ])
+}
+
+/// `border: 1px solid red` and the per-side variants.
+///
+/// Order-independent, per the spec: each component is identified by what it
+/// parses as, not by where it sits. Omitted components reset to their initial
+/// value — which is why `border: solid` alone produces a visible border of
+/// `medium` width, and why `border: 1px` alone produces no border at all.
+fn parse_border_shorthand(
+    name: &str,
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let mut width: Option<CssValue> = None;
+    let mut style: Option<CssValue> = None;
+    let mut color: Option<CssValue> = None;
+
+    for group in split_on_whitespace(value) {
+        if style.is_none() {
+            if let Ok(v) = parse_border_style(&group) {
+                style = Some(v);
+                continue;
+            }
+        }
+        if width.is_none() {
+            if let Ok(v) = parse_border_width(&group) {
+                width = Some(v);
+                continue;
+            }
+        }
+        if color.is_none() {
+            if let Ok(v) = parse_color(&group) {
+                color = Some(v);
+                continue;
+            }
+        }
+        return Err(ValueError::InvalidValue(format!(
+            "unrecognised {name} component"
+        )));
+    }
+    if width.is_none() && style.is_none() && color.is_none() {
+        return Err(ValueError::InvalidValue(format!("empty {name}")));
+    }
+
+    let width =
+        width.unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::BorderTopWidth));
+    let style =
+        style.unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::BorderTopStyle));
+    let color =
+        color.unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::BorderTopColor));
+
+    let sides: &[usize] = match name {
+        "border-top" => &[0],
+        "border-right" => &[1],
+        "border-bottom" => &[2],
+        "border-left" => &[3],
+        _ => &[0, 1, 2, 3],
+    };
+
+    let mut out = Vec::with_capacity(sides.len() * 3);
+    for &i in sides {
+        out.push(PropertyDeclaration {
+            property: BorderSide::Width.ids()[i].clone(),
+            value: width.clone(),
+            important,
+        });
+        out.push(PropertyDeclaration {
+            property: BorderSide::Style.ids()[i].clone(),
+            value: style.clone(),
+            important,
+        });
+        out.push(PropertyDeclaration {
+            property: BorderSide::Color.ids()[i].clone(),
+            value: color.clone(),
+            important,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_border_style(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    use crate::css_values::types::display::BorderStyle;
+    if let Some(ident) = single_ident(value) {
+        let style = match ident.to_ascii_lowercase().as_str() {
+            "none" => BorderStyle::None,
+            "hidden" => BorderStyle::Hidden,
+            "dotted" => BorderStyle::Dotted,
+            "dashed" => BorderStyle::Dashed,
+            "solid" => BorderStyle::Solid,
+            "double" => BorderStyle::Double,
+            "groove" => BorderStyle::Groove,
+            "ridge" => BorderStyle::Ridge,
+            "inset" => BorderStyle::Inset,
+            "outset" => BorderStyle::Outset,
+            other => {
+                return Err(ValueError::InvalidValue(format!(
+                    "invalid border-style: {other}"
+                )))
+            }
+        };
+        return Ok(CssValue::BorderStyle(style));
+    }
+    Err(ValueError::InvalidValue("expected border-style".into()))
 }

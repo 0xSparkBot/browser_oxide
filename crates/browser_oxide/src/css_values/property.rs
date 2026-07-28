@@ -28,6 +28,14 @@ pub enum PropertyId {
     BorderRightWidth,
     BorderBottomWidth,
     BorderLeftWidth,
+    BorderTopStyle,
+    BorderRightStyle,
+    BorderBottomStyle,
+    BorderLeftStyle,
+    BorderTopColor,
+    BorderRightColor,
+    BorderBottomColor,
+    BorderLeftColor,
     BoxSizing,
     OverflowX,
     OverflowY,
@@ -87,6 +95,14 @@ impl PropertyId {
             "border-right-width" => Self::BorderRightWidth,
             "border-bottom-width" => Self::BorderBottomWidth,
             "border-left-width" => Self::BorderLeftWidth,
+            "border-top-style" => Self::BorderTopStyle,
+            "border-right-style" => Self::BorderRightStyle,
+            "border-bottom-style" => Self::BorderBottomStyle,
+            "border-left-style" => Self::BorderLeftStyle,
+            "border-top-color" => Self::BorderTopColor,
+            "border-right-color" => Self::BorderRightColor,
+            "border-bottom-color" => Self::BorderBottomColor,
+            "border-left-color" => Self::BorderLeftColor,
             "box-sizing" => Self::BoxSizing,
             "overflow-x" => Self::OverflowX,
             "overflow-y" => Self::OverflowY,
@@ -157,6 +173,7 @@ pub enum CssValue {
 
     // Color
     Color(Color),
+    BorderStyle(BorderStyle),
 
     // Flex
     FlexDirection(FlexDirection),

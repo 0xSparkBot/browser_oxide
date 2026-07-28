@@ -30,6 +30,25 @@ pub fn initial_value(property: &PropertyId) -> CssValue {
         | PropertyId::PaddingLeft => {
             CssValue::LengthPercentage(LengthPercentage::Length(Length::Zero))
         }
+        PropertyId::BorderTopStyle
+        | PropertyId::BorderRightStyle
+        | PropertyId::BorderBottomStyle
+        | PropertyId::BorderLeftStyle => {
+            CssValue::BorderStyle(crate::css_values::types::display::BorderStyle::None)
+        }
+        // `currentColor`. The engine has no keyword for it, so the initial is
+        // the initial `color` — correct for the overwhelmingly common case
+        // where `color` is not set on the element itself, and closer than
+        // transparent for the rest.
+        PropertyId::BorderTopColor
+        | PropertyId::BorderRightColor
+        | PropertyId::BorderBottomColor
+        | PropertyId::BorderLeftColor => CssValue::Color(Color::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 1.0,
+        }),
         PropertyId::BorderTopWidth
         | PropertyId::BorderRightWidth
         | PropertyId::BorderBottomWidth

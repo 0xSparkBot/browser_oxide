@@ -17,6 +17,8 @@ pub mod layout;
 pub mod net;
 pub mod protocol;
 pub mod stealth;
+/// Style resolution: DOM + stylesheets -> a ComputedStyle per element.
+pub mod style;
 pub mod workers;
 
 pub mod challenge;
