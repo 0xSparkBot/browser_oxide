@@ -2,7 +2,7 @@ use browser_oxide::canvas::Canvas2D;
 
 #[test]
 fn test_measure_text_bit_accuracy() {
-    let mut canvas = Canvas2D::new(200, 100, "Linux".to_string(), 0).unwrap();
+    let mut canvas = Canvas2D::new(200, 100, "Linux".to_string()).unwrap();
 
     // 16px Arial is a common detection target
     canvas.set_font("16px Arial");
@@ -19,7 +19,7 @@ fn test_measure_text_bit_accuracy() {
 
 #[test]
 fn test_measure_text_empty() {
-    let mut canvas = Canvas2D::new(200, 100, "Linux".to_string(), 0).unwrap();
+    let mut canvas = Canvas2D::new(200, 100, "Linux".to_string()).unwrap();
     canvas.set_font("16px Arial");
     let width = canvas.measure_text("");
     assert_eq!(width, 0.0);

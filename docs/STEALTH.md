@@ -181,7 +181,7 @@ default and may be omitted from YAML/JSON; everything else is required.
 |---|---|---|
 | `pdf_viewer_enabled` | bool | `navigator.pdfViewerEnabled`. |
 | `plugins_count`, `mime_types_count` | u32 | Reported plugin/MIME counts. |
-| `canvas_seed`, `audio_seed` | u64 | Deterministic per-profile FP noise seeds. |
+| `canvas_seed`, `audio_seed` | u64 | Deterministic per-profile FP noise seeds. **`canvas_seed` no longer affects Canvas 2D** — the encode-time per-pixel noise was removed, so `toDataURL`/`getImageData` are clean, deterministic and identical to each other. It still seeds the WebGL readback backend and the per-family `measureText` width deltas. |
 | `prefers_color_scheme` | String | `"light"` / `"dark"`. |
 | `pointer_type` | String | `"fine"` (mouse) / `"coarse"` (touch). |
 | `hover_capability` | String | `"hover"` / `"none"`. |

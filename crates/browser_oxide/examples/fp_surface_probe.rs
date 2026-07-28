@@ -1,11 +1,16 @@
 //! Read-only fingerprint-surface probe used for the FINGERPRINT_SURFACE.md audit.
 //!
 //! Prints, for a fixed profile:
-//!   - the canvas `toDataURL` length + FNV-1a digest (the existing invariant),
-//!   - the `getImageData` digest for the SAME drawing (to test whether the
-//!     seeded jitter applied at encode time is also applied to raw pixel reads),
-//!   - the same pair for a profile with a DIFFERENT canvas_seed (to test
-//!     whether the seed reaches raw pixel reads at all).
+//!   - the canvas `toDataURL` length + FNV-1a digest,
+//!   - the `getImageData` digest for the SAME drawing,
+//!   - the same pair for a profile with a DIFFERENT canvas_seed.
+//!
+//! The audit ran this to demonstrate the defect: encode-time seeded noise
+//! moved the `toDataURL` digest with the seed while leaving `getImageData`
+//! byte-identical, so the defence covered one API and not the other. Since
+//! the noise was removed, all four digests are expected to be **stable and
+//! seed-independent** — that is now the passing result, and a `toDataURL`
+//! digest that moves with `canvas_seed` would be the regression.
 //!
 //! Alters no engine behaviour; it only evaluates script against a page.
 

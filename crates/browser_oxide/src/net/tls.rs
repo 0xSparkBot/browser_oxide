@@ -4,6 +4,10 @@
 //! including cipher suites, curves, signature algorithms, extensions,
 //! and certificate compression — all in the exact order that produces
 //! the correct JA3/JA4 fingerprint.
+//!
+//! Extension *order* is the one deliberate exception. Chrome permutes it
+//! on every handshake, so there is no single order to reproduce; see the
+//! "Chrome desktop/Android extension order" note further down this file.
 
 use crate::stealth::{DeviceClass, StealthProfile};
 use boring2::ssl::{
@@ -180,7 +184,8 @@ const SAFARI_IOS_EXTENSION_PERMUTATION: &[u8] = &[
     15, // psk_key_exchange_modes
     17, // supported_versions
     21, // cert_compression (compress_certificate, type 27). boring2 kExtensions
-        // index is 21 (proven by CHROME_EXTENSION_PERMUTATION, which emits 0x1b);
+        // index is 21 (per `ExtensionType::BORING_SSLEXTENSION_PERMUTATION` in
+        // boring2 ssl/mod.rs, the authoritative mirror of the C table);
         // the previous `22` is the PADDING slot — a live TLS-fingerprint capture
         // showed this index emitting ext 0x15 (padding) instead of 0x1b
         // here, giving JA4 t13d2013h2 vs real iOS-18 Safari's t13d2014h2. With
@@ -262,11 +267,11 @@ const FIREFOX_RECORD_SIZE_LIMIT: u16 = 0x4001;
 /// `BORING_SSLEXTENSION_PERMUTATION` table — same index space the Chrome and
 /// Safari permutations use). FIXED order every handshake (NSS does not
 /// Fisher-Yates shuffle). 15 extensions → the Firefox `t13d1715h2` JA4 count.
-/// Index map (proven from CHROME_/SAFARI_ permutations + boring2 ext table):
+/// Index map (from `ExtensionType::BORING_SSLEXTENSION_PERMUTATION`):
 /// 0=SNI, 1=ECH, 2=ext_master_secret, 3=renegotiate, 4=supported_groups,
 /// 5=ec_point_formats, 6=session_ticket, 7=ALPN, 8=status_request,
 /// 9=signature_algorithms, 14=key_share, 15=psk_kex_modes, 17=supported_versions,
-/// 22=delegated_credentials, 26=record_size_limit. Order verified against a
+/// 22=delegated_credentials, 25=record_size_limit. Order verified against a
 /// reference Firefox 135 TLS capture — iterate if the JA4 ext-hash diverges.
 const FIREFOX_EXTENSION_PERMUTATION: &[u8] = &[
     0,  // server_name
@@ -289,58 +294,97 @@ const FIREFOX_EXTENSION_PERMUTATION: &[u8] = &[
 /// ALPN protocols: h2 + http/1.1
 const ALPN_PROTOS: &[u8] = b"\x02h2\x08http/1.1";
 
-use rand::prelude::SliceRandom;
-
-/// Chrome 147 extension permutation (indices into BoringSSL kExtensions table).
-/// 16 extensions matching a verified Chrome 147 macOS arm64 reference capture.
-///
-/// **Real Chrome shuffling behavior** (per Fastly TLS Fingerprinting blog
-/// + Chromestatus 5124606246518784 + BoringSSL `ssl_setup_extension_permutation`
-/// source): Chrome shuffles ALL non-PSK extensions with a single Fisher-Yates
-/// pass — there is no documented bucket structure. The only positional
-/// constraint is psk_key_exchange_modes / pre_shared_key being last (BoringSSL
-/// enforces this). The previous 3-bucket scheme was folklore from earlier
-/// public RE work; it reduced shuffle entropy by ~720,000× and put
-/// signature_algorithms always at position 16 — a deterministic positional
-/// pattern that per-handshake classifiers can detect as anomalous.
-const CHROME_EXTENSION_PERMUTATION: &[u8] = &[
-    14, // key_share (51)
-    1,  // encrypted_client_hello (65037)
-    4,  // supported_groups (10)
-    11, // certificate_timestamp (18)
-    15, // psk_key_exchange_modes (45)
-    2,  // extended_master_secret (23)
-    24, // application_settings_new (17613)
-    21, // cert_compression (27)
-    17, // supported_versions (43)
-    0,  // server_name (0)
-    3,  // renegotiate (65281)
-    5,  // ec_point_formats (11)
-    8,  // status_request (5)
-    7,  // application_layer_protocol_negotiation (16)
-    6,  // session_ticket (35)
-    9,  // signature_algorithms (13)
-];
-
-/// Generate a fresh Fisher-Yates shuffle over all 16 Chrome 147 extensions.
-fn shuffled_chrome_extension_permutation() -> Vec<u8> {
-    let mut rng = rand::rng();
-    let mut permutation = CHROME_EXTENSION_PERMUTATION.to_vec();
-    permutation.shuffle(&mut rng);
-    permutation
-}
+// ---------------------------------------------------------------------------
+// Chrome desktop/Android extension order: permuted per handshake, by
+// BoringSSL, and deliberately not pinned by us.
+// ---------------------------------------------------------------------------
+//
+// Chrome has shuffled its ClientHello extension order on every connection
+// since Chrome 110 — visible on the wire from 20 January 2023, as an
+// anti-ossification measure. Fastly measured the result in the wild as
+// "nearly 15 factorial" orderings, so that "each connection ... practically
+// [has] a unique JA3 fingerprint". There is therefore no "the" Chrome
+// extension order to reproduce, and a *stable* order is by itself positive
+// evidence of not-Chrome.
+//
+// This engine used to reproduce that mechanism at the wrong granularity. It
+// called `set_permute_extensions(false)` and installed a single
+// Fisher-Yates-shuffled order onto the `SSL_CTX`, once, in
+// `chrome_connector()`. That connector is held as `Arc<SslConnector>` by
+// `HttpClient` and reused for every connection the client makes, so one
+// draw from 16! ≈ 2×10¹³ orderings — roughly 44 bits — was chosen at client
+// construction and then replayed verbatim to every origin the session
+// contacted. That is a session-unique identifier carried *below* HTTP,
+// where no cookie policy, storage partition or blocklist can reach it, and
+// readable by every server, CDN and passive observer that computes JA3 or
+// an ordered JA4 variant. (JA4 proper sorts the extension list precisely to
+// survive Chrome's permutation, so a JA4-only observer never saw it. JA3
+// does not sort, and Cloudflare exposes `ja3_hash` alongside `ja4`.)
+//
+// WHY PER-HANDSHAKE PERMUTATION AND NOT A FIXED, FLEET-WIDE ORDER
+//
+// The rest of the privacy work here is converging on the Tor strategy —
+// normalise, do not randomise (`docs/FINGERPRINT_SURFACE.md` §1; W3C's
+// fingerprinting guidance; the WWW 2025 *Breaking the Shield* finding that
+// randomisation-based defences fare worse than fixed outputs). A fixed
+// order is the obvious reading of that recommendation, and it is the wrong
+// answer here, for two reasons.
+//
+//  1. The objection to randomisation is that it manufactures a
+//     configuration nobody has ever seen and holds it long enough to
+//     identify. Neither half applies to a per-handshake permutation: the
+//     observable distribution is exactly real Chrome's, and the value is
+//     discarded before anything can be joined to it. Randomness re-drawn
+//     per connection *destroys* a linkable identifier rather than creating
+//     one. The defect was never that the order was random; it was that it
+//     was random only once.
+//  2. Normalisation and impersonation conflict only when the fleet-wide
+//     constant cannot match a real browser. On this surface the constant is
+//     precisely what cannot match: real Chrome has no fixed extension
+//     order, so shipping one would give every browser_oxide user the same
+//     wire-visible "not Chrome, and specifically this engine" label — a
+//     static signature an anti-bot vendor enumerates once and matches
+//     forever, with no anonymity set beyond browser_oxide's own users.
+//     Per-handshake permutation puts the user inside Chrome's population,
+//     which is what the impersonation strategy and the anonymity-set
+//     argument both want.
+//
+// So the two philosophies agree here, and the fixed-order option is the one
+// that satisfies neither. Safari and Firefox keep an explicit fixed order
+// below because *those* browsers genuinely emit one — Apple's stack and NSS
+// do not shuffle. That is impersonation fidelity, and it is fleet-wide
+// constant for the same reason the real browsers' orders are.
+//
+// MECHANISM
+//
+// `SSL_CTX_set_permute_extensions(ctx, 1)` makes BoringSSL run
+// `ssl_setup_extension_permutation()` once per handshake off the
+// `SSL_HANDSHAKE`, seeded from `RAND_bytes` (boringssl `ssl/extensions.cc`,
+// called from `ssl/handshake_client.cc`). It is mutually exclusive with the
+// boring2 fork's `SSL_CTX_set_extension_permutation()`: the fork consults
+// the context permutation only on the `!permute_extensions` path, so a
+// fixed order and a per-handshake shuffle can never both be in force.
+//
+// BoringSSL permutes all 26 slots of its `kExtensions` table rather than a
+// curated subset, but a slot emits bytes only when the matching feature is
+// configured, so the extension *set* — and hence the JA4 `t13d1516h2`
+// extension count — is unchanged; only the order moves. Handing the slot
+// list back to BoringSSL also fixes a latent bug in the curated 16-index
+// list: it omitted the `cookie` slot, so a second ClientHello following a
+// HelloRetryRequest would have silently dropped the server's cookie.
 
 /// Build an `SslConnector` configured with the TLS fingerprint matching
 /// `profile.device_class`. Currently all variants share Chrome 147 desktop
 /// configuration; this also branches for Android and iOS Safari.
 pub fn chrome_connector(profile: &StealthProfile) -> Result<SslConnector, NetError> {
     // Per-device_class branching.
-    //  - Desktop / Android: shared Chrome 147 cipher/sigalg/extension config.
+    //  - Desktop / Android: shared Chrome 147 cipher/sigalg/extension config,
+    //    with the extension order permuted per handshake by BoringSSL.
     //    Android only diverges in the curves list (Kyber768Draft00 vs MLKEM).
-    //  - MobileIOS: distinct Safari 18 cipher/sigalg/curves + skip Fisher-Yates
-    //    extension permutation + zlib cert compression + SslOptions::NO_TICKET.
-    //    Per-connection ALPS and ECH grease are also skipped — see
-    //    configure_connection() below.
+    //  - MobileIOS: distinct Safari 18 cipher/sigalg/curves + a fixed
+    //    extension order (Safari does not permute) + zlib cert compression +
+    //    SslOptions::NO_TICKET. Per-connection ALPS and ECH grease are also
+    //    skipped — see configure_connection() below.
     let is_safari_ios = profile.device_class == DeviceClass::MobileIOS;
     // Firefox wire class: a desktop profile whose browser family is Firefox
     // emits an NSS-class ClientHello (no GREASE, FFDHE groups,
@@ -417,7 +461,33 @@ pub fn chrome_connector(profile: &StealthProfile) -> Result<SslConnector, NetErr
     // Firefox tell, so disable it for the Firefox arm.
     builder.set_grease_enabled(!is_firefox);
 
-    builder.set_permute_extensions(false);
+    // Extension order. Chrome permutes per handshake; Safari and Firefox emit
+    // a fixed order. See the "Chrome desktop/Android extension order" note
+    // above for why we permute rather than pin a fleet-wide Chrome order.
+    //
+    // The two settings are mutually exclusive in BoringSSL — the fork
+    // consults the context permutation only when permute_extensions is off —
+    // so exactly one arm below takes effect, and setting both would silently
+    // make the fixed order dead.
+    let fixed_extension_order: Option<&[u8]> = if is_safari_ios {
+        Some(SAFARI_IOS_EXTENSION_PERMUTATION)
+    } else if is_firefox {
+        // Firefox/NSS emits a FIXED extension order every handshake, like
+        // Safari — use the Firefox order verbatim.
+        Some(FIREFOX_EXTENSION_PERMUTATION)
+    } else {
+        None
+    };
+    builder.set_permute_extensions(fixed_extension_order.is_none());
+    if let Some(order) = fixed_extension_order {
+        // Safari's PADDING positional ordering still requires raw extension
+        // injection (deferred); BoringSSL auto-emits PADDING when the
+        // ClientHello length crosses ~512 bytes, which our Safari profile
+        // typically does.
+        builder
+            .set_extension_permutation_indices(order)
+            .map_err(|e| NetError::Tls(e.to_string()))?;
+    }
 
     builder.enable_ocsp_stapling();
     builder.enable_signed_cert_timestamps();
@@ -473,43 +543,7 @@ pub fn chrome_connector(profile: &StealthProfile) -> Result<SslConnector, NetErr
     }
     builder.set_cert_store(cert_store.build());
 
-    let connector = builder.build();
-
-    // Extension order:
-    //  - Chrome: per-handshake Fisher-Yates shuffle of all 16 desktop extensions
-    //  - Safari iOS: FIXED order (same every handshake) — Phase D
-    //    upgrade. Set Safari's specific 13-extension order via the same
-    //    permutation API. PADDING positional ordering still requires raw
-    //    extension injection (deferred); BoringSSL auto-emits PADDING when
-    //    ClientHello length crosses ~512 bytes, which our Safari profile
-    //    typically does.
-    let permutation = if is_safari_ios {
-        SAFARI_IOS_EXTENSION_PERMUTATION.to_vec()
-    } else if is_firefox {
-        // Firefox/NSS emits a FIXED extension order every handshake (no
-        // Fisher-Yates), like Safari — use the Firefox order verbatim.
-        FIREFOX_EXTENSION_PERMUTATION.to_vec()
-    } else {
-        shuffled_chrome_extension_permutation()
-    };
-    // SAFETY: BoringSSL's `SSL_CTX_set_extension_permutation` reads
-    // `len` consecutive `uint8_t` from `ptr` and copies them into the
-    // SSL_CTX. `permutation` is a contiguous `Vec<u8>` that lives
-    // for the duration of this call; `permutation.as_ptr()` and
-    // `permutation.len()` are an exact, in-bounds, non-null
-    // pair. `connector.context()` is a live `SslContext` we just
-    // built — its `as_ptr()` returns a non-null pointer valid for
-    // the call. No aliasing concern: BoringSSL only reads the
-    // permutation buffer.
-    unsafe {
-        boring_sys2::SSL_CTX_set_extension_permutation(
-            connector.context().as_ptr(),
-            permutation.as_ptr(),
-            permutation.len(),
-        );
-    }
-
-    Ok(connector)
+    Ok(builder.build())
 }
 
 /// Configure a per-connection TLS session with ALPS, ECH GREASE, and SNI.
@@ -660,8 +694,14 @@ rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
         );
 
         // --- JA4 input 4: extension count (16 — JA4 `c` digit) ---
+        // The extension *set* is no longer a hand-curated list; BoringSSL
+        // derives it from the builder config (see the extension-order note in
+        // this file). CHROME_CLIENTHELLO_EXTENSIONS records what that config
+        // is expected to put on the wire, and
+        // `chrome_extension_order_is_redrawn_per_handshake` checks it against
+        // a real ClientHello rather than against another constant.
         assert_eq!(
-            CHROME_EXTENSION_PERMUTATION.len(),
+            CHROME_CLIENTHELLO_EXTENSIONS.len(),
             16,
             "Chrome extension count drifted — JA4 extension-count digit \
              would change"
@@ -813,23 +853,197 @@ rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
         );
     }
 
-    #[test]
-    fn test_shuffle_is_full_fisher_yates() {
-        // Real Chrome shuffles all 16 extensions uniformly (no buckets).
-        // Verify the shuffle preserves the full set + is non-deterministic.
-        let p1 = shuffled_chrome_extension_permutation();
-        let p2 = shuffled_chrome_extension_permutation();
+    /// The 16 extension types a desktop Chrome ClientHello carries, as wire
+    /// codepoints, sorted. GREASE and PADDING are excluded: BoringSSL emits
+    /// both outside the permutation, and JA4 excludes them from its count.
+    /// This is the JA4 `t13d15**16**h2` extension count.
+    const CHROME_CLIENTHELLO_EXTENSIONS: &[u16] = &[
+        0,     // server_name
+        5,     // status_request
+        10,    // supported_groups
+        11,    // ec_point_formats
+        13,    // signature_algorithms
+        16,    // application_layer_protocol_negotiation
+        18,    // signed_certificate_timestamp
+        23,    // extended_master_secret
+        27,    // compress_certificate
+        35,    // session_ticket
+        43,    // supported_versions
+        45,    // psk_key_exchange_modes
+        51,    // key_share
+        17613, // application_settings (new codepoint)
+        65037, // encrypted_client_hello (GREASE ECH)
+        65281, // renegotiation_info
+    ];
 
-        assert_eq!(p1.len(), 16);
-        assert_eq!(p2.len(), 16);
+    /// True for the 16 GREASE codepoints (RFC 8701): both bytes equal and of
+    /// the form `0x?A`.
+    fn is_grease(ext_type: u16) -> bool {
+        (ext_type >> 8) == (ext_type & 0x00ff) && (ext_type & 0x000f) == 0x000a
+    }
 
-        let mut sorted = p1.clone();
-        sorted.sort();
-        let mut expected = CHROME_EXTENSION_PERMUTATION.to_vec();
-        expected.sort();
-        assert_eq!(sorted, expected, "shuffle must preserve the set");
+    /// Pull the extension types, in wire order, out of one captured
+    /// ClientHello record payload (i.e. the bytes after the 5-byte TLS record
+    /// header). GREASE and PADDING (21) are dropped, matching JA4's rules and
+    /// leaving exactly the extensions the permutation governs.
+    fn clienthello_extension_types(record_payload: &[u8]) -> Vec<u16> {
+        let be16 = |b: &[u8], i: usize| ((b[i] as u16) << 8) | b[i + 1] as u16;
 
-        // Probabilistically should differ run-to-run.
-        assert_ne!(p1, p2, "Shuffle should be non-deterministic");
+        assert_eq!(
+            record_payload[0], 1,
+            "expected a ClientHello handshake message"
+        );
+        let hs_len = ((record_payload[1] as usize) << 16)
+            | ((record_payload[2] as usize) << 8)
+            | record_payload[3] as usize;
+        // A Chrome ClientHello with an MLKEM768 key share runs ~1.9 kB, far
+        // under the 16 kB record limit, so it always arrives whole. Assert it
+        // rather than silently parsing a fragment.
+        assert_eq!(
+            hs_len,
+            record_payload.len() - 4,
+            "ClientHello spans more than one TLS record — parser would need \
+             to reassemble"
+        );
+        let body = &record_payload[4..];
+
+        let mut p = 2 + 32; // legacy_version + random
+        p += 1 + body[p] as usize; // legacy_session_id
+        p += 2 + be16(body, p) as usize; // cipher_suites
+        p += 1 + body[p] as usize; // legacy_compression_methods
+        let ext_end = p + 2 + be16(body, p) as usize;
+        p += 2;
+
+        let mut types = Vec::new();
+        while p + 4 <= ext_end {
+            let ext_type = be16(body, p);
+            let ext_len = be16(body, p + 2) as usize;
+            p += 4 + ext_len;
+            if !is_grease(ext_type) && ext_type != 21 {
+                types.push(ext_type);
+            }
+        }
+        assert_eq!(p, ext_end, "extension block did not parse cleanly");
+        types
+    }
+
+    /// Drive one real handshake attempt from `connector` against a throwaway
+    /// listener and return the extension types its ClientHello carried, in
+    /// wire order. The handshake never completes — the listener reads the
+    /// ClientHello and hangs up — which is all we need, because the
+    /// permutation is chosen while the ClientHello is being built.
+    async fn capture_clienthello_extensions(
+        connector: &SslConnector,
+        profile: &StealthProfile,
+    ) -> Vec<u16> {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 5];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_exact(&mut header),
+            )
+            .await
+            .expect("timed out reading TLS record header")
+            .unwrap();
+            let mut payload = vec![0u8; ((header[3] as usize) << 8) | header[4] as usize];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_exact(&mut payload),
+            )
+            .await
+            .expect("timed out reading ClientHello")
+            .unwrap();
+            payload
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_tls(connector, profile, "localhost", tcp),
+        )
+        .await;
+
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("capture server timed out")
+            .expect("capture server task");
+        clienthello_extension_types(&payload)
+    }
+
+    /// **Regression test for the per-session TLS supercookie.**
+    ///
+    /// Two handshakes from **one** `SslConnector` must not present the same
+    /// extension order. That "one connector" is the whole point: `HttpClient`
+    /// builds a connector once in `new()` and holds it as `Arc<SslConnector>`
+    /// for every `connect_tls` it ever makes (`net/mod.rs`), so a connector
+    /// reused across two handshakes *is* a client reused across two origins.
+    ///
+    /// The previous test compared two calls of a shuffle helper, which was
+    /// non-deterministic in isolation while the order the wire actually saw
+    /// was fixed for the client's lifetime — so it passed throughout.
+    ///
+    /// The false-failure risk is one in 16! (≈ 5×10⁻¹⁴) per run, which is far
+    /// below the flake floor of anything else in this suite.
+    #[tokio::test]
+    async fn chrome_extension_order_is_redrawn_per_handshake() {
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let connector = chrome_connector(&profile).expect("connector");
+
+        let first = capture_clienthello_extensions(&connector, &profile).await;
+        let second = capture_clienthello_extensions(&connector, &profile).await;
+
+        // The set must be Chrome's, unchanged — permuting must not add or
+        // drop an extension, or the JA4 count digit moves.
+        for (label, observed) in [("first", &first), ("second", &second)] {
+            let mut sorted = (*observed).clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted, CHROME_CLIENTHELLO_EXTENSIONS,
+                "{label} ClientHello carried a different extension set than \
+                 the Chrome reference — JA4 would change"
+            );
+        }
+
+        // ...and the order must be redrawn, as real Chrome has done since 110.
+        assert_ne!(
+            first, second,
+            "two handshakes from the SAME connector sent an identical \
+             extension order: the permutation is fixed for the client's \
+             lifetime and is therefore a ~44-bit cross-site identifier"
+        );
+    }
+
+    /// The mirror of the above: profiles that impersonate a browser which
+    /// genuinely does *not* permute must stay byte-stable across handshakes.
+    /// Without this, "fix the supercookie" could be satisfied by permuting
+    /// everything, which would break Safari and Firefox fidelity.
+    #[tokio::test]
+    async fn safari_and_firefox_extension_order_is_fixed_per_handshake() {
+        for profile in [
+            crate::stealth::presets::iphone_15_pro_safari_18(),
+            crate::stealth::presets::firefox_135_windows(),
+        ] {
+            let connector = chrome_connector(&profile).expect("connector");
+            let first = capture_clienthello_extensions(&connector, &profile).await;
+            let second = capture_clienthello_extensions(&connector, &profile).await;
+            assert_eq!(
+                first, second,
+                "{} emits a fixed extension order in reality; ours varied \
+                 between handshakes",
+                profile.browser_name
+            );
+            assert!(
+                !first.is_empty(),
+                "captured no extensions for {}",
+                profile.browser_name
+            );
+        }
     }
 }

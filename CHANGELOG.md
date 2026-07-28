@@ -6,6 +6,45 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+- **Canvas 2D per-pixel noise, and with it the `canvas_seed` dependence of the
+  Canvas 2D path.** `Canvas2D::to_data_url_with_jitter` (a `canvas_seed`-driven
+  PCG32 that perturbed R, G and B of 5% of pixels at PNG-encode time) and a
+  second, discarded LCG pass inside `op_canvas_to_data_url` are both gone.
+  `Canvas2D` no longer carries a seed at all, so `Canvas2D::new` loses its
+  fourth argument.
+
+  Two defects made this a net loss rather than a defence. The noise was applied
+  at *encode* and not at *readback*, so `getImageData` returned the clean
+  buffer — the defence was one call away from being skipped, and the two APIs
+  disagreeing was itself a deterministic test for "this browser spoofs its
+  canvas", since in every real browser they are backed by the same pixels. And
+  because every preset hardcodes `canvas_seed`, the output was perfectly stable,
+  which is what a fingerprinter wants: it earned neither Brave's benefit (no
+  stable identity, which needs per-session/per-origin re-seeding) nor Tor's
+  (everyone alike), while guaranteeing the render matched no real Chrome and so
+  defeating the impersonation strategy `PRIVACY.md` states. See
+  `browser_oxide_app/docs/FINGERPRINT_SURFACE.md` §1 and §3.3.
+
+  The canvas now renders cleanly and deterministically: every browser_oxide
+  user on a build produces byte-identical canvas output, and `toDataURL` and
+  `getImageData` are provably indistinguishable
+  (`canvas::canvas2d::tests::readback_and_data_url_agree`).
+
+  `canvas_seed` remains a live profile field — it seeds the WebGL readback
+  backend and the per-family `measureText` deltas — but nothing in Canvas 2D
+  reads it.
+
+### Changed
+- **The `canvas_fp_probe` value moved, as intended:
+  `len=3698 fnv1a=b98f33e270ae88b4`** (was `len=17502 fnv1a=5b1d42ee9bdc9713`).
+  The drop is mostly compression: sparse ±1 noise is close to incompressible,
+  so removing it shrank the IDAT roughly five-fold. The probe is now documented
+  for what it is worth — a **renderer change detector**, not a privacy claim.
+  A stable hash is what a fingerprinter wants, so it was never evidence the
+  surface was defended; it is a build-over-build tripwire for unintended render
+  or encode changes.
+
 ## [0.1.3]
 
 > Lands the `deno_core` 0.408 bump deferred from 0.1.2 — a V8 isolate must now be
@@ -55,8 +94,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Verified
 - Canvas fingerprint byte-identical across the V8 bump —
-  `examples/canvas_fp_probe.rs` reports `len=17502 fnv1a=5b1d42ee9bdc9713`, the
-  same value as 0.1.1 and 0.1.2.
+  `examples/canvas_fp_probe.rs` reported `len=17502 fnv1a=5b1d42ee9bdc9713`, the
+  same value as 0.1.1 and 0.1.2. (Historical: that value was measured while the
+  encode path still applied per-pixel noise. The noise was removed in
+  Unreleased and the probe now reports `len=3698 fnv1a=b98f33e270ae88b4`.)
 - Real-site regression vs `main`, 15 open sites, both engine paths: zero
   regressions; the warm-reuse fix from 0.1.2 still holds (pool 11/15 → 12/15).
 - Full CI matrix green on ubuntu (stable/beta/nightly), macOS and Windows —

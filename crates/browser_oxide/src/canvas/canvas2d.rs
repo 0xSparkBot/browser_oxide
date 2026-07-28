@@ -608,20 +608,24 @@ fn opacity_filter(amount: f32) -> ColorFilter {
 }
 
 /// CPU-based Canvas 2D rendering context backed by Skia.
+///
+/// Deliberately carries **no fingerprinting seed**. The context used to
+/// hold `profile.canvas_seed` and perturb the pixel buffer on its way out
+/// through `toDataURL`; that machinery was removed — see the note on
+/// [`Canvas2D::to_data_url`] for why noise is the wrong tool here.
 pub struct Canvas2D {
     /// Premultiplied RGBA8 pixel buffer, `width * height * 4` bytes.
     pixels: Vec<u8>,
     width: u32,
     height: u32,
     os_name: String,
-    seed: u64,
     state: CanvasState,
     state_stack: Vec<CanvasState>,
     path: Path2D,
 }
 
 impl Canvas2D {
-    pub fn new(width: u32, height: u32, os_name: String, seed: u64) -> Option<Self> {
+    pub fn new(width: u32, height: u32, os_name: String) -> Option<Self> {
         if width == 0 || height == 0 {
             return None;
         }
@@ -631,7 +635,6 @@ impl Canvas2D {
             width,
             height,
             os_name,
-            seed,
             state: CanvasState::default(),
             state_stack: Vec::new(),
             path: Path2D::new(),
@@ -918,6 +921,16 @@ impl Canvas2D {
 
     /// Get RGBA pixel data for a region (non-premultiplied, matching
     /// Canvas 2D's `getImageData` semantics).
+    ///
+    /// This is the single source of truth for what the canvas contains:
+    /// [`Canvas2D::to_png_bytes`] encodes precisely the buffer this returns
+    /// for the full canvas, so `toDataURL` and `getImageData` cannot
+    /// disagree. That equality is load-bearing rather than incidental — a
+    /// page that decodes the data URL and diffs it against a readback is a
+    /// standard spoofing check, and any transform applied to one path and
+    /// not the other would fail it. It is asserted by
+    /// `readback_and_data_url_agree` below; do not add processing to either
+    /// path without adding it to the other.
     pub fn get_image_data(&self, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
         let mut out = Vec::with_capacity((w * h * 4) as usize);
         for row in y..(y + h).min(self.height) {
@@ -1092,64 +1105,48 @@ impl Canvas2D {
     // --- Encoding ---
 
     /// Encode the canvas as a PNG data URL.
+    ///
+    /// **This is the only encode path, and it adds no noise.** That is a
+    /// deliberate reversal of the engine's earlier design, in which a
+    /// `canvas_seed`-driven PCG32 perturbed the R, G and B of 5% of pixels
+    /// here — and only here — before encoding. Three things were wrong with
+    /// that, and they compound:
+    ///
+    /// 1. **It only covered half the surface.** [`Canvas2D::get_image_data`]
+    ///    returned the clean buffer, so a page that called `getImageData`
+    ///    instead of `toDataURL` skipped the defence entirely, one call away.
+    ///    Worse, the two disagreeing was itself a *positive* test for this
+    ///    engine: in every real browser the pixels behind `toDataURL` and
+    ///    `getImageData` are the same pixels, so a page could decode our data
+    ///    URL, diff it against the readback, and conclude "this browser is
+    ///    lying about its canvas" with certainty. A defence that announces
+    ///    itself is worse than no defence.
+    /// 2. **The noise was randomisation in name only.** Every preset hardcodes
+    ///    its `canvas_seed`, so the output was perfectly stable — which is
+    ///    exactly what a fingerprinter wants. Brave's farbling earns its keep
+    ///    by re-seeding per session and per eTLD+1 so no stable identity can
+    ///    form; a constant seed gets none of that benefit while paying the
+    ///    full detectability cost.
+    /// 3. **It broke the impersonation strategy.** `PRIVACY.md` chooses to
+    ///    hide inside Chrome's population rather than inside browser_oxide's.
+    ///    Corrupting 5% of the pixels guarantees the render matches no real
+    ///    Chrome, so the defence was actively defeating the strategy it was
+    ///    meant to serve.
+    ///
+    /// What replaces it is the Tor answer applied consistently: render
+    /// cleanly and deterministically, so every browser_oxide user on a given
+    /// build produces byte-identical canvas output and the hash carries no
+    /// per-user information. The anonymity set is the whole user base rather
+    /// than the individual, and — because both APIs now derive from the same
+    /// buffer — there is nothing for a consistency check to catch.
+    ///
+    /// Both W3C's fingerprinting guidance ("standardizing behaviors rather
+    /// than randomizing") and the WWW 2025 *Breaking the Shield* result
+    /// (randomisation-based canvas defences fared worse than fixed outputs)
+    /// point the same way.
     pub fn to_data_url(&self) -> String {
         let png_bytes = self.to_png_bytes();
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_bytes);
-        format!("data:image/png;base64,{}", b64)
-    }
-
-    /// Encode with tiny invisible noise to break deterministic fingerprinting.
-    pub fn to_data_url_with_jitter(&self) -> String {
-        let mut pixels = self.get_image_data(0, 0, self.width, self.height);
-        if !pixels.is_empty() {
-            // PCG32-style PRNG seeded by the profile
-            let mut state = self.seed.wrapping_add(0x9E3779B97F4A7C15);
-            let inc = (self.seed >> 32) | 1;
-
-            let next_u32 = |s: &mut u64| {
-                let old_state = *s;
-                *s = old_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(inc);
-                let xorshifted = (((old_state >> 18) ^ old_state) >> 27) as u32;
-                let rot = (old_state >> 59) as u32;
-                (xorshifted >> rot) | (xorshifted << (rot.wrapping_neg() & 31))
-            };
-
-            for i in (0..pixels.len()).step_by(4) {
-                let val = next_u32(&mut state);
-                if (val % 100) < 5 {
-                    // Jitter 5% of pixels
-                    // Perturb RGB by +/- 1 in a way that remains in [0, 255]
-                    pixels[i] = if pixels[i] > 128 {
-                        pixels[i].wrapping_sub(1)
-                    } else {
-                        pixels[i].wrapping_add(1)
-                    };
-                    pixels[i + 1] = if pixels[i + 1] > 128 {
-                        pixels[i + 1].wrapping_sub(1)
-                    } else {
-                        pixels[i + 1].wrapping_add(1)
-                    };
-                    pixels[i + 2] = if pixels[i + 2] > 128 {
-                        pixels[i + 2].wrapping_sub(1)
-                    } else {
-                        pixels[i + 2].wrapping_add(1)
-                    };
-                }
-            }
-        }
-        let mut buf = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut buf, self.width, self.height);
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder.write_header().expect("PNG header write failed");
-            writer
-                .write_image_data(&pixels)
-                .expect("PNG data write failed");
-        }
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf);
         format!("data:image/png;base64,{}", b64)
     }
 
@@ -1177,10 +1174,13 @@ impl Canvas2D {
             // `Compression::Balanced` does map back to the same flate2 level
             // this uses, `Filter::Adaptive` is NOT equivalent to the
             // `Paeth` + adaptive pair below: measured on the standard
-            // FingerprintJS canvas sequence, 0.18 emits a 9,646-byte data URL
-            // where 0.17 emits 17,502. That is a different fingerprint for
-            // every canvas the engine renders. See
-            // `examples/canvas_fp_probe.rs` for the A/B harness.
+            // FingerprintJS canvas sequence, 0.18 emitted a data URL barely
+            // over half the length 0.17 emits. That is a different
+            // fingerprint for every canvas the engine renders. (Those two
+            // figures were taken while the encode path still applied
+            // per-pixel noise, which inflated both; the *ratio* is the point,
+            // and it is a property of the filter strategy, not of the noise.)
+            // See `examples/canvas_fp_probe.rs` for the A/B harness.
             encoder.set_compression(png::Compression::Default);
             encoder.set_filter(png::FilterType::Paeth);
             encoder.set_adaptive_filter(png::AdaptiveFilterType::Adaptive);
@@ -1384,7 +1384,7 @@ mod tests {
 
     #[test]
     fn create_canvas() {
-        let c = Canvas2D::new(200, 100, "Linux".to_string(), 0).unwrap();
+        let c = Canvas2D::new(200, 100, "Linux".to_string()).unwrap();
         assert_eq!(c.width(), 200);
         assert_eq!(c.height(), 100);
         assert!(!c.has_content());
@@ -1392,7 +1392,7 @@ mod tests {
 
     #[test]
     fn fill_rect_produces_pixels() {
-        let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c.set_fill_color(255, 0, 0, 1.0);
         c.fill_rect(10.0, 10.0, 50.0, 50.0);
         assert!(c.has_content());
@@ -1400,7 +1400,7 @@ mod tests {
 
     #[test]
     fn clear_rect_clears() {
-        let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c.set_fill_color(255, 0, 0, 1.0);
         c.fill_rect(0.0, 0.0, 100.0, 100.0);
         assert!(c.has_content());
@@ -1410,7 +1410,7 @@ mod tests {
 
     #[test]
     fn path_fill() {
-        let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c.set_fill_color(0, 0, 255, 1.0);
         c.begin_path();
         c.move_to(10.0, 10.0);
@@ -1423,7 +1423,7 @@ mod tests {
 
     #[test]
     fn stroke_rect() {
-        let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c.set_stroke_color(0, 255, 0, 1.0);
         c.set_line_width(2.0);
         c.stroke_rect(10.0, 10.0, 80.0, 80.0);
@@ -1432,7 +1432,7 @@ mod tests {
 
     #[test]
     fn get_image_data_red() {
-        let mut c = Canvas2D::new(10, 10, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(10, 10, "Linux".to_string()).unwrap();
         c.set_fill_color(255, 0, 0, 1.0);
         c.fill_rect(0.0, 0.0, 10.0, 10.0);
         let data = c.get_image_data(0, 0, 10, 10);
@@ -1445,7 +1445,7 @@ mod tests {
 
     #[test]
     fn to_data_url() {
-        let mut c = Canvas2D::new(10, 10, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(10, 10, "Linux".to_string()).unwrap();
         c.set_fill_color(255, 0, 0, 1.0);
         c.fill_rect(0.0, 0.0, 10.0, 10.0);
         let url = c.to_data_url();
@@ -1453,9 +1453,84 @@ mod tests {
         assert!(url.len() > 30);
     }
 
+    /// Draw one scene, read it out through **both** public canvas-read APIs,
+    /// and assert a page cannot tell them apart.
+    ///
+    /// This is the regression gate for the defect that motivated removing the
+    /// canvas noise. Encode-time perturbation used to make `toDataURL` differ
+    /// from `getImageData` on ~5% of pixels, and because every real browser
+    /// backs both APIs with the same framebuffer, that mismatch was a
+    /// deterministic one-page test for "this browser is spoofing its canvas" —
+    /// and simultaneously meant the defence could be skipped by calling the
+    /// unprotected API. Decoding the data URL and diffing it against the
+    /// readback is exactly the check such a page would run; it must find
+    /// nothing.
+    ///
+    /// The scene deliberately mixes an opaque fill, a translucent fill (so
+    /// the premultiply/unpremultiply round-trip is exercised) and shaped text
+    /// (so glyph antialiasing coverage is in the comparison), because a noise
+    /// pass would show up first in exactly those partially-covered pixels.
+    #[test]
+    fn readback_and_data_url_agree() {
+        let mut c = Canvas2D::new(64, 40, "Linux".to_string()).unwrap();
+        c.set_fill_color(255, 102, 0, 1.0);
+        c.fill_rect(0.0, 0.0, 40.0, 20.0);
+        c.set_fill_color(0, 102, 153, 0.7);
+        c.fill_rect(12.0, 8.0, 40.0, 24.0);
+        c.set_fill_color(0, 0, 0, 1.0);
+        c.set_font("14px sans-serif");
+        c.fill_text("oxide", 2.0, 34.0);
+        assert!(c.has_content(), "fixture must actually draw something");
+
+        let readback = c.get_image_data(0, 0, c.width(), c.height());
+
+        let url = c.to_data_url();
+        let b64 = url
+            .strip_prefix("data:image/png;base64,")
+            .expect("data URL prefix");
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .expect("data URL must be valid base64");
+        let (decoded, w, h) = Canvas2D::decode_image(&png).expect("data URL must decode as PNG");
+
+        assert_eq!((w, h), (c.width(), c.height()), "decoded dimensions");
+        assert_eq!(
+            decoded.len(),
+            readback.len(),
+            "readback and decoded data URL must cover the same pixels"
+        );
+
+        // Report *where* rather than just *that*, so a future regression that
+        // reintroduces sparse noise is immediately recognisable as such.
+        let differing = decoded
+            .chunks_exact(4)
+            .zip(readback.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            differing,
+            0,
+            "toDataURL and getImageData disagree on {differing} of {} pixels — the two APIs \
+             must be indistinguishable, or the difference is itself a fingerprint",
+            readback.len() / 4
+        );
+
+        // Belt and braces: the drawn colour must survive verbatim. ±1
+        // perturbation would leave the pixel counts equal above only if it
+        // hit both paths, so pin an exact value too.
+        let px = |x: usize, y: usize| {
+            let o = (y * c.width() as usize + x) * 4;
+            &readback[o..o + 4]
+        };
+        assert_eq!(
+            px(2, 2),
+            &[255, 102, 0, 255],
+            "opaque fill must render exactly, with no per-pixel noise"
+        );
+    }
+
     #[test]
     fn to_png_bytes_magic() {
-        let mut c = Canvas2D::new(10, 10, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(10, 10, "Linux".to_string()).unwrap();
         c.set_fill_color(0, 0, 255, 1.0);
         c.fill_rect(0.0, 0.0, 10.0, 10.0);
         let bytes = c.to_png_bytes();
@@ -1464,7 +1539,7 @@ mod tests {
 
     #[test]
     fn fill_text_produces_content() {
-        let mut c = Canvas2D::new(200, 50, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(200, 50, "Linux".to_string()).unwrap();
         c.set_fill_color(0, 0, 0, 1.0);
         c.set_font("16px sans-serif");
         c.fill_text("Hello World", 10.0, 30.0);
@@ -1473,14 +1548,14 @@ mod tests {
 
     #[test]
     fn measure_text_nonzero() {
-        let c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         let width = c.measure_text("Hello");
         assert!(width > 0.0);
     }
 
     #[test]
     fn save_restore() {
-        let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c.set_fill_color(255, 0, 0, 1.0);
         c.save();
         c.set_fill_color(0, 0, 255, 1.0);
@@ -1501,12 +1576,12 @@ mod tests {
 
     #[test]
     fn fill_text_renders_real_glyphs() {
-        let mut text_canvas = Canvas2D::new(200, 50, "Linux".to_string(), 0).unwrap();
+        let mut text_canvas = Canvas2D::new(200, 50, "Linux".to_string()).unwrap();
         text_canvas.set_fill_color(0, 0, 0, 1.0);
         text_canvas.set_font("16px sans-serif");
         text_canvas.fill_text("Hello World", 10.0, 30.0);
 
-        let mut rect_canvas = Canvas2D::new(200, 50, "Linux".to_string(), 0).unwrap();
+        let mut rect_canvas = Canvas2D::new(200, 50, "Linux".to_string()).unwrap();
         rect_canvas.set_fill_color(0, 0, 0, 1.0);
         rect_canvas.fill_rect(10.0, 14.0, 80.0, 16.0);
 
@@ -1520,11 +1595,11 @@ mod tests {
 
     #[test]
     fn measure_text_varies_by_font_size() {
-        let mut c1 = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c1 = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c1.set_font("10px sans-serif");
         let w1 = c1.measure_text("Hello");
 
-        let mut c2 = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c2 = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c2.set_font("20px sans-serif");
         let w2 = c2.measure_text("Hello");
 
@@ -1533,7 +1608,7 @@ mod tests {
 
     #[test]
     fn measure_text_varies_by_content() {
-        let c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         let short = c.measure_text("Hi");
         let long = c.measure_text("Hello World");
         assert!(long > short);
@@ -1542,7 +1617,7 @@ mod tests {
     #[test]
     fn fill_text_deterministic() {
         fn render() -> Vec<u8> {
-            let mut c = Canvas2D::new(200, 50, "Linux".to_string(), 0).unwrap();
+            let mut c = Canvas2D::new(200, 50, "Linux".to_string()).unwrap();
             c.set_fill_color(0, 0, 0, 1.0);
             c.set_font("16px sans-serif");
             c.fill_text("Fingerprint", 10.0, 30.0);
@@ -1555,12 +1630,12 @@ mod tests {
 
     #[test]
     fn different_text_different_output() {
-        let mut c1 = Canvas2D::new(200, 50, "Linux".to_string(), 0).unwrap();
+        let mut c1 = Canvas2D::new(200, 50, "Linux".to_string()).unwrap();
         c1.set_fill_color(0, 0, 0, 1.0);
         c1.set_font("16px sans-serif");
         c1.fill_text("Hello", 10.0, 30.0);
 
-        let mut c2 = Canvas2D::new(200, 50, "Linux".to_string(), 0).unwrap();
+        let mut c2 = Canvas2D::new(200, 50, "Linux".to_string()).unwrap();
         c2.set_fill_color(0, 0, 0, 1.0);
         c2.set_font("16px sans-serif");
         c2.fill_text("World", 10.0, 30.0);
@@ -1571,7 +1646,7 @@ mod tests {
     #[test]
     fn deterministic_output() {
         fn render() -> Vec<u8> {
-            let mut c = Canvas2D::new(50, 50, "Linux".to_string(), 0).unwrap();
+            let mut c = Canvas2D::new(50, 50, "Linux".to_string()).unwrap();
             c.set_fill_color(128, 64, 32, 1.0);
             c.fill_rect(5.0, 5.0, 40.0, 40.0);
             c.to_png_bytes()
@@ -1583,7 +1658,7 @@ mod tests {
 
     #[test]
     fn linear_gradient_fill_rect() {
-        let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c.set_fill_gradient(Gradient::Linear {
             x0: 0.0,
             y0: 0.0,
@@ -1614,7 +1689,7 @@ mod tests {
 
     #[test]
     fn radial_gradient_fill_rect() {
-        let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c.set_fill_gradient(Gradient::Radial {
             x0: 50.0,
             y0: 50.0,
@@ -1642,7 +1717,7 @@ mod tests {
     #[test]
     fn radial_gradient_inner_radius_changes_output() {
         fn render(r0: f32) -> Vec<u8> {
-            let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+            let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
             c.set_fill_gradient(Gradient::Radial {
                 x0: 50.0,
                 y0: 50.0,
@@ -1671,7 +1746,7 @@ mod tests {
     fn radial_gradient_offset_focal() {
         // Focal point at (25, 25) with r0=0, expanding out to (75, 75) r1=60.
         // This is the two-circle form that tiny_skia could not express.
-        let mut c = Canvas2D::new(100, 100, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(100, 100, "Linux".to_string()).unwrap();
         c.set_fill_gradient(Gradient::Radial {
             x0: 25.0,
             y0: 25.0,
@@ -1699,7 +1774,7 @@ mod tests {
 
     #[test]
     fn gradient_resets_on_solid_color() {
-        let mut c = Canvas2D::new(50, 50, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(50, 50, "Linux".to_string()).unwrap();
         c.set_fill_gradient(Gradient::Linear {
             x0: 0.0,
             y0: 0.0,
@@ -1765,7 +1840,7 @@ mod tests {
 
     #[test]
     fn multiply_blend_darkens_overlap() {
-        let mut c = Canvas2D::new(40, 40, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(40, 40, "Linux".to_string()).unwrap();
         // Start with a red background.
         c.set_fill_color(200, 200, 0, 1.0);
         c.fill_rect(0.0, 0.0, 40.0, 40.0);
@@ -1788,7 +1863,7 @@ mod tests {
         // variant must paint strictly more pixels because its drop
         // shadow spreads ink beyond the rect's rasterized footprint.
         fn render(blur: f32) -> usize {
-            let mut c = Canvas2D::new(80, 80, "Linux".to_string(), 0).unwrap();
+            let mut c = Canvas2D::new(80, 80, "Linux".to_string()).unwrap();
             c.set_fill_color(0, 0, 0, 1.0);
             if blur > 0.0 {
                 c.set_shadow_color(255, 0, 0, 255);
@@ -1809,7 +1884,7 @@ mod tests {
 
     #[test]
     fn filter_grayscale_collapses_color() {
-        let mut c = Canvas2D::new(20, 20, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(20, 20, "Linux".to_string()).unwrap();
         c.set_filter("grayscale(100%)");
         c.set_fill_color(255, 0, 0, 1.0);
         c.fill_rect(0.0, 0.0, 20.0, 20.0);
@@ -1855,7 +1930,7 @@ mod tests {
 
     #[test]
     fn conic_gradient_renders() {
-        let mut c = Canvas2D::new(60, 60, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(60, 60, "Linux".to_string()).unwrap();
         c.set_fill_gradient(Gradient::Conic {
             cx: 30.0,
             cy: 30.0,
@@ -1893,7 +1968,7 @@ mod tests {
             height: 2,
             repetition: PatternRepetition::Repeat,
         };
-        let mut c = Canvas2D::new(10, 10, "Linux".to_string(), 0).unwrap();
+        let mut c = Canvas2D::new(10, 10, "Linux".to_string()).unwrap();
         c.set_fill_pattern(pattern);
         c.fill_rect(0.0, 0.0, 10.0, 10.0);
         assert!(c.has_content(), "pattern should fill with repeating tiles");

@@ -1,9 +1,20 @@
-//! Prints the canvas fingerprint data-URL length + digest for a fixed profile.
+//! Prints the canvas data-URL length + digest for a fixed profile and a fixed
+//! drawing sequence.
 //!
-//! Used to prove that a `png` crate bump does not perturb the encoded IDAT
-//! bytes: run it on two checkouts and compare. The canvas fingerprint is a
-//! stealth-critical output, so the PNG encoder must stay byte-stable across
-//! dependency upgrades.
+//! **This is a renderer change detector, not a privacy claim.** The digest is
+//! an A/B harness: run it on two checkouts and compare, and any difference
+//! means something in the render or encode path moved — a `png` crate bump
+//! that perturbs the IDAT bytes, a font-database change, a Skia upgrade, an
+//! antialiasing tweak. Those are all changes we want to notice deliberately
+//! rather than discover from a downstream diff.
+//!
+//! It is emphatically *not* evidence that the canvas surface is defended. It
+//! once was read that way — the value was documented as a fingerprinting
+//! invariant — but a stable hash is what a fingerprinter wants, not what
+//! frustrates one. Its worth here is purely as a build-over-build tripwire.
+//! What the value should be is "whatever a clean, deterministic render
+//! produces today"; when it changes, the question to ask is *what moved in
+//! the renderer*, not *is our privacy still intact*.
 
 use browser_oxide::Page;
 
