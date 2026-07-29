@@ -94,6 +94,41 @@ impl LayoutEngine {
         self.dirty = true;
     }
 
+    /// Resize the viewport, which is a restyle and not just a relayout.
+    ///
+    /// Width and height are media features, so a resize can change *which rules
+    /// match* — `@media (min-width: 768px)` is not a fixed answer for the
+    /// document's life. That is why this marks dirty rather than merely
+    /// stretching the boxes: the next `compute` re-runs the cascade against the
+    /// new size, and a `min-width` block that stopped matching stops applying.
+    ///
+    /// Embedders that also run script must keep `matchMedia` in step — see
+    /// `Page::set_viewport`, which does both.
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        self.viewport = viewport;
+        self.dirty = true;
+    }
+
+    /// The viewport the next layout will be solved into, in CSS pixels.
+    pub fn viewport(&self) -> Viewport {
+        self.viewport
+    }
+
+    /// The media features this document's `@media` blocks are evaluated
+    /// against: the real viewport, plus the per-document knobs set above.
+    ///
+    /// Built fresh on every `compute` rather than cached, because a cached copy
+    /// is precisely how the viewport would go stale again.
+    fn media_features(&self) -> crate::css_cascade::MediaFeatures {
+        crate::css_cascade::MediaFeatures {
+            width: self.viewport.width as f64,
+            height: self.viewport.height as f64,
+            device_pixel_ratio: self.viewport.device_pixel_ratio as f64,
+            prefers_color_scheme: self.color_scheme,
+            ..Default::default()
+        }
+    }
+
     /// Follow `os_name`'s text-metric convention and font aliasing.
     ///
     /// Call this with the active stealth profile's OS so laid-out geometry and
@@ -163,7 +198,10 @@ impl LayoutEngine {
 
         // Resolve the cascade before building boxes. Everything below reads
         // styles out of `self.styles`; nothing re-resolves them.
-        self.styles = crate::style::compute_styles(dom, &self.extra_css, self.color_scheme);
+        //
+        // This runs on every `compute`, not once per document, which is what
+        // makes a resize change the breakpoints rather than only the box sizes.
+        self.styles = crate::style::compute_styles(dom, &self.extra_css, &self.media_features());
 
         let ctx = ResolveContext {
             font_size: 16.0,

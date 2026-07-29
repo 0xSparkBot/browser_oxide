@@ -1135,6 +1135,53 @@ impl Page {
             .clone()
     }
 
+    /// Resize the page's viewport to `width` x `height` CSS pixels.
+    ///
+    /// This is a window resize, not a crop. Width and height are media
+    /// features, so it changes which `@media` blocks match, which changes the
+    /// cascade, which changes layout — a `@media (min-width: 800px)` rule stops
+    /// applying when the window narrows past 800px, exactly as in a real
+    /// browser.
+    ///
+    /// It moves the JS-visible size with it, and that is the point rather than a
+    /// convenience. CSS reads the layout engine's viewport while `matchMedia`
+    /// and `window.innerWidth` read the stealth profile's `inner_width`; if only
+    /// one moved, a page could ask the same question two ways and get two
+    /// answers. That kind of internal disagreement is a stronger fingerprinting
+    /// signal than either value on its own — the same failure mode the colour
+    /// scheme and timezone surfaces are careful to avoid.
+    ///
+    /// Note what this does *not* do: `MediaQueryList` objects script already
+    /// holds do not fire `change`, and no `resize` event is dispatched. Freshly
+    /// evaluated queries are correct; live listeners are not yet wired.
+    pub fn set_viewport(&mut self, width: u32, height: u32) {
+        let runtime = self.event_loop.runtime_mut().inner();
+        let op_state = runtime.op_state();
+        let mut state = op_state.borrow_mut();
+
+        if let Some(dom_state) = state.try_borrow_mut::<crate::js_runtime::state::DomState>() {
+            dom_state
+                .layout_engine
+                .set_viewport(crate::layout::Viewport::new(width as f32, height as f32));
+            if let Some(profile) = dom_state.stealth_profile.as_mut() {
+                profile.inner_width = width;
+                profile.inner_height = height;
+            }
+        }
+        // `op_get_profile_value` — and therefore `innerWidth` and `matchMedia`
+        // — answers from `StealthState`, which holds its own clone of the
+        // profile. Updating only `DomState`'s copy would leave JS reporting the
+        // pre-resize size.
+        if let Some(stealth) =
+            state.try_borrow_mut::<crate::js_runtime::extensions::stealth_ext::StealthState>()
+        {
+            if let Some(profile) = stealth.profile.as_mut() {
+                profile.inner_width = width;
+                profile.inner_height = height;
+            }
+        }
+    }
+
     /// Borrow the DOM and layout engine out of the JS runtime's op state and
     /// run `f` against them.
     ///
@@ -1147,6 +1194,11 @@ impl Page {
         height: u32,
         f: impl FnOnce(&crate::dom::Dom, &mut crate::layout::LayoutEngine) -> Option<T>,
     ) -> Option<T> {
+        // Capturing at a size *is* a resize: the throwaway engine below already
+        // laid out at `width`, and now its `@media` blocks resolve there too, so
+        // JS has to be told or it would still be answering for the old size.
+        self.set_viewport(width, height);
+
         let runtime = self.event_loop.runtime_mut().inner();
         let op_state = runtime.op_state();
         let mut state = op_state.borrow_mut();
@@ -4837,6 +4889,92 @@ mod tests {
         assert_eq!(w, "1920");
         let h = page.evaluate("window.innerHeight").unwrap();
         assert_eq!(h, "1080");
+    }
+
+    /// The document behind the resize tests below: one breakpoint, two colours.
+    const BREAKPOINT_DOC: &str = "<html><head><style>\
+         .box { width:100px; height:100px; background-color:#0000ff }\
+         @media (min-width: 800px) { .box { background-color:#ff0000 } }\
+         </style></head><body style='margin:0'><div class='box'></div></body></html>";
+
+    /// Un-premultiplied colour of one pixel of a `screenshot_rgba` buffer.
+    fn rgba_pixel(buf: &[u8], stride: u32, x: u32, y: u32) -> (u8, u8, u8) {
+        let i = ((y * stride + x) * 4) as usize;
+        (buf[i], buf[i + 1], buf[i + 2])
+    }
+
+    #[tokio::test]
+    async fn a_resize_moves_the_breakpoint_and_the_pixels_with_it() {
+        // The claim a screenshot API has to make: capturing at a size is a
+        // resize, so the same document comes back differently at 900px and at
+        // 700px. Before the viewport was threaded into the cascade, both were
+        // red — every `@media` was evaluated against a hardcoded 1920x1080.
+        let mut page = Page::from_html(BREAKPOINT_DOC, None::<crate::stealth::StealthProfile>)
+            .await
+            .unwrap();
+
+        let wide = page
+            .screenshot_rgba(900, 300)
+            .expect("the document rendered");
+        assert_eq!(rgba_pixel(&wide, 900, 50, 50), (255, 0, 0));
+
+        let narrow = page
+            .screenshot_rgba(700, 300)
+            .expect("the document rendered");
+        assert_eq!(
+            rgba_pixel(&narrow, 700, 50, 50),
+            (0, 0, 255),
+            "narrowing the same live page must drop the min-width rule"
+        );
+
+        let wide_again = page
+            .screenshot_rgba(900, 300)
+            .expect("the document rendered");
+        assert_eq!(
+            rgba_pixel(&wide_again, 900, 50, 50),
+            (255, 0, 0),
+            "and widening must bring it back — the first evaluation must not stick"
+        );
+    }
+
+    #[tokio::test]
+    async fn css_and_match_media_answer_the_same_width() {
+        // CSS reads the layout viewport; `matchMedia` and `innerWidth` read the
+        // stealth profile. Two sources for one fact is how a page catches a
+        // client out — the same class of inconsistency the colour-scheme and
+        // timezone surfaces are built to avoid — so a resize has to move both.
+        let profile = crate::stealth::presets::chrome_148_linux();
+        let mut page = Page::from_html(BREAKPOINT_DOC, Some(profile))
+            .await
+            .unwrap();
+
+        page.set_viewport(700, 300);
+        assert_eq!(page.evaluate("window.innerWidth").unwrap(), "700");
+        assert_eq!(
+            page.evaluate("matchMedia('(min-width: 800px)').matches")
+                .unwrap(),
+            "false"
+        );
+        let narrow = page
+            .screenshot_rgba(700, 300)
+            .expect("the document rendered");
+        assert_eq!(
+            rgba_pixel(&narrow, 700, 50, 50),
+            (0, 0, 255),
+            "CSS must agree with what matchMedia just said"
+        );
+
+        page.set_viewport(900, 300);
+        assert_eq!(page.evaluate("window.innerWidth").unwrap(), "900");
+        assert_eq!(
+            page.evaluate("matchMedia('(min-width: 800px)').matches")
+                .unwrap(),
+            "true"
+        );
+        let wide = page
+            .screenshot_rgba(900, 300)
+            .expect("the document rendered");
+        assert_eq!(rgba_pixel(&wide, 900, 50, 50), (255, 0, 0));
     }
 
     /// Real Chrome returns the viewport (innerWidth × innerHeight) for

@@ -21,9 +21,7 @@
 
 use std::collections::HashMap;
 
-use crate::css_cascade::{
-    cascade_sort, CascadeEntry, ColorScheme, ComputedStyle, MediaFeatures, Origin,
-};
+use crate::css_cascade::{cascade_sort, CascadeEntry, ComputedStyle, MediaFeatures, Origin};
 use crate::css_parser::ast::{Block, ComponentValue, Declaration, Rule};
 use crate::css_selectors::{
     compute_specificity, matches_selector, parse_selector_list, Selector, Specificity,
@@ -90,44 +88,40 @@ impl StyleTree {
 /// stylesheets it fetched, or a sheet injected by a test. `<style>` blocks in
 /// the document are found here and do not need to be passed in.
 ///
-/// `color_scheme` decides which side of a `@media (prefers-color-scheme: …)`
-/// block survives collection. It is a parameter rather than a global because it
-/// is a property of the document being styled — a shell may want its own UI
-/// pages light while a tab follows the user — and because a global read of the
-/// host's theme is exactly the fingerprinting leak this engine avoids
-/// elsewhere.
-pub fn compute_styles(dom: &Dom, extra_css: &[String], color_scheme: ColorScheme) -> StyleTree {
+/// `features` decides which `@media` blocks survive collection — the viewport
+/// width and height a `min-width` breakpoint is measured against, and which side
+/// of a `@media (prefers-color-scheme: …)` block applies. They are a parameter
+/// rather than a global because both are properties of the document being
+/// styled: it is laid out into one particular box, and a shell may want its own
+/// UI pages light while a tab follows the user. Reading either from the host
+/// behind the caller's back is exactly the fingerprinting leak this engine
+/// avoids elsewhere.
+///
+/// The result is only valid for the `features` it was computed with. Nothing is
+/// cached across calls, so a resize is handled by calling this again with the
+/// new viewport — see `LayoutEngine::set_viewport`.
+pub fn compute_styles(dom: &Dom, extra_css: &[String], features: &MediaFeatures) -> StyleTree {
     let mut rules = Vec::new();
     let mut order = 0u32;
-
-    // Only the colour scheme is caller-supplied so far. Width and height stay
-    // at the 1920x1080 default even when the viewport differs, which is a
-    // separate (pre-existing) gap: wiring the real viewport in would silently
-    // move every `min-width` breakpoint the engine has ever matched, so it is
-    // deliberately not done here.
-    let features = MediaFeatures {
-        prefers_color_scheme: color_scheme,
-        ..MediaFeatures::default()
-    };
 
     collect_rules(
         UA_STYLESHEET,
         Origin::UserAgent,
-        &features,
+        features,
         &mut order,
         &mut rules,
     );
 
     for entry in crate::stylesheet_collector::find_stylesheets(dom) {
         if let crate::stylesheet_collector::StylesheetEntry::Inline(css) = entry {
-            collect_rules(&css, Origin::Author, &features, &mut order, &mut rules);
+            collect_rules(&css, Origin::Author, features, &mut order, &mut rules);
         }
         // External sheets are the caller's job to fetch; they arrive via
         // `extra_css`. Silently ignoring them here is what the engine already
         // does elsewhere, and pretending otherwise would be worse.
     }
     for css in extra_css {
-        collect_rules(css, Origin::Author, &features, &mut order, &mut rules);
+        collect_rules(css, Origin::Author, features, &mut order, &mut rules);
     }
 
     let mut tree = StyleTree::default();
@@ -324,6 +318,7 @@ pub fn selector_text(prelude: &[ComponentValue<'_>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css_cascade::ColorScheme;
     use crate::css_values::property::{CssValue, PropertyId};
     use crate::css_values::types::color::Color;
     use crate::css_values::types::display::Display;
@@ -334,7 +329,17 @@ mod tests {
 
     fn styles_for_scheme(html: &str, scheme: ColorScheme) -> (Dom, StyleTree) {
         let dom = crate::html_parser::parse_html(html);
-        let tree = compute_styles(&dom, &[], scheme);
+        let features = MediaFeatures {
+            prefers_color_scheme: scheme,
+            ..MediaFeatures::default()
+        };
+        let tree = compute_styles(&dom, &[], &features);
+        (dom, tree)
+    }
+
+    fn styles_at(html: &str, width: f64, height: f64) -> (Dom, StyleTree) {
+        let dom = crate::html_parser::parse_html(html);
+        let tree = compute_styles(&dom, &[], &MediaFeatures::for_viewport(width, height));
         (dom, tree)
     }
 
@@ -486,6 +491,80 @@ mod tests {
              }</style></head><body>x</body></html>";
         let (dom, tree) = styles_for_scheme(html, ColorScheme::Dark);
         assert_eq!(body_background(&tree, &dom), Some(rgba(0, 0, 0)));
+    }
+
+    /// The shape every responsive site ships: a base rule plus a breakpoint.
+    const RESPONSIVE: &str = "<html><head><style>\
+         body { background-color: white }\
+         @media (min-width: 800px) { body { background-color: black } }\
+         </style></head><body>x</body></html>";
+
+    #[test]
+    fn a_min_width_breakpoint_matches_only_above_its_width() {
+        // Asserted through the computed style rather than the parser: the
+        // defect was never that `@media (min-width: …)` failed to parse. It
+        // parsed, and was then evaluated against a hardcoded 1920px, so the
+        // desktop branch of every responsive site won at every window size.
+        let (wide_dom, wide) = styles_at(RESPONSIVE, 900.0, 600.0);
+        assert_eq!(
+            body_background(&wide, &wide_dom),
+            Some(rgba(0, 0, 0)),
+            "900px is above the 800px breakpoint"
+        );
+
+        let (narrow_dom, narrow) = styles_at(RESPONSIVE, 700.0, 600.0);
+        assert_eq!(
+            body_background(&narrow, &narrow_dom),
+            Some(rgba(255, 255, 255)),
+            "700px is below the breakpoint, so the base rule must stand"
+        );
+    }
+
+    #[test]
+    fn a_max_width_breakpoint_matches_only_below_its_width() {
+        let html = "<html><head><style>\
+             body { background-color: white }\
+             @media (max-width: 600px) { body { background-color: black } }\
+             </style></head><body>x</body></html>";
+        let (small_dom, small) = styles_at(html, 480.0, 800.0);
+        assert_eq!(body_background(&small, &small_dom), Some(rgba(0, 0, 0)));
+        let (big_dom, big) = styles_at(html, 1200.0, 800.0);
+        assert_eq!(body_background(&big, &big_dom), Some(rgba(255, 255, 255)));
+    }
+
+    #[test]
+    fn the_viewport_is_not_baked_in_at_the_first_evaluation() {
+        // The one that matters for resize: styling the *same* document twice at
+        // two widths must give two answers. If any part of the pipeline cached
+        // the first match — a memoised feature set, a parsed-once rule list —
+        // this is where it would show up, and a resize would only appear to
+        // work after a reload.
+        let dom = crate::html_parser::parse_html(RESPONSIVE);
+        let wide = compute_styles(&dom, &[], &MediaFeatures::for_viewport(900.0, 600.0));
+        let narrow = compute_styles(&dom, &[], &MediaFeatures::for_viewport(700.0, 600.0));
+        let wide_again = compute_styles(&dom, &[], &MediaFeatures::for_viewport(900.0, 600.0));
+
+        assert_eq!(body_background(&wide, &dom), Some(rgba(0, 0, 0)));
+        assert_eq!(body_background(&narrow, &dom), Some(rgba(255, 255, 255)));
+        assert_eq!(
+            body_background(&wide_again, &dom),
+            Some(rgba(0, 0, 0)),
+            "and back again — shrinking must not be a one-way door"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_in_an_external_sheet_sees_the_viewport_too() {
+        // `extra_css` is a separate collection pass from the `<style>` blocks,
+        // and an external sheet is where a real site's breakpoints live.
+        let dom = crate::html_parser::parse_html("<html><body>x</body></html>");
+        let sheet = vec!["body { background-color: white } \
+             @media (min-width: 800px) { body { background-color: black } }"
+            .to_string()];
+        let wide = compute_styles(&dom, &sheet, &MediaFeatures::for_viewport(900.0, 600.0));
+        let narrow = compute_styles(&dom, &sheet, &MediaFeatures::for_viewport(700.0, 600.0));
+        assert_eq!(body_background(&wide, &dom), Some(rgba(0, 0, 0)));
+        assert_eq!(body_background(&narrow, &dom), Some(rgba(255, 255, 255)));
     }
 
     #[test]

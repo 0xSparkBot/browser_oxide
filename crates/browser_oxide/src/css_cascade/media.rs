@@ -1,6 +1,11 @@
 use crate::css_parser::{ComponentValue, Token, TokenKind};
 
 /// Media feature values for @media evaluation.
+///
+/// `width`/`height` are the viewport in CSS pixels — the same box layout is
+/// solved into, not the screen and not the window's outer size. They are only
+/// correct if whoever builds this passes the real one; see
+/// [`MediaFeatures::for_viewport`].
 #[derive(Debug, Clone)]
 pub struct MediaFeatures {
     pub width: f64,
@@ -68,6 +73,31 @@ pub enum Scripting {
     Enabled,
 }
 
+impl MediaFeatures {
+    /// Features for a document laid out into a `width` x `height` CSS-pixel
+    /// viewport, everything else left at its default.
+    ///
+    /// Every caller that knows the viewport should use this rather than
+    /// `Default`, which cannot know it. Taking the size as an argument is the
+    /// point: the long-standing defect here was that nothing ever overwrote the
+    /// default, so `@media (min-width: 768px)` matched at 320px as happily as
+    /// at 1920px, and a constructor that makes the size impossible to forget is
+    /// what stops that recurring.
+    pub fn for_viewport(width: f64, height: f64) -> Self {
+        Self {
+            width,
+            height,
+            ..Self::default()
+        }
+    }
+}
+
+/// The fallback viewport, for a caller with no layout box to speak of.
+///
+/// It is the commonest desktop resolution, which makes it the least surprising
+/// thing to assume, and it is what the engine assumed unconditionally before
+/// the viewport was threaded through. It is a *fallback*, not a viewport:
+/// anything that renders has a real one and should say so.
 impl Default for MediaFeatures {
     fn default() -> Self {
         Self {
@@ -351,6 +381,36 @@ mod tests {
     fn prefers_color_scheme_negated() {
         assert!(eval_with("not (prefers-color-scheme: dark)", &features()));
         assert!(!eval_with("not (prefers-color-scheme: dark)", &dark()));
+    }
+
+    #[test]
+    fn width_features_follow_the_viewport_given() {
+        // The breakpoint has to move with the viewport, both ways round: a
+        // `min-width` evaluator that ignored its argument would still pass a
+        // one-sided test at the default size.
+        let narrow = MediaFeatures::for_viewport(320.0, 640.0);
+        let wide = MediaFeatures::for_viewport(1024.0, 768.0);
+        assert!(!eval_with("(min-width: 768px)", &narrow));
+        assert!(eval_with("(min-width: 768px)", &wide));
+        assert!(eval_with("(max-width: 768px)", &narrow));
+        assert!(!eval_with("(max-width: 768px)", &wide));
+    }
+
+    #[test]
+    fn a_breakpoint_matches_exactly_at_its_boundary() {
+        // `min-width: 768px` is inclusive; off-by-one here is the difference
+        // between a tablet getting the tablet layout and the phone one.
+        let exact = MediaFeatures::for_viewport(768.0, 1024.0);
+        let one_less = MediaFeatures::for_viewport(767.0, 1024.0);
+        assert!(eval_with("(min-width: 768px)", &exact));
+        assert!(!eval_with("(min-width: 768px)", &one_less));
+    }
+
+    #[test]
+    fn height_features_follow_the_viewport_given() {
+        let short = MediaFeatures::for_viewport(1024.0, 400.0);
+        assert!(eval_with("(max-height: 600px)", &short));
+        assert!(!eval_with("(min-height: 600px)", &short));
     }
 
     #[test]

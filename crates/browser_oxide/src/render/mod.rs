@@ -137,6 +137,36 @@ mod tests {
     }
 
     #[test]
+    fn the_background_shorthand_reaches_the_pixels() {
+        // `background: <colour>` is how the real web writes this, and until the
+        // shorthand was parsed the declaration never reached the cascade — the
+        // box came out the canvas's white.
+        let (target, _, _) = render(
+            "<html><body style='margin:0'>\
+             <div style='width:100px; height:100px; background:#ff0000'></div>\
+             </body></html>",
+            200,
+            200,
+        );
+        assert_eq!(pixel(&target, 50, 50), (255, 0, 0, 255));
+    }
+
+    #[test]
+    fn a_background_shorthand_repaints_over_an_earlier_colour() {
+        // The reset, at the pixel level: the shorthand names no colour, so the
+        // red before it must be gone and the canvas white must show through.
+        let (target, _, _) = render(
+            "<html><body style='margin:0'>\
+             <div style='width:100px; height:100px; \
+             background-color:#ff0000; background:url(x.png) no-repeat'></div>\
+             </body></html>",
+            200,
+            200,
+        );
+        assert_eq!(pixel(&target, 50, 50), (255, 255, 255, 255));
+    }
+
+    #[test]
     fn a_stylesheet_reaches_the_pixels() {
         let (target, _, _) = render(
             "<html><head><style>.box { width:80px; height:80px; background-color:#0000ff }</style></head>\
@@ -145,6 +175,72 @@ mod tests {
             200,
         );
         assert_eq!(pixel(&target, 40, 40), (0, 0, 255, 255));
+    }
+
+    #[test]
+    fn a_breakpoint_decides_which_pixels_are_painted() {
+        // The whole media-query fix in one claim, checked where it is
+        // observable: the same document, two window widths, two colours. The
+        // engine used to evaluate every `@media` against a hardcoded 1920x1080,
+        // so the wide branch was painted at every size — including 200px.
+        const HTML: &str = "<html><head><style>\
+             .box { width:100px; height:100px; background-color:#0000ff }\
+             @media (min-width: 800px) { .box { background-color:#ff0000 } }\
+             </style></head><body style='margin:0'><div class='box'></div></body></html>";
+
+        let (wide, _, _) = render(HTML, 900, 300);
+        assert_eq!(
+            pixel(&wide, 50, 50),
+            (255, 0, 0, 255),
+            "900px is above the 800px breakpoint, so the @media rule wins"
+        );
+
+        let (narrow, _, _) = render(HTML, 700, 300);
+        assert_eq!(
+            pixel(&narrow, 50, 50),
+            (0, 0, 255, 255),
+            "700px is below it, so the base rule must stand"
+        );
+    }
+
+    #[test]
+    fn resizing_an_engine_repaints_at_the_new_breakpoint() {
+        // Distinct from the test above, which builds a fresh engine per size.
+        // Here one engine is resized, which is what a real window does — and if
+        // the cascade were resolved once per document rather than once per
+        // layout, this is the test that would fail while the other passed.
+        const HTML: &str = "<html><head><style>\
+             .box { width:100px; height:100px; background-color:#0000ff }\
+             @media (min-width: 800px) { .box { background-color:#ff0000 } }\
+             </style></head><body style='margin:0'><div class='box'></div></body></html>";
+
+        let dom = crate::html_parser::parse_html(HTML);
+        let mut layout = LayoutEngine::new(Viewport::new(900.0, 300.0));
+        let mut inline = InlineLayout::new();
+
+        let mut paint = |layout: &mut LayoutEngine, w: u32, h: u32| {
+            layout.ensure_computed(&dom);
+            let (list, _) = build_display_list(&dom, layout, &mut inline, w as f32, h as f32);
+            let mut target = Target::new(w, h);
+            assert!(target.paint(&list));
+            pixel(&target, 50, 50)
+        };
+
+        assert_eq!(paint(&mut layout, 900, 300), (255, 0, 0, 255));
+
+        layout.set_viewport(Viewport::new(700.0, 300.0));
+        assert_eq!(
+            paint(&mut layout, 700, 300),
+            (0, 0, 255, 255),
+            "narrowing must drop the min-width rule, not keep the first answer"
+        );
+
+        layout.set_viewport(Viewport::new(900.0, 300.0));
+        assert_eq!(
+            paint(&mut layout, 900, 300),
+            (255, 0, 0, 255),
+            "and widening must bring it back"
+        );
     }
 
     #[test]
