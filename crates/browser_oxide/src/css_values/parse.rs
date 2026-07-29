@@ -13,9 +13,23 @@ pub fn parse_property(
     important: bool,
 ) -> Result<Vec<PropertyDeclaration>, ValueError> {
     let value_trimmed = trim_whitespace(value);
+    let name_lower = name.to_ascii_lowercase();
 
-    // CSS-wide keywords
+    // CSS-wide keywords. On a shorthand the keyword applies to every longhand
+    // in the family, not to a property named after the shorthand — without
+    // that, `button { font: inherit }`, which every reset stylesheet on the web
+    // contains, lands on a `Custom("font")` entry that nothing reads.
     if let Some(keyword) = try_css_wide_keyword(value_trimmed) {
+        if let Some(longhands) = shorthand_longhands(&name_lower) {
+            return Ok(longhands
+                .into_iter()
+                .map(|property| PropertyDeclaration {
+                    property,
+                    value: keyword.clone(),
+                    important,
+                })
+                .collect());
+        }
         return Ok(vec![PropertyDeclaration {
             property: PropertyId::from_name(name),
             value: keyword,
@@ -23,13 +37,19 @@ pub fn parse_property(
         }]);
     }
 
-    let name_lower = name.to_ascii_lowercase();
-
     // Shorthand expansion
     match name_lower.as_str() {
         "margin" => return parse_box_shorthand(value_trimmed, important, "margin"),
         "padding" => return parse_box_shorthand(value_trimmed, important, "padding"),
         "overflow" => return parse_overflow_shorthand(value_trimmed, important),
+        "background" => return parse_background_shorthand(value_trimmed, important),
+        "font" => return parse_font_shorthand(value_trimmed, important),
+        "flex" => return parse_flex_shorthand(value_trimmed, important),
+        "flex-flow" => return parse_flex_flow_shorthand(value_trimmed, important),
+        "gap" => return parse_gap_shorthand(value_trimmed, important),
+        "place-items" | "place-content" | "place-self" => {
+            return parse_place_shorthand(&name_lower, value_trimmed, important)
+        }
         "border-width" => {
             return parse_border_side_shorthand(value_trimmed, important, BorderSide::Width)
         }
@@ -78,7 +98,7 @@ pub fn parse_property(
         "flex-basis" => parse_length_percentage_auto(value_trimmed)?,
         "align-items" | "align-self" | "align-content" | "justify-content" | "justify-items"
         | "justify-self" => parse_alignment(value_trimmed)?,
-        "gap" | "row-gap" | "column-gap" => parse_length_percentage(value_trimmed)?,
+        "row-gap" | "column-gap" => parse_length_percentage(value_trimmed)?,
         "font-size" => parse_font_size(value_trimmed)?,
         "font-family" => parse_font_family(value_trimmed)?,
         "font-weight" => parse_font_weight(value_trimmed)?,
@@ -1473,13 +1493,7 @@ fn parse_border_shorthand(
     let color =
         color.unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::BorderTopColor));
 
-    let sides: &[usize] = match name {
-        "border-top" => &[0],
-        "border-right" => &[1],
-        "border-bottom" => &[2],
-        "border-left" => &[3],
-        _ => &[0, 1, 2, 3],
-    };
+    let sides = border_sides(name);
 
     let mut out = Vec::with_capacity(sides.len() * 3);
     for &i in sides {
@@ -1643,6 +1657,855 @@ fn try_angle(cv: &ComponentValue<'_>) -> Option<Angle> {
         }) if *value == 0.0 => Some(Angle::Deg(0.0)),
         _ => None,
     }
+}
+
+/// Shorthands, checked through the *computed* style rather than the parser's
+/// output.
+///
+/// This is deliberate. `background` was missing from `parse_property` for the
+/// whole life of the module, and a test asserting the parser had produced some
+/// token would have passed throughout: the declaration was dropped later, at
+/// the cascade. Only a computed value proves a shorthand actually arrived.
+#[cfg(test)]
+mod shorthand_cascade {
+    use crate::css_cascade::{ComputedStyle, MediaFeatures};
+    use crate::css_values::property::{CssValue, LineHeight, PropertyId};
+    use crate::css_values::types::color::Color;
+    use crate::css_values::types::display::{FlexDirection, FlexWrap};
+    use crate::css_values::types::font::{FontFamily, FontStyle, FontWeight};
+    use crate::css_values::types::length::{Length, LengthPercentage, LengthPercentageAuto};
+    use crate::dom::node::NodeId;
+
+    /// Computed style of the first `tag` in `html`, with author CSS applied.
+    fn computed(html: &str, tag: &str) -> ComputedStyle {
+        let dom = crate::html_parser::parse_html(html);
+        let tree = crate::style::compute_styles(&dom, &[], &MediaFeatures::default());
+        let node = *dom
+            .get_elements_by_tag_name(NodeId::DOCUMENT, tag)
+            .first()
+            .unwrap_or_else(|| panic!("no <{tag}> in the document"));
+        tree.get(node)
+            .unwrap_or_else(|| panic!("<{tag}> has no computed style"))
+            .clone()
+    }
+
+    /// Computed style of the `<body>` after a `<style>` block.
+    fn body_with(css: &str) -> ComputedStyle {
+        computed(
+            &format!("<html><head><style>{css}</style></head><body>x</body></html>"),
+            "body",
+        )
+    }
+
+    fn background_of(style: &ComputedStyle) -> CssValue {
+        style.get_or_initial(&PropertyId::BackgroundColor)
+    }
+
+    fn rgb(r: u8, g: u8, b: u8) -> CssValue {
+        CssValue::Color(Color::Rgba { r, g, b, a: 1.0 })
+    }
+
+    #[test]
+    fn background_black_computes_to_a_black_background_colour() {
+        assert_eq!(
+            background_of(&body_with("body { background: black }")),
+            rgb(0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn background_keeps_the_colour_that_sits_beside_an_image() {
+        // The shape every real page uses. The image is dropped; the colour is
+        // exactly what must not be.
+        assert_eq!(
+            background_of(&body_with(
+                "body { background: #fff url(bg.png) no-repeat }"
+            )),
+            rgb(255, 255, 255)
+        );
+    }
+
+    #[test]
+    fn a_later_background_colour_overrides_the_shorthand() {
+        assert_eq!(
+            background_of(&body_with(
+                "body { background: black } body { background-color: red }"
+            )),
+            rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_later_background_shorthand_resets_an_earlier_background_colour() {
+        // The classic shorthand bug: `background: url(x)` names no colour, so
+        // it must reset the colour longhand to transparent rather than leave
+        // the earlier red standing.
+        assert_eq!(
+            background_of(&body_with(
+                "body { background-color: red } body { background: url(x.png) }"
+            )),
+            CssValue::Color(Color::Transparent)
+        );
+    }
+
+    #[test]
+    fn a_gradient_background_resets_the_colour_rather_than_being_rejected() {
+        // A gradient is dropped, not honoured — but the declaration is still
+        // valid, so the earlier red must not survive it. If the shorthand were
+        // rejected instead, red would stay.
+        assert_eq!(
+            background_of(&body_with(
+                "body { background-color: red } \
+                 body { background: linear-gradient(red, blue) }"
+            )),
+            CssValue::Color(Color::Transparent)
+        );
+    }
+
+    #[test]
+    fn a_genuinely_invalid_background_leaves_the_earlier_value_alone() {
+        // The other side of the previous test: garbage must be rejected, and a
+        // rejected declaration cascades as if it were never written.
+        assert_eq!(
+            background_of(&body_with(
+                "body { background-color: red } body { background: notacolour }"
+            )),
+            rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_more_specific_longhand_beats_an_earlier_shorthand() {
+        // Specificity must still decide, even though the shorthand is written
+        // later in source order.
+        let style = computed(
+            "<html><head><style>\
+             #p { background-color: white } p { background: black }\
+             </style></head><body><p id=p>x</p></body></html>",
+            "p",
+        );
+        assert_eq!(background_of(&style), rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn important_on_a_shorthand_carries_to_its_longhands() {
+        assert_eq!(
+            background_of(&body_with(
+                "body { background: black !important } body { background-color: red }"
+            )),
+            rgb(0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_css_wide_keyword_on_a_shorthand_reaches_every_longhand() {
+        // `button { font: inherit }` is in every reset stylesheet there is.
+        let style = computed(
+            "<html><head><style>\
+             body { font-weight: bold; font-size: 30px } button { font: inherit }\
+             </style></head><body><button>x</button></body></html>",
+            "button",
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FontWeight),
+            CssValue::FontWeight(FontWeight::Bold)
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FontSize),
+            CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(30.0)))
+        );
+    }
+
+    #[test]
+    fn font_shorthand_expands_and_resets_its_siblings() {
+        let style = body_with("body { font-style: italic } body { font: bold 12px/1.5 Arial }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FontWeight),
+            CssValue::FontWeight(FontWeight::Bold)
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FontSize),
+            CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(12.0)))
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::LineHeight),
+            CssValue::LineHeight(LineHeight::Number(1.5))
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FontFamily),
+            CssValue::FontFamily(vec![FontFamily::Named("Arial".into())])
+        );
+        // The shorthand named no style, so the earlier italic is reset.
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FontStyle),
+            CssValue::FontStyle(FontStyle::Normal)
+        );
+    }
+
+    #[test]
+    fn a_font_system_keyword_is_rejected_whole() {
+        // No host font metrics, so nothing is guessed — the earlier value
+        // stands rather than being replaced by an invention.
+        let style = body_with("body { font-size: 30px } body { font: caption }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FontSize),
+            CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(30.0)))
+        );
+    }
+
+    #[test]
+    fn gap_reaches_the_longhands_layout_actually_reads() {
+        let style = body_with("body { gap: 10px 20px }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::RowGap),
+            CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(10.0)))
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::ColumnGap),
+            CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(20.0)))
+        );
+    }
+
+    #[test]
+    fn a_later_column_gap_overrides_the_gap_shorthand() {
+        let style = body_with("body { gap: 10px } body { column-gap: 4px }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::RowGap),
+            CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(10.0)))
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::ColumnGap),
+            CssValue::LengthPercentage(LengthPercentage::Length(Length::Px(4.0)))
+        );
+    }
+
+    #[test]
+    fn flex_one_means_grow_one_shrink_one_basis_zero() {
+        let style = body_with("body { flex: 1 }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexGrow),
+            CssValue::Number(1.0)
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexShrink),
+            CssValue::Number(1.0)
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexBasis),
+            CssValue::LengthPercentageAuto(LengthPercentageAuto::Percentage(0.0))
+        );
+    }
+
+    #[test]
+    fn flex_with_a_basis_alone_still_grows() {
+        // `flex-grow`'s own initial is 0; the shorthand's omitted default is 1.
+        let style = body_with("body { flex: 200px }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexGrow),
+            CssValue::Number(1.0)
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexBasis),
+            CssValue::LengthPercentageAuto(LengthPercentageAuto::Length(Length::Px(200.0)))
+        );
+    }
+
+    #[test]
+    fn flex_shorthand_resets_an_earlier_grow() {
+        let style = body_with("body { flex-grow: 7 } body { flex: none }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexGrow),
+            CssValue::Number(0.0)
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexShrink),
+            CssValue::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn flex_flow_expands_and_resets() {
+        let style = body_with("body { flex-wrap: wrap } body { flex-flow: column }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexDirection),
+            CssValue::FlexDirection(FlexDirection::Column)
+        );
+        // Wrap was not named by the shorthand, so it reverts to initial.
+        assert_eq!(
+            style.get_or_initial(&PropertyId::FlexWrap),
+            CssValue::FlexWrap(FlexWrap::Nowrap)
+        );
+    }
+
+    #[test]
+    fn place_items_fills_both_axes() {
+        use crate::css_values::types::display::AlignmentValue;
+        let style = body_with("body { place-items: center }");
+        assert_eq!(
+            style.get_or_initial(&PropertyId::AlignItems),
+            CssValue::Alignment(AlignmentValue::Center)
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::JustifyItems),
+            CssValue::Alignment(AlignmentValue::Center)
+        );
+    }
+}
+
+/// Which physical sides a `border`-family shorthand writes to.
+fn border_sides(name: &str) -> &'static [usize] {
+    match name {
+        "border-top" => &[0],
+        "border-right" => &[1],
+        "border-bottom" => &[2],
+        "border-left" => &[3],
+        _ => &[0, 1, 2, 3],
+    }
+}
+
+/// Every longhand each supported shorthand controls.
+///
+/// Only used for the CSS-wide keywords, which name no component values of
+/// their own and so cannot go through the ordinary per-shorthand parser. Kept
+/// next to the shorthands themselves so adding one and forgetting the keyword
+/// path is a visible omission rather than a silent one.
+fn shorthand_longhands(name: &str) -> Option<Vec<PropertyId>> {
+    use PropertyId as P;
+    let ids = match name {
+        "margin" => vec![P::MarginTop, P::MarginRight, P::MarginBottom, P::MarginLeft],
+        "padding" => vec![
+            P::PaddingTop,
+            P::PaddingRight,
+            P::PaddingBottom,
+            P::PaddingLeft,
+        ],
+        "overflow" => vec![P::OverflowX, P::OverflowY],
+        "border-width" => BorderSide::Width.ids().to_vec(),
+        "border-style" => BorderSide::Style.ids().to_vec(),
+        "border-color" => BorderSide::Color.ids().to_vec(),
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            let widths = BorderSide::Width.ids();
+            let styles = BorderSide::Style.ids();
+            let colors = BorderSide::Color.ids();
+            border_sides(name)
+                .iter()
+                .flat_map(|&i| [widths[i].clone(), styles[i].clone(), colors[i].clone()])
+                .collect()
+        }
+        // The engine's only background longhand — see `parse_background_shorthand`.
+        "background" => vec![P::BackgroundColor],
+        "font" => vec![
+            P::FontStyle,
+            P::FontWeight,
+            P::FontSize,
+            P::LineHeight,
+            P::FontFamily,
+        ],
+        "flex" => vec![P::FlexGrow, P::FlexShrink, P::FlexBasis],
+        "flex-flow" => vec![P::FlexDirection, P::FlexWrap],
+        "gap" => vec![P::RowGap, P::ColumnGap],
+        "place-items" => vec![P::AlignItems, P::JustifyItems],
+        "place-content" => vec![P::AlignContent, P::JustifyContent],
+        "place-self" => vec![P::AlignSelf, P::JustifySelf],
+        _ => return None,
+    };
+    Some(ids)
+}
+
+/// `background: #fff url(bg.png) no-repeat center / cover`.
+///
+/// The engine has exactly one background longhand — `background-color` — and
+/// `render::painter` fills a solid rect and nothing else. There is no
+/// `background-image`, `-repeat`, `-attachment`, `-position`, `-size`,
+/// `-origin` or `-clip` property to expand into, so those components are
+/// recognised (which keeps the declaration valid, so the colour beside them
+/// survives) and then deliberately discarded. Nothing here invents a property
+/// layout or paint could not honour: an image or gradient is lost exactly as it
+/// already was, but the colour under it is no longer lost with it.
+///
+/// The reset is the half that bites. A shorthand sets *every* longhand in its
+/// family, so `background: url(x)` after `background-color: red` must leave the
+/// box transparent rather than red — when no colour component appears the
+/// initial value is written out explicitly rather than merely omitted.
+fn parse_background_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let layers = split_on_comma(value);
+    // `split_on_comma` always yields at least one group.
+    let last = layers.len() - 1;
+    let mut color: Option<CssValue> = None;
+
+    for (index, layer) in layers.iter().enumerate() {
+        if layer.is_empty() {
+            return Err(ValueError::InvalidValue("empty background layer".into()));
+        }
+        for item in layer {
+            // Only the final layer may carry the colour: it paints beneath
+            // every layer, so a colour anywhere else is invalid rather than
+            // merely unhonoured.
+            if index == last && color.is_none() {
+                if let Ok(c) = parse_color(std::slice::from_ref(item)) {
+                    color = Some(c);
+                    continue;
+                }
+            }
+            if is_background_component(item) {
+                continue;
+            }
+            return Err(ValueError::InvalidValue(
+                "unrecognised background component".into(),
+            ));
+        }
+    }
+
+    Ok(vec![PropertyDeclaration {
+        property: PropertyId::BackgroundColor,
+        value: color
+            .unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::BackgroundColor)),
+        important,
+    }])
+}
+
+/// Everything in the `background` grammar other than `<background-color>`.
+///
+/// Matching these keeps the declaration valid so its colour is kept; the value
+/// itself is dropped, because the engine has no longhand to put it in. See
+/// `parse_background_shorthand`.
+fn is_background_component(cv: &ComponentValue<'_>) -> bool {
+    match cv {
+        ComponentValue::Token(Token { kind, .. }) => match kind {
+            TokenKind::Url(_) => true,
+            // Separates `<position>` from `<size>`.
+            TokenKind::Delim('/') => true,
+            // Positions and sizes.
+            TokenKind::Number { .. }
+            | TokenKind::Percentage { .. }
+            | TokenKind::Dimension { .. } => true,
+            TokenKind::Ident(name) => matches!(
+                name.to_ascii_lowercase().as_str(),
+                "none"
+                    | "repeat"
+                    | "repeat-x"
+                    | "repeat-y"
+                    | "no-repeat"
+                    | "space"
+                    | "round"
+                    | "scroll"
+                    | "fixed"
+                    | "local"
+                    | "border-box"
+                    | "padding-box"
+                    | "content-box"
+                    | "text"
+                    | "left"
+                    | "right"
+                    | "top"
+                    | "bottom"
+                    | "center"
+                    | "cover"
+                    | "contain"
+                    | "auto"
+            ),
+            _ => false,
+        },
+        ComponentValue::Function(f) => matches!(
+            f.name.to_ascii_lowercase().as_str(),
+            "url"
+                | "image-set"
+                | "-webkit-image-set"
+                | "cross-fade"
+                | "element"
+                | "linear-gradient"
+                | "radial-gradient"
+                | "conic-gradient"
+                | "repeating-linear-gradient"
+                | "repeating-radial-gradient"
+                | "repeating-conic-gradient"
+                | "-webkit-linear-gradient"
+                | "-webkit-radial-gradient"
+                | "-webkit-gradient"
+                | "calc"
+                | "min"
+                | "max"
+                | "clamp"
+        ),
+        _ => false,
+    }
+}
+
+/// `font: italic bold 14px/1.4 "Helvetica Neue", sans-serif`.
+///
+/// Expands to font-style, font-weight, font-size, line-height and font-family.
+/// `font-variant` and `font-stretch` are recognised in the prelude and then
+/// dropped: the engine has no property for either, so there is nowhere for them
+/// to go, and inventing one would only move the loss downstream.
+///
+/// The system font keywords (`caption`, `menu`, `status-bar`, …) are rejected
+/// outright rather than approximated. Resolving them needs host font metrics
+/// this engine deliberately never reads, and guessing would restyle the element
+/// to something the platform never said.
+fn parse_font_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let mut style: Option<CssValue> = None;
+    let mut weight: Option<CssValue> = None;
+    let mut line_height: Option<CssValue> = None;
+
+    // Prelude: style / variant / weight / stretch in any order, then the size.
+    let mut i = 0usize;
+    while i < value.len() {
+        if is_whitespace_token(&value[i]) {
+            i += 1;
+            continue;
+        }
+        let one = std::slice::from_ref(&value[i]);
+        if style.is_none() {
+            if let Ok(v) = parse_font_style(one) {
+                style = Some(v);
+                i += 1;
+                continue;
+            }
+        }
+        if weight.is_none() {
+            if let Ok(v) = parse_font_weight(one) {
+                weight = Some(v);
+                i += 1;
+                continue;
+            }
+        }
+        if is_dropped_font_prelude(&value[i]) {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    // Size is mandatory, and it is where a system font keyword lands and fails.
+    let Some(size_token) = value.get(i) else {
+        return Err(ValueError::InvalidValue(
+            "font shorthand needs a size".into(),
+        ));
+    };
+    let size = parse_font_size(std::slice::from_ref(size_token))?;
+    i += 1;
+
+    // Optional `/ <line-height>`.
+    while i < value.len() && is_whitespace_token(&value[i]) {
+        i += 1;
+    }
+    if value.get(i).is_some_and(is_slash_token) {
+        i += 1;
+        while i < value.len() && is_whitespace_token(&value[i]) {
+            i += 1;
+        }
+        let Some(lh) = value.get(i) else {
+            return Err(ValueError::InvalidValue(
+                "font shorthand: `/` with no line-height".into(),
+            ));
+        };
+        line_height = Some(parse_line_height(std::slice::from_ref(lh))?);
+        i += 1;
+    }
+
+    // Family is mandatory and takes the rest, commas and all.
+    let family_tokens = trim_whitespace(&value[i..]);
+    if family_tokens.is_empty() {
+        return Err(ValueError::InvalidValue(
+            "font shorthand needs a family".into(),
+        ));
+    }
+    let family = parse_font_family(family_tokens)?;
+
+    Ok(vec![
+        PropertyDeclaration {
+            property: PropertyId::FontStyle,
+            value: style
+                .unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::FontStyle)),
+            important,
+        },
+        PropertyDeclaration {
+            property: PropertyId::FontWeight,
+            value: weight
+                .unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::FontWeight)),
+            important,
+        },
+        PropertyDeclaration {
+            property: PropertyId::FontSize,
+            value: size,
+            important,
+        },
+        PropertyDeclaration {
+            property: PropertyId::LineHeight,
+            value: line_height
+                .unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::LineHeight)),
+            important,
+        },
+        PropertyDeclaration {
+            property: PropertyId::FontFamily,
+            value: family,
+            important,
+        },
+    ])
+}
+
+/// `font-variant` and `font-stretch` keywords: legal in the `font` prelude,
+/// unrepresentable in this engine, so consumed and thrown away.
+fn is_dropped_font_prelude(cv: &ComponentValue<'_>) -> bool {
+    try_ident(cv).is_some_and(|ident| {
+        matches!(
+            ident.to_ascii_lowercase().as_str(),
+            "normal"
+                | "small-caps"
+                | "ultra-condensed"
+                | "extra-condensed"
+                | "condensed"
+                | "semi-condensed"
+                | "semi-expanded"
+                | "expanded"
+                | "extra-expanded"
+                | "ultra-expanded"
+        )
+    })
+}
+
+/// `flex: 1`, `flex: 0 0 200px`, `flex: auto`, `flex: none`.
+///
+/// The omitted-component defaults are the shorthand's own, not the longhands':
+/// `flex: 200px` means grow 1, though `flex-grow`'s initial value is 0. Reading
+/// the initial values off the longhands instead makes every `flex: <basis>`
+/// item refuse to grow.
+///
+/// `flex-basis: content` is not supported — the engine's `LengthPercentageAuto`
+/// has no such variant — so `flex: 1 1 content` is rejected whole rather than
+/// silently becoming something else.
+fn parse_flex_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let groups = split_on_whitespace(value);
+    if groups.is_empty() || groups.len() > 3 {
+        return Err(ValueError::InvalidValue("invalid flex shorthand".into()));
+    }
+
+    if groups.len() == 1 {
+        if let Some(ident) = single_ident(&groups[0]) {
+            if ident.eq_ignore_ascii_case("none") {
+                return Ok(flex_declarations(
+                    0.0,
+                    0.0,
+                    CssValue::LengthPercentageAuto(LengthPercentageAuto::Auto),
+                    important,
+                ));
+            }
+        }
+    }
+
+    let mut grow: Option<f64> = None;
+    let mut shrink: Option<f64> = None;
+    let mut basis: Option<CssValue> = None;
+
+    for group in &groups {
+        // A unitless number is always a flex factor, never a basis — which is
+        // why `flex: 0` means grow 0 and not basis 0px.
+        if let Ok(CssValue::Number(n)) = parse_number(group) {
+            if grow.is_none() {
+                grow = Some(n);
+            } else if shrink.is_none() {
+                shrink = Some(n);
+            } else {
+                return Err(ValueError::InvalidValue("too many flex factors".into()));
+            }
+            continue;
+        }
+        if basis.is_none() {
+            if let Ok(v) = parse_length_percentage_auto(group) {
+                basis = Some(v);
+                continue;
+            }
+        }
+        return Err(ValueError::InvalidValue(
+            "unrecognised flex component".into(),
+        ));
+    }
+
+    Ok(flex_declarations(
+        grow.unwrap_or(1.0),
+        shrink.unwrap_or(1.0),
+        basis.unwrap_or(CssValue::LengthPercentageAuto(
+            LengthPercentageAuto::Percentage(0.0),
+        )),
+        important,
+    ))
+}
+
+fn flex_declarations(
+    grow: f64,
+    shrink: f64,
+    basis: CssValue,
+    important: bool,
+) -> Vec<PropertyDeclaration> {
+    vec![
+        PropertyDeclaration {
+            property: PropertyId::FlexGrow,
+            value: CssValue::Number(grow),
+            important,
+        },
+        PropertyDeclaration {
+            property: PropertyId::FlexShrink,
+            value: CssValue::Number(shrink),
+            important,
+        },
+        PropertyDeclaration {
+            property: PropertyId::FlexBasis,
+            value: basis,
+            important,
+        },
+    ]
+}
+
+/// `flex-flow: column wrap` — direction and wrap in either order.
+fn parse_flex_flow_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let groups = split_on_whitespace(value);
+    if groups.is_empty() || groups.len() > 2 {
+        return Err(ValueError::InvalidValue(
+            "invalid flex-flow shorthand".into(),
+        ));
+    }
+
+    let mut direction: Option<CssValue> = None;
+    let mut wrap: Option<CssValue> = None;
+    for group in &groups {
+        if direction.is_none() {
+            if let Ok(v) = parse_flex_direction(group) {
+                direction = Some(v);
+                continue;
+            }
+        }
+        if wrap.is_none() {
+            if let Ok(v) = parse_flex_wrap(group) {
+                wrap = Some(v);
+                continue;
+            }
+        }
+        return Err(ValueError::InvalidValue(
+            "unrecognised flex-flow component".into(),
+        ));
+    }
+
+    Ok(vec![
+        PropertyDeclaration {
+            property: PropertyId::FlexDirection,
+            value: direction
+                .unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::FlexDirection)),
+            important,
+        },
+        PropertyDeclaration {
+            property: PropertyId::FlexWrap,
+            value: wrap.unwrap_or_else(|| crate::css_cascade::initial_value(&PropertyId::FlexWrap)),
+            important,
+        },
+    ])
+}
+
+/// `gap: 12px 20px` — row gap, then column gap.
+///
+/// `PropertyId::Gap` existed and nothing ever read it: `layout::style_map` asks
+/// for `RowGap` and `ColumnGap` only. So every `gap` on every flex container
+/// parsed cleanly into a value no consumer looked at. Expanding to the two
+/// longhands is what makes the property reach layout at all.
+fn parse_gap_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let groups = split_on_whitespace(value);
+    let (row, column) = match groups.len() {
+        1 => (
+            parse_length_percentage(&groups[0])?,
+            parse_length_percentage(&groups[0])?,
+        ),
+        2 => (
+            parse_length_percentage(&groups[0])?,
+            parse_length_percentage(&groups[1])?,
+        ),
+        _ => {
+            return Err(ValueError::InvalidValue(
+                "expected one or two gap values".into(),
+            ))
+        }
+    };
+    Ok(vec![
+        PropertyDeclaration {
+            property: PropertyId::RowGap,
+            value: row,
+            important,
+        },
+        PropertyDeclaration {
+            property: PropertyId::ColumnGap,
+            value: column,
+            important,
+        },
+    ])
+}
+
+/// `place-items`, `place-content`, `place-self`: align first, justify second,
+/// the second defaulting to the first.
+fn parse_place_shorthand(
+    name: &str,
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let groups = split_on_whitespace(value);
+    let (align, justify) = match groups.len() {
+        1 => (parse_alignment(&groups[0])?, parse_alignment(&groups[0])?),
+        2 => (parse_alignment(&groups[0])?, parse_alignment(&groups[1])?),
+        _ => {
+            return Err(ValueError::InvalidValue(format!(
+                "expected one or two {name} values"
+            )))
+        }
+    };
+    let (align_id, justify_id) = match name {
+        "place-items" => (PropertyId::AlignItems, PropertyId::JustifyItems),
+        "place-content" => (PropertyId::AlignContent, PropertyId::JustifyContent),
+        _ => (PropertyId::AlignSelf, PropertyId::JustifySelf),
+    };
+    Ok(vec![
+        PropertyDeclaration {
+            property: align_id,
+            value: align,
+            important,
+        },
+        PropertyDeclaration {
+            property: justify_id,
+            value: justify,
+            important,
+        },
+    ])
+}
+
+fn is_whitespace_token(cv: &ComponentValue<'_>) -> bool {
+    matches!(
+        cv,
+        ComponentValue::Token(Token {
+            kind: TokenKind::Whitespace,
+            ..
+        })
+    )
+}
+
+fn is_slash_token(cv: &ComponentValue<'_>) -> bool {
+    matches!(
+        cv,
+        ComponentValue::Token(Token {
+            kind: TokenKind::Delim('/'),
+            ..
+        })
+    )
 }
 
 /// Split a function's arguments on commas.
