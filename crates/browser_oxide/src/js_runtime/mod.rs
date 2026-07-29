@@ -8,6 +8,7 @@ pub mod native_fns;
 pub mod runtime;
 pub mod snapshot;
 pub mod state;
+pub mod timezone;
 pub mod utils;
 
 use crate::dom::Dom;

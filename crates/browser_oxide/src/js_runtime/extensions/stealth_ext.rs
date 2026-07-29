@@ -153,6 +153,19 @@ pub fn op_has_stealth_profile(state: &mut OpState) -> bool {
     state.profile.is_some()
 }
 
+/// The IANA zone this process has installed into ICU, or `""` if none took.
+///
+/// When non-empty, V8's own date cache is already computing local time in the
+/// profile's zone, so the bootstrap's `Date.prototype` rewrites are redundant.
+/// Worse than redundant: a replaced `Date.prototype.toString` carries own
+/// `prototype` and `toString` properties that no built-in method has, which is
+/// itself an engine fingerprint. JS consults this to stand down.
+#[op2]
+#[string]
+pub fn op_native_timezone() -> String {
+    crate::js_runtime::timezone::applied_timezone().unwrap_or_default()
+}
+
 /// Returns whether the document is cross-origin-isolated. Drives
 /// `self.crossOriginIsolated` and gates SAB transfer.
 #[op2(fast)]
@@ -208,6 +221,7 @@ deno_core::extension!(
     ops = [
         op_get_profile_value,
         op_has_stealth_profile,
+        op_native_timezone,
         op_cross_origin_isolated,
         op_is_secure_context,
         op_behavior_mouse_trajectory,

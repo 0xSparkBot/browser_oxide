@@ -68,6 +68,14 @@
     }
 
     // --- Intl Sync (matches window_bootstrap) ---
+    // The worker's TIMEZONE needs nothing here: ICU's process-wide default is
+    // pointed at the profile's zone before this isolate is built
+    // (js_runtime/timezone.rs, called from create_worker_runtime), so every
+    // Date accessor in this realm already agrees with the page's. That matters
+    // because re-reading time inside a Worker to catch main-thread-only
+    // patching is a deployed detection technique. What is left below is locale
+    // coherence, and pinning resolvedOptions so the two realms cannot disagree
+    // even if the process override is ever unavailable.
     if (ops.op_has_stealth_profile && ops.op_has_stealth_profile()) {
         const profileTz = ops.op_get_profile_value("timezone") || "Europe/Moscow";
         const profileLocale = ops.op_get_profile_value("language") || "ru-RU";

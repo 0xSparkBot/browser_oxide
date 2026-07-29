@@ -204,6 +204,22 @@ pub fn create_runtime_with_signals(
         None => FetchState::new(None),
     };
 
+    // Captured before the profile is moved into StealthState. These go to ICU,
+    // underneath JavaScript, so that every `Date` accessor agrees with the
+    // profile rather than only the handful the bootstrap patches reach — see
+    // `js_runtime::timezone`.
+    let (tz_zone, tz_locale) = options
+        .stealth_profile
+        .as_ref()
+        .map(|p| (p.timezone.clone(), p.language.clone()))
+        .unwrap_or_default();
+
+    // Strictly before `JsRuntime::new` below: V8 caches ICU's default locale
+    // the first time the isolate touches anything locale-sensitive, and the
+    // bootstrap it runs during construction does exactly that. See
+    // `timezone::install_process_defaults`.
+    crate::js_runtime::timezone::install_process_defaults(&tz_zone, &tz_locale);
+
     let stealth_state = StealthState::new_with_flags(
         options.stealth_profile,
         options.cross_origin_isolated,
@@ -253,6 +269,12 @@ pub fn create_runtime_with_signals(
         module_loader,
         ..Default::default()
     });
+
+    // Guarded: with no profile nothing was installed, and clearing the date
+    // cache of an isolate that is legitimately on host time buys nothing.
+    if !tz_zone.is_empty() {
+        crate::js_runtime::timezone::resync_isolate(runtime.v8_isolate());
+    }
 
     // Per-runtime NavSignal — populated by JS via op_set_pending_nav,
     // consumed by BrowserEventLoop to short-circuit run_until_idle.
@@ -446,6 +468,18 @@ pub fn create_worker_runtime(
     // `ensure_tokio_context`.
     let _tokio_guard = ensure_tokio_context();
 
+    // A Worker is its own isolate with its own date cache and its own cached
+    // default locale, so it needs this even though ICU's process-wide default
+    // was already set by the page that spawned it — and it needs it *before*
+    // the isolate exists, for the reason given in
+    // `timezone::install_process_defaults`. Bot-detection sensors deliberately
+    // re-read time from a Worker to catch main-thread-only patching.
+    let (tz_zone, tz_locale) = profile
+        .as_ref()
+        .map(|p| (p.timezone.clone(), p.language.clone()))
+        .unwrap_or_default();
+    crate::js_runtime::timezone::install_process_defaults(&tz_zone, &tz_locale);
+
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![
             console_extension::init(),
@@ -459,6 +493,12 @@ pub fn create_worker_runtime(
         ],
         ..Default::default()
     });
+
+    // Guarded: with no profile nothing was installed, and clearing the date
+    // cache of an isolate that is legitimately on host time buys nothing.
+    if !tz_zone.is_empty() {
+        crate::js_runtime::timezone::resync_isolate(runtime.v8_isolate());
+    }
 
     // Populate minimum states required by the enabled extensions.
     runtime.op_state().borrow_mut().put(TimerState::new());

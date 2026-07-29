@@ -2573,16 +2573,21 @@
     };
 
     // =========================================================
-    // Intl timezone consistency.
+    // Intl locale + timezone consistency.
     // Some scorers cross-check the IANA timezone
     // reported by `Intl.DateTimeFormat().resolvedOptions().timeZone` against
-    // the IP geolocation and the `timezone` header hint. V8 uses the process
-    // TZ env var (whatever the machine says), so a Moscow profile run from a
-    // US datacenter would report `America/New_York`, which is an instant tell.
+    // the IP geolocation and the `timezone` header hint, so a Moscow profile
+    // reporting `America/New_York` from a US datacenter is an instant tell.
     //
-    // Monkey-patch: override the default timeZone option on Intl.DateTimeFormat
-    // so resolvedOptions() returns the profile timezone. Also patch
-    // Date.prototype.getTimezoneOffset to return the profile's UTC offset.
+    // The timezone itself is now handled BELOW JavaScript: the process points
+    // ICU — which is where V8's date cache reads local time from — at the
+    // profile's zone (see js_runtime/timezone.rs). That is what makes
+    // getHours() agree with toString(); a JS-only veneer never could, because
+    // the set of Date accessors that read local time is open-ended.
+    //
+    // What remains here is the locale half plus resolvedOptions coherence:
+    // every Intl constructor called with no explicit locale must resolve to
+    // the profile's language rather than the host's.
     // =========================================================
     // IMPORTANT: the original gate `if (op_has_stealth_profile())` fired at
     // V8-snapshot-build time — returning false and skipping the patch. The
@@ -2634,200 +2639,223 @@
             };
         }
 
-        // Date.prototype.getTimezoneOffset — compute the offset from the
-        // profile timezone at each call so DST transitions stay accurate.
-        const _origGetTimezoneOffset = Date.prototype.getTimezoneOffset;
-        Date.prototype.getTimezoneOffset = function () {
-            const profileTz = _profileTz();
-            if (!profileTz) return _origGetTimezoneOffset.call(this);
-            try {
-                const fmt = new _OrigDTF("en-US", {
-                    timeZone: profileTz,
-                    year: "numeric", month: "2-digit", day: "2-digit",
-                    hour: "2-digit", minute: "2-digit", second: "2-digit",
-                    hour12: false,
-                });
-                const parts = fmt.formatToParts(this);
-                const get = (t) => parts.find((p) => p.type === t)?.value;
-                const tzDate = new Date(Date.UTC(
-                    parseInt(get("year"), 10),
-                    parseInt(get("month"), 10) - 1,
-                    parseInt(get("day"), 10),
-                    parseInt(get("hour"), 10),
-                    parseInt(get("minute"), 10),
-                    parseInt(get("second"), 10),
-                ));
-                return Math.round((this.getTime() - tzDate.getTime()) / 60000);
-            } catch (_e) {
-                return _origGetTimezoneOffset.call(this);
-            }
-        };
-        Object.defineProperty(Date.prototype.getTimezoneOffset, "toString", {
-            value: () => "function getTimezoneOffset() { [native code] }",
-            configurable: true,
-        });
-        Object.defineProperty(Date.prototype.getTimezoneOffset, _nativeTag, { value: 'getTimezoneOffset', configurable: true });
-
-        // =========================================================
-        // Date.prototype toString patches — print the profile's
-        // timezone, not UTC. Some scripts probe
-        // `new Date().toString()` because it's the cheapest TZ probe
-        // available; UTC output on a macOS profile is a hard tell.
+        // ---------------------------------------------------------
+        // Everything below is a FALLBACK, and only runs when the
+        // process-wide ICU override did not take (see
+        // js_runtime/timezone.rs). With that override in force V8's own date
+        // cache already computes local time in the profile's zone for EVERY
+        // accessor — getHours, getDate, the setters, and whatever the next V8
+        // release adds — so rewriting four methods here buys nothing and costs
+        // something: a replaced Date.prototype.toString carries own
+        // `prototype` and `toString` properties that no genuine built-in
+        // method has, which is a free engine detector.
         //
-        // Real Chrome on macOS / America/Los_Angeles produces:
-        //   "Tue Apr 29 2026 13:02:46 GMT-0700 (Pacific Daylight Time)"
-        //
-        // We patch four methods consistently:
-        //   - toString()        full date+time+tz
-        //   - toDateString()    date portion only
-        //   - toTimeString()    time + tz portion only
-        //   - toLocaleString()  default-locale form (when called w/o args)
-        // =========================================================
+        // Caveat, same shape as the op_has_stealth_profile one noted above:
+        // under BROWSER_OXIDE_USE_SNAPSHOT this file runs at snapshot-build
+        // time, where no profile exists and the op therefore answers "". The
+        // veneer then installs unconditionally. Results still AGREE — it
+        // formats through the profile's zone explicitly — so the snapshot path
+        // degrades to "correct but more fingerprintable", never to a leak.
+        // ---------------------------------------------------------
+        const _nativeTz = (typeof ops.op_native_timezone === 'function')
+            ? ops.op_native_timezone()
+            : '';
+        if (!_nativeTz) {
+            // Date.prototype.getTimezoneOffset — compute the offset from the
+            // profile timezone at each call so DST transitions stay accurate.
+            const _origGetTimezoneOffset = Date.prototype.getTimezoneOffset;
+            Date.prototype.getTimezoneOffset = function () {
+                const profileTz = _profileTz();
+                if (!profileTz) return _origGetTimezoneOffset.call(this);
+                try {
+                    const fmt = new _OrigDTF("en-US", {
+                        timeZone: profileTz,
+                        year: "numeric", month: "2-digit", day: "2-digit",
+                        hour: "2-digit", minute: "2-digit", second: "2-digit",
+                        hour12: false,
+                    });
+                    const parts = fmt.formatToParts(this);
+                    const get = (t) => parts.find((p) => p.type === t)?.value;
+                    const tzDate = new Date(Date.UTC(
+                        parseInt(get("year"), 10),
+                        parseInt(get("month"), 10) - 1,
+                        parseInt(get("day"), 10),
+                        parseInt(get("hour"), 10),
+                        parseInt(get("minute"), 10),
+                        parseInt(get("second"), 10),
+                    ));
+                    return Math.round((this.getTime() - tzDate.getTime()) / 60000);
+                } catch (_e) {
+                    return _origGetTimezoneOffset.call(this);
+                }
+            };
+            Object.defineProperty(Date.prototype.getTimezoneOffset, "toString", {
+                value: () => "function getTimezoneOffset() { [native code] }",
+                configurable: true,
+            });
+            Object.defineProperty(Date.prototype.getTimezoneOffset, _nativeTag, { value: 'getTimezoneOffset', configurable: true });
 
-        // Map IANA name → English long-form ("Pacific Daylight Time", etc.)
-        // Chrome derives this from the longGeneric+timeZoneName fields that
-        // Intl.DateTimeFormat exposes. Compute via the cached _OrigDTF.
-        const _tzLongName = (date, tz) => {
-            try {
-                const fmt = new _OrigDTF("en-US", {
-                    timeZone: tz, timeZoneName: "long",
-                });
-                const parts = fmt.formatToParts(date);
-                const tzPart = parts.find(p => p.type === "timeZoneName");
-                return tzPart ? tzPart.value : "";
-            } catch (_e) { return ""; }
-        };
+            // =========================================================
+            // Date.prototype toString patches — print the profile's
+            // timezone, not UTC. Some scripts probe
+            // `new Date().toString()` because it's the cheapest TZ probe
+            // available; UTC output on a macOS profile is a hard tell.
+            //
+            // Real Chrome on macOS / America/Los_Angeles produces:
+            //   "Tue Apr 29 2026 13:02:46 GMT-0700 (Pacific Daylight Time)"
+            //
+            // We patch four methods consistently:
+            //   - toString()        full date+time+tz
+            //   - toDateString()    date portion only
+            //   - toTimeString()    time + tz portion only
+            //   - toLocaleString()  default-locale form (when called w/o args)
+            // =========================================================
 
-        // Compute "GMT-0700" style offset string from the profile timezone
-        // for a specific moment (DST-aware via our patched getTimezoneOffset).
-        const _gmtOffsetString = (date) => {
-            const offMin = date.getTimezoneOffset();
-            const sign = offMin <= 0 ? "+" : "-";
-            const abs = Math.abs(offMin);
-            const hh = String(Math.floor(abs / 60)).padStart(2, "0");
-            const mm = String(abs % 60).padStart(2, "0");
-            return `GMT${sign}${hh}${mm}`;
-        };
+            // Map IANA name → English long-form ("Pacific Daylight Time", etc.)
+            // Chrome derives this from the longGeneric+timeZoneName fields that
+            // Intl.DateTimeFormat exposes. Compute via the cached _OrigDTF.
+            const _tzLongName = (date, tz) => {
+                try {
+                    const fmt = new _OrigDTF("en-US", {
+                        timeZone: tz, timeZoneName: "long",
+                    });
+                    const parts = fmt.formatToParts(date);
+                    const tzPart = parts.find(p => p.type === "timeZoneName");
+                    return tzPart ? tzPart.value : "";
+                } catch (_e) { return ""; }
+            };
 
-        // Pull profile-localized date+time parts so we can format the
-        // "Tue Apr 29 2026 13:02:46" portion the way real Chrome does.
-        // Returns { weekday, month, day, year, hh, mm, ss } strings.
-        const _tzParts = (date, tz) => {
-            try {
-                const fmt = new _OrigDTF("en-US", {
-                    timeZone: tz, weekday: "short", month: "short",
-                    day: "2-digit", year: "numeric",
-                    hour: "2-digit", minute: "2-digit", second: "2-digit",
-                    hour12: false,
-                });
-                const parts = fmt.formatToParts(date);
-                const get = (t) => parts.find(p => p.type === t)?.value || "";
-                const hour = get("hour");
-                // Chrome uses 24-hour; Intl may produce "24" for midnight in
-                // some locales — normalize to "00".
-                return {
-                    weekday: get("weekday"),
-                    month: get("month"),
-                    day: get("day"),
-                    year: get("year"),
-                    hour: hour === "24" ? "00" : hour,
-                    minute: get("minute"),
-                    second: get("second"),
-                };
-            } catch (_e) { return null; }
-        };
+            // Compute "GMT-0700" style offset string from the profile timezone
+            // for a specific moment (DST-aware via our patched getTimezoneOffset).
+            const _gmtOffsetString = (date) => {
+                const offMin = date.getTimezoneOffset();
+                const sign = offMin <= 0 ? "+" : "-";
+                const abs = Math.abs(offMin);
+                const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+                const mm = String(abs % 60).padStart(2, "0");
+                return `GMT${sign}${hh}${mm}`;
+            };
 
-        const _origDateToString = Date.prototype.toString;
-        Date.prototype.toString = function toString() {
-            // `Date.prototype.toString.call(non-Date)` must throw TypeError —
-            // mirror real Chrome by delegating to the original.
-            if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
-                return _origDateToString.call(this);
-            }
-            const tz = _profileTz();
-            if (!tz) return _origDateToString.call(this);
-            const p = _tzParts(this, tz);
-            if (!p) return _origDateToString.call(this);
-            const longName = _tzLongName(this, tz);
-            const offStr = _gmtOffsetString(this);
-            // Format: "Tue Apr 29 2026 13:02:46 GMT-0700 (Pacific Daylight Time)"
-            const longPart = longName ? ` (${longName})` : "";
-            return `${p.weekday} ${p.month} ${p.day} ${p.year} ${p.hour}:${p.minute}:${p.second} ${offStr}${longPart}`;
-        };
-        Object.defineProperty(Date.prototype.toString, "toString", {
-            value: () => "function toString() { [native code] }",
-            configurable: true,
-        });
-        Object.defineProperty(Date.prototype.toString, _nativeTag, { value: 'toString', configurable: true });
+            // Pull profile-localized date+time parts so we can format the
+            // "Tue Apr 29 2026 13:02:46" portion the way real Chrome does.
+            // Returns { weekday, month, day, year, hh, mm, ss } strings.
+            const _tzParts = (date, tz) => {
+                try {
+                    const fmt = new _OrigDTF("en-US", {
+                        timeZone: tz, weekday: "short", month: "short",
+                        day: "2-digit", year: "numeric",
+                        hour: "2-digit", minute: "2-digit", second: "2-digit",
+                        hour12: false,
+                    });
+                    const parts = fmt.formatToParts(date);
+                    const get = (t) => parts.find(p => p.type === t)?.value || "";
+                    const hour = get("hour");
+                    // Chrome uses 24-hour; Intl may produce "24" for midnight in
+                    // some locales — normalize to "00".
+                    return {
+                        weekday: get("weekday"),
+                        month: get("month"),
+                        day: get("day"),
+                        year: get("year"),
+                        hour: hour === "24" ? "00" : hour,
+                        minute: get("minute"),
+                        second: get("second"),
+                    };
+                } catch (_e) { return null; }
+            };
 
-        const _origDateToDateString = Date.prototype.toDateString;
-        Date.prototype.toDateString = function toDateString() {
-            if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
-                return _origDateToDateString.call(this);
-            }
-            const tz = _profileTz();
-            if (!tz) return _origDateToDateString.call(this);
-            const p = _tzParts(this, tz);
-            if (!p) return _origDateToDateString.call(this);
-            return `${p.weekday} ${p.month} ${p.day} ${p.year}`;
-        };
-        Object.defineProperty(Date.prototype.toDateString, "toString", {
-            value: () => "function toDateString() { [native code] }",
-            configurable: true,
-        });
-        Object.defineProperty(Date.prototype.toDateString, _nativeTag, { value: 'toDateString', configurable: true });
+            const _origDateToString = Date.prototype.toString;
+            Date.prototype.toString = function toString() {
+                // `Date.prototype.toString.call(non-Date)` must throw TypeError —
+                // mirror real Chrome by delegating to the original.
+                if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
+                    return _origDateToString.call(this);
+                }
+                const tz = _profileTz();
+                if (!tz) return _origDateToString.call(this);
+                const p = _tzParts(this, tz);
+                if (!p) return _origDateToString.call(this);
+                const longName = _tzLongName(this, tz);
+                const offStr = _gmtOffsetString(this);
+                // Format: "Tue Apr 29 2026 13:02:46 GMT-0700 (Pacific Daylight Time)"
+                const longPart = longName ? ` (${longName})` : "";
+                return `${p.weekday} ${p.month} ${p.day} ${p.year} ${p.hour}:${p.minute}:${p.second} ${offStr}${longPart}`;
+            };
+            Object.defineProperty(Date.prototype.toString, "toString", {
+                value: () => "function toString() { [native code] }",
+                configurable: true,
+            });
+            Object.defineProperty(Date.prototype.toString, _nativeTag, { value: 'toString', configurable: true });
 
-        const _origDateToTimeString = Date.prototype.toTimeString;
-        Date.prototype.toTimeString = function toTimeString() {
-            if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
-                return _origDateToTimeString.call(this);
-            }
-            const tz = _profileTz();
-            if (!tz) return _origDateToTimeString.call(this);
-            const p = _tzParts(this, tz);
-            if (!p) return _origDateToTimeString.call(this);
-            const longName = _tzLongName(this, tz);
-            const offStr = _gmtOffsetString(this);
-            const longPart = longName ? ` (${longName})` : "";
-            return `${p.hour}:${p.minute}:${p.second} ${offStr}${longPart}`;
-        };
-        Object.defineProperty(Date.prototype.toTimeString, "toString", {
-            value: () => "function toTimeString() { [native code] }",
-            configurable: true,
-        });
-        Object.defineProperty(Date.prototype.toTimeString, _nativeTag, { value: 'toTimeString', configurable: true });
+            const _origDateToDateString = Date.prototype.toDateString;
+            Date.prototype.toDateString = function toDateString() {
+                if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
+                    return _origDateToDateString.call(this);
+                }
+                const tz = _profileTz();
+                if (!tz) return _origDateToDateString.call(this);
+                const p = _tzParts(this, tz);
+                if (!p) return _origDateToDateString.call(this);
+                return `${p.weekday} ${p.month} ${p.day} ${p.year}`;
+            };
+            Object.defineProperty(Date.prototype.toDateString, "toString", {
+                value: () => "function toDateString() { [native code] }",
+                configurable: true,
+            });
+            Object.defineProperty(Date.prototype.toDateString, _nativeTag, { value: 'toDateString', configurable: true });
 
-        // toLocaleString is already covered by the patched Intl.DateTimeFormat
-        // (which Date.prototype.toLocaleString delegates to internally), but
-        // V8's implementation calls the *original* Intl constructor directly
-        // bypassing our patch. Force-route through our patched constructor.
-        const _origDateToLocaleString = Date.prototype.toLocaleString;
-        Date.prototype.toLocaleString = function toLocaleString(...args) {
-            if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
-                return _origDateToLocaleString.apply(this, args);
-            }
-            const tz = _profileTz();
-            const loc = _profileLocale() || "en-US";
-            if (!tz) return _origDateToLocaleString.apply(this, args);
-            try {
-                const locales = args[0] !== undefined ? args[0] : loc;
-                const options = Object.assign(
-                    { timeZone: tz },
-                    args[1] || {
-                        year: "numeric", month: "numeric", day: "numeric",
-                        hour: "numeric", minute: "numeric", second: "numeric",
-                    },
-                );
-                return new _OrigDTF(locales, options).format(this);
-            } catch (_e) {
-                return _origDateToLocaleString.apply(this, args);
-            }
-        };
-        Object.defineProperty(Date.prototype.toLocaleString, "toString", {
-            value: () => "function toLocaleString() { [native code] }",
-            configurable: true,
-        });
-        Object.defineProperty(Date.prototype.toLocaleString, _nativeTag, { value: 'toLocaleString', configurable: true });
+            const _origDateToTimeString = Date.prototype.toTimeString;
+            Date.prototype.toTimeString = function toTimeString() {
+                if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
+                    return _origDateToTimeString.call(this);
+                }
+                const tz = _profileTz();
+                if (!tz) return _origDateToTimeString.call(this);
+                const p = _tzParts(this, tz);
+                if (!p) return _origDateToTimeString.call(this);
+                const longName = _tzLongName(this, tz);
+                const offStr = _gmtOffsetString(this);
+                const longPart = longName ? ` (${longName})` : "";
+                return `${p.hour}:${p.minute}:${p.second} ${offStr}${longPart}`;
+            };
+            Object.defineProperty(Date.prototype.toTimeString, "toString", {
+                value: () => "function toTimeString() { [native code] }",
+                configurable: true,
+            });
+            Object.defineProperty(Date.prototype.toTimeString, _nativeTag, { value: 'toTimeString', configurable: true });
+
+            // toLocaleString is already covered by the patched Intl.DateTimeFormat
+            // (which Date.prototype.toLocaleString delegates to internally), but
+            // V8's implementation calls the *original* Intl constructor directly
+            // bypassing our patch. Force-route through our patched constructor.
+            const _origDateToLocaleString = Date.prototype.toLocaleString;
+            Date.prototype.toLocaleString = function toLocaleString(...args) {
+                if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
+                    return _origDateToLocaleString.apply(this, args);
+                }
+                const tz = _profileTz();
+                const loc = _profileLocale() || "en-US";
+                if (!tz) return _origDateToLocaleString.apply(this, args);
+                try {
+                    const locales = args[0] !== undefined ? args[0] : loc;
+                    const options = Object.assign(
+                        { timeZone: tz },
+                        args[1] || {
+                            year: "numeric", month: "numeric", day: "numeric",
+                            hour: "numeric", minute: "numeric", second: "numeric",
+                        },
+                    );
+                    return new _OrigDTF(locales, options).format(this);
+                } catch (_e) {
+                    return _origDateToLocaleString.apply(this, args);
+                }
+            };
+            Object.defineProperty(Date.prototype.toLocaleString, "toString", {
+                value: () => "function toLocaleString() { [native code] }",
+                configurable: true,
+            });
+            Object.defineProperty(Date.prototype.toLocaleString, _nativeTag, { value: 'toLocaleString', configurable: true });
+        }
     }
 
     // =========================================================
