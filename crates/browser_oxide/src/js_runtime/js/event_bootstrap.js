@@ -574,6 +574,16 @@
     // the Node prototype chain — do not reassign it here or the
     // `document instanceof EventTarget` check will break.
 
+    // Browser-generated cross-frame postMessage events are trusted. Hand the
+    // private WeakSet-backed minter into dom_bootstrap's closure before the
+    // temporary bootstrap object is removed; page JS never receives the fn.
+    try {
+        const bo = globalThis.__browser_oxide;
+        if (bo && typeof bo._installFrameMessageTrustMarker === 'function') {
+            bo._installFrameMessageTrustMarker(_markTrusted);
+        }
+    } catch (_) { /* ignore */ }
+
     // Privileged handoff of the trusted-event minter (behavioral E1/E2). Our
     // init scripts (humanize.js) capture this into a closure and `delete` it
     // synchronously at their top — before any page script runs — so page JS

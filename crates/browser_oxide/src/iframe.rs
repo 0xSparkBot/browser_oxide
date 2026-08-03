@@ -24,6 +24,22 @@ pub struct ChildIframe {
     pub event_loop: BrowserEventLoop,
 }
 
+fn complete_document_lifecycle(event_loop: &mut BrowserEventLoop) {
+    // Match the top-level Page lifecycle. Child frames previously executed
+    // their scripts but never dispatched DOMContentLoaded/load or advanced
+    // document.readyState, leaving real widgets stuck in the loading phase.
+    let _ = event_loop
+        .execute_script("document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));");
+    let _ = event_loop
+        .execute_script("globalThis._browser_oxide.__documentReadyState = 'interactive';");
+    let _ = event_loop.execute_script(
+        "window.dispatchEvent(new Event('load')); \
+         try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}",
+    );
+    let _ =
+        event_loop.execute_script("globalThis._browser_oxide.__documentReadyState = 'complete';");
+}
+
 impl ChildIframe {
     /// Create a child iframe from srcdoc HTML.
     pub async fn from_srcdoc(
@@ -59,6 +75,8 @@ impl ChildIframe {
                 tracing::warn!(script_index = i, error = %e, "iframe script error");
             }
         }
+
+        complete_document_lifecycle(&mut event_loop);
 
         // Bound child-frame startup by the same deployment-configurable
         // navigation deadline as top-level pages. An explicit "off" keeps the
@@ -277,6 +295,8 @@ impl ChildIframe {
                 tracing::warn!(script_index = i, error = %e, "iframe script error");
             }
         }
+
+        complete_document_lifecycle(&mut event_loop);
 
         // `run_until_settled` returns once the frame has loaded with no in-flight
         // fetch, ignoring the perpetual short timers a live frame keeps running.

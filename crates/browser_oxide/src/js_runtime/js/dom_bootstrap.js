@@ -9,6 +9,7 @@
     const _nodeTypes = new WeakMap();
     const _tagNames = new WeakMap();
     const _localNames = new WeakMap();
+    let _markFrameMessageTrusted = null;
 
     function _getNodeId(node) {
         if (node === null || node === undefined) return -1;
@@ -593,6 +594,17 @@
             ops.op_dom_set_text_content(_getNodeId(this), String(val));
         }
         appendChild(child) {
+            // DOM Standard: appending a DocumentFragment inserts its children
+            // in order and empties the fragment; the fragment node itself is
+            // never attached. Real widgets commonly construct their iframe in
+            // a fragment before committing it to the live document.
+            if (child && child.nodeType === 11) {
+                if (child === this) return child;
+                while (child.firstChild) {
+                    this.appendChild(child.firstChild);
+                }
+                return child;
+            }
             ops.op_dom_append_child(_getNodeId(this), _getNodeId(child));
             _onNodeInserted(child);
             return child;
@@ -603,6 +615,15 @@
             return child;
         }
         replaceChild(newChild, oldChild) {
+            if (newChild && newChild.nodeType === 11) {
+                if (newChild !== this) {
+                    while (newChild.firstChild) {
+                        this.insertBefore(newChild.firstChild, oldChild);
+                    }
+                }
+                this.removeChild(oldChild);
+                return oldChild;
+            }
             const parent = _getNodeId(this);
             const oldId = _getNodeId(oldChild);
             const newId = _getNodeId(newChild);
@@ -614,6 +635,13 @@
         }
         insertBefore(newChild, refChild) {
             if (refChild === null || refChild === undefined) return this.appendChild(newChild);
+            if (newChild && newChild.nodeType === 11) {
+                if (newChild === this) return newChild;
+                while (newChild.firstChild) {
+                    this.insertBefore(newChild.firstChild, refChild);
+                }
+                return newChild;
+            }
             ops.op_dom_insert_before(_getNodeId(this), _getNodeId(newChild), _getNodeId(refChild));
             _onNodeInserted(newChild);
             return newChild;
@@ -1110,6 +1138,7 @@
             // whenever attachShadow was actually called — observable to
             // scripts that exercise Shadow DOM.
             const shadowRoot = _wrapNode(shadowId);
+            Object.setPrototypeOf(shadowRoot, ShadowRoot.prototype);
             // ShadowRoot inherits Node methods (appendChild, querySelector, etc.)
             Object.defineProperties(shadowRoot, {
                 mode: { value: mode, enumerable: true },
@@ -1527,7 +1556,50 @@
         set data(val) { _setCharacterData(this, val); }
     }
 
-    class DocumentFragment extends Node {}
+    class DocumentFragment extends Node {
+        _scopedElementIds(selector) {
+            const wanted = selector === undefined ? null : String(selector);
+            const result = [];
+            const stack = [];
+            const roots = this.childNodes;
+            for (let i = roots.length - 1; i >= 0; i--) stack.push(roots[i]);
+            while (stack.length) {
+                const node = stack.pop();
+                if (!node) continue;
+                if (node.nodeType === 1) {
+                    if (wanted === null || node.matches(wanted)) result.push(_getNodeId(node));
+                }
+                const children = node.childNodes;
+                if (children) {
+                    for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+                }
+            }
+            return result;
+        }
+        get children() {
+            return new NodeList(ops.op_dom_get_child_elements_with_types(_getNodeId(this)), 1);
+        }
+        get firstElementChild() { return _wrapNode(ops.op_dom_get_first_element_child(_getNodeId(this))); }
+        get lastElementChild() { return _wrapNode(ops.op_dom_get_last_element_child(_getNodeId(this))); }
+        get childElementCount() { return ops.op_dom_get_child_element_count(_getNodeId(this)); }
+        querySelector(sel) {
+            const ids = this._scopedElementIds(sel);
+            return ids.length ? _wrapNode(ids[0]) : null;
+        }
+        querySelectorAll(sel) {
+            return new NodeList(this._scopedElementIds(sel), 2);
+        }
+        getElementById(id) {
+            const wanted = String(id);
+            const ids = this._scopedElementIds();
+            for (const nodeId of ids) {
+                const el = _wrapNode(nodeId);
+                if (el && el.id === wanted) return el;
+            }
+            return null;
+        }
+    }
+    class ShadowRoot extends DocumentFragment {}
 
     let _currentScript = null;
     function _setCurrentScript(el) { _currentScript = el; }
@@ -2086,6 +2158,7 @@
     globalThis.Text = Text;
     globalThis.Comment = Comment;
     globalThis.DocumentFragment = DocumentFragment;
+    globalThis.ShadowRoot = ShadowRoot;
     globalThis.Document = Document;
     globalThis.NodeList = NodeList;
     globalThis.DOMTokenList = DOMTokenList;
@@ -3496,6 +3569,7 @@
                 } catch (_) { data = m.d; }
                 try {
                     const ev = new MessageEvent("message", { data: data, origin: m.o || "", source: _frameHandle(m.s) });
+                    if (_markFrameMessageTrusted) _markFrameMessageTrusted(ev);
                     globalThis.dispatchEvent(ev);
                     if (typeof globalThis.onmessage === "function") { try { globalThis.onmessage(ev); } catch (_) {} }
                 } catch (_) {}
@@ -3703,7 +3777,12 @@
     // before page scripts run. Callers must CAPTURE the helper during
     // their own bootstrap execution, not look it up per-call.
     Object.defineProperty(globalThis, '__browser_oxide', {
-        value: { _getNodeId },
+        value: {
+            _getNodeId,
+            _installFrameMessageTrustMarker(fn) {
+                if (typeof fn === 'function') _markFrameMessageTrusted = fn;
+            },
+        },
         enumerable: false,
         configurable: true,
         writable: false,

@@ -1,6 +1,6 @@
 use crate::css_values::calc::resolve_computed_value;
 use crate::css_values::types::length::CalcContext;
-use crate::dom::node::NodeId;
+use crate::dom::node::{NodeData, NodeId};
 use crate::dom::DomElement;
 use crate::js_runtime::native_fns::{install_native_fp_tostring, IframeRealmStore};
 use crate::js_runtime::state::DomState;
@@ -89,7 +89,7 @@ pub fn op_dom_get_attribute(
     state: &mut OpState,
     #[smi] node_id: i32,
     #[string] name: &str,
-) -> String {
+) -> Option<String> {
     let state = state.borrow::<DomState>();
     let id = NodeId::from_raw(node_id as u32);
     state
@@ -102,7 +102,6 @@ pub fn op_dom_get_attribute(
                 .find(|a| a.name.local.eq_ignore_ascii_case(name))
                 .map(|a| a.value.clone())
         })
-        .unwrap_or_default()
 }
 
 #[op2(fast)]
@@ -430,7 +429,12 @@ pub fn op_dom_is_connected(state: &mut OpState, #[smi] node_id: i32) -> bool {
         if id == NodeId::DOCUMENT {
             return true;
         }
-        cur = state.dom.get(id).and_then(|n| n.parent);
+        cur = state.dom.get(id).and_then(|node| match &node.data {
+            // A shadow root is not a normal child of its host, but nodes in a
+            // shadow tree are connected whenever the host is connected.
+            NodeData::ShadowRoot { host, .. } => Some(*host),
+            _ => node.parent,
+        });
     }
     false
 }

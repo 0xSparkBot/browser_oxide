@@ -284,7 +284,9 @@ async fn frame_tree_child_to_parent_postmessage() {
     let mut page = Page::from_html(
         r#"<!DOCTYPE html><html><body><script>
         globalThis.__got = 'none';
-        window.addEventListener('message', function(e){ globalThis.__got = JSON.stringify(e.data); });
+        window.addEventListener('message', function(e){
+            globalThis.__got = JSON.stringify({data:e.data, trusted:e.isTrusted});
+        });
         </script></body></html>"#,
         Some(profile.clone()),
     )
@@ -301,7 +303,7 @@ async fn frame_tree_child_to_parent_postmessage() {
     // Give the child a listener, then post parent -> child via contentWindow.
     page.frame_tree_evaluate(
         0,
-        "globalThis.__cgot='none'; window.addEventListener('message', function(e){ globalThis.__cgot = JSON.stringify(e.data); });",
+        "globalThis.__cgot='none'; window.addEventListener('message', function(e){ globalThis.__cgot = JSON.stringify({data:e.data, trusted:e.isTrusted}); });",
     );
     page.evaluate(
         "document.querySelector('iframe').contentWindow.postMessage({toChild:'hi'}, '*')",
@@ -320,11 +322,19 @@ async fn frame_tree_child_to_parent_postmessage() {
         got.contains("relayed") && got.contains("yes"),
         "top page must receive the child frame's postMessage: {got}"
     );
+    assert!(
+        got.contains("\"trusted\":true"),
+        "child-to-parent MessageEvent must be trusted: {got}"
+    );
     let cgot = page
         .frame_tree_evaluate(0, "String(globalThis.__cgot)")
         .unwrap_or_default();
     assert!(
         cgot.contains("toChild") && cgot.contains("hi"),
         "child frame must receive the parent's postMessage: {cgot}"
+    );
+    assert!(
+        cgot.contains("\"trusted\":true"),
+        "parent-to-child MessageEvent must be trusted: {cgot}"
     );
 }

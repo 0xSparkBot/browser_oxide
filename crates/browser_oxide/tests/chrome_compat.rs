@@ -734,6 +734,87 @@ async fn el_get_attribute() {
     assert_eq!(check("typeof document.body.getAttribute").await, "function");
 }
 #[tokio::test]
+async fn el_get_attribute_missing_is_null() {
+    assert_eq!(
+        check("document.body.getAttribute('definitely-missing') === null").await,
+        "true"
+    );
+}
+#[tokio::test]
+async fn dynamic_iframe_remains_connected_and_queryable() {
+    assert_eq!(
+        check(
+            r#"(function(){
+                var host=document.createElement('div');
+                document.body.appendChild(host);
+                var frame=document.createElement('iframe');
+                frame.id='dynamic-frame-check';
+                host.appendChild(frame);
+                return JSON.stringify({
+                    connected:frame.isConnected,
+                    parent:frame.parentElement===host,
+                    byId:document.getElementById('dynamic-frame-check')===frame,
+                    count:document.querySelectorAll('iframe').length,
+                    serialized:/<iframe/i.test(host.innerHTML)
+                });
+            })()"#,
+        )
+        .await,
+        r#"{"connected":true,"parent":true,"byId":true,"count":1,"serialized":true}"#
+    );
+}
+#[tokio::test]
+async fn appending_document_fragment_moves_its_children() {
+    assert_eq!(
+        check(
+            r#"(function(){
+                var host=document.createElement('div');
+                document.body.appendChild(host);
+                var fragment=document.createDocumentFragment();
+                var frame=document.createElement('iframe');
+                frame.id='fragment-frame-check';
+                fragment.appendChild(frame);
+                host.appendChild(fragment);
+                return JSON.stringify({
+                    connected:frame.isConnected,
+                    parent:frame.parentElement===host,
+                    fragmentEmpty:fragment.childNodes.length===0,
+                    byId:document.getElementById('fragment-frame-check')===frame,
+                    count:document.querySelectorAll('iframe').length
+                });
+            })()"#,
+        )
+        .await,
+        r#"{"connected":true,"parent":true,"fragmentEmpty":true,"byId":true,"count":1}"#
+    );
+}
+#[tokio::test]
+async fn shadow_root_supports_scoped_queries() {
+    assert_eq!(
+        check(
+            r#"(function(){
+                var host=document.createElement('div');
+                document.body.appendChild(host);
+                var root=host.attachShadow({mode:'closed'});
+                var frame=document.createElement('iframe');
+                frame.id='shadow-frame-check';
+                root.appendChild(frame);
+                return JSON.stringify({
+                    query:root.querySelector('#shadow-frame-check')===frame,
+                    queryAll:root.querySelectorAll('iframe').length===1,
+                    byId:root.getElementById('shadow-frame-check')===frame,
+                    children:root.children.length===1,
+                    first:root.firstElementChild===frame,
+                    count:root.childElementCount===1,
+                    closed:host.shadowRoot===null
+                });
+            })()"#,
+        )
+        .await,
+        r#"{"query":true,"queryAll":true,"byId":true,"children":true,"first":true,"count":true,"closed":true}"#
+    );
+}
+#[tokio::test]
 async fn el_set_attribute() {
     assert_eq!(check("typeof document.body.setAttribute").await, "function");
 }
