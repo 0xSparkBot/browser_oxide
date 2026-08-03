@@ -348,3 +348,46 @@ async fn reset_is_idempotent_across_many_reuses() {
         );
     }
 }
+
+/// The SilvR frame-tree overhaul added Rust-side queues, child isolates and
+/// process-wide mailboxes that are not visible to the original JS-only reuse
+/// tests. A queued iframe from the outgoing document must never materialize in
+/// the next document, and the new navigation must receive a fresh top-frame id.
+#[tokio::test]
+async fn reset_clears_frame_tree_state() {
+    let mut page = Page::from_html(BLANK, None::<StealthProfile>)
+        .await
+        .unwrap();
+
+    page.init_top_frame();
+    let old_frame_id = page.evaluate("String(globalThis.__frameId)").unwrap();
+    page.evaluate(
+        "const f = document.createElement('iframe'); \
+         f.src = 'https://example.com/stale-frame'; \
+         document.body.appendChild(f); 'queued'",
+    )
+    .unwrap();
+    assert!(
+        page.event_loop().iframe_signal().has_pending(),
+        "test setup failed to queue a pending frame"
+    );
+
+    page.reset_for_reuse();
+    assert!(
+        !page.event_loop().iframe_signal().has_pending(),
+        "outgoing document's pending iframe survived reset"
+    );
+    assert_eq!(
+        page.frame_tree_count(),
+        0,
+        "outgoing document's materialized frame isolates survived reset"
+    );
+
+    page.reload_html(BLANK, "about:blank");
+    page.init_top_frame();
+    let new_frame_id = page.evaluate("String(globalThis.__frameId)").unwrap();
+    assert_ne!(
+        old_frame_id, new_frame_id,
+        "warm reuse retained the outgoing top-frame routing id"
+    );
+}

@@ -7,15 +7,15 @@ fn create_test_runtime() -> BrowserJsRuntime {
     BrowserJsRuntime::new(dom)
 }
 
-#[test]
-fn basic_js_execution() {
+#[tokio::test]
+async fn basic_js_execution() {
     let mut rt = create_test_runtime();
     let result = rt.execute_script("1 + 2", None).unwrap();
     assert_eq!(result, "3");
 }
 
-#[test]
-fn console_log_capture() {
+#[tokio::test]
+async fn console_log_capture() {
     let mut rt = create_test_runtime();
     rt.execute_script("console.log('hello from JS')", None)
         .unwrap();
@@ -24,15 +24,15 @@ fn console_log_capture() {
     assert_eq!(output[0].args[0], "[string] hello from JS");
 }
 
-#[test]
-fn document_exists() {
+#[tokio::test]
+async fn document_exists() {
     let mut rt = create_test_runtime();
     let result = rt.execute_script("typeof document", None).unwrap();
     assert_eq!(result, "object");
 }
 
-#[test]
-fn document_query_selector() {
+#[tokio::test]
+async fn document_query_selector() {
     let mut rt = create_test_runtime();
     let result = rt
         .execute_script("document.querySelector('#main').tagName", None)
@@ -40,8 +40,8 @@ fn document_query_selector() {
     assert_eq!(result, "DIV");
 }
 
-#[test]
-fn document_get_element_by_id() {
+#[tokio::test]
+async fn document_get_element_by_id() {
     let mut rt = create_test_runtime();
     let result = rt
         .execute_script("document.getElementById('main').className", None)
@@ -49,8 +49,8 @@ fn document_get_element_by_id() {
     assert_eq!(result, "container");
 }
 
-#[test]
-fn element_text_content() {
+#[tokio::test]
+async fn element_text_content() {
     let mut rt = create_test_runtime();
     let result = rt
         .execute_script("document.querySelector('p').textContent", None)
@@ -58,8 +58,8 @@ fn element_text_content() {
     assert_eq!(result, "Hello world");
 }
 
-#[test]
-fn element_inner_html() {
+#[tokio::test]
+async fn element_inner_html() {
     let mut rt = create_test_runtime();
     let result = rt
         .execute_script("document.querySelector('#main').innerHTML", None)
@@ -75,8 +75,8 @@ fn element_inner_html() {
     );
 }
 
-#[test]
-fn create_element_and_append() {
+#[tokio::test]
+async fn create_element_and_append() {
     let mut rt = create_test_runtime();
     rt.execute_script(
         r#"
@@ -94,8 +94,8 @@ fn create_element_and_append() {
     assert_eq!(result, "SPAN");
 }
 
-#[test]
-fn set_text_content() {
+#[tokio::test]
+async fn set_text_content() {
     let mut rt = create_test_runtime();
     rt.execute_script(
         r#"
@@ -111,8 +111,8 @@ fn set_text_content() {
     assert_eq!(result, "Modified!");
 }
 
-#[test]
-fn set_inner_html() {
+#[tokio::test]
+async fn set_inner_html() {
     let mut rt = create_test_runtime();
     rt.execute_script(
         r#"
@@ -128,8 +128,8 @@ fn set_inner_html() {
     assert_eq!(result, "New content");
 }
 
-#[test]
-fn set_attribute() {
+#[tokio::test]
+async fn set_attribute() {
     let mut rt = create_test_runtime();
     rt.execute_script(
         r#"
@@ -148,8 +148,8 @@ fn set_attribute() {
     assert_eq!(result, "hello");
 }
 
-#[test]
-fn class_list() {
+#[tokio::test]
+async fn class_list() {
     let mut rt = create_test_runtime();
     rt.execute_script(
         r#"
@@ -174,36 +174,36 @@ fn class_list() {
     );
 }
 
-#[test]
-fn document_title() {
+#[tokio::test]
+async fn document_title() {
     let mut rt = create_test_runtime();
     let result = rt.execute_script("document.title", None).unwrap();
     assert_eq!(result, "Test");
 }
 
-#[test]
-fn document_has_focus() {
+#[tokio::test]
+async fn document_has_focus() {
     let mut rt = create_test_runtime();
     let result = rt.execute_script("document.hasFocus()", None).unwrap();
     assert_eq!(result, "true");
 }
 
-#[test]
-fn document_visibility_state() {
+#[tokio::test]
+async fn document_visibility_state() {
     let mut rt = create_test_runtime();
     let result = rt.execute_script("document.visibilityState", None).unwrap();
     assert_eq!(result, "visible");
 }
 
-#[test]
-fn window_self_reference() {
+#[tokio::test]
+async fn window_self_reference() {
     let mut rt = create_test_runtime();
     let result = rt.execute_script("window === globalThis", None).unwrap();
     assert_eq!(result, "true");
 }
 
-#[test]
-fn node_types_exist() {
+#[tokio::test]
+async fn node_types_exist() {
     let mut rt = create_test_runtime();
     let result = rt.execute_script("typeof Element", None).unwrap();
     assert_eq!(result, "function");
@@ -213,8 +213,8 @@ fn node_types_exist() {
     assert_eq!(result, "function");
 }
 
-#[test]
-fn take_dom_back() {
+#[tokio::test]
+async fn take_dom_back() {
     let rt = create_test_runtime();
     let dom = rt.take_dom();
     // Verify the DOM is intact
@@ -222,8 +222,8 @@ fn take_dom_back() {
     assert!(!html.is_empty());
 }
 
-#[test]
-fn query_selector_all() {
+#[tokio::test]
+async fn query_selector_all() {
     let dom = browser_oxide::html_parser::parse_html(
         "<html><body><ul><li>a</li><li>b</li><li>c</li></ul></body></html>",
     );
@@ -234,8 +234,8 @@ fn query_selector_all() {
     assert_eq!(result, "3");
 }
 
-#[test]
-fn get_elements_by_tag_name() {
+#[tokio::test]
+async fn get_elements_by_tag_name() {
     let mut rt = create_test_runtime();
     // The test HTML has: html, head, title, body, div, p
     let result = rt
@@ -246,8 +246,8 @@ fn get_elements_by_tag_name() {
 
 // === Stealth profile tests ===
 
-#[test]
-fn stealth_profile_overrides_navigator() {
+#[tokio::test]
+async fn stealth_profile_overrides_navigator() {
     let profile = browser_oxide::stealth::chrome_148_windows();
     let dom = browser_oxide::html_parser::parse_html("<html><head></head><body></body></html>");
     let mut rt = BrowserJsRuntime::with_profile(dom, profile);
@@ -268,8 +268,8 @@ fn stealth_profile_overrides_navigator() {
     assert_eq!(cores, "8");
 }
 
-#[test]
-fn stealth_profile_overrides_screen() {
+#[tokio::test]
+async fn stealth_profile_overrides_screen() {
     let profile = browser_oxide::stealth::chrome_148_macos();
     let dom = browser_oxide::html_parser::parse_html("<html><head></head><body></body></html>");
     let mut rt = BrowserJsRuntime::with_profile(dom, profile);
@@ -281,8 +281,8 @@ fn stealth_profile_overrides_screen() {
     assert_eq!(dpr, "2"); // macOS Retina = 2x
 }
 
-#[test]
-fn stealth_profile_overrides_window_dims() {
+#[tokio::test]
+async fn stealth_profile_overrides_window_dims() {
     let profile = browser_oxide::stealth::chrome_148_linux();
     let dom = browser_oxide::html_parser::parse_html("<html><head></head><body></body></html>");
     let mut rt = BrowserJsRuntime::with_profile(dom, profile);
@@ -294,8 +294,8 @@ fn stealth_profile_overrides_window_dims() {
     assert_eq!(ih, "969");
 }
 
-#[test]
-fn get_computed_style_basic() {
+#[tokio::test]
+async fn get_computed_style_basic() {
     let mut rt = create_test_runtime();
     let result = rt
         .execute_script("getComputedStyle(document.body).display", None)
@@ -303,8 +303,8 @@ fn get_computed_style_basic() {
     assert_eq!(result, "block");
 }
 
-#[test]
-fn get_computed_style_instanceof() {
+#[tokio::test]
+async fn get_computed_style_instanceof() {
     let mut rt = create_test_runtime();
     let result = rt
         .execute_script(
@@ -315,8 +315,8 @@ fn get_computed_style_instanceof() {
     assert_eq!(result, "true");
 }
 
-#[test]
-fn no_profile_uses_defaults() {
+#[tokio::test]
+async fn no_profile_uses_defaults() {
     let mut rt = create_test_runtime(); // no profile
     let ua = rt.execute_script("navigator.userAgent", None).unwrap();
     assert!(
@@ -331,8 +331,8 @@ fn no_profile_uses_defaults() {
 /// Real Chrome on `new URL("blob:null/uuid").protocol` returns `"blob:"`.
 /// Pre-fix, BO's URL polyfill emitted `""`. Caught during worker-URL testing
 /// and fixed in commit (this commit).
-#[test]
-fn url_blob_scheme_protocol_and_origin() {
+#[tokio::test]
+async fn url_blob_scheme_protocol_and_origin() {
     let mut rt = create_test_runtime();
     let proto = rt
         .execute_script(r#"new URL("blob:null/7aeb61c9-deadbeef").protocol"#, None)
@@ -350,8 +350,8 @@ fn url_blob_scheme_protocol_and_origin() {
 
 /// `data:` URLs are opaque per WHATWG URL spec: protocol="data:",
 /// origin="null". Real Chrome behavior.
-#[test]
-fn url_data_scheme_protocol_and_origin() {
+#[tokio::test]
+async fn url_data_scheme_protocol_and_origin() {
     let mut rt = create_test_runtime();
     let proto = rt
         .execute_script(r#"new URL("data:text/html,<p>hi</p>").protocol"#, None)
@@ -364,8 +364,8 @@ fn url_data_scheme_protocol_and_origin() {
 }
 
 /// `javascript:` URLs are also opaque.
-#[test]
-fn url_javascript_scheme_protocol() {
+#[tokio::test]
+async fn url_javascript_scheme_protocol() {
     let mut rt = create_test_runtime();
     let proto = rt
         .execute_script(r#"new URL("javascript:void(0)").protocol"#, None)
@@ -374,8 +374,8 @@ fn url_javascript_scheme_protocol() {
 }
 
 /// `about:` URLs (about:blank, about:srcdoc) are opaque.
-#[test]
-fn url_about_scheme_protocol() {
+#[tokio::test]
+async fn url_about_scheme_protocol() {
     let mut rt = create_test_runtime();
     let proto = rt
         .execute_script(r#"new URL("about:blank").protocol"#, None)
@@ -386,8 +386,8 @@ fn url_about_scheme_protocol() {
 /// Regression: http(s) URLs must still parse correctly — the opaque-scheme
 /// branch is added BEFORE the http regex, so it must not divert non-opaque
 /// schemes.
-#[test]
-fn url_https_still_parses_after_opaque_branch() {
+#[tokio::test]
+async fn url_https_still_parses_after_opaque_branch() {
     let mut rt = create_test_runtime();
     let proto = rt
         .execute_script(r#"new URL("https://example.com/foo?a=1#b").protocol"#, None)

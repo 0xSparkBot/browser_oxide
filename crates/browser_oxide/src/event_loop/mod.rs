@@ -257,6 +257,9 @@ pub struct BrowserEventLoop {
 pub enum IdleReason {
     /// All pending work completed (no timers, no promises, no async ops).
     AllWorkDone,
+    /// The page settled: load fired and the DOM stopped mutating, with
+    /// background timers/rAF/network still pending (via `run_until_settled`).
+    Settled,
     /// The timeout was reached.
     Timeout,
 }
@@ -266,35 +269,12 @@ impl BrowserEventLoop {
         Self { runtime }
     }
 
-    /// Run the event loop until idle, timeout, or a JS-triggered navigation.
-    ///
-    /// "Idle" means deno_core's event loop has no more pending work
-    /// (no timers, no unresolved promises, no pending async ops).
-    ///
-    /// **Nav short-circuit (gap: challenge-vendor 5-second retry window):** if JS
-    /// sets `globalThis.__pendingNavigation` (via `location.href = ...`,
-    /// `location.reload()`, form.submit, meta-refresh, etc.), the JS
-    /// bootstrap calls `op_set_pending_nav` which flips an atomic flag
-    /// shared with this loop. We detect it on the next tick boundary,
-    /// drain microtasks for a ~150 ms tail (so in-flight `fetch().then(...)`
-    /// can land its cookies in the jar), then return `AllWorkDone`. This
-    /// mirrors real-Chrome behavior where the navigation commits within
-    /// tens of ms of the setter call.
-    ///
-    /// Without this short-circuit, sites that issue a challenge-token
-    /// fetch followed by `location.href = retry_url` had to wait for the
-    /// full `timeout` ceiling before the next iteration fired the retry
-    /// — easily blowing past the challenge vendor's ~5-second tolerance.
-    pub async fn run_until_idle(
+    /// Drive the event loop, waker-driven with no timer. With `honor_settle`,
+    /// exit on render-quiescence ([`IdleReason::Settled`]); else on full idle.
+    async fn run_until_inner(
         &mut self,
-        timeout: Duration,
+        honor_settle: bool,
     ) -> Result<IdleReason, deno_core::error::AnyError> {
-        let deadline = Instant::now() + timeout;
-        // Tail time after nav-pending is detected, to let post-fetch
-        // microtasks (cookies, etc.) settle before we hand off to the
-        // navigation iteration.
-        const NAV_TAIL: Duration = Duration::from_millis(150);
-
         // Profiling state — only allocates when the env var is set, so
         // production overhead is one OnceLock-cached load + a branch.
         let profiling = profile_enabled();
@@ -313,35 +293,51 @@ impl BrowserEventLoop {
         };
         let mut tick_idx: u32 = 0;
 
-        let outcome: Result<IdleReason, deno_core::error::AnyError> = loop {
-            // Check timeout
-            if Instant::now() >= deadline {
-                break Ok(IdleReason::Timeout);
-            }
+        // Wakes only on real events (idle, frame message, navigation, readiness);
+        // no poll cadence or timer.
+        let nav_notify = self.runtime.nav_notify();
 
-            // JS-triggered navigation? Drain a short tail and exit.
-            if self.runtime.nav_pending() {
-                let tail_deadline = Instant::now() + NAV_TAIL;
-                while Instant::now() < tail_deadline {
-                    let _ = tokio::time::timeout(
-                        Duration::from_millis(25),
-                        self.runtime.run_event_loop(),
-                    )
-                    .await;
-                }
+        // With `honor_settle`, its Notify wakes the select on each mutation/load
+        // transition so a page parked on background work re-checks promptly.
+        let ready_notify = crate::js_runtime::readiness::notify();
+
+        let outcome: Result<IdleReason, deno_core::error::AnyError> = loop {
+            // A frame posted a cross-frame message — hand back so the driver
+            // delivers it now. Only ever set in frame-tree mode.
+            if crate::js_runtime::extensions::frame_ext::frame_msg_pending() {
                 break Ok(IdleReason::AllWorkDone);
             }
 
-            // Run one event loop tick with a short timeout
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let tick_timeout = remaining.min(Duration::from_millis(100));
+            // JS-triggered navigation: flush the microtask tail (a fetch `.then`
+            // that wrote a cookie or set the nav) before handing off.
+            if self.runtime.nav_pending() {
+                self.runtime.drain_microtasks();
+                break Ok(IdleReason::AllWorkDone);
+            }
 
             let tick_t0 = if profiling {
                 Some(Instant::now())
             } else {
                 None
             };
-            let result = tokio::time::timeout(tick_timeout, self.runtime.run_event_loop()).await;
+            // `biased` keeps V8 progress first; the frame/nav/readiness wakes
+            // let those transitions resume with no poll latency.
+            let frame_notify = crate::js_runtime::extensions::frame_ext::frame_msg_notify();
+            let ready_fut = ready_notify.notified();
+            tokio::pin!(ready_fut);
+            let result: Result<Result<(), deno_core::error::AnyError>, ()> = tokio::select! {
+                biased;
+                r = self.runtime.run_event_loop() => Ok(r),
+                _ = frame_notify.notified() => Err(()),
+                _ = nav_notify.notified() => Err(()),
+                _ = &mut ready_fut, if honor_settle => Err(()),
+            };
+
+            // Microtasks drained this turn, so a quiet `settle_poll` means the
+            // render stabilized. Call once per turn: it compares across turns.
+            if honor_settle && crate::js_runtime::readiness::settle_poll() {
+                break Ok(IdleReason::Settled);
+            }
 
             // Capture pending-task snapshot AFTER the tick (so the row
             // reflects what's still in-flight). Skipped when profiling
@@ -368,9 +364,9 @@ impl BrowserEventLoop {
                     break Ok(IdleReason::AllWorkDone);
                 }
                 Ok(Err(e)) => break Err(e),
-                Err(_timeout) => {
-                    // Tick timed out — event loop still has pending work.
-                    // Continue looping (and re-check nav_pending at the top).
+                Err(_woke) => {
+                    // A frame/nav/readiness notify woke us (not full idle);
+                    // re-check the exits at the top and re-drive.
                     continue;
                 }
             }
@@ -390,9 +386,57 @@ impl BrowserEventLoop {
         outcome
     }
 
+    /// Drive until the event loop is idle without imposing a deadline.
+    ///
+    /// This is crate-private so public callers cannot accidentally hang forever
+    /// on perpetual intervals, telemetry loops, or long polling.
+    pub(crate) async fn run_until_idle_unbounded(
+        &mut self,
+    ) -> Result<IdleReason, deno_core::error::AnyError> {
+        self.run_until_inner(false).await
+    }
+
+    /// Drive until fully idle or until `timeout` expires.
+    ///
+    /// The core remains completely waker-driven; the deadline is enforced only
+    /// at this API boundary. This preserves the pre-overhaul public API.
+    pub async fn run_until_idle(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<IdleReason, deno_core::error::AnyError> {
+        match tokio::time::timeout(timeout, self.run_until_idle_unbounded()).await {
+            Ok(result) => result,
+            Err(_) => Ok(IdleReason::Timeout),
+        }
+    }
+
+    /// Drive until the page has settled without imposing a deadline.
+    pub(crate) async fn run_until_settled_unbounded(
+        &mut self,
+    ) -> Result<IdleReason, deno_core::error::AnyError> {
+        self.run_until_inner(true).await
+    }
+
+    /// Drive until the page has settled (load fired + DOM stopped mutating),
+    /// leaving background timers/rAF/network pending, or until `timeout` expires.
+    pub async fn run_until_settled(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<IdleReason, deno_core::error::AnyError> {
+        match tokio::time::timeout(timeout, self.run_until_settled_unbounded()).await {
+            Ok(result) => result,
+            Err(_) => Ok(IdleReason::Timeout),
+        }
+    }
+
     /// Execute a script in the runtime.
     pub fn execute_script(&mut self, code: &str) -> Result<String, deno_core::error::AnyError> {
         self.runtime.execute_script(code, None)
+    }
+
+    /// Flush the microtask queue. See [`BrowserJsRuntime::drain_microtasks`].
+    pub fn drain_microtasks(&mut self) {
+        self.runtime.drain_microtasks();
     }
 
     /// Execute a script in the runtime with a given source name.
@@ -433,6 +477,30 @@ impl BrowserEventLoop {
     /// Get the underlying runtime.
     pub fn runtime(&self) -> &BrowserJsRuntime {
         &self.runtime
+    }
+
+    /// Poll this frame's event loop once for the unified frame-tree driver.
+    pub fn poll_once(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), deno_core::error::AnyError>> {
+        self.runtime.poll_once(cx)
+    }
+
+    /// Deliver queued cross-frame messages into this frame (cached-fn call).
+    pub fn deliver_frame_messages(&mut self) {
+        self.runtime.deliver_frame_messages();
+    }
+
+    /// `--inspect-brk`: block until a CDP frontend attaches, then pause at the
+    /// next statement. No-op unless the inspector is running. Debug-only.
+    pub fn inspector_break_on_next_statement(&mut self) {
+        self.runtime.inspector_break_on_next_statement();
+    }
+
+    /// This frame's queue of `<iframe src>` insertions awaiting materialization.
+    pub fn iframe_signal(&mut self) -> crate::js_runtime::extensions::frame_ext::IframeSignal {
+        self.runtime.iframe_signal()
     }
 
     /// Reset the runtime's pending-navigation signal. Called by callers
@@ -484,6 +552,9 @@ mod tests {
     use super::*;
 
     fn create_loop() -> BrowserEventLoop {
+        // Readiness is thread-local and tests share a thread (--test-threads=1),
+        // so clear any load/counter state left by a previous test.
+        crate::js_runtime::readiness::reset();
         let dom = crate::html_parser::parse_html(
             "<html><head></head><body><div id=\"output\"></div></body></html>",
         );
@@ -536,20 +607,106 @@ mod tests {
         assert_eq!(result, "promise resolved");
     }
 
+    // Readiness model: a page is settled once load has fired with no in-flight
+    // fetch and no refed (short) render timer; background work stays pending.
+
     #[tokio::test]
-    #[ignore = "regression: run_until_idle returns AllWorkDone instead of Timeout when a far-future setTimeout is pending — see fix.md"]
-    async fn timeout_respected() {
+    async fn settles_despite_running_short_interval() {
         let mut evloop = create_loop();
-        // Schedule a timer that takes longer than our timeout
+        // A short setInterval is refed (pins run_event_loop forever) but is
+        // background work: run_until_settled must return once load fires.
         evloop
-            .execute_script("setTimeout(() => {}, 10000);")
+            .execute_script(
+                r#"
+                setInterval(() => {}, 1000);
+                setTimeout(() => { globalThis[Symbol.for('__browser_oxide_mark_load__')](); }, 0);
+            "#,
+            )
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let reason = evloop
+            .run_until_settled(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(reason, IdleReason::Settled);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a background interval must not pin the settle drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn settles_despite_perpetual_short_timer() {
+        let mut evloop = create_loop();
+        // A self-rescheduling short timer (React's scheduler, telemetry) runs
+        // forever; it must NOT block settle. Settle fires once load fires.
+        evloop
+            .execute_script(
+                r#"
+                (function spin(){ setTimeout(spin, 50); })();
+                setTimeout(() => { globalThis[Symbol.for('__browser_oxide_mark_load__')](); }, 0);
+            "#,
+            )
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let reason = evloop
+            .run_until_settled(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(reason, IdleReason::Settled);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a perpetual short timer must not pin the settle drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn settles_after_render_burst() {
+        let mut evloop = create_loop();
+        // A microtask-burst render (React's initial mount): every node goes in
+        // during one turn. Settle must capture the whole burst, never half-done.
+        evloop
+            .execute_script(
+                r#"
+                setTimeout(() => { globalThis[Symbol.for('__browser_oxide_mark_load__')](); }, 0);
+                Promise.resolve().then(() => {
+                    const out = document.querySelector('#output');
+                    for (let i = 0; i < 5; i++) out.appendChild(document.createElement('div'));
+                });
+            "#,
+            )
             .unwrap();
 
         let reason = evloop
-            .run_until_idle(Duration::from_millis(200))
+            .run_until_settled(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let count = evloop
+            .execute_script("String(document.querySelectorAll('#output div').length)")
+            .unwrap();
+        assert_eq!(count, "5", "settled before the render burst completed");
+        assert!(matches!(
+            reason,
+            IdleReason::Settled | IdleReason::AllWorkDone
+        ));
+    }
+
+    #[tokio::test]
+    async fn caller_timeout_bounds_a_never_settling_page() {
+        let mut evloop = create_loop();
+        // load never fires and a refed timer keeps the loop busy, so the page
+        // never settles; the public API must return its bounded Timeout result.
+        evloop.execute_script("setInterval(() => {}, 50);").unwrap();
+
+        let start = std::time::Instant::now();
+        let reason = evloop
+            .run_until_settled(Duration::from_millis(400))
             .await
             .unwrap();
         assert_eq!(reason, IdleReason::Timeout);
+        assert!(start.elapsed() >= Duration::from_millis(400));
     }
 
     #[tokio::test]
@@ -579,11 +736,14 @@ mod tests {
     #[tokio::test]
     async fn request_animation_frame() {
         let mut evloop = create_loop();
+        // rAF is a background timer, so it fires only while the loop is driven.
+        // A refed 100ms timer keeps run_until_idle alive past the rAF tick.
         evloop
             .execute_script(
                 r#"requestAnimationFrame((ts) => {
                     document.querySelector('#output').textContent = 'raf:' + (typeof ts);
-                });"#,
+                });
+                setTimeout(() => {}, 100);"#,
             )
             .unwrap();
 

@@ -6098,7 +6098,7 @@ async fn message_channel_paired_routing() {
     for _ in 0..10 {
         let _ = page
             .event_loop()
-            .run_until_idle(std::time::Duration::from_millis(10))
+            .run_until_idle(std::time::Duration::from_millis(25))
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -6145,7 +6145,7 @@ async fn message_channel_queue_then_start() {
     for _ in 0..10 {
         let _ = page
             .event_loop()
-            .run_until_idle(std::time::Duration::from_millis(10))
+            .run_until_idle(std::time::Duration::from_millis(25))
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }

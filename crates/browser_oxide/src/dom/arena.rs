@@ -343,14 +343,26 @@ impl Dom {
 
     // --- Phase 2: Methods for JS integration ---
 
-    /// Set text content: remove all children, add a single text node.
+    /// Set text content. A Text/Comment node mutates its own value (React's
+    /// `commitTextUpdate` sets `nodeValue`); an element replaces its children.
     pub fn set_text_content(&mut self, id: NodeId, text: &str) {
-        // Remove all children
+        if let Some(node) = self.get_mut(id) {
+            match &mut node.data {
+                NodeData::Text(s) => {
+                    *s = text.to_string();
+                    return;
+                }
+                NodeData::Comment(s) => {
+                    *s = text.to_string();
+                    return;
+                }
+                _ => {}
+            }
+        }
         let children: Vec<NodeId> = self.children(id);
         for child in children {
             self.remove(child);
         }
-        // Add text node
         if !text.is_empty() {
             let text_id = self.create_text(text.to_string());
             self.append_child(id, text_id);
@@ -392,6 +404,25 @@ impl Dom {
             },
             &mut results,
         );
+        results
+    }
+
+    /// The `<script>`/`<link>`/`<iframe>` descendants of `root` (and `root`
+    /// itself), in document order — the only tags that need insertion handling.
+    pub fn collect_insert_targets(&self, root: NodeId) -> Vec<NodeId> {
+        let is_target = |node: &Node| {
+            node.as_element().is_some_and(|e| {
+                let t = &e.name.local;
+                t.eq_ignore_ascii_case("script")
+                    || t.eq_ignore_ascii_case("link")
+                    || t.eq_ignore_ascii_case("iframe")
+            })
+        };
+        let mut results = Vec::new();
+        if self.get(root).is_some_and(is_target) {
+            results.push(root);
+        }
+        self.collect_elements(root, &is_target, &mut results);
         results
     }
 
@@ -836,6 +867,18 @@ mod tests {
         dom.set_text_content(div, "new text");
         assert_eq!(dom.text_content(div), "new text");
         assert_eq!(dom.child_elements(div).len(), 0); // span removed
+    }
+
+    #[test]
+    fn set_text_content_on_text_node() {
+        // React's commitTextUpdate does `textNode.nodeValue = …`; the Text node's
+        // OWN value must change (not get an invalid text-node child appended).
+        let mut dom = Dom::new();
+        let text = dom.create_text("old".to_string());
+        dom.append_child(NodeId::DOCUMENT, text);
+        dom.set_text_content(text, "updated");
+        assert_eq!(dom.text_content(text), "updated");
+        assert!(dom.children(text).is_empty());
     }
 
     #[test]

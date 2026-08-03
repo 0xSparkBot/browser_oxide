@@ -340,6 +340,10 @@ pub async fn op_fetch(
     // must send fetch-style headers (not navigation headers) here.
     let method_upper = method.to_uppercase();
 
+    // Tracked as an in-flight request for readiness; placed after the CSP/blocker
+    // early returns so blocked fetches don't hold readiness open.
+    let _net = crate::js_runtime::readiness::RequestGuard::new();
+
     // Apply a 30-second hard timeout so hanging connections (e.g. a server
     // that black-holes requests it dislikes) don't hold the V8 event loop
     // open indefinitely.
@@ -491,7 +495,20 @@ pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> St
             return String::new();
         }
     }
+    fetch_sync_core(url, referer)
+}
 
+/// Sync fetch for iframe documents and their same-origin resources. Skips the
+/// parent's `script-src` CSP: a child frame is a separate origin with its own CSP.
+#[op2]
+#[string]
+pub fn op_net_fetch_frame_sync(#[string] url: String, #[string] referer: String) -> String {
+    fetch_sync_core(url, referer)
+}
+
+/// Shared body of the sync fetch ops. CSP, if any, is applied by the calling
+/// op before this runs, not here.
+fn fetch_sync_core(url: String, referer: String) -> String {
     // Resource blocker — return empty body for ad/tracker URLs without
     // doing any HTTP work. Tracker JS that loads via <script src=…>
     // (gtm.js, gpt.js, doubleclick) is the dominant time sink on
@@ -586,22 +603,9 @@ pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> St
             )
             .await
             {
-                Ok(Ok(resp)) => {
-                    let body = resp.text();
-                    if body.is_empty() {
-                        eprintln!(
-                            "[op_net_fetch_sync] empty body for {} (status={})",
-                            url_clone, resp.status
-                        );
-                    } else if url_clone.ends_with(".js") && body.len() > 10000 {
-                        let filename = format!("/tmp/fetched_script_{}.js", body.len());
-                        let _ = std::fs::write(&filename, &body);
-                        eprintln!("[op_net_fetch_sync] saved script to {}", filename);
-                    }
-                    body
-                }
+                Ok(Ok(resp)) => resp.text(),
                 Ok(Err(e)) => {
-                    eprintln!("[op_net_fetch_sync] FAILED fetch {}: {}", url_clone, e);
+                    tracing::debug!(url = %url_clone, error = %e, "sync fetch failed");
                     String::new()
                 }
                 Err(_) => {
@@ -614,11 +618,6 @@ pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> St
     .join()
     .unwrap_or_default();
 
-    eprintln!(
-        "[op_net_fetch_sync] fetched {} bytes from {}",
-        result.len(),
-        url
-    );
     result
 }
 
@@ -784,6 +783,7 @@ deno_core::extension!(
         op_cookie_set,
         op_cookie_set_sync,
         op_net_fetch_sync,
+        op_net_fetch_frame_sync,
         op_net_xhr_sync,
         op_drain_csp_violations
     ],

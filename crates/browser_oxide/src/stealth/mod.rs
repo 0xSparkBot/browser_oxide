@@ -16,3 +16,16 @@ pub use config::{ConfigError, ConfigFormat};
 pub use gpu::GpuProfile;
 pub use presets::*;
 pub use profile::{DeviceClass, StealthProfile};
+
+/// Human-timing pause for behavioral stealth (tab-switch dwell, post-challenge
+/// jitter, per-point mouse + per-keystroke input pacing). A no-op unless the
+/// `slowdowns` feature is enabled, so the default build spends zero time here
+/// and runs at full speed. The duration is consumed in both builds so call
+/// sites keep their computed values "used" under `-D warnings`.
+#[cfg(feature = "slowdowns")]
+pub(crate) async fn stealth_delay(dur: std::time::Duration) {
+    tokio::time::sleep(dur).await;
+}
+
+#[cfg(not(feature = "slowdowns"))]
+pub(crate) async fn stealth_delay(_dur: std::time::Duration) {}

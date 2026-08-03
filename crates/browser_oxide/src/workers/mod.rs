@@ -113,14 +113,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn create_worker() {
+    #[tokio::test]
+    async fn create_worker() {
         let worker = WebWorker::new("const x = 42;");
         assert!(worker.is_ok());
     }
 
-    #[test]
-    fn worker_post_message() {
+    #[tokio::test]
+    async fn worker_post_message() {
         let mut worker = WebWorker::new(
             r#"
             onmessage = function(e) {
@@ -136,8 +136,8 @@ mod tests {
         assert_eq!(messages[0], json!(42));
     }
 
-    #[test]
-    fn worker_no_dom() {
+    #[tokio::test]
+    async fn worker_no_dom() {
         let mut worker = WebWorker::new(
             r#"
             postMessage(typeof document);
@@ -150,8 +150,8 @@ mod tests {
         assert!(!messages.is_empty());
     }
 
-    #[test]
-    fn worker_has_console() {
+    #[tokio::test]
+    async fn worker_has_console() {
         let worker = WebWorker::new(
             r#"
             console.log("worker log");
@@ -160,8 +160,8 @@ mod tests {
         assert!(worker.is_ok());
     }
 
-    #[test]
-    fn worker_has_timers() {
+    #[tokio::test]
+    async fn worker_has_timers() {
         // Verify timer functions exist (don't actually call setTimeout
         // which requires async event loop)
         let mut worker = WebWorker::new(
@@ -174,16 +174,16 @@ mod tests {
         assert_eq!(messages[0], json!("function"));
     }
 
-    #[test]
-    fn worker_terminate() {
+    #[tokio::test]
+    async fn worker_terminate() {
         let mut worker = WebWorker::new("").unwrap();
         assert!(!worker.is_terminated());
         worker.terminate();
         assert!(worker.is_terminated());
     }
 
-    #[test]
-    fn worker_multiple_messages() {
+    #[tokio::test]
+    async fn worker_multiple_messages() {
         let mut worker = WebWorker::new(
             r#"
             onmessage = function(e) {

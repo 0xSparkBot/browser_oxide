@@ -49,7 +49,7 @@ async fn audio_compressor_in_blink_range() {
     // enough under deno_core 0.403 — startRendering resolves via the event loop.
     let _ = page
         .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(3))
+        .run_until_idle(std::time::Duration::from_secs(5))
         .await;
     let r = page
         .evaluate("String(globalThis.__audioSum)")

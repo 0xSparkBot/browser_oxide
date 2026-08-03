@@ -238,54 +238,45 @@
         ops.op_worker_self_post(payload);
     };
 
-    // --- close: terminate this worker ---
+    // --- close: stop this worker's message pump ---
     // Terminating a worker from inside is rare; the parent handles cleanup.
-    // We DO stop the message-pump interval here so a self-closed worker stops
-    // holding `pending_intervals > 0` forever (06_ENGINE_CORRECTNESS #8) — a
-    // closed DedicatedWorkerGlobalScope must not keep a live 5 ms poll.
-    let _pumpId = 0;
+    let _closed = false;
     self.close = function () {
-        if (_pumpId) {
-            try { clearInterval(_pumpId); } catch (_e) {}
-            _pumpId = 0;
-        }
-        // parent.terminate() still drives real shutdown via AtomicBool.
+        _closed = true;
+        // parent.terminate() drives real shutdown via the terminate flag +
+        // notify_worker, which resolves the awaited recv and ends the pump.
     };
 
-    // --- Poll loop: drain parent→worker messages and fire message events ---
-    function drainOnce() {
-        while (true) {
-            const s = ops.op_worker_self_recv();
-            if (!s) break;
-            let payload;
-            try {
-                payload = JSON.parse(s);
-            } catch (e) {
-                continue;
-            }
-            const deserializer =
-                _browser_oxide && _browser_oxide.deserializeFromWire;
-            const data = deserializer
-                ? deserializer(payload && payload.data)
-                : payload && payload.data;
-            const event = {
-                type: "message",
-                data,
-                origin: "",
-                lastEventId: "",
-                source: null,
-                ports: [],
-                timeStamp: Date.now(),
-            };
-            // Use Event constructor from interfaces_bootstrap
-            const ev = new MessageEvent("message", { data });
-            self.dispatchEvent(ev);
+    function _dispatchWorkerMessage(s) {
+        let payload;
+        try {
+            payload = JSON.parse(s);
+        } catch (_e) {
+            return;
         }
+        const deserializer =
+            _browser_oxide && _browser_oxide.deserializeFromWire;
+        const data = deserializer
+            ? deserializer(payload && payload.data)
+            : payload && payload.data;
+        self.dispatchEvent(new MessageEvent("message", { data }));
     }
-    // Prime the pump every 5ms. In a later pass this can be driven by the
-    // event loop directly instead of setInterval. Capture the id so
-    // self.close() can clear it (see above).
-    _pumpId = setInterval(drainOnce, 5);
+
+    // --- Pump: event-driven parent→worker message delivery ---
+    // Parks on the worker's Notify via `op_worker_self_await_message`, which
+    // resolves with "" once the worker is terminated to end the loop.
+    (async function _workerPump() {
+        while (!_closed) {
+            let s;
+            try {
+                s = await ops.op_worker_self_await_message();
+            } catch (_e) {
+                break;
+            }
+            if (!s) break; // "" ⇒ terminated
+            _dispatchWorkerMessage(s);
+        }
+    })();
 
     // --- importScripts: classic-worker synchronous script loader ---
     self.importScripts = function importScripts(...urls) {
@@ -346,5 +337,53 @@
                 return _mediaTypes.has(base);
             }
         };
+    }
+
+    // crypto.subtle for Workers (digest only, rest are stubs)
+    if (!globalThis.crypto || !globalThis.crypto.subtle) {
+        const _toBytes = (src) => {
+            if (src == null) return new Uint8Array(0);
+            if (src instanceof Uint8Array) return src;
+            if (src instanceof ArrayBuffer) return new Uint8Array(src);
+            if (ArrayBuffer.isView(src)) return new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+            return new Uint8Array(src);
+        };
+        const _subtleStub = (name) => function() {
+            return Promise.reject(new DOMException(name + " not implemented", "NotSupportedError"));
+        };
+        const subtle = {
+            digest: function(algorithm, data) {
+                try {
+                    const algName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name) || "";
+                    const bytes = _toBytes(data);
+                    const out = ops.op_crypto_digest(String(algName), bytes);
+                    return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+                } catch (e) {
+                    return Promise.reject(e);
+                }
+            },
+        };
+        for (const m of ['sign','verify','encrypt','decrypt','generateKey','importKey','exportKey','deriveKey','deriveBits','wrapKey','unwrapKey']) {
+            subtle[m] = _subtleStub(m);
+        }
+        if (!globalThis.crypto) {
+            globalThis.crypto = {
+                subtle: subtle,
+                getRandomValues: function(arr) {
+                    ops.op_crypto_random_fill(arr);
+                    return arr;
+                },
+                randomUUID: function() {
+                    const b = new Uint8Array(16);
+                    ops.op_crypto_random_fill(b);
+                    b[6] = (b[6] & 0x0f) | 0x40;
+                    b[8] = (b[8] & 0x3f) | 0x80;
+                    const h = Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+                    return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
+                }
+            };
+        } else {
+            globalThis.crypto.subtle = subtle;
+        }
     }
 })(globalThis);

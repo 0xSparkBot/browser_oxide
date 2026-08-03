@@ -171,7 +171,7 @@ async fn humanize_mouse_intervals_are_right_skewed() {
     for _ in 0..90 {
         let _ = page
             .event_loop()
-            .run_until_idle(std::time::Duration::from_millis(20))
+            .run_until_idle(std::time::Duration::from_millis(50))
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     }

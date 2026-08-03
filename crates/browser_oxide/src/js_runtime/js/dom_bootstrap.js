@@ -4,6 +4,11 @@
     const _nodeIds = new WeakMap();
     const _nodeCache = new Map();
     const _scrollState = new Map(); // nodeId -> {top, left}
+    // Per-node type/tag cached in WeakMaps (not on the node) so
+    // `Object.getOwnPropertyNames(el)` stays [] like real Chrome.
+    const _nodeTypes = new WeakMap();
+    const _tagNames = new WeakMap();
+    const _localNames = new WeakMap();
 
     function _getNodeId(node) {
         if (node === null || node === undefined) return -1;
@@ -53,6 +58,7 @@
             case 11: node = new DocumentFragment(nodeId); break;
             default: node = new Node(nodeId); break;
         }
+        _nodeTypes.set(node, nodeType);
         _nodeCache.set(nodeId, new WeakRef(node));
         return node;
     }
@@ -83,6 +89,18 @@
     let _onNodeInsertedDepth = 0;
     const _MAX_NODE_INSERT_DEPTH = 64;
 
+    // Frame-tree routing handle when the frame tree is active and the frame is
+    // materialized, else the same-isolate child realm.
+    function _frameWindowFor(el) {
+        try {
+            if (globalThis.__frameId !== undefined && globalThis.__frameIdForNode && globalThis.__frameHandleFor) {
+                const _f = globalThis.__frameIdForNode[_getNodeId(el)];
+                if (_f !== undefined) return globalThis.__frameHandleFor(_f);
+            }
+        } catch (_) {}
+        return _getIframeWindow(el);
+    }
+
     function _onNodeInserted(child, sync = true) {
         if (!child) return;
         if (_onNodeInsertedDepth >= _MAX_NODE_INSERT_DEPTH) {
@@ -94,7 +112,11 @@
         }
         _onNodeInsertedDepth++;
         try {
-            return _onNodeInsertedInner(child, sync);
+            const targets = ops.op_dom_collect_insert_targets(_getNodeId(child));
+            for (let i = 0; i < targets.length; i++) {
+                const el = _wrapNode(targets[i]);
+                if (el) _handleInsertedElement(el, sync);
+            }
         } finally {
             _onNodeInsertedDepth--;
         }
@@ -139,7 +161,7 @@
         _maskFunction(DOMRect, 'DOMRect');
     }
 
-    function _onNodeInsertedInner(child, sync = true) {
+    function _handleInsertedElement(child, sync = true) {
         // 1. Dynamic script loading
         const childTag = (child.tagName || child.nodeName || "").toLowerCase();
         const type = (child.getAttribute?.('type') || '').toLowerCase();
@@ -154,9 +176,14 @@
         if (childTag === 'script' && !childSrc) {
             const code = child.textContent || child.innerText || '';
             if (code && code.trim()) {
-                console.log(`[DOM] executing inline script (${code.length} bytes)`);
-                try { (0, eval)(code); } catch (e) {
-                    console.log(`[DOM] inline eval error: ${e.message}`);
+                if (_currentMatRealmId !== null) {
+                    // Inserted by a child realm's code — run it in that realm.
+                    try { ops.op_eval_in_child_realm(_currentMatRealmId, code); } catch (_) {}
+                } else {
+                    console.log(`[DOM] executing inline script (${code.length} bytes)`);
+                    try { (0, eval)(code); } catch (e) {
+                        console.log(`[DOM] inline eval error: ${e.message}`);
+                    }
                 }
             }
         }
@@ -164,6 +191,33 @@
         if (childTag === 'script' && childSrc) {
             const src = childSrc;
             const scriptEl = child;
+
+            // Script inserted by a child realm's code: resolve its relative src
+            // against the frame's origin and run it in that realm.
+            if (_currentMatRealmId !== null) {
+                const _rid = _currentMatRealmId;
+                let _cbase = _realmBaseUrl.get(_rid) || (globalThis.location ? globalThis.location.href : 'about:blank');
+                let _cUrl = src;
+                if (!src.startsWith('http') && !src.startsWith('data:')) {
+                    try { _cUrl = new URL(src, _cbase).href; } catch (_) {}
+                }
+                try {
+                    const _ccode = ops.op_net_fetch_frame_sync(_cUrl, _cbase);
+                    if (_ccode) {
+                        try { ops.op_eval_in_child_realm(_rid, _ccode); } catch (_) {}
+                        if (scriptEl.onload) scriptEl.onload(new Event('load'));
+                        scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
+                    } else {
+                        if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
+                        scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
+                    }
+                } catch (_) {
+                    if (scriptEl.onerror) scriptEl.onerror(new Event('error'));
+                    scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('error'));
+                }
+                return;
+            }
+
             let fullUrl = src;
             if (!src.startsWith('http') && !src.startsWith('data:')) {
                 try {
@@ -229,7 +283,13 @@
                 _syncEvalDepth++;
                 console.log(`[DOM] sync fetching script (depth ${_syncEvalDepth}): ${fullUrl}`);
                 try {
-                    const code = ops.op_net_fetch_sync(fullUrl, globalThis.location?.href || "");
+                    // A child frame's scripts belong to the frame's origin (its
+                    // own CSP), so use the fetch that skips the top's script-src.
+                    const _isChildFrame = globalThis.__frameId !== undefined
+                        && globalThis.__frameId !== globalThis.__topFrameId;
+                    const code = _isChildFrame
+                        ? ops.op_net_fetch_frame_sync(fullUrl, globalThis.location?.href || "")
+                        : ops.op_net_fetch_sync(fullUrl, globalThis.location?.href || "");
                     if (code) {
                         console.log(`[DOM] sync executing script (${code.length} bytes): ${fullUrl}`);
                         try {
@@ -287,10 +347,50 @@
             }
         }
 
-        // 2. Recursive check for children (handles <div><script>...</script></div>)
-        if (child.childNodes && child.childNodes.length > 0) {
-            for (let i = 0; i < child.childNodes.length; i++) {
-                _onNodeInserted(child.childNodes[i], sync);
+        // Fire `load` on an injected stylesheet/preload <link>: CSS chunk loaders
+        // wait on it or hang. Deferred to a microtask to match async loading.
+        if (childTag === 'link') {
+            let _rel = '';
+            try { _rel = String((child.getAttribute && child.getAttribute('rel')) || child.rel || '').toLowerCase(); } catch (_) {}
+            let _lhref = '';
+            try { _lhref = (child.getAttribute && child.getAttribute('href')) || child.href || ''; } catch (_) {}
+            if (_lhref && (_rel.indexOf('stylesheet') >= 0 || _rel.indexOf('preload') >= 0 || _rel.indexOf('prefetch') >= 0 || _rel.indexOf('modulepreload') >= 0)) {
+                queueMicrotask(() => {
+                    try {
+                        if (typeof child.onload === 'function') child.onload(new Event('load'));
+                        child.dispatchEvent && child.dispatchEvent(new Event('load'));
+                    } catch (_) {}
+                });
+            }
+        }
+
+        // Auto-load <iframe src>: build the child realm so it can postMessage back.
+        // Deferred to a task so it runs after the inserting script sets up listeners.
+        if (childTag === 'iframe') {
+            let isrc = '';
+            try { isrc = (child.getAttribute && child.getAttribute('src')) || child.src || ''; } catch (_) {}
+            // Record the realm inserting this iframe (null = top page) so its
+            // parent-postMessage routing chains correctly once materialized.
+            try { if (child.__oxParentRealm === undefined) child.__oxParentRealm = _currentMatRealmId; } catch (_) {}
+            if (isrc && isrc !== 'about:blank' && !/^javascript:/i.test(isrc) && !/^data:/i.test(isrc)) {
+                // Frame-tree path: materialize this as a real child context.
+                // Resolve the src against this frame's location for correct origin.
+                try {
+                    const _abs = new URL(isrc, (globalThis.location && globalThis.location.href) || 'about:blank').href;
+                    let _nm = '';
+                    try { _nm = (child.getAttribute && child.getAttribute('name')) || child.name || ''; } catch (_) {}
+                    const _fid = ops.op_frame_pending(_getNodeId(child), _abs, _nm);
+                    // Register the pre-assigned id so `contentWindow` routes to
+                    // this frame right away (no child-realm fall-through).
+                    if (globalThis.__frameId !== undefined && _fid) {
+                        globalThis.__oxRegisterChildFrame(_getNodeId(child), _fid);
+                    }
+                } catch (_) {}
+                // Same-isolate child-realm materialization only when the frame
+                // tree is off; in frame-tree mode the engine does it.
+                if (globalThis.__frameId === undefined) {
+                    setTimeout(() => { try { void child.contentWindow; } catch (_) {} }, 0);
+                }
             }
         }
     }
@@ -298,14 +398,20 @@
     globalThis.__onNodeInserted = _onNodeInserted;
 
     class NodeList {
-        constructor(data, isTyped = false) {
-            if (isTyped) {
+        constructor(data, mode = 0) {
+            if (mode === 1) {
+                // interleaved [id, type, id, type, ...]
                 this._ids = [];
                 for (let i = 0; i < data.length; i += 2) {
                     const id = data[i];
-                    const type = data[i+1];
                     this._ids.push(id);
-                    this[i/2] = _wrapNodeWithType(id, type);
+                    this[i/2] = _wrapNodeWithType(id, data[i+1]);
+                }
+            } else if (mode === 2) {
+                // all elements (type 1); pass the type to skip a node_type op each
+                this._ids = data;
+                for (let i = 0; i < data.length; i++) {
+                    this[i] = _wrapNodeWithType(data[i], 1);
                 }
             } else {
                 this._ids = data;
@@ -439,10 +545,13 @@
         static ATTRIBUTE_NODE = 2;
         static CDATA_SECTION_NODE = 4;
 
-        get nodeType() { return ops.op_dom_get_node_type(_getNodeId(this)); }
+        get nodeType() {
+            const t = _nodeTypes.get(this);
+            return t !== undefined ? t : ops.op_dom_get_node_type(_getNodeId(this));
+        }
         get nodeName() {
             const type = this.nodeType;
-            if (type === 1) return ops.op_dom_get_tag_name(_getNodeId(this)).toUpperCase();
+            if (type === 1) return this.tagName;
             if (type === 3) return "#text";
             if (type === 8) return "#comment";
             if (type === 9) return "#document";
@@ -456,19 +565,12 @@
         }
         set nodeValue(val) {
             const type = this.nodeType;
-            if (type === 3 || type === 8) ops.op_dom_set_text_content(_getNodeId(this), String(val));
+            if (type === 3 || type === 8) _setCharacterData(this, val);
         }
         get ownerDocument() {
             return this.nodeType === 9 ? null : _document;
         }
-        get isConnected() {
-            let n = this;
-            while (n) {
-                if (n.nodeType === 9) return true;
-                n = n.parentNode;
-            }
-            return false;
-        }
+        get isConnected() { return ops.op_dom_is_connected(_getNodeId(this)); }
         get baseURI() {
             return globalThis.location?.href || "about:blank";
         }
@@ -477,13 +579,19 @@
             const p = this.parentNode;
             return p && p.nodeType === 1 ? p : null;
         }
-        get childNodes() { return new NodeList(ops.op_dom_get_children_with_types(_getNodeId(this)), true); }
+        get childNodes() { return new NodeList(ops.op_dom_get_children_with_types(_getNodeId(this)), 1); }
         get firstChild() { return _wrapNode(ops.op_dom_get_first_child(_getNodeId(this))); }
         get lastChild() { return _wrapNode(ops.op_dom_get_last_child(_getNodeId(this))); }
         get nextSibling() { return _wrapNode(ops.op_dom_get_next_sibling(_getNodeId(this))); }
         get previousSibling() { return _wrapNode(ops.op_dom_get_prev_sibling(_getNodeId(this))); }
         get textContent() { return ops.op_dom_get_text_content(_getNodeId(this)); }
-        set textContent(val) { ops.op_dom_set_text_content(_getNodeId(this), String(val)); }
+        set textContent(val) {
+            if (_moObservers.length > 0) {
+                const t = this.nodeType;
+                if (t === 3 || t === 8) { _setCharacterData(this, val); return; }
+            }
+            ops.op_dom_set_text_content(_getNodeId(this), String(val));
+        }
         appendChild(child) {
             ops.op_dom_append_child(_getNodeId(this), _getNodeId(child));
             _onNodeInserted(child);
@@ -515,14 +623,10 @@
             return _wrapNode(newId);
         }
         contains(other) {
-            if (!other) return false;
-            if (other === this) return true;
-            let p = other.parentNode;
-            while (p) {
-                if (p === this) return true;
-                p = p.parentNode;
-            }
-            return false;
+            if (!other || typeof other !== "object") return false;
+            const oid = _getNodeId(other);
+            if (oid === null || oid === undefined || oid < 0) return false;
+            return ops.op_dom_contains(_getNodeId(this), oid);
         }
         hasChildNodes() { return ops.op_dom_get_children(_getNodeId(this)).length > 0; }
         getRootNode() {
@@ -640,8 +744,14 @@
     }
 
     class Element extends Node {
-        get tagName() { return ops.op_dom_get_tag_name(_getNodeId(this)).toUpperCase(); }
-        get localName() { return ops.op_dom_get_tag_name(_getNodeId(this)); }
+        get tagName() {
+            const t = _tagNames.get(this);
+            return t !== undefined ? t : ops.op_dom_get_tag_name(_getNodeId(this)).toUpperCase();
+        }
+        get localName() {
+            const t = _localNames.get(this);
+            return t !== undefined ? t : ops.op_dom_get_tag_name(_getNodeId(this));
+        }
         get id() { return ops.op_dom_get_attribute(_getNodeId(this), "id") || ""; }
         set id(val) { ops.op_dom_set_attribute(_getNodeId(this), "id", String(val)); }
         get className() { return ops.op_dom_get_attribute(_getNodeId(this), "class") || ""; }
@@ -687,16 +797,10 @@
         set innerHTML(val) { ops.op_dom_set_inner_html(_getNodeId(this), String(val)); }
         get outerHTML() { return ops.op_dom_get_outer_html(_getNodeId(this)); }
         get children() {
-            return new NodeList(ops.op_dom_get_child_elements_with_types(_getNodeId(this)), true);
+            return new NodeList(ops.op_dom_get_child_elements_with_types(_getNodeId(this)), 1);
         }
-        get firstElementChild() {
-            const els = ops.op_dom_get_child_elements(_getNodeId(this));
-            return els.length > 0 ? _wrapNode(els[0]) : null;
-        }
-        get lastElementChild() {
-            const els = ops.op_dom_get_child_elements(_getNodeId(this));
-            return els.length > 0 ? _wrapNode(els[els.length - 1]) : null;
-        }
+        get firstElementChild() { return _wrapNode(ops.op_dom_get_first_element_child(_getNodeId(this))); }
+        get lastElementChild() { return _wrapNode(ops.op_dom_get_last_element_child(_getNodeId(this))); }
         getAttribute(name) { return ops.op_dom_get_attribute(_getNodeId(this), name); }
         setAttribute(name, value) { ops.op_dom_set_attribute(_getNodeId(this), name, String(value)); }
         removeAttribute(name) { ops.op_dom_remove_attribute(_getNodeId(this), name); }
@@ -706,28 +810,18 @@
             return id !== null ? _wrapNode(id) : null;
         }
         querySelectorAll(sel) {
-            return new NodeList(ops.op_dom_query_selector_all(_getNodeId(this), sel));
+            return new NodeList(ops.op_dom_query_selector_all(_getNodeId(this), sel), 2);
         }
-        matches(sel) {
-            const all = ops.op_dom_query_selector_all(
-                ops.op_dom_get_parent(_getNodeId(this)) || ops.op_dom_document_node(),
-                sel
-            );
-            return all.includes(_getNodeId(this));
-        }
+        matches(sel) { return ops.op_dom_matches(_getNodeId(this), String(sel)); }
         closest(sel) {
-            let el = this;
-            while (el) {
-                if (el.matches && el.matches(sel)) return el;
-                el = el.parentElement;
-            }
-            return null;
+            const id = ops.op_dom_closest(_getNodeId(this), String(sel));
+            return id !== -1 ? _wrapNode(id) : null;
         }
         getElementsByTagName(tag) {
-            return new NodeList(ops.op_dom_get_elements_by_tag_name(_getNodeId(this), tag));
+            return new NodeList(ops.op_dom_get_elements_by_tag_name(_getNodeId(this), tag), 2);
         }
         getElementsByClassName(cls) {
-            return new NodeList(ops.op_dom_get_elements_by_class_name(_getNodeId(this), cls));
+            return new NodeList(ops.op_dom_get_elements_by_class_name(_getNodeId(this), cls), 2);
         }
         // Layout APIs (wired to taffy via layout_ext ops)
         getBoundingClientRect() {
@@ -993,25 +1087,9 @@
                 }
             });
         }
-        get nextElementSibling() {
-            let n = this.nextSibling;
-            while (n) {
-                if (n.nodeType === 1) return n;
-                n = n.nextSibling;
-            }
-            return null;
-        }
-        get previousElementSibling() {
-            let n = this.previousSibling;
-            while (n) {
-                if (n.nodeType === 1) return n;
-                n = n.previousSibling;
-            }
-            return null;
-        }
-        get childElementCount() {
-            return ops.op_dom_get_child_elements(_getNodeId(this)).length;
-        }
+        get nextElementSibling() { return _wrapNode(ops.op_dom_get_next_element_sibling(_getNodeId(this))); }
+        get previousElementSibling() { return _wrapNode(ops.op_dom_get_prev_element_sibling(_getNodeId(this))); }
+        get childElementCount() { return ops.op_dom_get_child_element_count(_getNodeId(this)); }
         // element.style — CSSStyleDeclaration proxy
         get style() {
             if (!this._style) this._style = _createStyleProxy(_getNodeId(this));
@@ -1271,6 +1349,10 @@
     class HTMLStyleElement extends HTMLElement {}
     class HTMLLinkElement extends HTMLElement {}
     class HTMLMetaElement extends HTMLElement {}
+    _reflectStr(HTMLMetaElement.prototype, 'name');
+    _reflectStr(HTMLMetaElement.prototype, 'content');
+    _reflectStr(HTMLMetaElement.prototype, 'httpEquiv', 'http-equiv');
+    _reflectStr(HTMLMetaElement.prototype, 'media');
     class HTMLTableElement extends HTMLElement {}
     class HTMLIFrameElement extends HTMLElement {}
     class HTMLVideoElement extends HTMLElement {}
@@ -1286,6 +1368,89 @@
     class HTMLTableSectionElement extends HTMLElement {}
     class HTMLLabelElement extends HTMLElement {}
     class HTMLOptionElement extends HTMLElement {}
+    Object.defineProperty(HTMLOptionElement.prototype, 'value', {
+        get() { return this.hasAttribute('value') ? this.getAttribute('value') : (this.textContent || '').trim(); },
+        set(v) { this.setAttribute('value', String(v)); },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLOptionElement.prototype, 'selected', {
+        get() { return this.hasAttribute('selected'); },
+        set(v) { if (v) this.setAttribute('selected', ''); else this.removeAttribute('selected'); },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLOptionElement.prototype, 'text', {
+        get() { return (this.textContent || '').trim(); },
+        set(v) { this.textContent = String(v); },
+        enumerable: true, configurable: true,
+    });
+    _reflectBool(HTMLOptionElement.prototype, 'defaultSelected', 'selected');
+    _reflectBool(HTMLOptionElement.prototype, 'disabled');
+    _reflectStr(HTMLOptionElement.prototype, 'label');
+
+    // HTMLSelectElement.options — live HTMLOptionsCollection of the <option>s.
+    // Code reading `select.options.length` throws without it.
+    Object.defineProperty(HTMLSelectElement.prototype, 'options', {
+        get() {
+            const opts = this.querySelectorAll('option');
+            const len = opts.length;
+            const ctor = globalThis.HTMLOptionsCollection;
+            const wrap = ctor && ctor.prototype ? Object.create(ctor.prototype) : Object.create(null);
+            for (let i = 0; i < len; i++) {
+                Object.defineProperty(wrap, i, {
+                    value: opts[i], writable: false, configurable: true, enumerable: true,
+                });
+            }
+            Object.defineProperty(wrap, 'length', {
+                value: len, writable: false, configurable: true, enumerable: false,
+            });
+            Object.defineProperty(wrap, 'item', {
+                value: function item(i) { i = Math.trunc(+i); return i >= 0 && i < len ? wrap[i] : null; },
+                writable: true, configurable: true, enumerable: false,
+            });
+            Object.defineProperty(wrap, 'namedItem', {
+                value: function namedItem(n) {
+                    for (let i = 0; i < len; i++) { const o = opts[i]; if (o.id === n || o.name === n) return o; }
+                    return null;
+                },
+                writable: true, configurable: true, enumerable: false,
+            });
+            Object.defineProperty(wrap, Symbol.iterator, {
+                value: function* () { for (let i = 0; i < len; i++) yield wrap[i]; },
+                writable: true, configurable: true, enumerable: false,
+            });
+            return wrap;
+        },
+        configurable: true, enumerable: true,
+    });
+    Object.defineProperty(HTMLSelectElement.prototype, 'selectedOptions', {
+        get() { const o = this.options; const r = []; for (let i = 0; i < o.length; i++) if (o[i].selected) r.push(o[i]); return r; },
+        configurable: true, enumerable: true,
+    });
+    Object.defineProperty(HTMLSelectElement.prototype, 'selectedIndex', {
+        get() { const o = this.options; for (let i = 0; i < o.length; i++) if (o[i].selected) return i; return -1; },
+        set(v) { const o = this.options; v = Math.trunc(+v); for (let i = 0; i < o.length; i++) o[i].selected = (i === v); },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLSelectElement.prototype, 'value', {
+        get() { const o = this.options; for (let i = 0; i < o.length; i++) if (o[i].selected) return o[i].value; return ''; },
+        set(v) {
+            const o = this.options; v = String(v);
+            for (let i = 0; i < o.length; i++) o[i].selected = (o[i].value === v);
+        },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLSelectElement.prototype, 'length', {
+        get() { return this.options.length; },
+        configurable: true, enumerable: true,
+    });
+    Object.defineProperty(HTMLSelectElement.prototype, 'type', {
+        get() { return this.multiple ? 'select-multiple' : 'select-one'; },
+        configurable: true, enumerable: true,
+    });
+    _reflectBool(HTMLSelectElement.prototype, 'multiple');
+    _reflectBool(HTMLSelectElement.prototype, 'disabled');
+    _reflectBool(HTMLSelectElement.prototype, 'required');
+    _reflectStr(HTMLSelectElement.prototype, 'name');
     class HTMLTemplateElement extends HTMLElement {}
     class HTMLPreElement extends HTMLElement {}
     class HTMLQuoteElement extends HTMLElement {}
@@ -1343,6 +1508,8 @@
     function _retargetElementProto(el) {
         try {
             const tag = ops.op_dom_get_tag_name(_getNodeId(el)).toLowerCase();
+            _localNames.set(el, tag);
+            _tagNames.set(el, tag.toUpperCase());
             const proto = _tagToProto[tag] || HTMLElement.prototype;
             Object.setPrototypeOf(el, proto);
         } catch {}
@@ -1350,14 +1517,14 @@
 
     class Text extends Node {
         get data() { return ops.op_dom_get_text_content(_getNodeId(this)); }
-        set data(val) { ops.op_dom_set_text_content(_getNodeId(this), String(val)); }
+        set data(val) { _setCharacterData(this, val); }
         get length() { return this.data.length; }
         get wholeText() { return this.data; }
     }
 
     class Comment extends Node {
         get data() { return ops.op_dom_get_text_content(_getNodeId(this)); }
-        set data(val) { ops.op_dom_set_text_content(_getNodeId(this), String(val)); }
+        set data(val) { _setCharacterData(this, val); }
     }
 
     class DocumentFragment extends Node {}
@@ -1438,17 +1605,17 @@
             return nodeId !== null ? _wrapNode(nodeId) : null;
         }
         getElementsByTagName(tag) {
-            return new NodeList(ops.op_dom_get_elements_by_tag_name(ops.op_dom_document_node(), tag));
+            return new NodeList(ops.op_dom_get_elements_by_tag_name(ops.op_dom_document_node(), tag), 2);
         }
         getElementsByClassName(cls) {
-            return new NodeList(ops.op_dom_get_elements_by_class_name(ops.op_dom_document_node(), cls));
+            return new NodeList(ops.op_dom_get_elements_by_class_name(ops.op_dom_document_node(), cls), 2);
         }
         querySelector(sel) {
             const id = ops.op_dom_query_selector(ops.op_dom_document_node(), sel);
             return id !== null ? _wrapNode(id) : null;
         }
         querySelectorAll(sel) {
-            return new NodeList(ops.op_dom_query_selector_all(ops.op_dom_document_node(), sel));
+            return new NodeList(ops.op_dom_query_selector_all(ops.op_dom_document_node(), sel), 2);
         }
         createElement(tag) {
             const el = _wrapNode(ops.op_dom_create_element(tag));
@@ -1569,7 +1736,7 @@
         get domain() { return globalThis.location?.hostname || ""; }
         get location() { return globalThis.location; }
         set location(val) { if (globalThis.location) globalThis.location.href = val; }
-        get referrer() { return ""; }
+        get referrer() { return globalThis.__frameReferrer || ""; }
         get hidden() { return false; }
         get visibilityState() { return "visible"; }
         get cookie() {
@@ -1839,6 +2006,39 @@
         // so leave the inherited offset-based getters in place for those.
     }
 
+    // GlobalEventHandlers on* IDL attributes. The WHATWG mixin lives on Window,
+    // Document, and HTMLElement; frameworks feature-detect them via `'on*' in document`.
+    const _globalEventHandlerNames = [
+        "onabort", "onauxclick", "onbeforeinput", "onbeforetoggle", "onblur",
+        "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick",
+        "onclose", "oncontextmenu", "oncopy", "oncuechange", "oncut", "ondblclick",
+        "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover",
+        "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended",
+        "onerror", "onfocus", "onformdata", "oninput", "oninvalid", "onkeydown",
+        "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata",
+        "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove",
+        "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpaste",
+        "onpause", "onplay", "onplaying", "onpointercancel", "onpointerdown",
+        "onpointerenter", "onpointerleave", "onpointermove", "onpointerout",
+        "onpointerover", "onpointerrawupdate", "onpointerup", "onprogress",
+        "onratechange", "onreset", "onresize", "onscroll", "onscrollend",
+        "onsecuritypolicyviolation", "onseeked", "onseeking", "onselect",
+        "onselectionchange", "onselectstart", "onslotchange", "onstalled",
+        "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "ontransitioncancel",
+        "ontransitionend", "ontransitionrun", "ontransitionstart", "onvolumechange",
+        "onwaiting", "onwebkitanimationend", "onwebkitanimationiteration",
+        "onwebkitanimationstart", "onwebkittransitionend", "onwheel",
+    ];
+    for (const _gehProto of [HTMLElement.prototype, Document.prototype]) {
+        for (const _geh of _globalEventHandlerNames) {
+            if (!Object.getOwnPropertyDescriptor(_gehProto, _geh)) {
+                Object.defineProperty(_gehProto, _geh, {
+                    value: null, writable: true, configurable: true, enumerable: true,
+                });
+            }
+        }
+    }
+
     globalThis.document = _document;
     globalThis.Document = Document;
     globalThis.HTMLDocument = Document;
@@ -1965,9 +2165,10 @@
         _notify(record) {
             if (!this._active) return;
             this._records.push(record);
-            // Schedule microtask to deliver
+            // queueMicrotask, not Promise.resolve(): a page Promise polyfill may
+            // itself be built on MutationObserver, which would deadlock delivery.
             if (this._records.length === 1) {
-                Promise.resolve().then(() => {
+                queueMicrotask(() => {
                     if (!this._active) return;
                     const batch = this._records.slice();
                     this._records = [];
@@ -2010,7 +2211,31 @@
             if (init.addedNodes) record.addedNodes = init.addedNodes;
             if (init.removedNodes) record.removedNodes = init.removedNodes;
             if (init.attributeName) record.attributeName = init.attributeName;
+            if ("oldValue" in init) record.oldValue = init.oldValue;
             obs._notify(record);
+        }
+    }
+
+    // Text mutations must emit a characterData record: some Promise polyfills
+    // use a MutationObserver on a text node as their microtask scheduler.
+    function _anyObserverWantsCDOldValue() {
+        for (const obs of _moObservers) {
+            if (!obs._active) continue;
+            for (const { options } of obs._targets.values()) {
+                if (options.characterData && options.characterDataOldValue) return true;
+            }
+        }
+        return false;
+    }
+    function _setCharacterData(node, val) {
+        const id = _getNodeId(node);
+        let old = null;
+        if (_moObservers.length > 0 && _anyObserverWantsCDOldValue()) {
+            old = ops.op_dom_get_text_content(id);
+        }
+        ops.op_dom_set_text_content(id, String(val));
+        if (_moObservers.length > 0) {
+            _notifyMO("characterData", id, { target: node, oldValue: old });
         }
     }
 
@@ -2046,7 +2271,7 @@
                 try { globalThis.__ifAppendCount = (_appendedIframes.length); } catch (_) {}
                 // Define lazy getter for window[N] — contentWindow is created on demand
                 Object.defineProperty(globalThis, String(_fi), {
-                    get: function() { return _getIframeWindow(_appendedIframes[_fi]); },
+                    get: function() { return _frameWindowFor(_appendedIframes[_fi]); },
                     configurable: true, enumerable: false,
                 });
                 // Update window.length (= number of child frames)
@@ -2083,7 +2308,7 @@
                 _appendedIframes.push(newChild);
                 try { globalThis.__ifAppendCount = (_appendedIframes.length); } catch (_) {}
                 Object.defineProperty(globalThis, String(_fi), {
-                    get: function() { return _getIframeWindow(_appendedIframes[_fi]); },
+                    get: function() { return _frameWindowFor(_appendedIframes[_fi]); },
                     configurable: true, enumerable: false,
                 });
                 try {
@@ -2388,6 +2613,19 @@
     // cache key in IframeRealmStore (HashMap<u32, ...>).
     let _nextRealmId = 0;
 
+    // Cap nested iframe materialization depth and skip a URL already in the
+    // current chain so a frame cycle can't recurse into a stack overflow.
+    let _ifMatDepth = 0;
+    const _IF_MAT_MAX = 6;
+    const _ifMatInProgress = new Set();
+
+    // Realm id whose frame scripts are currently running (`null` = top page), so
+    // an iframe they insert is tagged with its true parent realm for postMessage routing.
+    let _currentMatRealmId = null;
+    // realm id -> the frame's document URL, so a script that frame inserts
+    // resolves its relative src against the frame's own origin.
+    const _realmBaseUrl = new Map();
+
     // Frame registry: window[0], window[1], ... and window.length.
     // Some scripts access child iframes via window[N]
     // (frames[N]), NOT via iframe.contentWindow. Real Chrome updates
@@ -2461,34 +2699,21 @@
     function _getIframeWindow(el) {
         let state = _iframeState.get(el);
         if (state) {
-            // Cross-origin transition: a script creates an iframe with no src, accesses
-            // contentWindow (creates child realm), then sets src to a cross-origin URL and re-accesses.
-            // When src changes to cross-origin, invalidate the cached realm and return a
-            // SecurityError proxy — exactly what real Chrome does.
+            // Rebuild the realm only when the src actually changed, not on every
+            // access, so a cross-origin frame's running app isn't wiped.
             try {
                 const _cSrc = (el && typeof el.getAttribute === "function")
                     ? (el.getAttribute("src") || el.src || "")
                     : (el && el.src || "");
-                if (_cSrc && _cSrc !== "about:blank" && !/^javascript:/i.test(_cSrc) && _cSrc !== "") {
-                    const _pOrig = _xOrigin((globalThis.location && globalThis.location.href) || "");
-                    const _sOrig = _xOrigin(_cSrc);
-                    if (_sOrig !== _pOrig) {
-                        const _xM = 'Blocked a frame with origin "' + _pOrig + '" from accessing a cross-origin frame.';
-                        const _xo2 = new Proxy({}, {
-                            get(t, p) { if (typeof p === 'symbol') return undefined; throw new DOMException(_xM, 'SecurityError'); },
-                            set() { throw new DOMException(_xM, 'SecurityError'); },
-                            has() { return false; },
-                        });
-                        const _xoS2 = { contentWindow: _xo2, contentDocument: null, _realmId: undefined, _processedSrcdoc: '' };
-                        _iframeState.set(el, _xoS2);
-                        return _xo2;
-                    }
+                if (state._src !== undefined && _cSrc !== state._src) {
+                    _iframeState.delete(el);
+                    state = undefined;
                 }
             } catch (_) {}
             // Re-run srcdoc scripts if srcdoc was set after initial contentWindow access.
             // A script may set iframe.srcdoc = "..." before or after first contentWindow
             // access; in either case we must execute the scripts in the child realm.
-            if (state._realmId !== undefined) {
+            if (state && state._realmId !== undefined) {
                 let _cur = "";
                 try { _cur = el.getAttribute("srcdoc") || el.srcdoc || ""; } catch (_) {}
                 if (_cur && _cur !== state._processedSrcdoc) {
@@ -2505,38 +2730,8 @@
                     } catch (_) {}
                 }
             }
-            return state.contentWindow;
+            if (state) return state.contentWindow;
         }
-
-        // ── Cross-origin iframe detection ────────────────────
-        // Some scripts create an iframe with a different origin (e.g. a
-        // data: URI or cross-origin https URL) and expect a SecurityError
-        // when accessing contentWindow.document. Return a Proxy that throws
-        // SecurityError on any property read — matches real Chrome behaviour.
-        try {
-            const _iSrc = (el && typeof el.getAttribute === "function")
-                ? (el.getAttribute("src") || el.src || "")
-                : (el && el.src || "");
-            if (_iSrc && _iSrc !== "about:blank" && !/^javascript:/i.test(_iSrc) && _iSrc !== "") {
-                const _pOrigin = _xOrigin((globalThis.location && globalThis.location.href) || "");
-                const _srcOrigin = _xOrigin(_iSrc);
-                if (_srcOrigin !== _pOrigin) {
-                    const _xMsg = 'Blocked a frame with origin "' + _pOrigin + '" from accessing a cross-origin frame.';
-                    const _xo = new Proxy({}, {
-                        get(t, p) {
-                            if (typeof p === 'symbol') return undefined;
-                            throw new DOMException(_xMsg, 'SecurityError');
-                        },
-                        set() { throw new DOMException(_xMsg, 'SecurityError'); },
-                        has() { return false; },
-                    });
-                    const _xoState = { contentWindow: _xo, contentDocument: null, _realmId: undefined, _processedSrcdoc: '' };
-                    _iframeState.set(el, _xoState);
-                    _registerFrame(_xo, el);
-                    return _xo;
-                }
-            }
-        } catch (_) {}
 
         // ── Build the iframe document shell ──────────────────────────────
         // srcdoc iframes: expose the source text for
@@ -2568,9 +2763,23 @@
             appendChild(_c) {},
             removeChild(_c) {},
         });
-        const _docEl = _srcdoc ? _mkHtmlMirror("html", _srcdoc) : null;
-        const _body = _srcdoc ? _mkHtmlMirror("body", _srcdoc) : null;
-        const _head = _srcdoc ? _mkHtmlMirror("head", "") : null;
+        // Cross-origin `src` frames get a real, appendable body/head so a frame
+        // script inserting a nested iframe actually triggers its materialization.
+        let _docEl = null, _body = null, _head = null, _realDoc = false;
+        if (_srcdoc) {
+            _docEl = _mkHtmlMirror("html", _srcdoc);
+            _body = _mkHtmlMirror("body", _srcdoc);
+            _head = _mkHtmlMirror("head", "");
+        } else {
+            try {
+                _docEl = _document.createElement("html");
+                _head = _document.createElement("head");
+                _body = _document.createElement("body");
+                _docEl.appendChild(_head);
+                _docEl.appendChild(_body);
+                _realDoc = true;
+            } catch (_) { _docEl = null; _body = null; _head = null; }
+        }
         const iframeDoc = {
             documentElement: _docEl,
             head: _head,
@@ -2580,14 +2789,20 @@
             visibilityState: "visible",
             hidden: false,
             hasFocus() { return false; },
-            querySelector() { return null; },
-            querySelectorAll() { return new NodeList([]); },
-            getElementById() { return null; },
+            querySelector(s) { return _realDoc && _body ? _body.querySelector(s) : null; },
+            querySelectorAll(s) { return _realDoc && _body ? _body.querySelectorAll(s) : new NodeList([]); },
+            getElementById(id) { return _realDoc && _body ? _body.querySelector('[id="' + String(id).replace(/"/g, '\\"') + '"]') : null; },
             getElementsByTagName(tag) {
                 const t = String(tag).toLowerCase();
                 if (_srcdoc && t === "html" && _docEl) return new NodeList([_docEl]);
                 if (_srcdoc && t === "body" && _body) return new NodeList([_body]);
                 if (_srcdoc && t === "head" && _head) return new NodeList([_head]);
+                if (_realDoc && _body) {
+                    if (t === "html" && _docEl) return new NodeList([_docEl]);
+                    if (t === "body") return new NodeList([_body]);
+                    if (t === "head" && _head) return new NodeList([_head]);
+                    return _body.getElementsByTagName(tag);
+                }
                 return new NodeList([]);
             },
             createElement(tag) { return _document.createElement(tag); },
@@ -2671,10 +2886,13 @@
                 toString() { return "about:blank"; },
             });
 
-            // Parent / top / name
-            _sp("parent", globalThis);
-            _sp("top", globalThis);
-            _sp("name", "");
+            // window.name reflects the iframe's name attribute; frame controllers
+            // read it as a channel id, so an empty name breaks the handshake.
+            let _frameName = "";
+            try { _frameName = (el && el.getAttribute && el.getAttribute("name")) || (el && el.name) || ""; } catch (_) {}
+            // parent / top are installed as context-aware accessors below
+            // (op_install_frame_parent), after the postMessage proxies exist.
+            _sp("name", _frameName);
 
             // Screen mirror (some scripts read these from inside child realm)
             _sp("screen", _iframeScreen);
@@ -2690,7 +2908,7 @@
             _sp("pageXOffset", 0); _sp("pageYOffset", 0);
             // Window state properties some scripts expect to be present.
             _sp("closed", false);
-            _sp("name", "");
+            _sp("name", _frameName);
             _sp("status", "");
             _sp("defaultStatus", "");
             _sp("screenTop", globalThis.screenTop || 0);
@@ -2834,7 +3052,7 @@
                     + "Object.defineProperty(globalThis,'addEventListener',{value:_n(ael,'addEventListener'),writable:true,configurable:true});"
                     + "Object.defineProperty(globalThis,'removeEventListener',{value:_n(rel,'removeEventListener'),writable:true,configurable:true});"
                     + "Object.defineProperty(globalThis,'dispatchEvent',{value:_n(de,'dispatchEvent'),writable:true,configurable:true});"
-                    + "Object.defineProperty(globalThis,'__deliverMessage',{value:function(data,origin,source){Promise.resolve().then(function(){try{de(new MessageEvent('message',{data:data,origin:origin||'',source:source||null}));}catch(_){}});},configurable:true});})();"
+                    + "Object.defineProperty(globalThis,'__deliverMessage',{value:function(data,origin,source){try{de(new MessageEvent('message',{data:data,origin:origin||'',source:source||null}));}catch(_){}},configurable:true});})();"
                 );
             } catch (_) {}
 
@@ -2845,38 +3063,82 @@
             // to the framed doc as the delivered event's `source`, NOT as
             // `parent`, so the parent-identity invariant is preserved.
             const _parentOrigin = (globalThis.location && globalThis.location.origin) || "";
-            const _postToParent = function postMessage(msg, origin) {
-                Promise.resolve().then(() => {
-                    try {
-                        globalThis.dispatchEvent(new MessageEvent("message", {
-                            data: msg,
-                            origin: (origin && origin !== "*") ? String(origin) : _parentOrigin,
-                            source: cw,
-                        }));
-                    } catch (_) {}
-                });
-            };
-            let _msgSource = null;
+            // The received event.origin is the sender (frame) origin, not the
+            // targetOrigin arg — derive it from the src so origin checks pass.
+            let _frameOrigin = _parentOrigin;
             try {
-                _msgSource = new Proxy(globalThis, {
-                    get(t, p) { return (p === "postMessage") ? _postToParent : Reflect.get(t, p); },
-                });
-            } catch (_) { _msgSource = { postMessage: _postToParent }; }
+                const _fs = (el && el.getAttribute && el.getAttribute("src")) || (el && el.src) || "";
+                const _o = _fs ? _xOrigin(_fs) : "";
+                if (_o && _o !== "null") _frameOrigin = _o;
+            } catch (_) {}
+            // Capture the parent realm's own dispatch + constructor so a child's
+            // parent.postMessage() always lands the event on the parent window.
+            const _parentDispatch = globalThis.dispatchEvent.bind(globalThis);
+            const _ParentMsgEvent = globalThis.MessageEvent;
+            // This frame's immediate parent realm (`null` = top page), set when
+            // the parent's scripts inserted this iframe (see `_handleInsertedElement`).
+            const _parentRealmId = (el && typeof el.__oxParentRealm === "number") ? el.__oxParentRealm : null;
+            const _dispatchToTop = (msg) => {
+                try {
+                    _parentDispatch(new _ParentMsgEvent("message", {
+                        data: msg, origin: _frameOrigin, source: cw,
+                    }));
+                } catch (e) {
+                    if (globalThis.__browser_oxide_debug) console.error("postToTop", e);
+                }
+            };
+            // Deliver a `message` to a parent CHILD realm's listeners (the relay
+            // chain step: a nested frame's parent is another frame, not the top).
+            const _dispatchToRealm = (rid, msg) => {
+                try {
+                    const _dj = JSON.stringify(msg === undefined ? null : msg);
+                    const _oj = JSON.stringify(_frameOrigin);
+                    ops.op_eval_in_child_realm(rid,
+                        "try{globalThis.__deliverMessage((" + _dj + ")," + _oj + ",null);}catch(_){}");
+                } catch (e) {
+                    if (globalThis.__browser_oxide_debug) console.error("postToRealm", e);
+                }
+            };
+            // A task, not microtask: real postMessage is async, so it lands after
+            // the triggering code finishes. `parent` routes to the parent realm; `top` to top.
+            const _postToParent = function postMessage(msg, _targetOrigin) {
+                setTimeout(() => {
+                    if (_parentRealmId !== null) _dispatchToRealm(_parentRealmId, msg);
+                    else _dispatchToTop(msg);
+                }, 0);
+            };
+            const _postToTop = function postMessage(msg, _targetOrigin) {
+                setTimeout(() => { _dispatchToTop(msg); }, 0);
+            };
+            const _mkSource = (fn) => {
+                try {
+                    return new Proxy(globalThis, {
+                        get(t, p) { return (p === "postMessage") ? fn : Reflect.get(t, p); },
+                    });
+                } catch (_) { return { postMessage: fn }; }
+            };
+            const _msgSource = _mkSource(_postToParent);
+            const _topSource = (_parentRealmId !== null) ? _mkSource(_postToTop) : _msgSource;
             _sp("__msgSource", _msgSource);
+            // parent / top are context-aware accessors (installed in Rust): the
+            // parent realm sees the real window, the child realm sees the routing proxy.
+            ops.op_install_frame_parent(_realmId, globalThis, _msgSource, _topSource);
 
             // parent→child: cw.postMessage(...) (and the framed doc's own
             // window.postMessage) deliver a 'message' INTO the child realm. Data
             // crosses the realm boundary as a JSON literal; the event's source
             // is the reply-routing proxy above.
             const _pm = function postMessage(msg, origin) {
-                Promise.resolve().then(() => {
+                queueMicrotask(() => {
                     try {
                         const _dj = JSON.stringify(msg === undefined ? null : msg);
                         const _oj = JSON.stringify((origin && origin !== "*") ? String(origin) : _parentOrigin);
                         ops.op_eval_in_child_realm(_realmId,
                             "try{globalThis.__deliverMessage((" + _dj + ")," + _oj + ",(globalThis.__msgSource||null));}catch(_){}"
                         );
-                    } catch (_) {}
+                    } catch (e) {
+                        if (globalThis.__browser_oxide_debug) console.error("postMessage->child", e);
+                    }
                 });
             };
             _sp("postMessage", _pm);
@@ -3004,6 +3266,11 @@
                 );
             } catch (_) {}
 
+            // Mark this the current materializing realm so any iframe its scripts
+            // insert is tagged with this realm as parent. Restored after src exec.
+            const _prevMatRealm = _currentMatRealmId;
+            _currentMatRealmId = _realmId;
+
             // Execute srcdoc scripts in the child realm.
             // Some scripts inject content via srcdoc to
             // run code inside the iframe. A real browser executes those
@@ -3041,7 +3308,9 @@
                     catch (_) { _iSrcUrl2 = _rawSrc2; }
                 }
             } catch (_) {}
-            if (_iSrcUrl2) {
+            if (_iSrcUrl2) { try { _realmBaseUrl.set(_realmId, _iSrcUrl2); } catch (_) {} }
+            if (_iSrcUrl2 && _ifMatDepth < _IF_MAT_MAX && !_ifMatInProgress.has(_iSrcUrl2)) {
+                _ifMatDepth++; _ifMatInProgress.add(_iSrcUrl2);
                 try {
                     let _u2 = null;
                     try { _u2 = new URL(_iSrcUrl2); } catch (_) {}
@@ -3054,7 +3323,7 @@
                             toString() { return _u2.href; },
                         });
                     }
-                    const _docHtml = ops.op_net_fetch_sync(_iSrcUrl2, (globalThis.location && globalThis.location.href) || "");
+                    const _docHtml = ops.op_net_fetch_frame_sync(_iSrcUrl2, (globalThis.location && globalThis.location.href) || "");
                     if (_docHtml && typeof _docHtml === "string" && _docHtml.length < 5000000) {
                         const _tagRe = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
                         let _sm;
@@ -3070,7 +3339,7 @@
                                 let _eu = _srcM[1];
                                 try { _eu = new URL(_eu, _iSrcUrl2).href; } catch (_) {}
                                 try {
-                                    const _code = ops.op_net_fetch_sync(_eu, _iSrcUrl2);
+                                    const _code = ops.op_net_fetch_frame_sync(_eu, _iSrcUrl2);
                                     if (_code && typeof _code === "string") {
                                         try { ops.op_eval_in_child_realm(_realmId, _code); } catch (_) {}
                                     }
@@ -3080,10 +3349,12 @@
                             }
                         }
                     }
-                } catch (_) {}
+                } catch (_) {} finally { _ifMatInProgress.delete(_iSrcUrl2); _ifMatDepth--; }
             }
 
-            state = { contentWindow: cw, contentDocument: iframeDoc, _realmId: _realmId, _processedSrcdoc: _srcdoc };
+            _currentMatRealmId = _prevMatRealm;
+
+            state = { contentWindow: cw, contentDocument: iframeDoc, _realmId: _realmId, _processedSrcdoc: _srcdoc, _src: ((el && el.getAttribute && el.getAttribute("src")) || (el && el.src) || "") };
             _iframeState.set(el, state);
             _registerFrame(cw, el);
             return cw;
@@ -3163,7 +3434,7 @@
         iframeLocals.globalThis = iframeWindow;
         iframeLocals.frames = iframeWindow;
         iframeLocals.length = 0;
-        state = { contentWindow: iframeWindow, contentDocument: iframeDoc };
+        state = { contentWindow: iframeWindow, contentDocument: iframeDoc, _src: ((el && el.getAttribute && el.getAttribute("src")) || (el && el.src) || "") };
         _iframeState.set(el, state);
         _registerFrame(iframeWindow, el);
         return iframeWindow;
@@ -3175,8 +3446,96 @@
 
     // Install on HTMLIFrameElement.prototype — covers parsed AND created iframes.
     if (typeof HTMLIFrameElement !== 'undefined') {
+        // Frame-tree cross-frame postMessage: the engine's FrameManager drives
+        // __oxFrameSetup / __oxRegisterChildFrame / __pumpFrameMessages per frame.
+        globalThis.__frameIdForNode = globalThis.__frameIdForNode || {};
+        const _frameHandleCache = {};
+        function _frameHandle(fid) {
+            if (fid === undefined || fid === null) return null;
+            // Stable identity per frame id: pages compare `event.source ===
+            // iframe.contentWindow`, so both must resolve to the same object.
+            if (_frameHandleCache[fid]) return _frameHandleCache[fid];
+            const _h = {
+                __isFrameHandle: true,
+                __frameId: fid,
+                postMessage: function(msg, _targetOrigin, _transfer) {
+                    try {
+                        if (globalThis.__OX_FT_MSGDBG) {
+                            const _t = arguments[2] || (_targetOrigin && _targetOrigin.transfer);
+                            (globalThis.__OXPOSTS || (globalThis.__OXPOSTS = [])).push(
+                                "->" + fid + " transfer=" + (_t && _t.length ? _t.length : 0)
+                                + " keys=" + (msg && typeof msg === 'object' ? Object.keys(msg).slice(0, 4).join(',') : typeof msg));
+                        }
+                        const _s = (_browser_oxide && _browser_oxide.serializeForWire)
+                            ? _browser_oxide.serializeForWire(msg) : msg;
+                        // event.origin on the receiving side is the sender's origin
+                        // (spec), not the targetOrigin arg; frames check it.
+                        const _origin = (globalThis.location && globalThis.location.origin) || "";
+                        ops.op_frame_post_message(
+                            fid, globalThis.__frameId || 0,
+                            JSON.stringify(_s),
+                            _origin);
+                    } catch (_) {}
+                },
+                get closed() { return false; },
+                get length() { return 0; },
+            };
+            _frameHandleCache[fid] = _h;
+            return _h;
+        }
+        globalThis.__frameHandleFor = _frameHandle;
+        globalThis.__pumpFrameMessages = function() {
+            let arr;
+            try { arr = JSON.parse(ops.op_frame_take_messages(globalThis.__frameId || 0)); }
+            catch (_) { return; }
+            for (const m of arr) {
+                let data;
+                try {
+                    data = (_browser_oxide && _browser_oxide.deserializeFromWire)
+                        ? _browser_oxide.deserializeFromWire(m.d) : m.d;
+                } catch (_) { data = m.d; }
+                try {
+                    const ev = new MessageEvent("message", { data: data, origin: m.o || "", source: _frameHandle(m.s) });
+                    globalThis.dispatchEvent(ev);
+                    if (typeof globalThis.onmessage === "function") { try { globalThis.onmessage(ev); } catch (_) {} }
+                } catch (_) {}
+            }
+        };
+        globalThis.__oxFrameSetup = function(frameId, parentId, topId) {
+            globalThis.__frameId = frameId;
+            globalThis.__parentFrameId = parentId;
+            globalThis.__topFrameId = topId;
+            // window.parent / window.top are getters that read these overrides.
+            if (parentId !== frameId) globalThis.__frameParentOverride = _frameHandle(parentId);
+            if (topId !== frameId) globalThis.__frameTopOverride = _frameHandle(topId);
+        };
+        globalThis.__oxRegisterChildFrame = function(nodeId, childFrameId) {
+            globalThis.__frameIdForNode[nodeId] = childFrameId;
+        };
+
+        // Fire the host `<iframe>`'s `load` event once its child frame has
+        // materialized: pages gate cross-frame setup on `iframe.onload`.
+        globalThis.__oxFrameLoaded = function(nodeId) {
+            try {
+                const el = _wrapNode(nodeId);
+                if (!el) return;
+                const ev = new Event("load");
+                try { Object.defineProperty(ev, "target", { value: el, configurable: true }); } catch (_) {}
+                try { el.dispatchEvent(ev); } catch (_) {}
+                if (typeof el.onload === "function") { try { el.onload(ev); } catch (_) {} }
+            } catch (_) {}
+        };
+
         Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
             get: function() {
+                // Frame-tree mode: hand back a routing handle to the real child
+                // frame once materialized; else the same-isolate child realm.
+                try {
+                    if (globalThis.__frameId !== undefined && globalThis.__frameIdForNode) {
+                        const fid = globalThis.__frameIdForNode[_getNodeId(this)];
+                        if (fid !== undefined) return _frameHandle(fid);
+                    }
+                } catch (_) {}
                 return _getIframeWindow(this);
             },
             configurable: true,

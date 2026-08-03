@@ -1,11 +1,9 @@
-use crate::dom::Dom;
+use crate::dom::{Dom, NodeId};
 use crate::event_loop::{BrowserEventLoop, IdleReason};
 use crate::iframe;
 use crate::js_runtime::{runtime::BrowserRuntimeOptions, BrowserJsRuntime};
 use crate::script_runner;
 use crate::stylesheet_collector;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Whether a URL is a "secure context" per WICG/secure-contexts §3.2.
@@ -30,6 +28,79 @@ pub(crate) fn is_secure_url(url: &str) -> bool {
             None => false,
         },
         _ => false, // about:, data:, blob:, javascript:, etc. — insecure
+    }
+}
+
+/// Serialized origin of a URL (`https://host[:port]`), empty if unparseable
+/// or opaque. Used to build a frame's `location.ancestorOrigins` chain.
+fn origin_of(url: &str) -> String {
+    match url::Url::parse(url).map(|u| u.origin()) {
+        Ok(o) if o.is_tuple() => o.ascii_serialization(),
+        _ => String::new(),
+    }
+}
+
+/// `document.referrer` + `location.ancestorOrigins` for a frame. Cross-origin
+/// downgrades the referrer to the parent origin (default referrer policy).
+fn frame_embedding(parent_url: &str, child_url: &str) -> (String, Vec<String>) {
+    let parent_origin = origin_of(parent_url);
+    if parent_origin.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let referrer = if parent_origin == origin_of(child_url) {
+        parent_url.to_string()
+    } else {
+        format!("{parent_origin}/")
+    };
+    (referrer, vec![parent_origin])
+}
+
+#[cfg(test)]
+mod frame_embedding_tests {
+    use super::{frame_embedding, origin_of};
+
+    #[test]
+    fn origin_of_serializes_tuple_origins() {
+        assert_eq!(
+            origin_of("https://checkout.stripe.com/c/pay/cs_x#frag"),
+            "https://checkout.stripe.com"
+        );
+        // default port is omitted
+        assert_eq!(
+            origin_of("https://js.stripe.com:443/v3/x.js"),
+            "https://js.stripe.com"
+        );
+        assert_eq!(origin_of("http://host:8080/p"), "http://host:8080");
+        // opaque / unparseable → empty
+        assert_eq!(origin_of("about:blank"), "");
+        assert_eq!(origin_of("not a url"), "");
+    }
+
+    #[test]
+    fn embedding_same_origin_keeps_full_referrer() {
+        let (referrer, ancestors) = frame_embedding(
+            "https://checkout.stripe.com/c/pay/x",
+            "https://checkout.stripe.com/inner",
+        );
+        assert_eq!(referrer, "https://checkout.stripe.com/c/pay/x");
+        assert_eq!(ancestors, vec!["https://checkout.stripe.com".to_string()]);
+    }
+
+    #[test]
+    fn embedding_cross_origin_downgrades_referrer_to_origin() {
+        let (referrer, ancestors) = frame_embedding(
+            "https://checkout.stripe.com/c/pay/x",
+            "https://js.stripe.com/v3/inner",
+        );
+        assert_eq!(referrer, "https://checkout.stripe.com/");
+        assert_eq!(ancestors, vec!["https://checkout.stripe.com".to_string()]);
+    }
+
+    #[test]
+    fn embedding_opaque_parent_yields_nothing() {
+        let (referrer, ancestors) = frame_embedding("about:blank", "https://js.stripe.com/x");
+        assert_eq!(referrer, "");
+        assert!(ancestors.is_empty());
     }
 }
 
@@ -63,34 +134,26 @@ mod is_secure_url_tests {
 /// "Uncaught Error: execution terminated" exception — caller is
 /// responsible for catching that and bailing out of the iteration.
 struct V8DeadlineWatcher {
-    cancel: Arc<AtomicBool>,
+    cancel_tx: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl V8DeadlineWatcher {
     fn new(isolate: deno_core::v8::IsolateHandle, deadline: Duration) -> Self {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = cancel.clone();
+        let (cancel_tx, rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            // Poll the cancel flag at 100 ms granularity so drop is fast.
-            while start.elapsed() < deadline {
-                if cancel_clone.load(Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if !cancel_clone.load(Ordering::Relaxed) {
-                eprintln!(
-                    "[V8DeadlineWatcher] deadline {}ms expired — firing terminate_execution",
-                    deadline.as_millis()
+            // Blocking wait: wakes when Drop signals cancel (send or disconnect),
+            // or after `deadline` to preempt CPU-bound JS that never yields.
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(deadline) {
+                tracing::warn!(
+                    deadline_ms = deadline.as_millis() as u64,
+                    "V8 deadline expired — terminating execution"
                 );
-                let ok = isolate.terminate_execution();
-                eprintln!("[V8DeadlineWatcher] terminate_execution returned {}", ok);
+                isolate.terminate_execution();
             }
         });
         Self {
-            cancel,
+            cancel_tx: Some(cancel_tx),
             handle: Some(handle),
         }
     }
@@ -98,9 +161,10 @@ impl V8DeadlineWatcher {
 
 impl Drop for V8DeadlineWatcher {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        // Signal cancel, then join — the watcher wakes on the channel event so
+        // this returns at once.
+        drop(self.cancel_tx.take());
         if let Some(h) = self.handle.take() {
-            // Best-effort join — watcher polls every 100 ms so this returns fast.
             let _ = h.join();
         }
     }
@@ -281,6 +345,40 @@ fn is_awswaf_challenge(html: &str) -> bool {
     html.len() < 4096 && html.contains("AwsWafIntegration") && html.contains("gokuProps")
 }
 
+/// Process-wide override for the navigation timeout. Outer `None` = unset (use
+/// default); inner `Some(d)` bounds a nav at `d`, inner `None` disables it.
+static NAV_TIMEOUT_OVERRIDE: std::sync::RwLock<Option<Option<Duration>>> =
+    std::sync::RwLock::new(None);
+
+/// Set the process-wide navigation timeout. `Some(d)` aborts a runaway page
+/// after `d`; `None` disables the watchdog (unbounded). Defaults to 30 s.
+pub fn set_navigation_timeout(timeout: Option<Duration>) {
+    *NAV_TIMEOUT_OVERRIDE
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(timeout);
+}
+
+/// Effective navigation timeout after which the V8 watchdog aborts a runaway
+/// page. Resolves `BROWSER_OXIDE_NAV_TIMEOUT_MS` → override → 30 s default.
+pub(crate) fn navigation_timeout() -> Option<Duration> {
+    if let Ok(v) = std::env::var("BROWSER_OXIDE_NAV_TIMEOUT_MS") {
+        let v = v.trim();
+        if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        if let Ok(ms) = v.parse::<u64>() {
+            return Some(Duration::from_millis(ms));
+        }
+    }
+    if let Some(t) = *NAV_TIMEOUT_OVERRIDE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return t;
+    }
+    Some(Duration::from_secs(30))
+}
+
 /// Per-host navigate-budget overrides, sourced entirely from the environment.
 ///
 /// The baseline navigate budget is 15 s — most pages render their primary
@@ -443,8 +541,46 @@ async fn scrub_cookie_collision(url: &str, client: &crate::net::HttpClient) {
 /// let page = Page::from_html("<html><body><script>document.title = 'Hello'</script></body></html>", None::<crate::stealth::StealthProfile>).await?;
 /// assert_eq!(page.title(), "Hello");
 /// ```
+/// A materialized child frame — a real browser context (own isolate + DOM +
+/// event loop), plus where it sits in the tree.
+struct FrameNode {
+    /// Process-unique frame id (also its `__frameId` inside the isolate + key
+    /// into the cross-frame message registry).
+    id: u32,
+    /// Parent frame id (the top page's id for a direct child).
+    parent: u32,
+    /// The `<iframe>` node in the parent frame's DOM (dedup key with `parent`).
+    host_node: NodeId,
+    /// This frame's document URL — used to build a child frame's
+    /// `document.referrer` + `location.ancestorOrigins` embedding chain.
+    url: String,
+    iframe: iframe::ChildIframe,
+    /// Persistent waker for the driver, owned for the frame's whole life so a
+    /// completion firing between polls still sets its dirty bit (no lost wakeup).
+    waker: std::sync::Arc<crate::js_runtime::frame_waker::FrameWaker>,
+}
+
+/// Result of one `drive_tree_once` turn.
+enum DriveOutcome {
+    /// A frame inserted an `<iframe src>`; caller materializes it + re-drives.
+    NeedMaterialize,
+    /// Every frame's event loop is idle (no pending timers/ops/network).
+    AllIdle,
+    /// The page tree settled (render-quiescence) — the DOM stopped mutating,
+    /// while background timers/rAF/network are still pending.
+    Settled,
+    /// JS requested a navigation.
+    Nav,
+}
+
 pub struct Page {
-    // Children hold V8 isolates created after parent — must drop first
+    // Children (frame tree + cold-path children) hold V8 isolates created
+    // after the parent — must drop before `event_loop` (see Drop).
+    frame_tree: Vec<FrameNode>,
+    /// The top page's frame id (0 = not yet assigned). Its `__frameId`.
+    top_frame_id: u32,
+    /// Persistent waker for the top page in the unified driver (see FrameNode).
+    top_waker: std::sync::Arc<crate::js_runtime::frame_waker::FrameWaker>,
     children: Vec<iframe::ChildIframe>,
     event_loop: BrowserEventLoop,
     url: String,
@@ -456,6 +592,9 @@ pub struct Page {
     /// challenge loop). The list is only consulted inside the navigate
     /// iteration.
     solvers: std::sync::Arc<[std::sync::Arc<dyn crate::ChallengeSolver>]>,
+    /// Reused across navigations so the TLS connector and connection pool
+    /// (keep-alive) persist. Built lazily on the first warm navigation.
+    http_client: Option<crate::net::HttpClient>,
 }
 
 impl Drop for Page {
@@ -472,8 +611,16 @@ impl Drop for Page {
             let mut state = op_state.borrow_mut();
             crate::js_runtime::extensions::worker_ext::drain_owned_workers(&mut state);
         }
+        // Release cross-frame mailboxes so the global registry doesn't grow.
+        if self.top_frame_id != 0 {
+            crate::js_runtime::extensions::frame_ext::dispose_frame(self.top_frame_id);
+        }
+        for node in &self.frame_tree {
+            crate::js_runtime::extensions::frame_ext::dispose_frame(node.id);
+        }
         // Drop children (newer isolates) before parent (older isolate)
         // V8 requires reverse drop order
+        while self.frame_tree.pop().is_some() {}
         while self.children.pop().is_some() {}
     }
 }
@@ -497,9 +644,9 @@ impl Page {
         "#;
         self.event_loop.execute_script(code)?;
 
-        // Sleep for a random amount of time to simulate reading another tab (e.g., 2-5 seconds)
-        // For testing we keep it short, but in a real scraper this would be realistic.
-        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        // Simulate reading another tab before re-focusing. Human-timing only —
+        // gated behind `slowdowns` so the default build doesn't pause here.
+        crate::stealth::stealth_delay(std::time::Duration::from_millis(2500)).await;
 
         let code_focus = r#"
             (function() {
@@ -566,6 +713,7 @@ impl Page {
         url: &str,
         profile: crate::stealth::StealthProfile,
     ) -> Result<Self, deno_core::error::AnyError> {
+        crate::js_runtime::readiness::reset();
         let dom = crate::html_parser::parse_html(html);
         let scripts = script_runner::find_scripts(&dom);
         let stylesheet_entries = stylesheet_collector::find_stylesheets(&dom);
@@ -620,8 +768,12 @@ impl Page {
         Ok(Self {
             event_loop,
             url: url.to_string(),
+            frame_tree: Vec::new(),
+            top_frame_id: 0,
+            top_waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
             children: Vec::new(),
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
+            http_client: None,
         })
     }
 
@@ -680,6 +832,7 @@ impl Page {
         url: &str,
         profile: Option<crate::stealth::StealthProfile>,
     ) -> Result<Self, deno_core::error::AnyError> {
+        crate::js_runtime::readiness::reset();
         let dom = crate::html_parser::parse_html(html);
 
         // Install CSP from any meta-tags present in the HTML (this code
@@ -813,7 +966,10 @@ impl Page {
             .ok();
 
         event_loop
-            .execute_script("window.dispatchEvent(new Event('load'));")
+            .execute_script(
+                "window.dispatchEvent(new Event('load')); \
+                 try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}",
+            )
             .ok();
 
         // After load, readyState = complete
@@ -821,11 +977,8 @@ impl Page {
             .execute_script("globalThis._browser_oxide.__documentReadyState = 'complete';")
             .ok();
 
-        // Run event loop until idle, capped at 8s. Real Chrome treats a page
-        // as ready well before all background timers settle — analytics RUM
-        // beacons + setInterval polling otherwise prevent "idle" indefinitely.
-        // 8s comfortably covers a fast PoW (<1s), a turnstile-style
-        // widget (2-4s), and most JS-heavy first-paint flows.
+        // Synthetic builder: run all inline JS to full idle (callers of `from_html`
+        // expect every script to have run), not the render-quiescence early-out.
         event_loop.run_until_idle(Duration::from_secs(8)).await?;
 
         // Process <iframe srcdoc="..."> elements
@@ -879,8 +1032,12 @@ impl Page {
         Ok(Self {
             event_loop,
             url: url.to_string(),
+            frame_tree: Vec::new(),
+            top_frame_id: 0,
+            top_waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
             children,
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
+            http_client: None,
         })
     }
 
@@ -892,6 +1049,285 @@ impl Page {
     /// Get the number of child iframes.
     pub fn child_iframe_count(&self) -> usize {
         self.children.len()
+    }
+
+    /// Number of materialized frames in the frame tree (excludes the top page).
+    pub fn frame_tree_count(&self) -> usize {
+        self.frame_tree.len()
+    }
+
+    /// Evaluate JS inside a frame-tree frame (by index) — proves the frame is a
+    /// real executing context. Test/debug helper.
+    pub fn frame_tree_evaluate(&mut self, index: usize, js: &str) -> Option<String> {
+        self.frame_tree
+            .get_mut(index)
+            .map(|n| n.iframe.evaluate(js).unwrap_or_default())
+    }
+
+    /// Assign the top page a frame id and put it in frame-tree mode. Must run
+    /// before the top's scripts so they register child frames on insert. Idempotent.
+    pub fn init_top_frame(&mut self) {
+        if self.top_frame_id == 0 {
+            self.top_frame_id = crate::js_runtime::extensions::frame_ext::next_frame_id();
+            let t = self.top_frame_id;
+            let _ = self.event_loop.execute_script(&format!(
+                "globalThis.__oxFrameSetup && globalThis.__oxFrameSetup({t},{t},{t});"
+            ));
+        }
+    }
+
+    pub async fn drive_frame_tree(
+        &mut self,
+        client: &crate::net::HttpClient,
+        profile: &crate::stealth::StealthProfile,
+    ) {
+        self.init_top_frame();
+        // Bounded by the round cap (nested-frame depth) and, per drive, by the V8
+        // deadline watcher. Each pass materializes new frames, then drives to settle.
+        for _ in 0..64 {
+            self.materialize_pending_frames(client, profile).await;
+            match self.drive_tree_once().await {
+                DriveOutcome::NeedMaterialize => continue,
+                DriveOutcome::AllIdle | DriveOutcome::Nav | DriveOutcome::Settled => break,
+            }
+        }
+    }
+
+    /// Materialize every `<iframe src>` signalled by the top page or any frame,
+    /// recursively (a materialized frame's own scripts may signal more).
+    async fn materialize_pending_frames(
+        &mut self,
+        client: &crate::net::HttpClient,
+        profile: &crate::stealth::StealthProfile,
+    ) {
+        use crate::js_runtime::extensions::frame_ext::PendingFrame;
+        let top_id = self.top_frame_id;
+        let mut rounds = 0;
+        loop {
+            let mut pending: Vec<(u32, PendingFrame)> = Vec::new();
+            for pf in self.event_loop.iframe_signal().drain() {
+                pending.push((top_id, pf));
+            }
+            for node in self.frame_tree.iter_mut() {
+                let pid = node.id;
+                for pf in node.iframe.event_loop.iframe_signal().drain() {
+                    pending.push((pid, pf));
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            for (parent, pf) in pending {
+                let host = NodeId::from_raw(pf.host_node_id);
+                if self
+                    .frame_tree
+                    .iter()
+                    .any(|n| n.parent == parent && n.host_node == host)
+                {
+                    continue;
+                }
+                let cid = pf.frame_id;
+                let parent_url = if parent == top_id {
+                    self.url.clone()
+                } else {
+                    self.frame_tree
+                        .iter()
+                        .find(|n| n.id == parent)
+                        .map(|n| n.url.clone())
+                        .unwrap_or_default()
+                };
+                let parent_origin = origin_of(&parent_url);
+                let referrer = if !parent_origin.is_empty() && parent_origin == origin_of(&pf.src) {
+                    parent_url.clone()
+                } else if !parent_origin.is_empty() {
+                    format!("{parent_origin}/")
+                } else {
+                    String::new()
+                };
+                let mut ancestor_origins: Vec<String> = Vec::new();
+                let mut cur = parent;
+                for _ in 0..20 {
+                    if cur == top_id {
+                        let o = origin_of(&self.url);
+                        if !o.is_empty() {
+                            ancestor_origins.push(o);
+                        }
+                        break;
+                    }
+                    match self.frame_tree.iter().find(|n| n.id == cur) {
+                        Some(n) => {
+                            let o = origin_of(&n.url);
+                            if !o.is_empty() {
+                                ancestor_origins.push(o);
+                            }
+                            cur = n.parent;
+                        }
+                        None => break,
+                    }
+                }
+                match iframe::ChildIframe::from_url(
+                    host,
+                    &pf.src,
+                    client,
+                    Some(profile),
+                    Some((cid, parent, top_id)),
+                    &pf.name,
+                    &referrer,
+                    &ancestor_origins,
+                )
+                .await
+                {
+                    Ok(child) => {
+                        if std::env::var_os("BROWSER_OXIDE_FT_DEBUG").is_some() {
+                            eprintln!(
+                                "[FT] materialized cid={cid} parent={parent} src={}",
+                                &pf.src[..pf.src.len().min(55)]
+                            );
+                        }
+                        let reg = format!(
+                            "globalThis.__oxRegisterChildFrame && globalThis.__oxRegisterChildFrame({0},{cid}); globalThis.__oxFrameLoaded && globalThis.__oxFrameLoaded({0});",
+                            pf.host_node_id
+                        );
+                        if parent == top_id {
+                            let _ = self.event_loop.execute_script(&reg);
+                        } else if let Some(p) = self.frame_tree.iter_mut().find(|n| n.id == parent)
+                        {
+                            let _ = p.iframe.event_loop.execute_script(&reg);
+                        }
+                        self.frame_tree.push(FrameNode {
+                            id: cid,
+                            parent,
+                            host_node: host,
+                            url: pf.src.clone(),
+                            iframe: child,
+                            waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!(src = %pf.src, error = %e, "frame materialize failed")
+                    }
+                }
+            }
+            rounds += 1;
+            if rounds > 16 {
+                break;
+            }
+        }
+    }
+
+    /// One waker-driven drive turn over the top page + every frame: poll each
+    /// dirty isolate, deliver cross-frame messages, sleep only when all await.
+    async fn drive_tree_once(&mut self) -> DriveOutcome {
+        use crate::js_runtime::extensions::frame_ext::{
+            clear_frame_msg_pending, frame_has_messages,
+        };
+        use std::task::{Context, Poll};
+        const MAX_SWEEPS: usize = 64;
+        let top_id = self.top_frame_id;
+        let mut first_poll = true;
+        let mut ready: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+
+        let driver = std::future::poll_fn(|cx| {
+            // Point every frame's persistent waker at this driver task, so a
+            // later op/timer/network completion re-wakes us.
+            self.top_waker.register(cx.waker());
+            for node in &self.frame_tree {
+                node.waker.register(cx.waker());
+            }
+
+            for _sweep in 0..MAX_SWEEPS {
+                // Poll the top + each frame whose waker is dirty (first sweep
+                // polls all, so each isolate registers its waker).
+                if first_poll || self.top_waker.take_dirty() {
+                    let w = self.top_waker.waker();
+                    let mut fcx = Context::from_waker(&w);
+                    let r = self.event_loop.poll_once(&mut fcx);
+                    ready.insert(top_id, r.is_ready());
+                }
+                for node in self.frame_tree.iter_mut() {
+                    if first_poll || node.waker.take_dirty() {
+                        let w = node.waker.waker();
+                        let mut fcx = Context::from_waker(&w);
+                        let r = node.iframe.event_loop.poll_once(&mut fcx);
+                        ready.insert(node.id, r.is_ready());
+                    }
+                }
+                first_poll = false;
+
+                // Deliver queued cross-frame messages (cached-fn call) and mark
+                // the target dirty so its MessageEvent microtasks drain next sweep.
+                let mut delivered = false;
+                if frame_has_messages(top_id) {
+                    self.event_loop.deliver_frame_messages();
+                    self.top_waker.mark_dirty();
+                    delivered = true;
+                }
+                for node in self.frame_tree.iter_mut() {
+                    if frame_has_messages(node.id) {
+                        node.iframe.event_loop.deliver_frame_messages();
+                        node.waker.mark_dirty();
+                        delivered = true;
+                    }
+                }
+                clear_frame_msg_pending();
+
+                let more = delivered
+                    || self.top_waker.is_dirty()
+                    || self.frame_tree.iter().any(|n| n.waker.is_dirty());
+                if !more {
+                    break;
+                }
+            }
+
+            // Hit the sweep cap with work still outstanding? Yield + re-poll.
+            let outstanding = self.top_waker.is_dirty()
+                || self.frame_tree.iter().any(|n| n.waker.is_dirty())
+                || frame_has_messages(top_id)
+                || self.frame_tree.iter().any(|n| frame_has_messages(n.id));
+            if outstanding {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            // A frame inserted a new <iframe src>? Hand back to materialize it.
+            if self.event_loop.iframe_signal().has_pending()
+                || self
+                    .frame_tree
+                    .iter_mut()
+                    .any(|n| n.iframe.event_loop.iframe_signal().has_pending())
+            {
+                return Poll::Ready(DriveOutcome::NeedMaterialize);
+            }
+
+            if self.event_loop.runtime().nav_pending() {
+                return Poll::Ready(DriveOutcome::Nav);
+            }
+
+            // Every frame's last poll was Ready (no pending timers/ops/network):
+            // genuinely idle this turn.
+            let all_ready = ready.get(&top_id).copied().unwrap_or(false)
+                && self
+                    .frame_tree
+                    .iter()
+                    .all(|n| ready.get(&n.id).copied().unwrap_or(false));
+            if all_ready {
+                return Poll::Ready(DriveOutcome::AllIdle);
+            }
+
+            // Load fired and this sweep mutated no frame's DOM — the tree settled;
+            // pending background work (rAF, long timers, sockets) doesn't hold us.
+            if crate::js_runtime::readiness::settle_poll() {
+                return Poll::Ready(DriveOutcome::Settled);
+            }
+
+            // Some frame is waiting on a future timer/network; sleep until a
+            // frame waker fires (a rAF page re-polls only its own frame).
+            Poll::Pending
+        });
+
+        // Waker-driven: returns the instant the tree settles or a frame navigates.
+        // A tree that never settles is bounded by the V8 deadline watcher.
+        driver.await
     }
 
     /// FP-E1: post-JS DOM rescan — materialize **script-injected**
@@ -954,11 +1390,16 @@ impl Page {
                     continue; // blank/JS frames are handled at build time
                 }
                 if let Some(full_src) = Self::resolve_url(base_url, src) {
+                    let (referrer, ancestors) = frame_embedding(base_url, &full_src);
                     match iframe::ChildIframe::from_url(
                         info.node_id,
                         &full_src,
                         client,
                         Some(profile),
+                        None,
+                        "",
+                        &referrer,
+                        &ancestors,
                     )
                     .await
                     {
@@ -1559,6 +2000,7 @@ impl Page {
     ///   on `globalThis.fetch` / `document.cookie` / `XMLHttpRequest`.
     ///   These are the expensive bits we're reusing.
     pub fn reset_for_reuse(&mut self) {
+        crate::js_runtime::readiness::reset();
         let _ = self.event_loop.execute_script(
             r#"(function() {
                 const g = globalThis;
@@ -1611,6 +2053,25 @@ impl Page {
             let mut state = op_state.borrow_mut();
             crate::js_runtime::extensions::worker_ext::drain_owned_workers(&mut state);
         }
+        // Drain frame insertions queued by the outgoing document before its DOM
+        // is replaced. Otherwise stale `<iframe src>` requests can materialize
+        // into the next navigation.
+        let _ = self.event_loop.iframe_signal().drain();
+
+        // SilvR's unified frame tree owns additional V8 isolates and process-wide
+        // mailboxes beyond the legacy `children` vector. Release both sets on
+        // warm reuse, in reverse creation order, exactly as `Page::drop` does.
+        if self.top_frame_id != 0 {
+            crate::js_runtime::extensions::frame_ext::dispose_frame(self.top_frame_id);
+        }
+        for node in &self.frame_tree {
+            crate::js_runtime::extensions::frame_ext::dispose_frame(node.id);
+        }
+        while self.frame_tree.pop().is_some() {}
+        self.top_frame_id = 0;
+        self.top_waker = crate::js_runtime::frame_waker::FrameWaker::new_dirty();
+        crate::js_runtime::extensions::frame_ext::clear_frame_msg_pending();
+
         // Drop the previous document's iframe isolates. Children are newer
         // isolates than this Page's, so clearing here keeps V8's
         // reverse-creation-order drop requirement satisfied.
@@ -1663,8 +2124,14 @@ impl Page {
                     )
                 })?
         };
-        let client = crate::net::HttpClient::shared(&profile)
-            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
+        // Reuse the Page's client so the connection pool (keep-alive) survives
+        // across navs; the pool/caches are Arc-shared, so the clone shares them.
+        if self.http_client.is_none() {
+            let c = crate::net::HttpClient::shared(&profile)
+                .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
+            self.http_client = Some(c);
+        }
+        let client = self.http_client.as_ref().unwrap().clone();
         crate::js_runtime::extensions::fetch_ext::set_fetch_client(client.clone());
         // The warm/PagePool reuse path previously skipped the cross-domain
         // cookie-collision scrub the cold path runs, so a pooled Page could
@@ -1695,15 +2162,17 @@ impl Page {
         drop(resp);
         wmark!("fetch done");
 
+        // Parse once, reused for CSP collection and subresource discovery below.
+        let dom = crate::html_parser::parse_html(&html);
+
         // Install CSP for this navigation (same logic as the cold build).
         {
-            let csp_dom = crate::html_parser::parse_html(&html);
             let header_refs: Vec<&str> = csp_headers.iter().map(|s| s.as_str()).collect();
             let report_refs: Vec<&str> = csp_headers_ro.iter().map(|s| s.as_str()).collect();
             let policy_set = crate::csp_collector::collect_csp_with_report_only(
                 &header_refs,
                 &report_refs,
-                &csp_dom,
+                &dom,
             );
             let env_bypass = std::env::var("BROWSER_OXIDE_CSP_BYPASS").is_ok();
             let enforce = profile.enforce_csp && !env_bypass;
@@ -1723,10 +2192,6 @@ impl Page {
         }
         wmark!("CSP set");
 
-        // Parse + find subresources. Parsing the same DOM twice (once
-        // for CSP, once here) is cheap (~µs for typical pages) and keeps
-        // the CSP block lifted from the cold path without a refactor.
-        let dom = crate::html_parser::parse_html(&html);
         let scripts_meta = script_runner::find_scripts(&dom);
         let stylesheet_entries = stylesheet_collector::find_stylesheets(&dom);
 
@@ -1868,16 +2333,10 @@ impl Page {
         }
         wmark!("replace_dom");
 
-        // Build-phase deadline watcher — preempts CPU-bound inline-script
-        // spins on the warm isolate the same way the cold build does.
-        let build_budget_ms: u64 = std::env::var("BROWSER_OXIDE_BUILD_BUDGET_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(25_000);
-        let _build_watcher = V8DeadlineWatcher::new(
-            self.event_loop.runtime_mut().isolate_handle(),
-            Duration::from_millis(build_budget_ms),
-        );
+        // The navigation timeout's watchdog — preempts a runaway page (hot JS
+        // loop / perpetual DOM mutation). `None` leaves the page unbounded.
+        let _build_watcher = navigation_timeout()
+            .map(|d| V8DeadlineWatcher::new(self.event_loop.runtime_mut().isolate_handle(), d));
 
         // Seed `location` for this navigation. The `reset_nav_pending` now
         // scrubs the spurious `__pendingNavigation` the setter writes, so
@@ -1897,6 +2356,22 @@ impl Page {
                 Duration::from_millis(50),
             )
             .await;
+
+        if std::env::var_os("BROWSER_OXIDE_INSPECT_BRK").is_some() {
+            self.event_loop.inspector_break_on_next_statement();
+        }
+
+        // Put the top page in frame-tree mode before its scripts run so they
+        // register child frames on insert.
+        if std::env::var_os("BROWSER_OXIDE_FRAME_TREE").is_some() {
+            self.init_top_frame();
+        }
+
+        if let Ok(pf) = std::env::var("BROWSER_OXIDE_PROBE_FILE") {
+            if let Ok(probe) = std::fs::read_to_string(&pf) {
+                let _ = self.event_loop.execute_script(&probe);
+            }
+        }
 
         // Run inline + external scripts in document order, draining
         // between each so microtasks land before the next script reads
@@ -1952,10 +2427,9 @@ impl Page {
             } else if let Err(e) = self.event_loop.execute_script_with_name(&code, &name) {
                 tracing::warn!(script = %name, error = %e, "warm script error");
             }
-            let _ = self
-                .event_loop
-                .run_until_idle(Duration::from_millis(50))
-                .await;
+            // Flush this script's microtasks before the next runs (browser script
+            // ordering); its async ops advance in the final drain.
+            self.event_loop.drain_microtasks();
         }
         wmark!("scripts executed");
 
@@ -1974,6 +2448,7 @@ impl Page {
                 document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
                 window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
                 window.dispatchEvent(new Event('load'));
+                try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}
             }, 0);"#,
         );
 
@@ -2002,12 +2477,25 @@ impl Page {
             })();"#,
         );
 
-        // Final drain to let async work settle. Same cap as the cold
-        // build phase — humanize timers are unref'd so they don't pin.
-        let _ = self
-            .event_loop
-            .run_until_idle(Duration::from_millis(500))
-            .await;
+        // Final drain — returns once the load event has fired with no in-flight
+        // fetch and no refed render timer (readiness.rs). Respect the same
+        // deployment timeout policy as cold navigation.
+        let _ = match navigation_timeout() {
+            Some(timeout) => self.event_loop.run_until_settled(timeout).await,
+            None => self.event_loop.run_until_settled_unbounded().await,
+        };
+        wmark!("warm settle drain");
+
+        // Materialize + drive the frame tree; when off, just drain the queue so
+        // it stays bounded.
+        if std::env::var_os("BROWSER_OXIDE_FRAME_TREE").is_some() {
+            // The driver materializes frames, delivers cross-frame messages, and
+            // sleeps between real events, returning once the tree settles.
+            self.drive_frame_tree(&client, &profile).await;
+        } else {
+            let _ = self.event_loop.iframe_signal().drain();
+        }
+
         self.event_loop.runtime_mut().cancel_terminate_execution();
         drop(_build_watcher);
         wmark!("drain done [READY]");
@@ -2497,10 +2985,8 @@ impl Page {
                 tracing::info!(pending = %pending_info, "initial pending navigation found");
             }
 
-            // Bounded poll for deferred navigation signals (auto-submitted forms,
-            // PoW completions, challenge-driven assigns). Replaces the previous
-            // fixed 2s wait. Checks every 200ms for up to 10s total; exits early
-            // on first hit.
+            // Wait for deferred navigation / solve signals (forms, PoW, challenge assigns),
+            // re-driving only when a new challenge iframe appears; 90 s give-up deadline.
             if pending_info.is_empty()
                 && (page.is_anti_bot_challenge()
                     || started_as_interstitial_challenge
@@ -2509,11 +2995,14 @@ impl Page {
                     || started_as_awswaf_challenge)
             {
                 let deadline = std::time::Instant::now() + Duration::from_secs(90);
-                while std::time::Instant::now() < deadline {
-                    let _ = page
-                        .event_loop()
-                        .run_until_idle(Duration::from_millis(200))
-                        .await;
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    // Blocks on the challenge's refed timers/network; returns when
+                    // work is done, on a JS-raised nav, or at the remaining deadline.
+                    let _ = page.event_loop().run_until_idle(remaining).await;
                     // A challenge script may have appendChild'd a
                     // cross-origin challenge iframe (e.g. a
                     // geo.captcha-delivery.com or a
@@ -2527,7 +3016,7 @@ impl Page {
                     // when nothing new appeared; gated by this poll's
                     // challenge condition ⇒ never runs for a benign nav
                     // (zero regression).
-                    let _ = page
+                    let new_frames = page
                         .rematerialize_iframes(&current_url, &client, &profile)
                         .await;
                     pending_info = page
@@ -2633,6 +3122,12 @@ impl Page {
                                 break;
                             }
                         }
+                    }
+
+                    // No new challenge iframe this pass and its own work already
+                    // drove to completion above, so nothing further to drive.
+                    if new_frames == 0 {
+                        break;
                     }
                 }
             }
@@ -3091,7 +3586,7 @@ impl Page {
                 // + small jitter mimics the natural human-action gap.
                 let jitter_ms =
                     250 + (std::time::Instant::now().elapsed().as_nanos() & 0xFF) as u64;
-                tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                crate::stealth::stealth_delay(Duration::from_millis(jitter_ms)).await;
                 // "Let the bundle self-solve": this vendor's `rt:'i'` nav
                 // sets a reload __pendingNavigation EARLY, so the flow
                 // lands here and would otherwise reload after ~250 ms —
@@ -3115,31 +3610,12 @@ impl Page {
                 // branches; the poll-entry invariant is
                 // `started_as_interstitial_challenge == is_challenge_doc(initial html)`.
                 if started_as_interstitial_challenge {
-                    let dd_deadline = std::time::Instant::now() + Duration::from_secs(45);
-                    let parsed_cur = url::Url::parse(&current_url).ok();
-                    while std::time::Instant::now() < dd_deadline {
-                        let _ = page
-                            .event_loop()
-                            .run_until_idle(Duration::from_millis(250))
-                            .await;
-                        if let Some(p) = parsed_cur.as_ref() {
-                            let now = client.cookies_for_url(p).await.unwrap_or_default();
-                            // FP-D3: require a genuine solve (cookie +
-                            // body no longer a challenge doc) — the
-                            // bare `datadome=` cookie is set on the 403
-                            // fail too, so the old check broke the
-                            // self-solve window on a false success.
-                            // E2 trait dispatch: a registered solver reports
-                            // the solve via its `solved_signal`.
-                            let body = page.content();
-                            if solvers.iter().any(|s| s.solved_signal(&now, &body)) {
-                                if debug_nav {
-                                    eprintln!("[solver] self-solve signal — proceeding to reload");
-                                }
-                                break;
-                            }
-                        }
-                    }
+                    // Drive the self-solve bundle to completion; returns when work
+                    // is done, on a JS-raised nav, or at the 45 s give-up deadline.
+                    let _ = page
+                        .event_loop()
+                        .run_until_idle(Duration::from_secs(45))
+                        .await;
                 }
                 let refetch_js = format!(
                     r#"
@@ -3418,6 +3894,7 @@ impl Page {
             std::collections::HashMap<String, std::collections::HashMap<String, String>>,
         >,
     ) -> Result<Self, deno_core::error::AnyError> {
+        crate::js_runtime::readiness::reset();
         let bp_trace = std::env::var("BROWSER_OXIDE_BUILD_PROFILE").is_ok();
         let bp_t0 = std::time::Instant::now();
         macro_rules! mark {
@@ -3626,17 +4103,9 @@ impl Page {
         // inline-script execution (delta.com, taobao.com — pages whose
         // first-paint scripts spawn document.write(<script>) chains or
         // tight setTimeout polling that hold the V8 thread indefinitely).
-        // 25s is generous: any honest first-paint completes well under it.
-        // Without this, build_page_with_scripts_and_init can run forever
-        // because tokio::time::timeout cannot preempt V8 microtask spins.
-        let build_budget_ms: u64 = std::env::var("BROWSER_OXIDE_BUILD_BUDGET_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(25_000);
-        let _build_watcher = V8DeadlineWatcher::new(
-            event_loop.runtime_mut().isolate_handle(),
-            Duration::from_millis(build_budget_ms),
-        );
+        // This is the navigation timeout's watchdog; `None` leaves it unbounded.
+        let _build_watcher = navigation_timeout()
+            .map(|d| V8DeadlineWatcher::new(event_loop.runtime_mut().isolate_handle(), d));
 
         // Set location (URL-state setup, not a real navigation —
         // reset the nav-pending signal so subsequent run_until_idle calls
@@ -4019,8 +4488,9 @@ impl Page {
                 }
             }
 
-            // Run loop for a short burst between scripts to flush tasks
-            let _ = event_loop.run_until_idle(Duration::from_millis(50)).await;
+            // Flush this script's microtasks before the next runs (browser script
+            // ordering); its async ops advance in the final drain.
+            event_loop.drain_microtasks();
         }
         mark!("inline scripts + interleaved drains");
 
@@ -4051,6 +4521,7 @@ impl Page {
                 try { globalThis._browser_oxide.__documentReadyState = 'complete'; } catch (_e) {}
                 document.dispatchEvent(new Event('readystatechange'));
                 window.dispatchEvent(new Event('load'));
+                try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}
             }, 0);
         "#,
             )
@@ -4090,28 +4561,18 @@ impl Page {
 
         mark!("meta-refresh scanner install");
 
-        // Run event loop until idle. Script errors should NOT abort
-        // navigation — log and continue, matching real browser behavior.
-        //
-        // 8 s cap. This drain flushes microtasks, zero-delay setTimeouts
-        // (DOMContentLoaded / load handlers, meta-refresh scanner), and
-        // any short async chains kicked off by inline scripts.
-        //
-        // Important: `humanize.js` now schedules its synthetic mouse /
-        // scroll timers via `globalThis.__bgSetTimeout` (timer_bootstrap.js)
-        // which is `.unref()`'d — so the humanize setTimeouts no longer
-        // pin this drain to its full ceiling. Benign pages exit idle in
-        // milliseconds; anti-bot challenge pages (AWS WAF / reddit verify /
-        // recaptcha invisible / a vendor interstitial) get the full 8 s they need for
-        // their async POST+reload chain to complete, which sets
-        // `__pendingNavigation` and triggers iter 1 with the proper token
-        // cookie. Cutting this below ~5 s causes those chains to never
-        // complete and the outer loop returns the challenge stub as the
-        // "rendered" page.
-        if let Err(e) = event_loop.run_until_idle(Duration::from_secs(8)).await {
+        // Drive the page in (script errors log and continue). Normal pages use
+        // `run_until_settled`; challenge docs need the full `run_until_idle` drain.
+        let drain = match (doc_is_challenge, navigation_timeout()) {
+            (true, Some(timeout)) => event_loop.run_until_idle(timeout).await,
+            (true, None) => event_loop.run_until_idle_unbounded().await,
+            (false, Some(timeout)) => event_loop.run_until_settled(timeout).await,
+            (false, None) => event_loop.run_until_settled_unbounded().await,
+        };
+        if let Err(e) = drain {
             tracing::warn!(error = %e, "Event loop error during run");
         }
-        mark!("build-phase run_until_idle");
+        mark!("build-phase drain");
 
         // Log errors captured during script execution
         if let Ok(errors) = event_loop.execute_script("JSON.stringify(window.__scriptErrors || [])")
@@ -4191,11 +4652,16 @@ impl Page {
             } else if let Some(src) = &info.src {
                 if !src.is_empty() && !src.starts_with("javascript:") {
                     if let Some(full_src) = Self::resolve_url(url, src) {
+                        let (referrer, ancestors) = frame_embedding(url, &full_src);
                         match iframe::ChildIframe::from_url(
                             info.node_id,
                             &full_src,
                             client,
                             Some(profile),
+                            None,
+                            "",
+                            &referrer,
+                            &ancestors,
                         )
                         .await
                         {
@@ -4232,8 +4698,12 @@ impl Page {
         Ok(Self {
             event_loop,
             url: url.to_string(),
+            frame_tree: Vec::new(),
+            top_frame_id: 0,
+            top_waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
             children,
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
+            http_client: None,
         })
     }
 

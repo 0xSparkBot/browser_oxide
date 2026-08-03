@@ -17,27 +17,41 @@ use deno_core::op2;
 use deno_core::OpState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
-/// State stored in OpState. Cloned by `BrowserJsRuntime::nav_pending_signal`
-/// so the event loop can read the flag without going through V8.
+/// State in OpState, cloned by `BrowserJsRuntime::nav_pending_signal`. The flag
+/// lets the event loop poll without V8; the `Notify` wakes it on a raised nav.
 #[derive(Clone, Default)]
-pub struct NavSignal(pub Arc<AtomicBool>);
+pub struct NavSignal {
+    flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
 
 impl NavSignal {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
     }
 
     pub fn raise(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.flag.store(true, Ordering::Relaxed);
+        // The op runs inside a poll before any waiter exists; `notify_one`
+        // stores a permit that the next `notified()` consumes.
+        self.notify.notify_one();
     }
 
     pub fn pending(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.flag.load(Ordering::Relaxed)
     }
 
     pub fn reset(&self) {
-        self.0.store(false, Ordering::Relaxed);
+        self.flag.store(false, Ordering::Relaxed);
+    }
+
+    pub fn notify(&self) -> Arc<Notify> {
+        self.notify.clone()
     }
 }
 

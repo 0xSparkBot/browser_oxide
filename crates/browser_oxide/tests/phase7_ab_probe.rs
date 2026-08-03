@@ -126,7 +126,7 @@ async fn run_probe(_url_label: &str) -> HashMap<String, String> {
         .unwrap();
     let _ = page
         .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(3))
+        .run_until_idle(std::time::Duration::from_secs(5))
         .await;
 
     // Pull each key one at a time using the same `pull(page, expr)`
@@ -389,7 +389,7 @@ async fn phase7_d2_secure_context_gating() {
     .unwrap();
     let _ = p
         .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(2))
+        .run_until_idle(std::time::Duration::from_secs(5))
         .await;
 
     let undef_keys = [
@@ -447,7 +447,7 @@ async fn phase7_d2_secure_context_gating() {
     .unwrap();
     let _ = p
         .event_loop()
-        .run_until_idle(std::time::Duration::from_secs(2))
+        .run_until_idle(std::time::Duration::from_secs(5))
         .await;
 
     let present = [

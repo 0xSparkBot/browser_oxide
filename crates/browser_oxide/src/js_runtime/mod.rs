@@ -3,8 +3,11 @@
 //! MIT/Apache-2.0 licensed. Part of the browser_oxide project.
 
 pub mod extensions;
+pub mod frame_waker;
+pub mod inspector;
 pub mod module_loader;
 pub mod native_fns;
+pub mod readiness;
 pub mod runtime;
 pub mod snapshot;
 pub mod state;
@@ -18,9 +21,29 @@ use extensions::nav_ext::NavSignal;
 use runtime::{create_runtime_with_signals, BrowserRuntimeOptions};
 use state::{ConsoleMessage, DomState};
 
+/// Native stack for a thread that builds or drives a V8 isolate. The default
+/// ~2 MB overflows while V8 parses deno_core's primordials.
+pub const V8_THREAD_STACK: usize = 64 * 1024 * 1024;
+
+/// Like `std::thread::spawn` but with a stack big enough to build or drive a V8 isolate.
+pub fn spawn_v8_thread<F>(name: impl Into<String>, f: F) -> std::thread::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let name = name.into();
+    std::thread::Builder::new()
+        .name(name.clone())
+        .stack_size(V8_THREAD_STACK)
+        .spawn(f)
+        .unwrap_or_else(|e| panic!("failed to spawn V8 thread {name}: {e}"))
+}
+
 /// A V8 JavaScript runtime with browser DOM bindings.
 pub struct BrowserJsRuntime {
     inner: JsRuntime,
+    /// Cached `__pumpFrameMessages` function so frame messages deliver via a
+    /// compiled call. Cleared and re-captured on `replace_dom`.
+    frame_deliver_fn: Option<v8::Global<v8::Function>>,
     /// Per-runtime navigation-pending signal. JS sets it via
     /// `op_set_pending_nav` (called from window_bootstrap.js whenever
     /// `__pendingNavigation` is assigned). The event loop polls it to
@@ -70,7 +93,11 @@ impl BrowserJsRuntime {
     pub fn new(dom: Dom) -> Self {
         let (inner, nav_signal) =
             create_runtime_with_signals(dom, BrowserRuntimeOptions::default());
-        Self { inner, nav_signal }
+        Self {
+            inner,
+            nav_signal,
+            frame_deliver_fn: None,
+        }
     }
 
     /// Create with a stealth profile.
@@ -82,23 +109,28 @@ impl BrowserJsRuntime {
                 ..Default::default()
             },
         );
-        Self { inner, nav_signal }
+        Self {
+            inner,
+            nav_signal,
+            frame_deliver_fn: None,
+        }
     }
 
     /// Create with full options.
     pub fn with_options(dom: Dom, mut options: BrowserRuntimeOptions) -> Self {
-        // TODO(deno-0.403): V8-149 snapshot RESTORE segfaults (deno_core 0.403
-        // snapshot deserialize — op external-reference handling). The engine is
-        // otherwise fully correct on V8 149; snapshot is DISABLED by default so
-        // we run bootstrap fresh (~1.5 s slower cold start, correctness intact).
-        // Re-enable with BROWSER_OXIDE_USE_SNAPSHOT=1 to test a fix.
+        // Disabled: building it crashes V8's serializer on an op-returned typed
+        // array's empty backing store, and it would not beat a cold bootstrap anyway.
         if std::env::var_os("BROWSER_OXIDE_USE_SNAPSHOT").is_some()
             && options.startup_snapshot.is_none()
         {
             options.startup_snapshot = Some(snapshot::get_snapshot());
         }
         let (inner, nav_signal) = create_runtime_with_signals(dom, options);
-        Self { inner, nav_signal }
+        Self {
+            inner,
+            nav_signal,
+            frame_deliver_fn: None,
+        }
     }
 
     /// Returns true iff JS has set a pending navigation since the last
@@ -113,6 +145,30 @@ impl BrowserJsRuntime {
         self.nav_signal.reset();
     }
 
+    /// `Notify` that fires the instant JS raises a pending navigation, waking the
+    /// event-loop driver immediately.
+    pub fn nav_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.nav_signal.notify()
+    }
+
+    /// Block until a CDP frontend connects, then pause at the next statement
+    /// (`--inspect-brk`). No-op if the inspector wasn't started; blocks the thread.
+    pub fn inspector_break_on_next_statement(&mut self) {
+        let has_inspector = self
+            .inner
+            .op_state()
+            .borrow()
+            .try_borrow::<crate::js_runtime::inspector::InspectorServer>()
+            .is_some();
+        if !has_inspector {
+            return;
+        }
+        let _guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        self.inner
+            .inspector()
+            .wait_for_session_and_break_on_next_statement();
+    }
+
     /// Get a thread-safe handle to the V8 isolate. Used to call
     /// `terminate_execution()` from a watcher thread when a wall-clock
     /// deadline expires — preempts CPU-bound JS spin loops that
@@ -120,6 +176,13 @@ impl BrowserJsRuntime {
     /// to the tokio scheduler. The returned handle is `Send + Sync`.
     pub fn isolate_handle(&mut self) -> deno_core::v8::IsolateHandle {
         self.inner.v8_isolate().thread_safe_handle()
+    }
+
+    /// Run the V8 microtask queue to completion, matching the boundary between
+    /// two `<script>`s: promise `.then`s resolve but `setTimeout`/`fetch` do not.
+    pub fn drain_microtasks(&mut self) {
+        let _guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        self.inner.v8_isolate().perform_microtask_checkpoint();
     }
 
     /// Cancel a previously-issued `terminate_execution()`. Required if
@@ -251,6 +314,55 @@ impl BrowserJsRuntime {
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))
     }
 
+    /// Poll this runtime's event loop once with the driver's context, so the
+    /// waker in `cx` becomes the wake target for this isolate's timers and ops.
+    pub fn poll_once(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), deno_core::error::AnyError>> {
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        self.inner
+            .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
+            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))
+    }
+
+    /// Cache `globalThis.__pumpFrameMessages` as a compiled function for direct
+    /// calls. No-op if the symbol is absent.
+    fn capture_frame_deliver_fn(&mut self) {
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        deno_core::v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let ctx = scope.get_current_context();
+        let global = ctx.global(scope);
+        let Some(key) = deno_core::v8::String::new(scope, "__pumpFrameMessages") else {
+            return;
+        };
+        let Some(val) = global.get(scope, key.into()) else {
+            return;
+        };
+        if let Ok(func) = deno_core::v8::Local::<deno_core::v8::Function>::try_from(val) {
+            self.frame_deliver_fn = Some(deno_core::v8::Global::new(scope, func));
+        }
+    }
+
+    /// Deliver any queued cross-frame messages into this runtime by calling the
+    /// cached `__pumpFrameMessages` (compiled once). Lazily captures it.
+    pub fn deliver_frame_messages(&mut self) {
+        if self.frame_deliver_fn.is_none() {
+            self.capture_frame_deliver_fn();
+        }
+        let Some(func) = self.frame_deliver_fn.clone() else {
+            return;
+        };
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        deno_core::v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let f = deno_core::v8::Local::new(scope, &func);
+        deno_core::v8::tc_scope!(let tc_scope, scope);
+        let recv = deno_core::v8::undefined(tc_scope).into();
+        let _ = f.call(tc_scope, recv, &[]);
+    }
+
     /// P2 — load + evaluate an EXTERNAL ES module (`<script type="module" src>`).
     /// The configured `BrowserModuleLoader` fetches the import graph on demand;
     /// we drive the event loop so those async fetches + top-level async work
@@ -319,6 +431,9 @@ impl BrowserJsRuntime {
     /// Replace the DOM in this runtime with a new one.
     /// Used for CDP Page.navigate to avoid recreating the V8 isolate.
     pub fn replace_dom(&mut self, dom: Dom, stylesheets: Vec<String>) {
+        // The bootstrap (and thus __pumpFrameMessages) is re-installed here;
+        // drop the cached handle so it is re-captured against the fresh function.
+        self.frame_deliver_fn = None;
         let state = self.inner.op_state();
         let mut state = state.borrow_mut();
         // Replace DomState — ops will pick up the new DOM on next call
@@ -355,6 +470,16 @@ impl BrowserJsRuntime {
     /// Get the OpState (shared state).
     pub fn op_state(&mut self) -> std::rc::Rc<std::cell::RefCell<deno_core::OpState>> {
         self.inner.op_state()
+    }
+
+    /// Clone this runtime's frame-tree signal, the queue of `<iframe src>` inserts
+    /// the JS requested. The frame-tree driver drains it to materialize children.
+    pub fn iframe_signal(&mut self) -> crate::js_runtime::extensions::frame_ext::IframeSignal {
+        self.inner
+            .op_state()
+            .borrow()
+            .borrow::<crate::js_runtime::extensions::frame_ext::IframeSignal>()
+            .clone()
     }
 
     pub fn record_resource_timing(&mut self, timings: crate::net::TimingStats) {

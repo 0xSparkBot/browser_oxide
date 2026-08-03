@@ -232,12 +232,11 @@ mod tests {
 
     #[tokio::test]
     async fn connect_invalid_host() {
-        let result = connect(
-            "this.host.does.not.exist.example",
-            443,
-            Duration::from_secs(2),
-        )
-        .await;
+        // Use a syntactically invalid hostname rather than a reserved DNS
+        // suffix. Corporate/VPN resolvers and captive portals may synthesize
+        // answers even for `.example`, making a nominally offline unit test
+        // environment-dependent and capable of connecting to a wildcard IP.
+        let result = connect("not a valid host name", 443, Duration::from_secs(2)).await;
         assert!(result.is_err());
     }
 }

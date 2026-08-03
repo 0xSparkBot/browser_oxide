@@ -156,8 +156,8 @@ async fn getter_chain_recursion_throws_range_error() {
 /// drives the C-stack directly: each frame consumes a 4 KB local
 /// array, and we recurse 4096 times = 16 MB. A 2 MB stack overflows
 /// way before reaching that depth; a 64 MB stack reaches it easily.
-#[test]
-fn test_thread_stack_is_at_least_16mb() {
+#[tokio::test]
+async fn test_thread_stack_is_at_least_16mb() {
     fn recurse(depth: u32, max: u32) -> u32 {
         // 4 KB per frame
         let _local: [u8; 4096] = [0; 4096];
