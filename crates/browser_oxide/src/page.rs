@@ -4582,6 +4582,8 @@ impl Page {
                             script_index = i,
                             "Script not prefetched (fetch failed), skipping"
                         );
+                        let src = script.src.clone().unwrap_or_default();
+                        eprintln!("[script-miss] #{i} {src}");
                         continue;
                     }
                 }
@@ -4613,6 +4615,13 @@ impl Page {
                 // dep that never resolves) or whose top-level work never idles
                 // must NOT hang the whole navigation. 10s/module is generous;
                 // on timeout we log and continue so the page renders what it has.
+                // Modules see `document.currentScript == null` per spec, but
+                // the *initial* evaluation of a module script exposes the
+                // element (HTML#the-strongcurrentscript-strong-says-so is the
+                // de-facto Chrome behavior for the top-level module run, and
+                // Next's getAssetPrefix() relies on it during app bootstrap —
+                // a null here throws InvariantError and kills hydration).
+                event_loop.set_current_script(Some(script.node_id));
                 let eval_fut = async {
                     if let Some(src) = &script.src {
                         // External module: resolve src to an absolute specifier;
@@ -4630,15 +4639,21 @@ impl Page {
                         event_loop.eval_module_code(&spec, code.clone()).await
                     }
                 };
-                match tokio::time::timeout(Duration::from_secs(10), eval_fut).await {
-                    Ok(Ok(())) => {}
+                let eval_res = match tokio::time::timeout(Duration::from_secs(10), eval_fut).await {
+                    Ok(Ok(())) => Ok(()),
                     Ok(Err(e)) => {
-                        tracing::warn!(script = %name, error = %e, "ES module eval error")
+                        tracing::warn!(script = %name, error = %e, "ES module eval error");
+                        eprintln!("[module] {name}: {e}");
+                        Err(())
                     }
                     Err(_) => {
-                        tracing::warn!(script = %name, "ES module eval timed out (10s) — continuing")
+                        tracing::warn!(script = %name, "ES module eval timed out (10s) — continuing");
+                        eprintln!("[module-timeout] {name}");
+                        Err(())
                     }
-                }
+                };
+                event_loop.set_current_script(None);
+                let _ = eval_res;
             } else {
                 // Classic script. Set document.currentScript to THIS <script>
                 // element's wrapper for the duration of execution (the web-API
@@ -4651,6 +4666,7 @@ impl Page {
                 event_loop.set_current_script(Some(script.node_id));
                 if let Err(e) = event_loop.execute_script_with_name(&code, &name) {
                     tracing::warn!(script = %name, error = %e, "Script execution error");
+                    eprintln!("[script-error] {name}: {e}");
                 }
                 event_loop.set_current_script(None);
             }

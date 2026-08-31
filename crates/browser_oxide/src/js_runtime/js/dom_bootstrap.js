@@ -1157,6 +1157,29 @@
         setAttribute(name, value) { ops.op_dom_set_attribute(_getNodeId(this), name, String(value)); }
         removeAttribute(name) { ops.op_dom_remove_attribute(_getNodeId(this), name); }
         hasAttribute(name) { return ops.op_dom_has_attribute(_getNodeId(this), name); }
+        // Namespaced / Attr-node APIs. react-dom's commit phase calls
+        // setAttributeNS("http://www.w3.org/1999/xlink", "xlink:type", v) and
+        // its unmount path drains el.attributes via removeAttributeNode.
+        // We key attributes by the full qualified name, so the NS variants
+        // just delegate with the qname as-is (set and remove both use the
+        // same qualified form in react-dom, keeping lookups consistent).
+        getAttributeNS(_ns, qname) { return this.getAttribute(String(qname)); }
+        setAttributeNS(_ns, qname, value) { this.setAttribute(String(qname), value); }
+        removeAttributeNS(_ns, qname) { this.removeAttribute(String(qname)); }
+        hasAttributeNS(_ns, qname) { return this.hasAttribute(String(qname)); }
+        setAttributeNode(attr) {
+            if (attr && typeof attr.name === "string") {
+                this.setAttribute(attr.name, attr.value);
+                return attr;
+            }
+            return null;
+        }
+        removeAttributeNode(attr) {
+            const name = attr && typeof attr.name === "string" ? attr.name : null;
+            if (name === null || !this.hasAttribute(name)) return null;
+            this.removeAttribute(name);
+            return attr;
+        }
         querySelector(sel) {
             const id = ops.op_dom_query_selector(_getNodeId(this), sel);
             return id !== null ? _wrapNode(id) : null;
@@ -1353,7 +1376,9 @@
             const namesOf = () => ops.op_dom_get_attribute_names(id);
             const itemFor = (name) => {
                 const val = ops.op_dom_get_attribute(id, name);
-                return val ? { name, value: val, specified: true } : null;
+                // typeof check (not truthiness): empty-string values
+                // (e.g. <script async>) are real attributes and must surface.
+                return typeof val === "string" ? { name, value: val, specified: true } : null;
             };
             return new Proxy([], {
                 get(target, prop) {
@@ -2095,7 +2120,15 @@
     }
 
     let _currentScript = null;
-    function _setCurrentScript(el) { _currentScript = el; }
+    // Sticky: keep the last executed <script> visible after its top-level
+    // returns. Next.js Turbopack's async `registerChunk` runs module
+    // factories in a promise continuation, where the app entry
+    // (`getAssetPrefix`) still reads `document.currentScript`; Chrome keeps
+    // the element readable there. A plain `null` clear would turn that read
+    // into an `InvariantError` and sever the hydration bootstrap. The value
+    // is overwritten by the next `set_current_script(Some)` and reset by the
+    // per-navigation bootstrap re-run.
+    function _setCurrentScript(el) { if (el !== null) _currentScript = el; }
 
     class HTMLAllCollection {
         constructor(doc) {
@@ -2176,8 +2209,20 @@
         }
         getElementsByClassName(cls) {
             const id = ops.op_dom_document_node();
-            const name = String(cls);
-            return new HTMLCollection(() => ops.op_dom_get_elements_by_class_name(id, name), 2);
+            return new HTMLCollection(() => ops.op_dom_get_elements_by_class_name(id, cls), 2);
+        }
+        // Used by Next.js route announcer & hash-scroll: look up by the
+        // "name" content attribute. Static result is fine for both callers
+        // (both index [0] immediately).
+        getElementsByName(name) {
+            const wanted = String(name);
+            const els = this.querySelectorAll("*");
+            const ids = [];
+            for (let i = 0; i < els.length; i++) {
+                const el = els[i];
+                if (el && el.getAttribute && el.getAttribute("name") === wanted) ids.push(_getNodeId(el));
+            }
+            return new NodeList(ids, 2);
         }
         querySelector(sel) {
             const id = ops.op_dom_query_selector(ops.op_dom_document_node(), sel);
@@ -3508,6 +3553,15 @@
                     try{event.target=this;}catch(_){}
                     const path=[];let current=this;
                     try{while(current){path.push(current);current=current.parentNode||null;}}catch(_){}
+                    // DOM standard: the propagation path of an event at the
+                    // Document continues through the window (capture inbound,
+                    // bubble outbound). Window-level lifecycle listeners
+                    // (DOMContentLoaded et al) never see document events
+                    // without this, because document.parentNode is null.
+                    try{
+                        const doc=globalThis.document;
+                        if(path.length>0&&path[path.length-1]===doc&&globalThis.window&&typeof globalThis.window.addEventListener==='function'&&path.indexOf(globalThis.window)<0)path.push(globalThis.window);
+                    }catch(_){}
                     if(path.length>1&&!event._stopped){
                         for(let i=path.length-1;i>0;i--){event.currentTarget=path[i];event.eventPhase=1;fire(path[i],event,true);if(event._stopped)break;}
                     }

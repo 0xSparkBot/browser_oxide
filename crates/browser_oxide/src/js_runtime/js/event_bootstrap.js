@@ -590,7 +590,9 @@
 
                 if (state) state.__documentReadyState = 'interactive';
                 document.dispatchEvent(trusted('readystatechange'));
-                document.dispatchEvent(trusted('DOMContentLoaded'));
+                // DOM standard: bubbles:true so the event propagates to the
+                // window (window-level DOMContentLoaded listeners).
+                document.dispatchEvent(trusted('DOMContentLoaded', { bubbles: true }));
 
                 if (state) state.__documentReadyState = 'complete';
                 document.dispatchEvent(trusted('readystatechange'));
