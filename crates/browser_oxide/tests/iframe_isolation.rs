@@ -110,27 +110,9 @@ async fn multiple_iframes_isolated() {
 // fetched/executed (the structural blocker for the bot-detection
 // sensor on such sites + every modern managed challenge, whose
 // challenge iframe is script-injected post-load).
-// `Page::rematerialize_iframes` must rescan the post-JS DOM and turn it
-// into a REAL child context. The srcdoc path is the network-free proof
-// of the rescan + real-child-execution wiring; the cross-origin `src`
-// fetch path is exercised by the live `#[ignore]` anti-bot suites.
-// DECISIVE [CODE] EXPERIMENT RESULT (verify-don't-assume): this probe
-// FAILED `left:0 right:1` — `rematerialize_iframes` finds 0. A
-// script's `createElement('iframe')`+`appendChild` does NOT surface a
-// `find_iframes`-visible arena-DOM iframe node: the wrapped
-// `Node.prototype.appendChild` (dom_bootstrap.js:1924) registers the
-// element in the JS-side `_appendedIframes` array + synthetic-window
-// registry, but the post-build arena-DOM walk `find_iframes` cannot see
-// it. ⇒ The post-JS rescan (this commit's `rematerialize_iframes`,
-// correct + gated infrastructure) is necessary but NOT sufficient
-// alone; FP-E1 full closure additionally requires the
-// createElement('iframe')/.src arena-interception so the script-created
-// iframe is a real, discoverable child-context node (the structural
-// "single highest-leverage engine investment" the engine research
-// names). `#[ignore]`d (not deleted) so the gate stays green while the
-// infra + this decisive finding land; un-ignore when the interception
-// subsystem lands.
-#[ignore = "FP-E1: rescan infra landed; needs createElement/.src arena-interception (decisive experiment recorded in 99 doc)"]
+// `Page::rematerialize_iframes` must discover the post-JS DOM host, create the
+// browser-visible child realm, execute srcdoc, and remain idempotent. This is a
+// network-free regression and therefore belongs in the default suite.
 #[tokio::test]
 async fn fp_e1_post_js_injected_iframe_is_materialized() {
     let profile = browser_oxide::stealth::presets::chrome_148_macos();
@@ -281,20 +263,23 @@ async fn frame_tree_materializes_src_iframe() {
 async fn frame_tree_child_to_parent_postmessage() {
     let profile = browser_oxide::stealth::presets::chrome_148_macos();
     let client = browser_oxide::net::HttpClient::shared(&profile).unwrap();
-    let mut page = Page::from_html(
+    let mut page = Page::from_html_with_url(
         r#"<!DOCTYPE html><html><body><script>
-        globalThis.__got = 'none';
+        globalThis.__got = [];
+        globalThis.__loadListenerCount = 0;
+        globalThis.__onloadCount = 0;
         window.addEventListener('message', function(e){
-            globalThis.__got = JSON.stringify({data:e.data, trusted:e.isTrusted});
+            globalThis.__got.push({data:e.data, trusted:e.isTrusted, origin:e.origin});
         });
         </script></body></html>"#,
+        "https://parent.example/frame-test",
         Some(profile.clone()),
     )
     .await
     .unwrap();
 
     page.evaluate(
-        "const f=document.createElement('iframe');f.src='https://example.com/';document.body.appendChild(f);",
+        "const f=document.createElement('iframe');f.src='https://example.com/';f.addEventListener('load',()=>__loadListenerCount++);f.onload=()=>__onloadCount++;document.body.appendChild(f);",
     )
     .unwrap();
     page.drive_frame_tree(&client, &profile).await;
@@ -303,38 +288,43 @@ async fn frame_tree_child_to_parent_postmessage() {
     // Give the child a listener, then post parent -> child via contentWindow.
     page.frame_tree_evaluate(
         0,
-        "globalThis.__cgot='none'; window.addEventListener('message', function(e){ globalThis.__cgot = JSON.stringify({data:e.data, trusted:e.isTrusted}); });",
+        "globalThis.__cgot=[]; window.addEventListener('message', function(e){ globalThis.__cgot.push({data:e.data, trusted:e.isTrusted, origin:e.origin}); });",
     );
     page.evaluate(
-        "document.querySelector('iframe').contentWindow.postMessage({toChild:'hi'}, '*')",
+        "const w=document.querySelector('iframe').contentWindow;w.postMessage({blocked:true}, 'https://wrong.example');w.postMessage({toChild:'hi'}, 'https://example.com')",
     )
     .unwrap();
     // Child posts child -> parent via `parent`.
-    page.frame_tree_evaluate(0, "parent.postMessage({relayed:'yes'}, '*')");
+    page.frame_tree_evaluate(
+        0,
+        "parent.postMessage({blocked:true}, 'https://wrong.example');parent.postMessage({relayed:'yes'}, 'https://parent.example')",
+    );
 
     // Drive to deliver both queued messages.
     page.drive_frame_tree(&client, &profile).await;
 
     let got = page
-        .evaluate("String(globalThis.__got)")
+        .evaluate("JSON.stringify(globalThis.__got)")
         .unwrap_or_default();
     assert!(
-        got.contains("relayed") && got.contains("yes"),
+        got == r#"[{"data":{"relayed":"yes"},"trusted":true,"origin":"https://example.com"}]"#,
         "top page must receive the child frame's postMessage: {got}"
     );
-    assert!(
-        got.contains("\"trusted\":true"),
-        "child-to-parent MessageEvent must be trusted: {got}"
-    );
     let cgot = page
-        .frame_tree_evaluate(0, "String(globalThis.__cgot)")
+        .frame_tree_evaluate(0, "JSON.stringify(globalThis.__cgot)")
         .unwrap_or_default();
     assert!(
-        cgot.contains("toChild") && cgot.contains("hi"),
+        cgot == r#"[{"data":{"toChild":"hi"},"trusted":true,"origin":"https://parent.example"}]"#,
         "child frame must receive the parent's postMessage: {cgot}"
     );
-    assert!(
-        cgot.contains("\"trusted\":true"),
-        "parent-to-child MessageEvent must be trusted: {cgot}"
+    assert_eq!(
+        page.evaluate("String(__loadListenerCount)").unwrap(),
+        "1",
+        "iframe load listener must fire exactly once"
+    );
+    assert_eq!(
+        page.evaluate("String(__onloadCount)").unwrap(),
+        "1",
+        "iframe onload handler must fire exactly once"
     );
 }

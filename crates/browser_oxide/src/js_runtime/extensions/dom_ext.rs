@@ -2,7 +2,9 @@ use crate::css_values::calc::resolve_computed_value;
 use crate::css_values::types::length::CalcContext;
 use crate::dom::node::{NodeData, NodeId};
 use crate::dom::DomElement;
-use crate::js_runtime::native_fns::{install_native_fp_tostring, IframeRealmStore};
+use crate::js_runtime::native_fns::{
+    install_native_fp_tostring, IframePropertyBridge, IframeRealmStore,
+};
 use crate::js_runtime::state::DomState;
 use crate::js_runtime::utils::tokens_to_string;
 use deno_core::op2;
@@ -10,6 +12,16 @@ use deno_core::v8;
 use deno_core::JsRuntime;
 use deno_core::OpState;
 use std::collections::HashMap;
+
+fn compile_realm_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: &str,
+) -> Option<v8::Global<v8::Function>> {
+    let source = v8::String::new(scope, source)?;
+    let value = v8::Script::compile(scope, source, None)?.run(scope)?;
+    let function = v8::Local::<v8::Function>::try_from(value).ok()?;
+    Some(v8::Global::new(scope, function))
+}
 
 /// Build a `CalcContext` from the current DOM state's stealth profile.
 /// Provides viewport + font-size + container dimensions so calc()
@@ -1351,8 +1363,10 @@ fn _window_ctor_cb(
 pub fn op_create_child_realm<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     #[smi] realm_id: i32,
+    #[smi] host_node_id: i32,
 ) -> v8::Local<'s, v8::Value> {
     let rid = realm_id as u32;
+    let host_node_id = host_node_id as u32;
 
     // Access OpState via the isolate-level state (public, stable in 0.311).
     // op_state_from takes &Isolate; HandleScope auto-derefs there.
@@ -1372,6 +1386,7 @@ pub fn op_create_child_realm<'s>(
     // handles BEFORE entering the child ContextScope (requires parent scope).
     let orig_fpt: Option<v8::Global<v8::Function>>;
     let native_tag_sym: Option<v8::Global<v8::Symbol>>;
+    let reusable_window_proxy: Option<v8::Global<v8::Object>>;
     {
         let op_state = op_state_rc.borrow();
         if let Some(store) = op_state.try_borrow::<IframeRealmStore>() {
@@ -1383,20 +1398,39 @@ pub fn op_create_child_realm<'s>(
                 let local = v8::Local::new(scope, g);
                 v8::Global::new(scope, local)
             });
+            reusable_window_proxy = store.window_proxies.get(&host_node_id).map(|g| {
+                let local = v8::Local::new(scope, g);
+                v8::Global::new(scope, local)
+            });
         } else {
             orig_fpt = None;
             native_tag_sym = None;
+            reusable_window_proxy = None;
         }
     }
 
     // Create the child context (vanilla v8::Context — full native intrinsics).
-    let child_ctx = v8::Context::new(scope, v8::ContextOptions::default());
+    // On navigation, V8 resets the reused global object's state while keeping
+    // its identity, which is exactly WindowProxy's browser contract.
+    let global_object = reusable_window_proxy
+        .as_ref()
+        .map(|global| v8::Local::new(scope, global).into());
+    let parent_ctx = scope.get_current_context();
+    let parent_microtask_queue =
+        parent_ctx.get_microtask_queue() as *const v8::MicrotaskQueue as *mut v8::MicrotaskQueue;
+    let child_ctx = v8::Context::new(
+        scope,
+        v8::ContextOptions {
+            global_object,
+            microtask_queue: Some(parent_microtask_queue),
+            ..Default::default()
+        },
+    );
 
     // Copy parent's security token to child so V8 treats the contexts as
     // same-origin (about:blank inherits the parent origin in Chrome).
     // Without this, accessing child-realm objects from the parent scope
     // throws "TypeError: no access" via V8's cross-context security check.
-    let parent_ctx = scope.get_current_context();
     let parent_tok = parent_ctx.get_security_token(scope);
     child_ctx.set_security_token(parent_tok);
 
@@ -1413,6 +1447,8 @@ pub fn op_create_child_realm<'s>(
 
     // Set up the child context.  Returns None on any fatal V8 allocation
     // failure (extremely rare); the outer code falls back to undefined.
+    let mut child_inner_global_g: Option<v8::Global<v8::Object>> = None;
+    let property_bridge: Option<IframePropertyBridge>;
     let child_global_g: Option<v8::Global<v8::Object>> = {
         let cs = &mut v8::ContextScope::new(scope, child_ctx);
 
@@ -1430,16 +1466,30 @@ pub fn op_create_child_realm<'s>(
             window_fn.set_name(n);
         }
 
-        // child_global.[[Prototype]] = Window.prototype
-        // → child_global.constructor.name === "Window"
+        // Preserve V8's native GlobalProxy -> inner-global link. The GlobalProxy
+        // is the engine primitive we use as WindowProxy; replacing its
+        // prototype directly disconnects the inner global and makes reflective
+        // operations such as Object.isExtensible/DefineOwnProperty stop
+        // forwarding correctly. Instead, type the *inner global* as Window.
+        let child_proxy = child_ctx.global(cs);
+        let inner_global = child_proxy
+            .get_prototype(cs)
+            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok());
+        if let Some(inner) = inner_global {
+            child_inner_global_g = Some(v8::Global::new(cs, inner));
+        }
+
+        // inner_global.[[Prototype]] = Window.prototype
+        // → GlobalProxy forwards into a Window-shaped ordinary global object.
         if let Some(pk) = v8::String::new(cs, "prototype") {
             if let Some(proto_val) = window_fn.get(cs, pk.into()) {
-                let child_global = child_ctx.global(cs);
-                child_global.set_prototype(cs, proto_val);
+                if let Some(inner) = inner_global {
+                    inner.set_prototype(cs, proto_val);
+                }
             }
         }
 
-        let child_global = child_ctx.global(cs);
+        let child_global = child_proxy;
 
         // Expose Window on child global (scripts may read `contentWindow.Window`).
         if let Some(k) = v8::String::new(cs, "Window") {
@@ -1471,6 +1521,33 @@ pub fn op_create_child_realm<'s>(
             install_native_fp_tostring(cs, orig, native_tag_sym.as_ref());
         }
 
+        property_bridge = (|| {
+            Some(IframePropertyBridge {
+                get: compile_realm_function(cs, "(function(k){return globalThis[k];})")?,
+                set: compile_realm_function(
+                    cs,
+                    "(function(k,v){globalThis[k]=v;return true;})",
+                )?,
+                has: compile_realm_function(cs, "(function(k){return k in globalThis;})")?,
+                delete: compile_realm_function(
+                    cs,
+                    "(function(k){return delete globalThis[k];})",
+                )?,
+                own_keys: compile_realm_function(
+                    cs,
+                    "(function(){return Reflect.ownKeys(globalThis).filter(function(k){return typeof k==='string';});})",
+                )?,
+                descriptor: compile_realm_function(
+                    cs,
+                    "(function(k){return Object.getOwnPropertyDescriptor(globalThis,k);})",
+                )?,
+                define: compile_realm_function(
+                    cs,
+                    "(function(k,d){return Reflect.defineProperty(globalThis,k,d);})",
+                )?,
+            })
+        })();
+
         Some(v8::Global::new(cs, child_global))
     };
 
@@ -1479,21 +1556,76 @@ pub fn op_create_child_realm<'s>(
         None => return v8::undefined(scope).into(),
     };
 
-    // Build Local from Global BEFORE moving Global into the store.
+    // Build Local and a second persistent handle BEFORE moving the realm-local
+    // handle into the store.
     let local: v8::Local<'s, v8::Value> = v8::Local::new(scope, &child_global_g).into();
+    let stable_window_proxy = {
+        let local = v8::Local::new(scope, &child_global_g);
+        v8::Global::new(scope, local)
+    };
 
     // Persist context (keeps it alive) and cache global in OpState.
     {
         let mut op_state = op_state_rc.borrow_mut();
         if let Some(store) = op_state.try_borrow_mut::<IframeRealmStore>() {
+            if let Some(old_rid) = store.node_to_realm.insert(host_node_id, rid) {
+                if old_rid != rid {
+                    store.contexts.remove(&old_rid);
+                    store.globals.remove(&old_rid);
+                    store.inner_globals.remove(&old_rid);
+                    store.public_windows.remove(&old_rid);
+                    store.property_bridges.remove(&old_rid);
+                    store.realm_to_node.remove(&old_rid);
+                }
+            }
+            store.realm_to_node.insert(rid, host_node_id);
             store
                 .contexts
                 .insert(rid, v8::Global::new(scope, child_ctx));
             store.globals.insert(rid, child_global_g);
+            if let Some(inner) = child_inner_global_g {
+                store.inner_globals.insert(rid, inner);
+            }
+            if let Some(bridge) = property_bridge {
+                store.property_bridges.insert(rid, bridge);
+            }
+            store
+                .window_proxies
+                .insert(host_node_id, stable_window_proxy);
         }
     }
 
     local
+}
+
+/// Drop a same-isolate iframe realm and both host/realm index entries.
+///
+/// JS calls this when an iframe navigates or is detached. Rust also uses the
+/// same store for public `FrameContext` lookup, so teardown must be atomic from
+/// both directions or stale handles can accidentally enter a replaced realm.
+#[op2(fast)]
+pub fn op_dispose_child_realm(
+    state: &mut OpState,
+    #[smi] realm_id: i32,
+    preserve_window_proxy: bool,
+) {
+    let rid = realm_id as u32;
+    let Some(store) = state.try_borrow_mut::<IframeRealmStore>() else {
+        return;
+    };
+    if let Some(node_id) = store.realm_to_node.remove(&rid) {
+        if store.node_to_realm.get(&node_id) == Some(&rid) {
+            store.node_to_realm.remove(&node_id);
+        }
+        if !preserve_window_proxy {
+            store.window_proxies.remove(&node_id);
+        }
+    }
+    store.contexts.remove(&rid);
+    store.globals.remove(&rid);
+    store.inner_globals.remove(&rid);
+    store.public_windows.remove(&rid);
+    store.property_bridges.remove(&rid);
 }
 
 /// Set a property on the INNER GLOBAL of a child realm.
@@ -1507,14 +1639,8 @@ pub fn op_create_child_realm<'s>(
 ///    GlobalProxy): makes the property an own property of the inner global, so
 ///    scope-chain lookups from scripts running INSIDE the realm find it.
 ///
-/// 2. `proxy.set()` on the GlobalProxy: puts the property in the proxy's own
-///    dictionary, so cross-context reads from the parent (`cw.screen`) find it.
-///
-/// Both paths are necessary: V8's API `Object::Set()` on a GlobalProxy writes to
-/// the proxy's own dict (not the inner global), so scope-chain lookups inside the
-/// realm miss it. Conversely, `create_data_property` on the inner global is NOT
-/// reachable from a cross-context `proxy.property` read (the proxy's own dict is
-/// checked first and exclusively for cross-context callers without the interceptor).
+/// The public HTML WindowProxy wrapper also forwards to this same inner global,
+/// so the ordinary Window data object is the single property source of truth.
 #[op2]
 pub fn op_set_child_realm_prop<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1525,89 +1651,517 @@ pub fn op_set_child_realm_prop<'s>(
     let rid = realm_id as u32;
     let op_state_rc = JsRuntime::op_state_from(scope);
 
-    let child_ctx_g: Option<v8::Global<v8::Context>> = {
+    let (child_ctx_g, function_g) = {
         let op_state = op_state_rc.borrow();
-        op_state.try_borrow::<IframeRealmStore>().and_then(|store| {
-            store.contexts.get(&rid).map(|g| {
-                let local = v8::Local::new(scope, g);
-                v8::Global::new(scope, local)
-            })
-        })
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return v8::undefined(scope).into();
+        };
+        (
+            store.contexts.get(&rid).cloned(),
+            store
+                .property_bridges
+                .get(&rid)
+                .map(|bridge| bridge.set.clone()),
+        )
     };
-    let child_ctx_g = match child_ctx_g {
-        Some(g) => g,
-        None => return v8::undefined(scope).into(),
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return v8::undefined(scope).into();
     };
 
     let child_ctx = v8::Local::new(scope, &child_ctx_g);
     let cs = &mut v8::ContextScope::new(scope, child_ctx);
-    let child_proxy = child_ctx.global(cs);
-
-    // Path 1: inner global own property (inside-realm scope chain visibility).
-    if let Some(inner) = child_proxy
-        .get_prototype(cs)
-        .and_then(|p| v8::Local::<v8::Object>::try_from(p).ok())
-    {
-        if let Ok(k) = v8::Local::<v8::Name>::try_from(key) {
-            inner.create_data_property(cs, k, value);
-        }
-    }
-
-    // Path 2: proxy own property (cross-context parent-side visibility).
-    child_proxy.set(cs, key, value);
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    let _ = function.call(cs, receiver, &[key, value]);
 
     v8::undefined(cs).into()
 }
 
-/// Getter for a child realm's `parent`/`top`: returns `data[0]` (parent WindowProxy)
-/// from the parent realm, `data[1]` (postMessage proxy) from inside the child realm.
-fn frame_parent_getter<'s>(
+/// Install a child-realm global only when the name is not already visible.
+///
+/// Window named-frame properties must not clobber native APIs or page-authored
+/// globals. The existence check and both inner/proxy writes happen in one V8
+/// context entry, so child mutation callbacks never need to re-enter the same
+/// realm through JavaScript evaluation.
+#[op2(fast)]
+pub fn op_set_child_realm_prop_if_absent<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+    key: v8::Local<v8::Value>,
+    value: v8::Local<v8::Value>,
+) -> bool {
+    let rid = realm_id as u32;
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, has_g, set_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return false;
+        };
+        (
+            store.contexts.get(&rid).cloned(),
+            store
+                .property_bridges
+                .get(&rid)
+                .map(|bridge| bridge.has.clone()),
+            store
+                .property_bridges
+                .get(&rid)
+                .map(|bridge| bridge.set.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(has_g), Some(set_g)) = (child_ctx_g, has_g, set_g) else {
+        return false;
+    };
+
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    let has_fn = v8::Local::new(cs, &has_g);
+    if has_fn
+        .call(cs, receiver, &[key])
+        .map(|value| value.boolean_value(cs))
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let set_fn = v8::Local::new(cs, &set_g);
+    set_fn
+        .call(cs, receiver, &[key, value])
+        .map(|value| value.boolean_value(cs))
+        .unwrap_or(false)
+}
+
+/// Return the same-isolate iframe realm whose JavaScript is currently running.
+/// `-1` denotes the top-level document / no child execution scope.
+#[op2(fast)]
+#[smi]
+pub fn op_current_child_realm_id(state: &mut OpState) -> i32 {
+    state
+        .try_borrow::<IframeRealmStore>()
+        .and_then(|store| store.execution_stack.last().copied())
+        .map(|id| id as i32)
+        .unwrap_or(-1)
+}
+
+/// Return the V8 GlobalProxy of the currently executing same-isolate iframe.
+/// The top-level document is represented by `undefined` so callers can fall
+/// back to their own `globalThis` without manufacturing another wrapper.
+#[op2]
+pub fn op_current_child_realm_window<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> v8::Local<'s, v8::Value> {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (public_window, child_ctx_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return v8::undefined(scope).into();
+        };
+        let Some(rid) = store.execution_stack.last().copied() else {
+            return v8::undefined(scope).into();
+        };
+        (
+            store.public_windows.get(&rid).cloned(),
+            store.contexts.get(&rid).cloned(),
+        )
+    };
+    if let Some(public_window) = public_window {
+        return v8::Local::new(scope, &public_window).into();
+    }
+    let Some(child_ctx_g) = child_ctx_g else {
+        return v8::undefined(scope).into();
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    child_ctx.global(scope).into()
+}
+
+/// Register the browser-visible WindowProxy wrapper for a same-isolate realm.
+#[op2(fast)]
+pub fn op_register_child_public_window<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+    window: v8::Local<v8::Value>,
+) {
+    let Ok(window) = v8::Local::<v8::Object>::try_from(window) else {
+        return;
+    };
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let mut op_state = op_state_rc.borrow_mut();
+    if let Some(store) = op_state.try_borrow_mut::<IframeRealmStore>() {
+        store
+            .public_windows
+            .insert(realm_id as u32, v8::Global::new(scope, window));
+    }
+}
+
+/// Return the ordinary inner global object behind a child realm's V8
+/// GlobalProxy. The public HTML WindowProxy wrapper uses this object as its
+/// data/reflection backend; the raw GlobalProxy remains the realm's execution
+/// identity (`window === globalThis === this`).
+#[op2]
+pub fn op_child_realm_inner_global<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+) -> v8::Local<'s, v8::Value> {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let inner_global = {
+        let op_state = op_state_rc.borrow();
+        op_state
+            .try_borrow::<IframeRealmStore>()
+            .and_then(|store| store.inner_globals.get(&(realm_id as u32)).cloned())
+    };
+    let Some(inner_global) = inner_global else {
+        return v8::undefined(scope).into();
+    };
+    v8::Local::new(scope, &inner_global).into()
+}
+
+/// Read a property from a child realm while entered in that realm's
+/// ContextScope. This is the authoritative bridge used by the public HTML
+/// WindowProxy wrapper; direct cross-context GlobalProxy reflection in V8 does
+/// not implement the browser WindowProxy exotic contract.
+#[op2(reentrant)]
+pub fn op_child_realm_get_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+    #[string] key: String,
+) -> v8::Local<'s, v8::Value> {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, function_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return v8::undefined(scope).into();
+        };
+        (
+            store.contexts.get(&(realm_id as u32)).cloned(),
+            store
+                .property_bridges
+                .get(&(realm_id as u32))
+                .map(|bridge| bridge.get.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return v8::undefined(scope).into();
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let Some(key) = v8::String::new(cs, &key) else {
+        return v8::undefined(cs).into();
+    };
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    function
+        .call(cs, receiver, &[key.into()])
+        .unwrap_or_else(|| v8::undefined(cs).into())
+}
+
+#[op2(fast)]
+pub fn op_child_realm_set_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+    #[string] key: String,
+    value: v8::Local<v8::Value>,
+) -> bool {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, function_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return false;
+        };
+        (
+            store.contexts.get(&(realm_id as u32)).cloned(),
+            store
+                .property_bridges
+                .get(&(realm_id as u32))
+                .map(|bridge| bridge.set.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return false;
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let Some(key) = v8::String::new(cs, &key) else {
+        return false;
+    };
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    function
+        .call(cs, receiver, &[key.into(), value])
+        .map(|value| value.boolean_value(cs))
+        .unwrap_or(false)
+}
+
+#[op2(fast)]
+pub fn op_child_realm_has_property(
+    scope: &mut v8::PinScope<'_, '_>,
+    #[smi] realm_id: i32,
+    #[string] key: String,
+) -> bool {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, function_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return false;
+        };
+        (
+            store.contexts.get(&(realm_id as u32)).cloned(),
+            store
+                .property_bridges
+                .get(&(realm_id as u32))
+                .map(|bridge| bridge.has.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return false;
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let Some(key) = v8::String::new(cs, &key) else {
+        return false;
+    };
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    function
+        .call(cs, receiver, &[key.into()])
+        .map(|value| value.boolean_value(cs))
+        .unwrap_or(false)
+}
+
+#[op2(fast)]
+pub fn op_child_realm_delete_property(
+    scope: &mut v8::PinScope<'_, '_>,
+    #[smi] realm_id: i32,
+    #[string] key: String,
+) -> bool {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, function_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return false;
+        };
+        (
+            store.contexts.get(&(realm_id as u32)).cloned(),
+            store
+                .property_bridges
+                .get(&(realm_id as u32))
+                .map(|bridge| bridge.delete.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return false;
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let Some(key) = v8::String::new(cs, &key) else {
+        return false;
+    };
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    function
+        .call(cs, receiver, &[key.into()])
+        .map(|value| value.boolean_value(cs))
+        .unwrap_or(false)
+}
+
+#[op2(reentrant)]
+pub fn op_child_realm_own_property_names<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+) -> v8::Local<'s, v8::Array> {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, function_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return v8::Array::new(scope, 0);
+        };
+        (
+            store.contexts.get(&(realm_id as u32)).cloned(),
+            store
+                .property_bridges
+                .get(&(realm_id as u32))
+                .map(|bridge| bridge.own_keys.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return v8::Array::new(scope, 0);
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    function
+        .call(cs, receiver, &[])
+        .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
+        .unwrap_or_else(|| v8::Array::new(cs, 0))
+}
+
+#[op2(reentrant)]
+pub fn op_child_realm_get_own_property_descriptor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+    #[string] key: String,
+) -> v8::Local<'s, v8::Value> {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, function_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return v8::undefined(scope).into();
+        };
+        (
+            store.contexts.get(&(realm_id as u32)).cloned(),
+            store
+                .property_bridges
+                .get(&(realm_id as u32))
+                .map(|bridge| bridge.descriptor.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return v8::undefined(scope).into();
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let Some(key) = v8::String::new(cs, &key) else {
+        return v8::undefined(cs).into();
+    };
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    function
+        .call(cs, receiver, &[key.into()])
+        .unwrap_or_else(|| v8::undefined(cs).into())
+}
+
+#[op2(fast)]
+pub fn op_child_realm_define_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] realm_id: i32,
+    #[string] key: String,
+    descriptor: v8::Local<v8::Object>,
+) -> bool {
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, function_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return false;
+        };
+        (
+            store.contexts.get(&(realm_id as u32)).cloned(),
+            store
+                .property_bridges
+                .get(&(realm_id as u32))
+                .map(|bridge| bridge.define.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return false;
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let Some(key) = v8::String::new(cs, &key) else {
+        return false;
+    };
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    function
+        .call(cs, receiver, &[key.into(), descriptor.into()])
+        .map(|value| value.boolean_value(cs))
+        .unwrap_or(false)
+}
+
+/// Delete a temporary property from both the inner global and the outer
+/// WindowProxy of a child realm. Constructor installation uses this to pass
+/// parent implementation references into a closure without leaving observable
+/// bootstrap names behind on `iframe.contentWindow`.
+#[op2(fast)]
+pub fn op_delete_child_realm_prop(
+    scope: &mut v8::PinScope,
+    #[smi] realm_id: i32,
+    #[string] key: String,
+) {
+    let rid = realm_id as u32;
+    let op_state_rc = JsRuntime::op_state_from(scope);
+    let (child_ctx_g, function_g) = {
+        let op_state = op_state_rc.borrow();
+        let Some(store) = op_state.try_borrow::<IframeRealmStore>() else {
+            return;
+        };
+        (
+            store.contexts.get(&rid).cloned(),
+            store
+                .property_bridges
+                .get(&rid)
+                .map(|bridge| bridge.delete.clone()),
+        )
+    };
+    let (Some(child_ctx_g), Some(function_g)) = (child_ctx_g, function_g) else {
+        return;
+    };
+    let child_ctx = v8::Local::new(scope, &child_ctx_g);
+    let cs = &mut v8::ContextScope::new(scope, child_ctx);
+    let Some(key) = v8::String::new(cs, &key) else {
+        return;
+    };
+    let key: v8::Local<v8::Value> = key.into();
+    let function = v8::Local::new(cs, &function_g);
+    let receiver: v8::Local<v8::Value> = child_ctx.global(cs).into();
+    let _ = function.call(cs, receiver, &[key]);
+}
+
+/// Relation getter for child `parent` / `top`.
+///
+/// External callers observe the public HTML WindowProxy wrapper. If the
+/// currently executing same-isolate realm is exactly the relation target, code
+/// inside that realm must see its raw V8 GlobalProxy so strict identity such as
+/// `inner.parent === window` remains true.
+fn frame_relation_getter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _key: v8::Local<'s, v8::Name>,
     args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let Ok(arr) = v8::Local::<v8::Array>::try_from(args.data()) else {
+    let Ok(data) = v8::Local::<v8::Array>::try_from(args.data()) else {
         return;
     };
-    let current = scope.get_current_context();
-    let child_ctxs: Vec<v8::Global<v8::Context>> = {
+    let public = data.get_index(scope, 0);
+    let raw = data.get_index(scope, 1);
+
+    let executing_ctx = {
         let op_state_rc = JsRuntime::op_state_from(scope);
         let op_state = op_state_rc.borrow();
-        op_state
-            .try_borrow::<IframeRealmStore>()
-            .map(|s| s.contexts.values().cloned().collect())
-            .unwrap_or_default()
+        op_state.try_borrow::<IframeRealmStore>().and_then(|store| {
+            let rid = *store.execution_stack.last()?;
+            store.contexts.get(&rid).cloned()
+        })
     };
-    let in_child = child_ctxs
-        .iter()
-        .any(|g| v8::Local::new(scope, g) == current);
-    let idx = if in_child { 1 } else { 0 };
-    if let Some(v) = arr.get_index(scope, idx) {
-        rv.set(v);
+    if let (Some(raw), Some(ctx_g)) = (raw, executing_ctx) {
+        let ctx = v8::Local::new(scope, &ctx_g);
+        let executing_raw: v8::Local<v8::Value> = ctx.global(scope).into();
+        if executing_raw.strict_equals(raw) {
+            rv.set(raw);
+            return;
+        }
+    }
+    if let Some(public) = public {
+        rv.set(public);
     }
 }
 
-/// Install `parent`/`top` as context-aware accessors on a child realm: `real_window`
-/// is the parent's WindowProxy, `msg_source`/`top_source` the postMessage proxies.
+/// Install browser-visible `parent`/`top` relations on a child realm.
+/// Message routing is handled independently by the sender-realm stack.
 #[op2]
 pub fn op_install_frame_parent<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     #[smi] realm_id: i32,
-    real_window: v8::Local<v8::Value>,
-    msg_source: v8::Local<v8::Value>,
-    top_source: v8::Local<v8::Value>,
+    parent_public_window: v8::Local<v8::Value>,
+    parent_raw_window: v8::Local<v8::Value>,
+    top_window: v8::Local<v8::Value>,
 ) -> v8::Local<'s, v8::Value> {
     let rid = realm_id as u32;
     let op_state_rc = JsRuntime::op_state_from(scope);
-    let child_ctx_g: Option<v8::Global<v8::Context>> = {
+    let child_ctx_g = {
         let op_state = op_state_rc.borrow();
-        op_state.try_borrow::<IframeRealmStore>().and_then(|store| {
-            store.contexts.get(&rid).map(|g| {
-                let local = v8::Local::new(scope, g);
-                v8::Global::new(scope, local)
-            })
-        })
+        op_state
+            .try_borrow::<IframeRealmStore>()
+            .and_then(|store| store.contexts.get(&rid).cloned())
     };
     let Some(child_ctx_g) = child_ctx_g else {
         return v8::undefined(scope).into();
@@ -1616,15 +2170,18 @@ pub fn op_install_frame_parent<'s>(
     let cs = &mut v8::ContextScope::new(scope, child_ctx);
     let child_proxy = child_ctx.global(cs);
 
-    for (key, source) in [("parent", msg_source), ("top", top_source)] {
+    for (key, public_window, raw_window) in [
+        ("parent", parent_public_window, parent_raw_window),
+        ("top", top_window, top_window),
+    ] {
         let Some(k) = v8::String::new(cs, key) else {
             continue;
         };
-        let arr = v8::Array::new(cs, 2);
-        arr.set_index(cs, 0, real_window);
-        arr.set_index(cs, 1, source);
+        let data = v8::Array::new(cs, 2);
+        data.set_index(cs, 0, public_window);
+        data.set_index(cs, 1, raw_window);
         let name: v8::Local<v8::Name> = k.into();
-        let cfg = v8::AccessorConfiguration::new(frame_parent_getter).data(arr.into());
+        let cfg = v8::AccessorConfiguration::new(frame_relation_getter).data(data.into());
         child_proxy.set_accessor_with_configuration(cs, name, cfg);
     }
     v8::undefined(cs).into()
@@ -1668,11 +2225,30 @@ pub fn op_eval_in_child_realm<'s>(
     // diagnostic channel
     // (`BROWSER_OXIDE_DEBUG_CHILD_REALM`) WITHOUT changing behavior: still
     // best-effort runs the script, still returns `None`.
+    {
+        let mut op_state = op_state_rc.borrow_mut();
+        if let Some(store) = op_state.try_borrow_mut::<IframeRealmStore>() {
+            store.execution_stack.push(rid);
+        }
+    }
     v8::tc_scope!(let tc, cs);
     let ok = match v8::Script::compile(tc, src, None) {
         Some(script) => script.run(tc).is_some(),
         None => false,
     };
+    // Parser/srcdoc/document.write scripts have the same end-of-task
+    // microtask semantics as scripts entered through FrameContext. Keep the
+    // realm id on the execution stack until the checkpoint has drained so
+    // promise callbacks retain their correct browsing-context identity.
+    let queue = child_ctx.get_microtask_queue();
+    queue.perform_checkpoint(tc);
+    {
+        let mut op_state = op_state_rc.borrow_mut();
+        if let Some(store) = op_state.try_borrow_mut::<IframeRealmStore>() {
+            let popped = store.execution_stack.pop();
+            debug_assert_eq!(popped, Some(rid));
+        }
+    }
     if !ok && std::env::var("BROWSER_OXIDE_DEBUG_CHILD_REALM").is_ok() {
         let msg = tc
             .exception()
@@ -1749,7 +2325,21 @@ deno_core::extension!(
         op_dom_storage_clear,
         op_dom_storage_keys,
         op_create_child_realm,
+        op_dispose_child_realm,
         op_set_child_realm_prop,
+        op_set_child_realm_prop_if_absent,
+        op_current_child_realm_id,
+        op_current_child_realm_window,
+        op_register_child_public_window,
+        op_child_realm_inner_global,
+        op_child_realm_get_property,
+        op_child_realm_set_property,
+        op_child_realm_has_property,
+        op_child_realm_delete_property,
+        op_child_realm_own_property_names,
+        op_child_realm_get_own_property_descriptor,
+        op_child_realm_define_property,
+        op_delete_child_realm_prop,
         op_install_frame_parent,
         op_eval_in_child_realm,
     ],

@@ -588,6 +588,53 @@ impl HttpClient {
         Ok(sender)
     }
 
+    fn port_for_url(parsed: &Url) -> Result<u16, NetError> {
+        parsed
+            .port_or_known_default()
+            .ok_or_else(|| NetError::Http(format!("unsupported URL scheme: {}", parsed.scheme())))
+    }
+
+    async fn send_h1_get_for_url(
+        &self,
+        parsed: &Url,
+        host: &str,
+        port: u16,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> Result<h1_client::RawResponse, NetError> {
+        let mut tcp_stream = self.connect_tcp(host, port).await?;
+        match parsed.scheme() {
+            "http" => h1_client::send_get(&mut tcp_stream, host, path, headers).await,
+            "https" => {
+                let mut tls_stream =
+                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
+                h1_client::send_get(&mut tls_stream, host, path, headers).await
+            }
+            scheme => Err(NetError::Http(format!("unsupported URL scheme: {scheme}"))),
+        }
+    }
+
+    async fn send_h1_post_for_url(
+        &self,
+        parsed: &Url,
+        host: &str,
+        port: u16,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<h1_client::RawResponse, NetError> {
+        let mut tcp_stream = self.connect_tcp(host, port).await?;
+        match parsed.scheme() {
+            "http" => h1_client::send_post(&mut tcp_stream, host, path, headers, body).await,
+            "https" => {
+                let mut tls_stream =
+                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
+                h1_client::send_post(&mut tls_stream, host, path, headers, body).await
+            }
+            scheme => Err(NetError::Http(format!("unsupported URL scheme: {scheme}"))),
+        }
+    }
+
     /// Pre-establish a TCP+TLS+HTTP/2 connection to a host.
     /// The connection is stored in the pool for future requests.
     pub async fn preconnect(&self, host: &str, port: u16) -> Result<(), NetError> {
@@ -663,7 +710,7 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = Self::port_for_url(&parsed)?;
 
         let mut hdrs: Vec<(String, String)> = headers
             .iter()
@@ -681,44 +728,38 @@ impl HttpClient {
             }
         }
 
-        let response = 'h2: {
-            for attempt in 0..2 {
-                let sender_res = self.get_sender(host, port).await;
-                let mut sender = match sender_res {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[net] H2 connection failed for {}: {}", host, e);
-                        break 'h2 None;
+        let response = if parsed.scheme() == "https" {
+            'h2: {
+                for attempt in 0..2 {
+                    let sender_res = self.get_sender(host, port).await;
+                    let mut sender = match sender_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                            break 'h2 None;
+                        }
+                    };
+                    let uri = parsed.as_str();
+                    match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
+                        Ok((parts, body)) => {
+                            let resp = self.build_response(parts, body, url).await?;
+                            break 'h2 Some(resp);
+                        }
+                        Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
+                            self.pool.evict(host, port).await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
-                };
-                let uri = parsed.as_str();
-                match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
-                    Ok((parts, body)) => {
-                        let resp = self.build_response(parts, body, url).await?;
-                        break 'h2 Some(resp);
-                    }
-                    Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
-                        self.pool.evict(host, port).await;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
                 }
+                None
             }
+        } else {
             None
         };
         let response = match response {
             Some(r) => r,
             None => {
-                let tcp_stream = tcp::connect_via_proxy(
-                    host,
-                    port,
-                    std::time::Duration::from_secs(10),
-                    Some(&self.dns_cache),
-                    self.proxy.as_ref(),
-                )
-                .await?;
-                let mut tls_stream =
-                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
                 let path = if parsed.query().is_some() {
                     format!("{}?{}", parsed.path(), parsed.query().unwrap())
                 } else {
@@ -734,7 +775,9 @@ impl HttpClient {
                         url, hdrs
                     );
                 }
-                let raw = h1_client::send_get(&mut tls_stream, host, &path, &hdrs).await?;
+                let raw = self
+                    .send_h1_get_for_url(&parsed, host, port, &path, &hdrs)
+                    .await?;
                 self.build_response_from_raw(raw, url).await?
             }
         };
@@ -775,16 +818,19 @@ impl HttpClient {
         url: &str,
         extra_headers: &[(String, String)],
     ) -> Result<Response, NetError> {
-        // Try HTTP/3 first
-        if let Ok(resp) = self.try_h3_request(url, Method::Get, extra_headers).await {
-            return Ok(resp);
-        }
-
         let parsed = Url::parse(url)?;
+        // HTTP/3 and HTTP/2 require TLS. Plain HTTP goes directly to the H1
+        // path instead of attempting a TLS handshake against the cleartext
+        // server.
+        if parsed.scheme() == "https" {
+            if let Ok(resp) = self.try_h3_request(url, Method::Get, extra_headers).await {
+                return Ok(resp);
+            }
+        }
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = Self::port_for_url(&parsed)?;
 
         // Browser-aware nav headers. For Chrome, may upgrade to high-entropy
         // Client Hints if this origin has sent Accept-CH. Firefox profiles
@@ -806,47 +852,41 @@ impl HttpClient {
         // Try HTTP/2 with automatic stale-connection recovery. If the pooled
         // connection has been closed by the server (GOAWAY), retry once with
         // a fresh connection.
-        let response = 'h2: {
-            for attempt in 0..2 {
-                let sender_res = self.get_sender(host, port).await;
-                let mut sender = match sender_res {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[net] H2 connection failed for {}: {}", host, e);
-                        break 'h2 None;
+        let response = if parsed.scheme() == "https" {
+            'h2: {
+                for attempt in 0..2 {
+                    let sender_res = self.get_sender(host, port).await;
+                    let mut sender = match sender_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                            break 'h2 None;
+                        }
+                    };
+                    let uri = parsed.as_str();
+                    match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
+                        Ok((parts, body)) => {
+                            let resp = self.build_response(parts, body, url).await?;
+                            break 'h2 Some(resp);
+                        }
+                        Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
+                            // Evict the dead connection from the pool and try once more.
+                            self.pool.evict(host, port).await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
-                };
-                let uri = parsed.as_str();
-                match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
-                    Ok((parts, body)) => {
-                        let resp = self.build_response(parts, body, url).await?;
-                        break 'h2 Some(resp);
-                    }
-                    Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
-                        // Evict the dead connection from the pool and try once more.
-                        self.pool.evict(host, port).await;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
                 }
+                None
             }
+        } else {
             None
         };
 
         let response = match response {
             Some(r) => r,
             None => {
-                // HTTP/1.1 fallback
-                let tcp_stream = tcp::connect_via_proxy(
-                    host,
-                    port,
-                    std::time::Duration::from_secs(10),
-                    Some(&self.dns_cache),
-                    self.proxy.as_ref(),
-                )
-                .await?;
-                let mut tls_stream =
-                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
+                // HTTP/1.1 fallback (plain TCP for http, TLS for https).
                 let path = if parsed.query().is_some() {
                     format!("{}?{}", parsed.path(), parsed.query().unwrap())
                 } else {
@@ -862,7 +902,9 @@ impl HttpClient {
                         url, hdrs
                     );
                 }
-                let raw = h1_client::send_get(&mut tls_stream, host, &path, &hdrs).await?;
+                let raw = self
+                    .send_h1_get_for_url(&parsed, host, port, &path, &hdrs)
+                    .await?;
                 self.build_response_from_raw(raw, url).await?
             }
         };
@@ -1050,7 +1092,7 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = Self::port_for_url(&parsed)?;
         let path = if let Some(q) = parsed.query() {
             format!("{}?{}", parsed.path(), q)
         } else {
@@ -1075,11 +1117,9 @@ impl HttpClient {
         }
         drop(jar);
 
-        let tcp_stream = self.connect_tcp(host, port).await?;
-        let connector = tls::chrome_connector(&self.profile)?;
-        let mut tls_stream = tls::connect_tls(&connector, &self.profile, host, tcp_stream).await?;
-
-        let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
+        let raw = self
+            .send_h1_post_for_url(&parsed, host, port, &path, &hdrs, body)
+            .await?;
         self.build_response_from_raw(raw, url).await
     }
 
@@ -1094,7 +1134,7 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = Self::port_for_url(&parsed)?;
 
         let mut hdrs: Vec<(String, String)> = headers
             .iter()
@@ -1149,58 +1189,51 @@ impl HttpClient {
             let _ = std::fs::write(format!("{stem}.meta.json"), meta);
         }
 
-        let response = 'h2: {
-            for attempt in 0..2 {
-                let sender_res = self.get_sender(host, port).await;
-                let mut sender = match sender_res {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[net] H2 connection failed for {}: {}", host, e);
-                        break 'h2 None;
+        let response = if parsed.scheme() == "https" {
+            'h2: {
+                for attempt in 0..2 {
+                    let sender_res = self.get_sender(host, port).await;
+                    let mut sender = match sender_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                            break 'h2 None;
+                        }
+                    };
+                    let uri = parsed.as_str();
+                    if uri.contains("/mfc")
+                        || uri.contains("/akam/13")
+                        || uri.contains("/tl")
+                        || uri.contains("/r")
+                    {
+                        eprintln!(
+                            "[net] sending H2 request to {} with headers: {:?}",
+                            uri, hdrs
+                        );
                     }
-                };
-                let uri = parsed.as_str();
-                if uri.contains("/mfc")
-                    || uri.contains("/akam/13")
-                    || uri.contains("/tl")
-                    || uri.contains("/r")
-                {
-                    eprintln!(
-                        "[net] sending H2 request to {} with headers: {:?}",
-                        uri, hdrs
-                    );
+                    match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
+                        Ok((parts, resp_body)) => {
+                            let resp = self.build_response(parts, resp_body, url).await?;
+                            break 'h2 Some(resp);
+                        }
+                        Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
+                            self.pool.evict(host, port).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("[net] H2 POST failed for {}: {}", uri, e);
+                        }
+                    }
                 }
-                match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
-                    Ok((parts, resp_body)) => {
-                        let resp = self.build_response(parts, resp_body, url).await?;
-                        break 'h2 Some(resp);
-                    }
-                    Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
-                        self.pool.evict(host, port).await;
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("[net] H2 POST failed for {}: {}", uri, e);
-                    }
-                }
+                None
             }
+        } else {
             None
         };
 
         let response = match response {
             Some(r) => r,
             None => {
-                let tcp_stream = tcp::connect_via_proxy(
-                    host,
-                    port,
-                    std::time::Duration::from_secs(10),
-                    Some(&self.dns_cache),
-                    self.proxy.as_ref(),
-                )
-                .await?;
-                let connector = tls::chrome_connector(&self.profile)?;
-                let mut tls_stream =
-                    tls::connect_tls(&connector, &self.profile, host, tcp_stream).await?;
                 let path = if parsed.query().is_some() {
                     format!("{}?{}", parsed.path(), parsed.query().unwrap())
                 } else {
@@ -1216,7 +1249,9 @@ impl HttpClient {
                         url, hdrs
                     );
                 }
-                let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
+                let raw = self
+                    .send_h1_post_for_url(&parsed, host, port, &path, &hdrs, body)
+                    .await?;
                 self.build_response_from_raw(raw, url).await?
             }
         };
@@ -1239,19 +1274,20 @@ impl HttpClient {
         body: &[u8],
         extra_headers: &[(String, String)],
     ) -> Result<Response, NetError> {
-        // Try HTTP/3 first
-        if let Ok(resp) = self
-            .try_h3_request(url, Method::Post(body.to_vec()), extra_headers)
-            .await
-        {
-            return Ok(resp);
-        }
-
         let parsed = Url::parse(url)?;
+        // QUIC/H2 are HTTPS-only; cleartext HTTP goes straight to H1.
+        if parsed.scheme() == "https" {
+            if let Ok(resp) = self
+                .try_h3_request(url, Method::Post(body.to_vec()), extra_headers)
+                .await
+            {
+                return Ok(resp);
+            }
+        }
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
-        let port = parsed.port().unwrap_or(443);
+        let port = Self::port_for_url(&parsed)?;
 
         // Browser-aware nav headers (Chrome may upgrade with high-entropy
         // Client Hints if origin sent Accept-CH; Firefox profiles skip).
@@ -1305,51 +1341,47 @@ impl HttpClient {
             }
         }
 
-        // Same stale-connection recovery as GET.
-        let response = 'h2: {
-            for attempt in 0..2 {
-                let sender_res = self.get_sender(host, port).await;
-                let mut sender = match sender_res {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[net] H2 connection failed for {}: {}", host, e);
-                        break 'h2 None;
+        // Same stale-connection recovery as GET. H2 is HTTPS-only.
+        let response = if parsed.scheme() == "https" {
+            'h2: {
+                for attempt in 0..2 {
+                    let sender_res = self.get_sender(host, port).await;
+                    let mut sender = match sender_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[net] H2 connection failed for {}: {}", host, e);
+                            break 'h2 None;
+                        }
+                    };
+                    let uri = parsed.as_str();
+                    match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
+                        Ok((parts, resp_body)) => {
+                            let resp = self.build_response(parts, resp_body, url).await?;
+                            break 'h2 Some(resp);
+                        }
+                        Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
+                            self.pool.evict(host, port).await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
-                };
-                let uri = parsed.as_str();
-                match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
-                    Ok((parts, resp_body)) => {
-                        let resp = self.build_response(parts, resp_body, url).await?;
-                        break 'h2 Some(resp);
-                    }
-                    Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
-                        self.pool.evict(host, port).await;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
                 }
+                None
             }
+        } else {
             None
         };
 
         let response = match response {
             Some(r) => r,
             None => {
-                let tcp_stream = tcp::connect_via_proxy(
-                    host,
-                    port,
-                    std::time::Duration::from_secs(10),
-                    Some(&self.dns_cache),
-                    self.proxy.as_ref(),
-                )
-                .await?;
-                let mut tls_stream =
-                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
                 let path = match parsed.query() {
                     Some(q) => format!("{}?{}", parsed.path(), q),
                     None => parsed.path().to_string(),
                 };
-                let raw = h1_client::send_post(&mut tls_stream, host, &path, &hdrs, body).await?;
+                let raw = self
+                    .send_h1_post_for_url(&parsed, host, port, &path, &hdrs, body)
+                    .await?;
                 self.build_response_from_raw(raw, url).await?
             }
         };

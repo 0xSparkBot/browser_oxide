@@ -11,6 +11,7 @@ pub mod readiness;
 pub mod runtime;
 pub mod snapshot;
 pub mod state;
+pub mod tokio_fallback;
 pub mod utils;
 
 use crate::dom::Dom;
@@ -18,7 +19,7 @@ use crate::stealth::StealthProfile;
 use deno_core::v8;
 use deno_core::JsRuntime;
 use extensions::nav_ext::NavSignal;
-use runtime::{create_runtime_with_signals, BrowserRuntimeOptions};
+use runtime::{create_runtime_with_signals, BrowserRuntimeOptions, RuntimeInternalFns};
 use state::{ConsoleMessage, DomState};
 
 /// Native stack for a thread that builds or drives a V8 isolate. The default
@@ -44,6 +45,10 @@ pub struct BrowserJsRuntime {
     /// Cached `__pumpFrameMessages` function so frame messages deliver via a
     /// compiled call. Cleared and re-captured on `replace_dom`.
     frame_deliver_fn: Option<v8::Global<v8::Function>>,
+    /// Privileged bootstrap closures retained after cleanup removes the
+    /// temporary page-visible bridge.
+    set_current_script_fn: Option<v8::Global<v8::Function>>,
+    complete_lifecycle_fn: Option<v8::Global<v8::Function>>,
     /// Per-runtime navigation-pending signal. JS sets it via
     /// `op_set_pending_nav` (called from window_bootstrap.js whenever
     /// `__pendingNavigation` is assigned). The event loop polls it to
@@ -91,29 +96,21 @@ impl Drop for IsolateEnterGuard {
 impl BrowserJsRuntime {
     /// Create a new runtime with the given DOM (no stealth profile).
     pub fn new(dom: Dom) -> Self {
-        let (inner, nav_signal) =
+        let (inner, nav_signal, internal_fns) =
             create_runtime_with_signals(dom, BrowserRuntimeOptions::default());
-        Self {
-            inner,
-            nav_signal,
-            frame_deliver_fn: None,
-        }
+        Self::from_parts(inner, nav_signal, internal_fns)
     }
 
     /// Create with a stealth profile.
     pub fn with_profile(dom: Dom, profile: StealthProfile) -> Self {
-        let (inner, nav_signal) = create_runtime_with_signals(
+        let (inner, nav_signal, internal_fns) = create_runtime_with_signals(
             dom,
             BrowserRuntimeOptions {
                 stealth_profile: Some(profile),
                 ..Default::default()
             },
         );
-        Self {
-            inner,
-            nav_signal,
-            frame_deliver_fn: None,
-        }
+        Self::from_parts(inner, nav_signal, internal_fns)
     }
 
     /// Create with full options.
@@ -125,11 +122,21 @@ impl BrowserJsRuntime {
         {
             options.startup_snapshot = Some(snapshot::get_snapshot());
         }
-        let (inner, nav_signal) = create_runtime_with_signals(dom, options);
+        let (inner, nav_signal, internal_fns) = create_runtime_with_signals(dom, options);
+        Self::from_parts(inner, nav_signal, internal_fns)
+    }
+
+    fn from_parts(
+        inner: JsRuntime,
+        nav_signal: NavSignal,
+        internal_fns: RuntimeInternalFns,
+    ) -> Self {
         Self {
             inner,
             nav_signal,
             frame_deliver_fn: None,
+            set_current_script_fn: internal_fns.set_current_script,
+            complete_lifecycle_fn: internal_fns.complete_document_lifecycle,
         }
     }
 
@@ -149,6 +156,39 @@ impl BrowserJsRuntime {
     /// event-loop driver immediately.
     pub fn nav_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.nav_signal.notify()
+    }
+
+    /// Set `document.currentScript` through a private bootstrap closure that is
+    /// retained after the page-visible bridge has been deleted.
+    pub fn set_current_script(&mut self, node_id: Option<u32>) {
+        let Some(function) = self.set_current_script_fn.clone() else {
+            return;
+        };
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let function = v8::Local::new(scope, &function);
+        let receiver = v8::undefined(scope).into();
+        let argument: v8::Local<v8::Value> = match node_id {
+            Some(id) => v8::Integer::new_from_unsigned(scope, id).into(),
+            None => v8::null(scope).into(),
+        };
+        let _ = function.call(scope, receiver, &[argument]);
+    }
+
+    /// Advance the document through the trusted browser lifecycle sequence.
+    pub fn complete_document_lifecycle(&mut self) {
+        let Some(function) = self.complete_lifecycle_fn.clone() else {
+            return;
+        };
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let function = v8::Local::new(scope, &function);
+        let receiver = v8::undefined(scope).into();
+        let _ = function.call(scope, receiver, &[]);
     }
 
     /// Block until a CDP frontend connects, then pause at the next statement
@@ -181,6 +221,7 @@ impl BrowserJsRuntime {
     /// Run the V8 microtask queue to completion, matching the boundary between
     /// two `<script>`s: promise `.then`s resolve but `setTimeout`/`fetch` do not.
     pub fn drain_microtasks(&mut self) {
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
         let _guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
         self.inner.v8_isolate().perform_microtask_checkpoint();
     }
@@ -231,6 +272,7 @@ impl BrowserJsRuntime {
         code: &str,
         name: Option<&str>,
     ) -> Result<String, deno_core::error::AnyError> {
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
         let __ctx = self.inner.main_context();
         // v8-149 + deno_core 0.403: a V8 isolate is entered (made the
         // thread-current isolate) when its `OwnedIsolate` is constructed and
@@ -299,8 +341,133 @@ impl BrowserJsRuntime {
         }
     }
 
+    /// Return the browser-visible child realm associated with an iframe host
+    /// node. This mapping is populated by `op_create_child_realm` when
+    /// `iframe.contentWindow` is first materialized.
+    pub fn child_realm_id_for_node(&self, node_id: u32) -> Option<u32> {
+        let state = self.inner.op_state();
+        let state = state.borrow();
+        state
+            .try_borrow::<native_fns::IframeRealmStore>()
+            .and_then(|store| store.node_to_realm.get(&node_id).copied())
+    }
+
+    /// Execute JavaScript in the exact V8 context backing an iframe's
+    /// `contentWindow` and stringify the result.
+    pub fn execute_child_realm_script(
+        &mut self,
+        realm_id: u32,
+        code: &str,
+        name: Option<&str>,
+    ) -> Result<String, deno_core::error::AnyError> {
+        // Clone the OpState handle before borrowing the V8 isolate mutably.
+        // Using `self.inner.op_state()` after `scope_with_context!` would
+        // overlap immutable and mutable borrows of the runtime.
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let op_state_rc = self.inner.op_state();
+        let child_ctx = {
+            let state = op_state_rc.borrow();
+            let store = state
+                .try_borrow::<native_fns::IframeRealmStore>()
+                .ok_or_else(|| deno_core::error::AnyError::msg("iframe realm store missing"))?;
+            store.contexts.get(&realm_id).cloned().ok_or_else(|| {
+                deno_core::error::AnyError::msg(format!(
+                    "iframe realm {realm_id} is no longer alive"
+                ))
+            })?
+        };
+
+        let __ctx = child_ctx;
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let source = v8::String::new(scope, code)
+            .ok_or_else(|| deno_core::error::AnyError::msg("failed to create V8 string"))?;
+
+        let mut script_origin = None;
+        if let Some(resource_name) = name {
+            let resource_name = v8::String::new(scope, resource_name)
+                .ok_or_else(|| deno_core::error::AnyError::msg("invalid script name"))?;
+            script_origin = Some(v8::ScriptOrigin::new(
+                scope,
+                resource_name.into(),
+                0,
+                0,
+                false,
+                0,
+                None,
+                false,
+                false,
+                false,
+                None,
+            ));
+        }
+
+        v8::tc_scope!(let tc_scope, scope);
+        let script =
+            v8::Script::compile(tc_scope, source, script_origin.as_ref()).ok_or_else(|| {
+                let message = tc_scope
+                    .exception()
+                    .and_then(|exception| exception.to_string(tc_scope))
+                    .map(|value| value.to_rust_string_lossy(tc_scope))
+                    .unwrap_or_else(|| "child-realm script compilation failed".to_string());
+                deno_core::error::AnyError::msg(message)
+            })?;
+        {
+            let mut state = op_state_rc.borrow_mut();
+            if let Some(store) = state.try_borrow_mut::<native_fns::IframeRealmStore>() {
+                store.execution_stack.push(realm_id);
+            }
+        }
+        let run_value = script.run(tc_scope);
+        // HTML performs a microtask checkpoint at the end of each script task.
+        // Run it while the child realm is still on `execution_stack` so Promise
+        // callbacks observe the correct incumbent sender for postMessage and
+        // other realm-sensitive APIs.
+        let current_ctx = tc_scope.get_current_context();
+        let queue = current_ctx.get_microtask_queue();
+        queue.perform_checkpoint(tc_scope);
+        {
+            let mut state = op_state_rc.borrow_mut();
+            if let Some(store) = state.try_borrow_mut::<native_fns::IframeRealmStore>() {
+                let popped = store.execution_stack.pop();
+                debug_assert_eq!(popped, Some(realm_id));
+            }
+        }
+        let value = run_value.ok_or_else(|| {
+            let message = tc_scope
+                .exception()
+                .and_then(|exception| exception.to_string(tc_scope))
+                .map(|value| value.to_rust_string_lossy(tc_scope))
+                .unwrap_or_else(|| "child-realm script execution failed".to_string());
+            deno_core::error::AnyError::msg(message)
+        })?;
+        Ok(value
+            .to_string(tc_scope)
+            .map(|value| value.to_rust_string_lossy(tc_scope))
+            .unwrap_or_default())
+    }
+
+    /// Remove every same-isolate iframe realm. Called before replacing the DOM
+    /// so a warm navigation cannot retain old WindowProxy/Document graphs.
+    pub fn clear_child_realms(&mut self) {
+        let state = self.inner.op_state();
+        let mut state = state.borrow_mut();
+        if let Some(store) = state.try_borrow_mut::<native_fns::IframeRealmStore>() {
+            store.contexts.clear();
+            store.globals.clear();
+            store.inner_globals.clear();
+            store.node_to_realm.clear();
+            store.realm_to_node.clear();
+            store.window_proxies.clear();
+            store.public_windows.clear();
+            store.property_bridges.clear();
+            store.execution_stack.clear();
+        }
+    }
+
     /// Run the V8 event loop until all pending work is done.
     pub async fn run_event_loop(&mut self) -> Result<(), deno_core::error::AnyError> {
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
         // v8-149: re-enter this runtime's own isolate so driving the event
         // loop (which runs JS, microtasks, and ops that build scopes) targets
         // the correct thread-current isolate even when a child-iframe runtime
@@ -320,6 +487,7 @@ impl BrowserJsRuntime {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), deno_core::error::AnyError>> {
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
         self.inner
             .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
@@ -348,6 +516,7 @@ impl BrowserJsRuntime {
     /// Deliver any queued cross-frame messages into this runtime by calling the
     /// cached `__pumpFrameMessages` (compiled once). Lazily captures it.
     pub fn deliver_frame_messages(&mut self) {
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
         if self.frame_deliver_fn.is_none() {
             self.capture_frame_deliver_fn();
         }
@@ -372,6 +541,7 @@ impl BrowserJsRuntime {
         &mut self,
         url: &str,
     ) -> Result<(), deno_core::error::AnyError> {
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
         let spec = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| deno_core::error::AnyError::msg(format!("module url {url}: {e}")))?;
         // v8-149: see `run_event_loop` — module loading drives V8 and must
@@ -390,6 +560,7 @@ impl BrowserJsRuntime {
         specifier: &str,
         code: String,
     ) -> Result<(), deno_core::error::AnyError> {
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
         let spec = deno_core::ModuleSpecifier::parse(specifier).map_err(|e| {
             deno_core::error::AnyError::msg(format!("inline module spec {specifier}: {e}"))
         })?;
@@ -407,6 +578,7 @@ impl BrowserJsRuntime {
         &mut self,
         mod_id: deno_core::ModuleId,
     ) -> Result<(), deno_core::error::AnyError> {
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
         // v8-149: see `run_event_loop` — mod_evaluate + the loop drive run on
         // this runtime's isolate; re-enter it in case a child is current.
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
@@ -434,6 +606,7 @@ impl BrowserJsRuntime {
         // The bootstrap (and thus __pumpFrameMessages) is re-installed here;
         // drop the cached handle so it is re-captured against the fresh function.
         self.frame_deliver_fn = None;
+        self.clear_child_realms();
         let state = self.inner.op_state();
         let mut state = state.borrow_mut();
         // Replace DomState — ops will pick up the new DOM on next call
@@ -468,7 +641,7 @@ impl BrowserJsRuntime {
     }
 
     /// Get the OpState (shared state).
-    pub fn op_state(&mut self) -> std::rc::Rc<std::cell::RefCell<deno_core::OpState>> {
+    pub fn op_state(&self) -> std::rc::Rc<std::cell::RefCell<deno_core::OpState>> {
         self.inner.op_state()
     }
 

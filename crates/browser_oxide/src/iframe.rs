@@ -16,33 +16,120 @@ pub struct IframeInfo {
     pub node_id: NodeId,
     pub srcdoc: Option<String>,
     pub src: Option<String>,
+    pub name: Option<String>,
 }
 
-/// A child iframe with its own V8 runtime and DOM.
-pub struct ChildIframe {
-    pub node_id: NodeId,
-    pub event_loop: BrowserEventLoop,
+/// Internal runtime used only by network-backed frame-tree contexts. Public
+/// callers use [`FrameContext`], so no API can create a second srcdoc isolate.
+pub(crate) struct ChildIframe {
+    pub(crate) node_id: NodeId,
+    pub(crate) event_loop: BrowserEventLoop,
+}
+
+/// A borrowed handle to the single execution context backing an iframe.
+///
+/// `SameIsolateRealm` is the genuine V8 child context exposed by
+/// `iframe.contentWindow`. `IsolatedRuntime` is used by the frame-tree network
+/// backend. Both present one public API, so callers never create or observe a
+/// second, duplicate iframe runtime.
+pub struct FrameContext<'a> {
+    node_id: NodeId,
+    backend: FrameContextBackend<'a>,
+}
+
+enum FrameContextBackend<'a> {
+    SameIsolateRealm {
+        event_loop: &'a mut BrowserEventLoop,
+        realm_id: u32,
+    },
+    IsolatedRuntime(&'a mut ChildIframe),
+}
+
+impl<'a> FrameContext<'a> {
+    pub(crate) fn same_isolate(
+        node_id: NodeId,
+        event_loop: &'a mut BrowserEventLoop,
+        realm_id: u32,
+    ) -> Self {
+        Self {
+            node_id,
+            backend: FrameContextBackend::SameIsolateRealm {
+                event_loop,
+                realm_id,
+            },
+        }
+    }
+
+    pub(crate) fn isolated(child: &'a mut ChildIframe) -> Self {
+        Self {
+            node_id: child.node_id,
+            backend: FrameContextBackend::IsolatedRuntime(child),
+        }
+    }
+
+    /// DOM host node for this browsing context.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Evaluate JavaScript in the exact context visible to page script.
+    pub fn evaluate(&mut self, js: &str) -> Result<String, deno_core::error::AnyError> {
+        match &mut self.backend {
+            FrameContextBackend::SameIsolateRealm {
+                event_loop,
+                realm_id,
+            } => event_loop.runtime_mut().execute_child_realm_script(
+                *realm_id,
+                js,
+                Some("about:srcdoc"),
+            ),
+            FrameContextBackend::IsolatedRuntime(child) => child.evaluate(js),
+        }
+    }
+
+    /// Drive pending work for this frame.
+    pub async fn pump(&mut self, timeout: Duration) -> Result<(), deno_core::error::AnyError> {
+        match &mut self.backend {
+            FrameContextBackend::SameIsolateRealm { event_loop, .. } => {
+                let _ = event_loop.run_until_idle(timeout).await;
+                Ok(())
+            }
+            FrameContextBackend::IsolatedRuntime(child) => child.pump(timeout).await,
+        }
+    }
+
+    /// Execute JavaScript and then drive pending work.
+    pub async fn execute_and_run(
+        &mut self,
+        js: &str,
+        timeout: Duration,
+    ) -> Result<(), deno_core::error::AnyError> {
+        self.evaluate(js)?;
+        self.pump(timeout).await
+    }
+
+    /// Query text in this frame's document.
+    pub fn query_text(&mut self, selector: &str) -> Option<String> {
+        self.evaluate(&format!(
+            r#"(() => {{ const el = document.querySelector("{}"); return el ? el.textContent : ""; }})()"#,
+            selector.replace('"', "\\\"")
+        ))
+        .ok()
+        .filter(|value| !value.is_empty())
+    }
 }
 
 fn complete_document_lifecycle(event_loop: &mut BrowserEventLoop) {
     // Match the top-level Page lifecycle. Child frames previously executed
     // their scripts but never dispatched DOMContentLoaded/load or advanced
     // document.readyState, leaving real widgets stuck in the loading phase.
-    let _ = event_loop
-        .execute_script("document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));");
-    let _ = event_loop
-        .execute_script("globalThis._browser_oxide.__documentReadyState = 'interactive';");
-    let _ = event_loop.execute_script(
-        "window.dispatchEvent(new Event('load')); \
-         try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}",
-    );
-    let _ =
-        event_loop.execute_script("globalThis._browser_oxide.__documentReadyState = 'complete';");
+    event_loop.complete_document_lifecycle();
 }
 
 impl ChildIframe {
-    /// Create a child iframe from srcdoc HTML.
-    pub async fn from_srcdoc(
+    /// Build isolated HTML for the internal frame-tree backend. Browser-visible
+    /// srcdoc frames never use this path.
+    async fn from_isolated_html(
         node_id: NodeId,
         html: &str,
         profile: &crate::stealth::StealthProfile,
@@ -93,7 +180,7 @@ impl ChildIframe {
     }
 
     /// Create a child iframe by fetching src URL via HTTP client.
-    pub async fn from_url(
+    pub(crate) async fn from_url(
         node_id: NodeId,
         url: &str,
         client: &crate::net::HttpClient,
@@ -144,7 +231,7 @@ impl ChildIframe {
         let html = resp.text();
         // Skip if response looks like non-HTML (binary, error page)
         if html.trim().is_empty() {
-            return Self::from_srcdoc(
+            return Self::from_isolated_html(
                 node_id,
                 "<html><body></body></html>",
                 stealth_profile.unwrap(),
@@ -312,34 +399,17 @@ impl ChildIframe {
     }
 
     /// Evaluate JS in the child's V8 context.
-    pub fn evaluate(&mut self, js: &str) -> Result<String, deno_core::error::AnyError> {
+    pub(crate) fn evaluate(&mut self, js: &str) -> Result<String, deno_core::error::AnyError> {
         self.event_loop.execute_script(js)
     }
 
     /// Run the child's event loop until idle or the caller's deadline.
-    pub async fn pump(&mut self, timeout: Duration) -> Result<(), deno_core::error::AnyError> {
-        let _ = self.event_loop.run_until_idle(timeout).await;
-        Ok(())
-    }
-
-    /// Execute JS then run the event loop until idle or timeout.
-    pub async fn execute_and_run(
+    pub(crate) async fn pump(
         &mut self,
-        js: &str,
         timeout: Duration,
     ) -> Result<(), deno_core::error::AnyError> {
-        self.event_loop
-            .execute_and_run(js, timeout)
-            .await
-            .map(|_| ())
-    }
-
-    /// Query the child's DOM for text content of a selector match.
-    pub fn query_text(&mut self, selector: &str) -> Option<String> {
-        self.evaluate(&format!(
-            r#"(() => {{ const el = document.querySelector("{}"); return el ? el.textContent : ""; }})()"#,
-            selector.replace('"', "\\\"")
-        )).ok().filter(|s| !s.is_empty())
+        let _ = self.event_loop.run_until_idle(timeout).await;
+        Ok(())
     }
 }
 
@@ -366,10 +436,16 @@ fn collect_iframes(dom: &Dom, node_id: NodeId, iframes: &mut Vec<IframeInfo>) {
                         .iter()
                         .find(|a| a.name.local == "src")
                         .map(|a| a.value.clone());
+                    let name = elem
+                        .attrs
+                        .iter()
+                        .find(|a| a.name.local == "name")
+                        .map(|a| a.value.clone());
                     iframes.push(IframeInfo {
                         node_id: child_id,
                         srcdoc,
                         src,
+                        name,
                     });
                 }
             }

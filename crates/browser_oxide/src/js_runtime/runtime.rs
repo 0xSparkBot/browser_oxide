@@ -153,26 +153,19 @@ fn heap_limits() -> (usize, usize) {
 /// fallback runtime is a `OnceLock` living to process exit — a temporary would
 /// leave the isolate holding a handle to a dropped runtime.
 fn ensure_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return None;
-    }
-    static FALLBACK_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    let rt = FALLBACK_RT.get_or_init(|| {
-        // Single worker + timer driver is all V8's delayed tasks need: they
-        // sleep, push onto the isolate's foreground queue, and wake it. The
-        // work itself is drained synchronously by our own event loop.
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_time()
-            .thread_name("browser-oxide-v8-delayed")
-            .build()
-            .expect("failed to build fallback tokio runtime for V8 delayed tasks")
-    });
-    Some(rt.enter())
+    crate::js_runtime::tokio_fallback::ensure_tokio_context()
 }
 
 pub fn create_runtime(dom: Dom, options: BrowserRuntimeOptions) -> JsRuntime {
     create_runtime_with_signals(dom, options).0
+}
+
+/// Private bootstrap functions captured before `cleanup_bootstrap.js` removes
+/// the temporary JS bridge from the page-visible global object.
+#[derive(Default)]
+pub struct RuntimeInternalFns {
+    pub set_current_script: Option<v8::Global<v8::Function>>,
+    pub complete_document_lifecycle: Option<v8::Global<v8::Function>>,
 }
 
 /// Create a runtime AND return its NavSignal so the event-loop driver
@@ -181,7 +174,7 @@ pub fn create_runtime(dom: Dom, options: BrowserRuntimeOptions) -> JsRuntime {
 pub fn create_runtime_with_signals(
     dom: Dom,
     options: BrowserRuntimeOptions,
-) -> (JsRuntime, NavSignal) {
+) -> (JsRuntime, NavSignal, RuntimeInternalFns) {
     let mut state = DomState::new(dom);
     state.stylesheets = options.stylesheets;
     if let Some(storage) = options.storage {
@@ -340,6 +333,8 @@ pub fn create_runtime_with_signals(
     // Execute bootstrap JS only if NOT starting from snapshot
     if options.startup_snapshot.is_none() {
         const BOOTSTRAP_JS: &str = concat!(
+            include_str!("js/ops_trap_bootstrap.js"),
+            "\n",
             include_str!("js/console_bootstrap.js"),
             "\n",
             include_str!("js/stealth_bootstrap.js"),
@@ -375,6 +370,41 @@ pub fn create_runtime_with_signals(
             eprintln!("[boot] BOOTSTRAP_JS exec: {:?}", _bt0.elapsed());
         }
     }
+
+    // Capture privileged helpers before cleanup removes the temporary bridge
+    // from the page-visible global object. Rust still needs these closures to
+    // set `document.currentScript` and emit browser-generated lifecycle events.
+    let internal_fns = {
+        let __ctx = runtime.main_context();
+        v8::scope_with_context!(scope, runtime.v8_isolate(), __ctx);
+        let global = scope.get_current_context().global(scope);
+        let bridge = v8::String::new(scope, "__browser_oxide")
+            .and_then(|key| global.get(scope, key.into()))
+            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok());
+
+        let mut captured = RuntimeInternalFns::default();
+        if let Some(bridge) = bridge {
+            for (name, slot) in [
+                ("_setCurrentScriptById", &mut captured.set_current_script),
+                (
+                    "_completeDocumentLifecycle",
+                    &mut captured.complete_document_lifecycle,
+                ),
+            ] {
+                let Some(key) = v8::String::new(scope, name) else {
+                    continue;
+                };
+                let Some(value) = bridge.get(scope, key.into()) else {
+                    continue;
+                };
+                let Ok(function) = v8::Local::<v8::Function>::try_from(value) else {
+                    continue;
+                };
+                *slot = Some(v8::Global::new(scope, function));
+            }
+        }
+        captured
+    };
 
     // All bootstrap scripts run with name "<anonymous>" so V8 stack
     // frames don't leak browser_oxide-specific tags — real Chrome's
@@ -475,7 +505,7 @@ pub fn create_runtime_with_signals(
         }
     }
 
-    (runtime, nav_signal)
+    (runtime, nav_signal, internal_fns)
 }
 
 /// Create a minimal JsRuntime suitable for a Web Worker.

@@ -532,8 +532,14 @@
         if (typeof _mask === 'function') {
             const _SKIP = new Set([Object.prototype, Function.prototype]);
             for (const _gname of Object.getOwnPropertyNames(globalThis)) {
-                let _v;
-                try { _v = globalThis[_gname]; } catch (_e) { continue; }
+                // Never read through an accessor while sweeping the global
+                // namespace. Window numeric frame properties (`window[0]`) and
+                // many Web APIs are getters; invoking them here can create
+                // realms or trigger observable work before page setup finishes.
+                let _desc;
+                try { _desc = Object.getOwnPropertyDescriptor(globalThis, _gname); } catch (_e) { continue; }
+                if (!_desc || !Object.prototype.hasOwnProperty.call(_desc, 'value')) continue;
+                const _v = _desc.value;
                 if (typeof _v !== 'function') continue;
                 const _p = _v.prototype;
                 if (!_p || _SKIP.has(_p)) continue;

@@ -540,6 +540,14 @@ fn match_sources(sources: &[Source], ctx: &CheckCtx<'_>) -> bool {
     let strict_dynamic = is_script_directive(ctx.directive)
         && sources.iter().any(|s| matches!(s, Source::StrictDynamic));
 
+    // CSP3 `#strict-dynamic-usage`: trust propagates at run time — every
+    // script element created by script (non parser-inserted) is allowed
+    // outright. Parser-inserted elements keep the nonce/hash check below;
+    // host sources only ever apply to the pre-load scan.
+    if strict_dynamic && !ctx.parser_inserted {
+        return true;
+    }
+
     for src in sources {
         match src {
             // Keywords with no fetch effect.

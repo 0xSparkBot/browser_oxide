@@ -582,6 +582,22 @@
         if (bo && typeof bo._installFrameMessageTrustMarker === 'function') {
             bo._installFrameMessageTrustMarker(_markTrusted);
         }
+        if (bo) {
+            bo._markTrustedEvent = _markTrusted;
+            bo._completeDocumentLifecycle = function() {
+                const state = globalThis._browser_oxide;
+                const trusted = (type, options) => _markTrusted(new Event(type, options));
+
+                if (state) state.__documentReadyState = 'interactive';
+                document.dispatchEvent(trusted('readystatechange'));
+                document.dispatchEvent(trusted('DOMContentLoaded'));
+
+                if (state) state.__documentReadyState = 'complete';
+                document.dispatchEvent(trusted('readystatechange'));
+                window.dispatchEvent(trusted('load'));
+                try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}
+            };
+        }
     } catch (_) { /* ignore */ }
 
     // Privileged handoff of the trusted-event minter (behavioral E1/E2). Our

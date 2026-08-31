@@ -86,6 +86,11 @@ fn frame_mailboxes() -> &'static Mutex<HashMap<u32, VecDeque<FrameMessage>>> {
     INST.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn frame_origins() -> &'static Mutex<HashMap<u32, String>> {
+    static INST: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+    INST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 static NEXT_FRAME_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Set when a frame posts a cross-frame message so the event loop returns early
@@ -127,6 +132,16 @@ pub fn dispose_frame(frame_id: u32) {
     if let Ok(mut m) = frame_mailboxes().lock() {
         m.remove(&frame_id);
     }
+    if let Ok(mut origins) = frame_origins().lock() {
+        origins.remove(&frame_id);
+    }
+}
+
+#[op2(fast)]
+pub fn op_frame_register_origin(#[smi] frame_id: u32, #[string] origin: &str) {
+    if let Ok(mut origins) = frame_origins().lock() {
+        origins.insert(frame_id, origin.to_string());
+    }
 }
 
 #[op2(fast)]
@@ -135,10 +150,22 @@ pub fn op_frame_post_message(
     #[smi] source_id: u32,
     #[string] data: &str,
     #[string] origin: &str,
+    #[string] target_origin: &str,
 ) {
+    if target_origin != "*" {
+        let allowed = frame_origins()
+            .lock()
+            .ok()
+            .and_then(|origins| origins.get(&target_id).cloned())
+            .map(|actual| actual == target_origin)
+            .unwrap_or(false);
+        if !allowed {
+            return;
+        }
+    }
     if std::env::var_os("BROWSER_OXIDE_FT_DEBUG").is_some() {
         eprintln!(
-            "[FT-msg] {source_id}->{target_id} origin={origin} data={}",
+            "[FT-msg] {source_id}->{target_id} origin={origin} target={target_origin} data={}",
             &data[..data.len().min(90)]
         );
     }
@@ -198,6 +225,7 @@ deno_core::extension!(
     frame_extension,
     ops = [
         op_frame_pending,
+        op_frame_register_origin,
         op_frame_post_message,
         op_frame_take_messages
     ],

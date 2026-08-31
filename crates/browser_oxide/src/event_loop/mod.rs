@@ -434,6 +434,18 @@ impl BrowserEventLoop {
         self.runtime.execute_script(code, None)
     }
 
+    /// Set or clear `document.currentScript` without exposing an internal JS
+    /// bridge to page code.
+    pub fn set_current_script(&mut self, node_id: Option<u32>) {
+        self.runtime.set_current_script(node_id);
+    }
+
+    /// Dispatch the trusted browser lifecycle sequence and advance
+    /// `document.readyState` through interactive to complete.
+    pub fn complete_document_lifecycle(&mut self) {
+        self.runtime.complete_document_lifecycle();
+    }
+
     /// Flush the microtask queue. See [`BrowserJsRuntime::drain_microtasks`].
     pub fn drain_microtasks(&mut self) {
         self.runtime.drain_microtasks();

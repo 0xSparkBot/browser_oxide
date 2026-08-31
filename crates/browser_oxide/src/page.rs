@@ -42,6 +42,7 @@ fn origin_of(url: &str) -> String {
 
 /// `document.referrer` + `location.ancestorOrigins` for a frame. Cross-origin
 /// downgrades the referrer to the parent origin (default referrer policy).
+#[cfg(test)]
 fn frame_embedding(parent_url: &str, child_url: &str) -> (String, Vec<String>) {
     let parent_origin = origin_of(parent_url);
     if parent_origin.is_empty() {
@@ -574,14 +575,15 @@ enum DriveOutcome {
 }
 
 pub struct Page {
-    // Children (frame tree + cold-path children) hold V8 isolates created
-    // after the parent — must drop before `event_loop` (see Drop).
+    // Frame-tree children hold V8 isolates created after the parent and must
+    // drop before `event_loop` (see Drop). Same-origin/srcdoc frames live as
+    // genuine child contexts inside the parent isolate and are owned by its
+    // IframeRealmStore — there is no second `children` isolate collection.
     frame_tree: Vec<FrameNode>,
     /// The top page's frame id (0 = not yet assigned). Its `__frameId`.
     top_frame_id: u32,
     /// Persistent waker for the top page in the unified driver (see FrameNode).
     top_waker: std::sync::Arc<crate::js_runtime::frame_waker::FrameWaker>,
-    children: Vec<iframe::ChildIframe>,
     event_loop: BrowserEventLoop,
     url: String,
     /// Registered [`crate::ChallengeSolver`]s. `Page::navigate` registers
@@ -618,10 +620,9 @@ impl Drop for Page {
         for node in &self.frame_tree {
             crate::js_runtime::extensions::frame_ext::dispose_frame(node.id);
         }
-        // Drop children (newer isolates) before parent (older isolate)
-        // V8 requires reverse drop order
+        // Drop frame-tree children (newer isolates) before the parent. V8
+        // requires reverse creation order.
         while self.frame_tree.pop().is_some() {}
-        while self.children.pop().is_some() {}
     }
 }
 
@@ -753,15 +754,11 @@ impl Page {
                 // W2.7 — name inline scripts with document URL (Chrome
                 // parity) instead of letting V8 default to <anonymous>.
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                let _ = event_loop.execute_script(&format!(
-                    "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                    script.node_id
-                ));
+                event_loop.set_current_script(Some(script.node_id));
                 if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
                     tracing::warn!(script_index = i, error = %e, "Script error in inline script");
                 }
-                let _ =
-                    event_loop.execute_script("globalThis.__browser_oxide._setCurrentScript(null)");
+                event_loop.set_current_script(None);
             }
         }
 
@@ -771,7 +768,6 @@ impl Page {
             frame_tree: Vec::new(),
             top_frame_id: 0,
             top_waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
-            children: Vec::new(),
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
             http_client: None,
         })
@@ -788,9 +784,6 @@ impl Page {
 
         // Swap DOM in existing runtime (no new V8 isolate needed)
         self.event_loop.runtime_mut().replace_dom(dom, stylesheets);
-
-        // Drop old iframe children
-        self.children.clear();
 
         // Update URL (URL-state setup, not a real navigation).
         self.url = url.to_string();
@@ -810,19 +803,14 @@ impl Page {
             }
             // W2.7 — Chrome parity: inline scripts report the document URL.
             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-            let _ = self.event_loop.execute_script(&format!(
-                "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                script.node_id
-            ));
+            self.event_loop.set_current_script(Some(script.node_id));
             if let Err(e) = self
                 .event_loop
                 .execute_script_with_name(&script.code, &self.url)
             {
                 tracing::warn!(script_index = i, error = %e, "Script error in inline script");
             }
-            let _ = self
-                .event_loop
-                .execute_script("globalThis.__browser_oxide._setCurrentScript(null)");
+            self.event_loop.set_current_script(None);
         }
     }
 
@@ -914,16 +902,11 @@ impl Page {
                         Ok(resp) => {
                             let code = resp.text();
                             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                            let _ = event_loop.execute_script(&format!(
-                                "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                                script.node_id
-                            ));
+                            event_loop.set_current_script(Some(script.node_id));
                             if let Err(e) = event_loop.execute_script(&code) {
                                 tracing::warn!(script_src = %src, error = %e, "Script error in external script");
                             }
-                            let _ = event_loop.execute_script(
-                                "globalThis.__browser_oxide._setCurrentScript(null)",
-                            );
+                            event_loop.set_current_script(None);
                         }
                         Err(e) => {
                             tracing::warn!(script_src = %src, error = %e, "Failed to fetch script")
@@ -932,15 +915,11 @@ impl Page {
                 }
             } else if !script.code.is_empty() {
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                let _ = event_loop.execute_script(&format!(
-                    "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                    script.node_id
-                ));
+                event_loop.set_current_script(Some(script.node_id));
                 if let Err(e) = event_loop.execute_script(&script.code) {
                     tracing::warn!(script_index = i, error = %e, "Script error in inline script");
                 }
-                let _ =
-                    event_loop.execute_script("globalThis.__browser_oxide._setCurrentScript(null)");
+                event_loop.set_current_script(None);
             }
         }
 
@@ -953,81 +932,20 @@ impl Page {
             .execute_script("globalThis._browser_oxide.__documentReadyState = 'loading';")
             .ok();
 
-        // Fire DOMContentLoaded and load events — many scripts wait for these
-        event_loop
-            .execute_script(
-                "document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));",
-            )
-            .ok();
-
-        // After DOMContentLoaded, readyState = interactive
-        event_loop
-            .execute_script("globalThis._browser_oxide.__documentReadyState = 'interactive';")
-            .ok();
-
-        event_loop
-            .execute_script(
-                "window.dispatchEvent(new Event('load')); \
-                 try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}",
-            )
-            .ok();
-
-        // After load, readyState = complete
-        event_loop
-            .execute_script("globalThis._browser_oxide.__documentReadyState = 'complete';")
-            .ok();
+        event_loop.complete_document_lifecycle();
 
         // Synthetic builder: run all inline JS to full idle (callers of `from_html`
         // expect every script to have run), not the render-quiescence early-out.
         event_loop.run_until_idle(Duration::from_secs(8)).await?;
 
-        // Process <iframe srcdoc="..."> elements
-        // Parse srcdoc HTML and execute scripts within an isolated scope
-        let iframes = {
-            let dom_ref = event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
-            let state = state.borrow();
-            let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
-            iframe::find_iframes(&dom_state.dom)
-        };
-        for iframe_info in &iframes {
-            if let Some(srcdoc) = &iframe_info.srcdoc {
-                // Execute srcdoc scripts in an isolated function scope
-                let node_id = iframe_info.node_id.to_raw();
-                let _escaped = srcdoc.replace('\\', "\\\\").replace('`', "\\`");
-                let setup_js = format!(
-                    r#"(() => {{
-                        const _iframeEl = (() => {{
-                            const nodeId = {node_id};
-                            // Find iframe element and set up its contentDocument
-                            const el = document.querySelectorAll('iframe')[0]; // simplified
-                            if (el && el.contentWindow) {{
-                                el.contentWindow._srcdocLoaded = true;
-                            }}
-                        }})();
-                    }})()"#,
-                );
-                event_loop.execute_script(&setup_js).ok();
-            }
-        }
-
-        // Create child Pages for iframes with srcdoc
-        let mut children = Vec::new();
-        let iframes = {
-            let dom_ref = event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
-            let state = state.borrow();
-            let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
-            iframe::find_iframes(&dom_state.dom)
-        };
-        for info in &iframes {
-            if let Some(srcdoc) = &info.srcdoc {
-                match iframe::ChildIframe::from_srcdoc(info.node_id, srcdoc, &p).await {
-                    Ok(child) => children.push(child),
-                    Err(e) => tracing::warn!(error = %e, "iframe srcdoc error"),
-                }
-            }
-        }
+        // Materialize parsed iframe realms through `contentWindow` itself.
+        // This executes srcdoc in the browser-visible child context rather than
+        // creating a second Rust-only iframe isolate.
+        event_loop
+            .execute_script(
+                "Array.from(document.querySelectorAll('iframe')).forEach(function(f){void f.contentWindow;});",
+            )
+            .ok();
 
         Ok(Self {
             event_loop,
@@ -1035,20 +953,60 @@ impl Page {
             frame_tree: Vec::new(),
             top_frame_id: 0,
             top_waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
-            children,
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
             http_client: None,
         })
     }
 
-    /// Get a child iframe by index.
-    pub fn child_iframe(&mut self, index: usize) -> Option<&mut iframe::ChildIframe> {
-        self.children.get_mut(index)
+    /// Get a child frame by document order.
+    ///
+    /// For `srcdoc`/same-isolate frames this enters the exact V8 child context
+    /// returned by `iframe.contentWindow`; for a materialized frame-tree child it
+    /// wraps that frame's runtime. No duplicate iframe isolate is created.
+    pub fn child_iframe(&mut self, index: usize) -> Option<iframe::FrameContext<'_>> {
+        let iframes = {
+            let state = self.event_loop.runtime().op_state();
+            let state = state.borrow();
+            let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
+            iframe::find_iframes(&dom_state.dom)
+        };
+        let host = iframes.get(index)?.node_id;
+
+        if self.top_frame_id != 0 {
+            if let Some(position) = self
+                .frame_tree
+                .iter()
+                .position(|node| node.parent == self.top_frame_id && node.host_node == host)
+            {
+                return Some(iframe::FrameContext::isolated(
+                    &mut self.frame_tree[position].iframe,
+                ));
+            }
+        }
+
+        // `contentWindow` is lazy. Force the browser-visible realm to exist,
+        // then resolve it through the host-node index stored in Rust.
+        let materialize = format!(
+            "(()=>{{const f=document.querySelectorAll('iframe')[{index}];if(!f)return false;void f.contentWindow;return true;}})()"
+        );
+        self.event_loop.execute_script(&materialize).ok()?;
+        let realm_id = self
+            .event_loop
+            .runtime()
+            .child_realm_id_for_node(host.to_raw())?;
+        Some(iframe::FrameContext::same_isolate(
+            host,
+            &mut self.event_loop,
+            realm_id,
+        ))
     }
 
-    /// Get the number of child iframes.
+    /// Get the number of iframe hosts in the current top-level document.
     pub fn child_iframe_count(&self) -> usize {
-        self.children.len()
+        let state = self.event_loop.runtime().op_state();
+        let state = state.borrow();
+        let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
+        iframe::find_iframes(&dom_state.dom).len()
     }
 
     /// Number of materialized frames in the frame tree (excludes the top page).
@@ -1076,6 +1034,288 @@ impl Page {
         }
     }
 
+    /// Execute JavaScript in the top document or one materialized parent frame.
+    /// Keeping this routing in one place prevents lifecycle and mapping helpers
+    /// from drifting apart as frame backends evolve.
+    fn execute_in_frame_context(&mut self, frame_id: u32, js: &str) -> Option<String> {
+        if frame_id == self.top_frame_id {
+            return self.event_loop.execute_script(js).ok();
+        }
+        self.frame_tree
+            .iter_mut()
+            .find(|node| node.id == frame_id)
+            .and_then(|node| node.iframe.event_loop.execute_script(js).ok())
+    }
+
+    fn frame_host_connected(&mut self, parent_id: u32, host_node: NodeId) -> bool {
+        let js = format!(
+            "String(!!(globalThis.__oxFrameHostConnected && globalThis.__oxFrameHostConnected({})))",
+            host_node.to_raw()
+        );
+        self.execute_in_frame_context(parent_id, &js)
+            .map(|value| value == "true")
+            .unwrap_or(false)
+    }
+
+    fn frame_host_matches_url(
+        &mut self,
+        parent_id: u32,
+        host_node: NodeId,
+        expected_url: &str,
+    ) -> bool {
+        let expected = serde_json::to_string(expected_url).unwrap_or_else(|_| "\"\"".to_string());
+        let js = format!(
+            "String(!!(globalThis.__oxFrameHostMatches && globalThis.__oxFrameHostMatches({}, {expected})))",
+            host_node.to_raw()
+        );
+        self.execute_in_frame_context(parent_id, &js)
+            .map(|value| value == "true")
+            .unwrap_or(false)
+    }
+
+    fn unregister_child_frame(&mut self, parent_id: u32, host_node: NodeId) {
+        let js = format!(
+            "globalThis.__oxUnregisterChildFrame && globalThis.__oxUnregisterChildFrame({});",
+            host_node.to_raw()
+        );
+        let _ = self.execute_in_frame_context(parent_id, &js);
+    }
+
+    fn forget_same_isolate_frame(&mut self, parent_id: u32, host_node: NodeId) {
+        let js = format!(
+            "globalThis.__oxForgetSameIsolateFrame && globalThis.__oxForgetSameIsolateFrame({});",
+            host_node.to_raw()
+        );
+        let _ = self.execute_in_frame_context(parent_id, &js);
+    }
+
+    fn bind_child_frame(
+        &mut self,
+        parent_id: u32,
+        host_node: NodeId,
+        child_id: u32,
+        child_url: &str,
+        dispatch_load: bool,
+    ) {
+        let child_origin =
+            serde_json::to_string(&origin_of(child_url)).unwrap_or_else(|_| "\"null\"".to_string());
+        let load_js = if dispatch_load {
+            format!(
+                " globalThis.__oxFrameLoaded && globalThis.__oxFrameLoaded({});",
+                host_node.to_raw()
+            )
+        } else {
+            String::new()
+        };
+        let js = format!(
+            "globalThis.__oxRegisterChildFrame && globalThis.__oxRegisterChildFrame({},{child_id},{child_origin});{load_js}",
+            host_node.to_raw(),
+        );
+        let _ = self.execute_in_frame_context(parent_id, &js);
+    }
+
+    fn register_child_frame(
+        &mut self,
+        parent_id: u32,
+        host_node: NodeId,
+        child_id: u32,
+        child_url: &str,
+    ) {
+        self.bind_child_frame(parent_id, host_node, child_id, child_url, true);
+    }
+
+    /// Rebind an already-materialized frame after a duplicate pending signal.
+    /// Unlike `register_child_frame`, this must not dispatch a second `load`.
+    fn restore_child_frame_mapping(
+        &mut self,
+        parent_id: u32,
+        host_node: NodeId,
+        child_id: u32,
+        child_url: &str,
+    ) {
+        self.bind_child_frame(parent_id, host_node, child_id, child_url, false);
+    }
+
+    /// Drop materialized frames whose host was removed or now points at a
+    /// different backend (`srcdoc`, blank/data/javascript URL, or another URL).
+    /// Descendants are pruned with the stale ancestor and process-global
+    /// mailboxes/origin registrations are released immediately.
+    fn prune_stale_frames(&mut self) {
+        if self.frame_tree.is_empty() {
+            return;
+        }
+
+        let metadata: Vec<(u32, u32, NodeId, String)> = self
+            .frame_tree
+            .iter()
+            .map(|node| (node.id, node.parent, node.host_node, node.url.clone()))
+            .collect();
+        let mut dead = std::collections::HashSet::new();
+        for (id, parent, host, url) in metadata {
+            if dead.contains(&parent)
+                || !self.frame_host_connected(parent, host)
+                || !self.frame_host_matches_url(parent, host, &url)
+            {
+                dead.insert(id);
+            }
+        }
+        if dead.is_empty() {
+            return;
+        }
+
+        for index in (0..self.frame_tree.len()).rev() {
+            let id = self.frame_tree[index].id;
+            if !dead.contains(&id) {
+                continue;
+            }
+            let parent = self.frame_tree[index].parent;
+            let host = self.frame_tree[index].host_node;
+            self.unregister_child_frame(parent, host);
+            crate::js_runtime::extensions::frame_ext::dispose_frame(id);
+            self.frame_tree.remove(index);
+        }
+        crate::js_runtime::extensions::frame_ext::clear_frame_msg_pending();
+    }
+
+    /// Drop an existing browsing-context subtree when the same host iframe
+    /// navigates to a new URL. The parent-side node mapping already points at
+    /// the newly pre-assigned frame id, so this intentionally does not
+    /// unregister the root host mapping.
+    fn drop_frame_subtree_for_navigation(&mut self, root_id: u32) {
+        let mut dead = std::collections::HashSet::from([root_id]);
+        loop {
+            let before = dead.len();
+            for node in &self.frame_tree {
+                if dead.contains(&node.parent) {
+                    dead.insert(node.id);
+                }
+            }
+            if dead.len() == before {
+                break;
+            }
+        }
+        for index in (0..self.frame_tree.len()).rev() {
+            let id = self.frame_tree[index].id;
+            if dead.contains(&id) {
+                crate::js_runtime::extensions::frame_ext::dispose_frame(id);
+                self.frame_tree.remove(index);
+            }
+        }
+        crate::js_runtime::extensions::frame_ext::clear_frame_msg_pending();
+    }
+
+    /// Materialize or replace one network-backed browsing context.
+    ///
+    /// Initial scans, dynamic insertion and `src` navigation all converge here
+    /// so registration, embedding metadata, teardown and mailbox ownership stay
+    /// identical across every creation path.
+    async fn materialize_frame_context(
+        &mut self,
+        parent: u32,
+        host: NodeId,
+        child_id: u32,
+        src: &str,
+        name: &str,
+        client: &crate::net::HttpClient,
+        profile: &crate::stealth::StealthProfile,
+    ) -> bool {
+        let top_id = self.top_frame_id;
+        if !self.frame_host_connected(parent, host) {
+            self.unregister_child_frame(parent, host);
+            crate::js_runtime::extensions::frame_ext::dispose_frame(child_id);
+            return false;
+        }
+
+        if let Some((existing_id, existing_url)) = self
+            .frame_tree
+            .iter()
+            .find(|node| node.parent == parent && node.host_node == host)
+            .map(|node| (node.id, node.url.clone()))
+        {
+            if existing_url == src {
+                crate::js_runtime::extensions::frame_ext::dispose_frame(child_id);
+                self.restore_child_frame_mapping(parent, host, existing_id, &existing_url);
+                return false;
+            }
+            self.drop_frame_subtree_for_navigation(existing_id);
+        }
+
+        // `contentWindow` may have been touched before the asynchronous network
+        // frame was ready. Remove that provisional same-isolate realm before
+        // installing the canonical frame-tree context.
+        self.forget_same_isolate_frame(parent, host);
+
+        let parent_url = if parent == top_id {
+            self.url.clone()
+        } else {
+            self.frame_tree
+                .iter()
+                .find(|node| node.id == parent)
+                .map(|node| node.url.clone())
+                .unwrap_or_default()
+        };
+        let parent_origin = origin_of(&parent_url);
+        let referrer = if !parent_origin.is_empty() && parent_origin == origin_of(src) {
+            parent_url.clone()
+        } else if !parent_origin.is_empty() {
+            format!("{parent_origin}/")
+        } else {
+            String::new()
+        };
+
+        let mut ancestor_origins = Vec::new();
+        let mut current = parent;
+        for _ in 0..20 {
+            if current == top_id {
+                let origin = origin_of(&self.url);
+                if !origin.is_empty() {
+                    ancestor_origins.push(origin);
+                }
+                break;
+            }
+            let Some(node) = self.frame_tree.iter().find(|node| node.id == current) else {
+                break;
+            };
+            let origin = origin_of(&node.url);
+            if !origin.is_empty() {
+                ancestor_origins.push(origin);
+            }
+            current = node.parent;
+        }
+
+        match iframe::ChildIframe::from_url(
+            host,
+            src,
+            client,
+            Some(profile),
+            Some((child_id, parent, top_id)),
+            name,
+            &referrer,
+            &ancestor_origins,
+        )
+        .await
+        {
+            Ok(child) => {
+                self.register_child_frame(parent, host, child_id, src);
+                self.frame_tree.push(FrameNode {
+                    id: child_id,
+                    parent,
+                    host_node: host,
+                    url: src.to_string(),
+                    iframe: child,
+                    waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
+                });
+                true
+            }
+            Err(error) => {
+                self.unregister_child_frame(parent, host);
+                crate::js_runtime::extensions::frame_ext::dispose_frame(child_id);
+                tracing::debug!(src, %error, "frame materialize failed");
+                false
+            }
+        }
+    }
+
     pub async fn drive_frame_tree(
         &mut self,
         client: &crate::net::HttpClient,
@@ -1085,8 +1325,11 @@ impl Page {
         // Bounded by the round cap (nested-frame depth) and, per drive, by the V8
         // deadline watcher. Each pass materializes new frames, then drives to settle.
         for _ in 0..64 {
+            self.prune_stale_frames();
             self.materialize_pending_frames(client, profile).await;
-            match self.drive_tree_once().await {
+            let outcome = self.drive_tree_once().await;
+            self.prune_stale_frames();
+            match outcome {
                 DriveOutcome::NeedMaterialize => continue,
                 DriveOutcome::AllIdle | DriveOutcome::Nav | DriveOutcome::Settled => break,
             }
@@ -1118,94 +1361,23 @@ impl Page {
                 break;
             }
             for (parent, pf) in pending {
-                let host = NodeId::from_raw(pf.host_node_id);
-                if self
-                    .frame_tree
-                    .iter()
-                    .any(|n| n.parent == parent && n.host_node == host)
-                {
-                    continue;
-                }
-                let cid = pf.frame_id;
-                let parent_url = if parent == top_id {
-                    self.url.clone()
-                } else {
-                    self.frame_tree
-                        .iter()
-                        .find(|n| n.id == parent)
-                        .map(|n| n.url.clone())
-                        .unwrap_or_default()
-                };
-                let parent_origin = origin_of(&parent_url);
-                let referrer = if !parent_origin.is_empty() && parent_origin == origin_of(&pf.src) {
-                    parent_url.clone()
-                } else if !parent_origin.is_empty() {
-                    format!("{parent_origin}/")
-                } else {
-                    String::new()
-                };
-                let mut ancestor_origins: Vec<String> = Vec::new();
-                let mut cur = parent;
-                for _ in 0..20 {
-                    if cur == top_id {
-                        let o = origin_of(&self.url);
-                        if !o.is_empty() {
-                            ancestor_origins.push(o);
-                        }
-                        break;
-                    }
-                    match self.frame_tree.iter().find(|n| n.id == cur) {
-                        Some(n) => {
-                            let o = origin_of(&n.url);
-                            if !o.is_empty() {
-                                ancestor_origins.push(o);
-                            }
-                            cur = n.parent;
-                        }
-                        None => break,
-                    }
-                }
-                match iframe::ChildIframe::from_url(
-                    host,
-                    &pf.src,
-                    client,
-                    Some(profile),
-                    Some((cid, parent, top_id)),
-                    &pf.name,
-                    &referrer,
-                    &ancestor_origins,
-                )
-                .await
-                {
-                    Ok(child) => {
-                        if std::env::var_os("BROWSER_OXIDE_FT_DEBUG").is_some() {
-                            eprintln!(
-                                "[FT] materialized cid={cid} parent={parent} src={}",
-                                &pf.src[..pf.src.len().min(55)]
-                            );
-                        }
-                        let reg = format!(
-                            "globalThis.__oxRegisterChildFrame && globalThis.__oxRegisterChildFrame({0},{cid}); globalThis.__oxFrameLoaded && globalThis.__oxFrameLoaded({0});",
-                            pf.host_node_id
-                        );
-                        if parent == top_id {
-                            let _ = self.event_loop.execute_script(&reg);
-                        } else if let Some(p) = self.frame_tree.iter_mut().find(|n| n.id == parent)
-                        {
-                            let _ = p.iframe.event_loop.execute_script(&reg);
-                        }
-                        self.frame_tree.push(FrameNode {
-                            id: cid,
-                            parent,
-                            host_node: host,
-                            url: pf.src.clone(),
-                            iframe: child,
-                            waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
-                        });
-                    }
-                    Err(e) => {
-                        tracing::debug!(src = %pf.src, error = %e, "frame materialize failed")
-                    }
+                let materialized = self
+                    .materialize_frame_context(
+                        parent,
+                        NodeId::from_raw(pf.host_node_id),
+                        pf.frame_id,
+                        &pf.src,
+                        &pf.name,
+                        client,
+                        profile,
+                    )
+                    .await;
+                if materialized && std::env::var_os("BROWSER_OXIDE_FT_DEBUG").is_some() {
+                    eprintln!(
+                        "[FT] materialized cid={} parent={parent} src={}",
+                        pf.frame_id,
+                        &pf.src[..pf.src.len().min(55)]
+                    );
                 }
             }
             rounds += 1;
@@ -1344,13 +1516,10 @@ impl Page {
     /// iframes and modern managed-challenge widgets. This is currently
     /// the single highest-leverage rendering gap.
     ///
-    /// This rescans the *current* (post-JS) DOM and, for every iframe
-    /// whose `node_id` is not already materialized in `self.children`,
-    /// performs the SAME real cross-origin fetch + child-context
-    /// execution the build-time path does (`ChildIframe::from_url`,
-    /// CSP-`frame-src`-gated identically to build time). Returns the
-    /// number of newly materialized iframes. Idempotent: re-running
-    /// only picks up iframes injected since the last call.
+    /// This rescans the *current* (post-JS) DOM. `srcdoc`/blank frames are
+    /// materialized in their browser-visible same-isolate realm; network frames
+    /// are promoted into the canonical frame tree. Returns the number of newly
+    /// materialized contexts and is idempotent across repeated scans.
     ///
     /// Caller MUST gate this on a challenge-origin flag (it is invoked
     /// only inside the challenge poll) so it never runs for a benign
@@ -1362,57 +1531,69 @@ impl Page {
         client: &crate::net::HttpClient,
         profile: &crate::stealth::StealthProfile,
     ) -> usize {
-        // Snapshot the current DOM's iframes (scoped borrow, dropped
-        // before any await / before touching self.children).
+        self.init_top_frame();
+        // Snapshot the current DOM's iframes before any await.
         let iframes = {
-            let dom_ref = self.event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
+            let state = self.event_loop.runtime().op_state();
             let state = state.borrow();
             let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
             iframe::find_iframes(&dom_state.dom)
         };
-        let already: Vec<_> = self.children.iter().map(|c| c.node_id).collect();
         let mut materialized = 0usize;
-        for info in &iframes {
-            if already.contains(&info.node_id) {
-                continue; // already a real child context — not script-new
-            }
-            if let Some(srcdoc) = &info.srcdoc {
-                match iframe::ChildIframe::from_srcdoc(info.node_id, srcdoc, profile).await {
-                    Ok(child) => {
-                        self.children.push(child);
+        for (index, info) in iframes.iter().enumerate() {
+            let src = info.src.as_deref().unwrap_or("");
+            let is_network = !src.is_empty()
+                && !src.starts_with("javascript:")
+                && !src.starts_with("data:")
+                && src != "about:blank";
+
+            if !is_network {
+                let before = self
+                    .event_loop
+                    .runtime()
+                    .child_realm_id_for_node(info.node_id.to_raw());
+                if before.is_none() {
+                    let js = format!(
+                        "(()=>{{const f=document.querySelectorAll('iframe')[{index}];if(!f)return false;void f.contentWindow;return true;}})()"
+                    );
+                    let _ = self.event_loop.execute_script(&js);
+                    if self
+                        .event_loop
+                        .runtime()
+                        .child_realm_id_for_node(info.node_id.to_raw())
+                        .is_some()
+                    {
                         materialized += 1;
                     }
-                    Err(e) => tracing::warn!(error = %e, "rematerialize srcdoc error"),
                 }
-            } else if let Some(src) = &info.src {
-                if src.is_empty() || src.starts_with("javascript:") {
-                    continue; // blank/JS frames are handled at build time
-                }
-                if let Some(full_src) = Self::resolve_url(base_url, src) {
-                    let (referrer, ancestors) = frame_embedding(base_url, &full_src);
-                    match iframe::ChildIframe::from_url(
-                        info.node_id,
-                        &full_src,
-                        client,
-                        Some(profile),
-                        None,
-                        "",
-                        &referrer,
-                        &ancestors,
-                    )
-                    .await
-                    {
-                        Ok(child) => {
-                            self.children.push(child);
-                            materialized += 1;
-                        }
-                        Err(e) => tracing::warn!(
-                            src = %full_src, error = %e,
-                            "rematerialize src-iframe error (CSP-blocked or fetch failed)"
-                        ),
-                    }
-                }
+                continue;
+            }
+
+            let Some(full_src) = Self::resolve_url(base_url, src) else {
+                continue;
+            };
+            let already = self.frame_tree.iter().any(|node| {
+                node.parent == self.top_frame_id
+                    && node.host_node == info.node_id
+                    && node.url == full_src
+            });
+            if already {
+                continue;
+            }
+            let child_id = crate::js_runtime::extensions::frame_ext::next_frame_id();
+            if self
+                .materialize_frame_context(
+                    self.top_frame_id,
+                    info.node_id,
+                    child_id,
+                    &full_src,
+                    info.name.as_deref().unwrap_or(""),
+                    client,
+                    profile,
+                )
+                .await
+            {
+                materialized += 1;
             }
         }
         materialized
@@ -2072,10 +2253,11 @@ impl Page {
         self.top_waker = crate::js_runtime::frame_waker::FrameWaker::new_dirty();
         crate::js_runtime::extensions::frame_ext::clear_frame_msg_pending();
 
-        // Drop the previous document's iframe isolates. Children are newer
-        // isolates than this Page's, so clearing here keeps V8's
-        // reverse-creation-order drop requirement satisfied.
-        self.children.clear();
+        // Drop the previous document's frame-tree isolates. Same-isolate child
+        // realms are cleared by `BrowserJsRuntime::replace_dom`.
+        while let Some(node) = self.frame_tree.pop() {
+            crate::js_runtime::extensions::frame_ext::dispose_frame(node.id);
+        }
     }
 
     /// Navigate this *warm* Page to a new URL by reusing its V8 isolate
@@ -2326,8 +2508,13 @@ impl Page {
 
         // Swap DOM (also resets `TimerState` Rust-side).
         self.event_loop.runtime_mut().replace_dom(dom, stylesheets);
-        self.children.clear();
         self.url = resp_url.clone();
+        // A warm navigation reuses the JS realm, including the previous
+        // document's readyState slot. Reset it before any new-page script runs;
+        // otherwise the second document observes `complete` during parsing.
+        let _ = self
+            .event_loop
+            .execute_script("globalThis._browser_oxide.__documentReadyState = 'loading';");
         for t in all_timings {
             self.event_loop.runtime_mut().record_resource_timing(t);
         }
@@ -2418,14 +2605,23 @@ impl Page {
                 match tokio::time::timeout(Duration::from_secs(10), eval_fut).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
+                        // Surface the same diagnostics a real browser prints to
+                        // its Console for a failed module eval; without this the
+                        // error is invisible whenever no `tracing` subscriber is
+                        // installed (default for the example binaries).
+                        eprintln!("[module] {name}: {e}");
                         tracing::warn!(script = %name, error = %e, "warm ES module eval error")
                     }
                     Err(_) => {
                         tracing::warn!(script = %name, "warm ES module eval timed out (10s) — continuing")
                     }
                 }
-            } else if let Err(e) = self.event_loop.execute_script_with_name(&code, &name) {
-                tracing::warn!(script = %name, error = %e, "warm script error");
+            } else {
+                self.event_loop.set_current_script(Some(script.node_id));
+                if let Err(e) = self.event_loop.execute_script_with_name(&code, &name) {
+                    tracing::warn!(script = %name, error = %e, "warm script error");
+                }
+                self.event_loop.set_current_script(None);
             }
             // Flush this script's microtasks before the next runs (browser script
             // ordering); its async ops advance in the final drain.
@@ -2440,17 +2636,7 @@ impl Page {
             .event_loop
             .execute_script(include_str!("js/humanize.js"));
 
-        // DOMContentLoaded + load events — same setTimeout(0) trick the
-        // cold build uses so dispatched handlers run inside the event
-        // loop (not synchronously during setup).
-        let _ = self.event_loop.execute_script(
-            r#"setTimeout(() => {
-                document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
-                window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
-                window.dispatchEvent(new Event('load'));
-                try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}
-            }, 0);"#,
-        );
+        self.event_loop.complete_document_lifecycle();
 
         // Meta-refresh scanner — sets `__pendingNavigation` if the page
         // has one. The caller doesn't loop on it (warm path skips the
@@ -2573,6 +2759,12 @@ impl Page {
                             policy_set.policies.len() - csp_headers.len(),
                             enforce
                         );
+                        for (idx, p) in policy_set.policies.iter().enumerate() {
+                            eprintln!(
+                                "[csp] policy#{idx} report_only={} {:?}",
+                                p.report_only, p.directives
+                            );
+                        }
                     }
                     crate::js_runtime::extensions::fetch_ext::set_csp_policy(
                         std::sync::Arc::new(policy_set),
@@ -4456,15 +4648,11 @@ impl Page {
                 // attribute or resolve a relative path) get null otherwise and
                 // silently stall. The _wrapNode/_setCurrentScript hooks already
                 // exist + are exported; this is the missing call site.
-                let _ = event_loop.execute_script(&format!(
-                    "globalThis.__browser_oxide._setCurrentScript(globalThis.__browser_oxide._wrapNode({}))",
-                    script.node_id
-                ));
+                event_loop.set_current_script(Some(script.node_id));
                 if let Err(e) = event_loop.execute_script_with_name(&code, &name) {
                     tracing::warn!(script = %name, error = %e, "Script execution error");
                 }
-                let _ =
-                    event_loop.execute_script("globalThis.__browser_oxide._setCurrentScript(null)");
+                event_loop.set_current_script(None);
             }
 
             // Flush logs for this script
@@ -4500,34 +4688,8 @@ impl Page {
             .ok();
         mark!("cleanup_bootstrap.js");
 
-        // Fire DOMContentLoaded and load events via setTimeout so they execute
-        // within the event loop (not synchronously during script setup).
-        // This ensures async handlers can create Promises that the event loop tracks.
-        event_loop
-            .execute_script(
-                r#"
-            setTimeout(() => {
-                // Advance the document lifecycle: loading -> interactive
-                // (DOMContentLoaded) -> complete (load). The navigate build
-                // path previously left __documentReadyState at the bootstrap
-                // default 'loading', so document.readyState NEVER reached
-                // 'complete' for any navigated page — frameworks that gate
-                // mounting on readyState==='complete' (or poll it) would
-                // spin/never mount. Fire readystatechange on each transition.
-                try { globalThis._browser_oxide.__documentReadyState = 'interactive'; } catch (_e) {}
-                document.dispatchEvent(new Event('readystatechange'));
-                document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
-                window.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));
-                try { globalThis._browser_oxide.__documentReadyState = 'complete'; } catch (_e) {}
-                document.dispatchEvent(new Event('readystatechange'));
-                window.dispatchEvent(new Event('load'));
-                try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}
-            }, 0);
-        "#,
-            )
-            .ok();
-
-        mark!("DOMContentLoaded/load setTimeout install");
+        event_loop.complete_document_lifecycle();
+        mark!("DOMContentLoaded/load dispatch");
 
         // Scan for <meta http-equiv="refresh" content="N;url=..."> and
         // schedule a pending navigation. Generic navigation primitive —
@@ -4634,58 +4796,14 @@ impl Page {
             }
         }
 
-        // Process iframes (srcdoc and src)
-        let mut children = Vec::new();
-        let iframes = {
-            let dom_ref = event_loop.runtime_mut().inner();
-            let state = dom_ref.op_state();
-            let state = state.borrow();
-            let dom_state = state.borrow::<crate::js_runtime::state::DomState>();
-            iframe::find_iframes(&dom_state.dom)
-        };
-        for info in &iframes {
-            if let Some(srcdoc) = &info.srcdoc {
-                match iframe::ChildIframe::from_srcdoc(info.node_id, srcdoc, profile).await {
-                    Ok(child) => children.push(child),
-                    Err(e) => tracing::warn!(error = %e, "iframe srcdoc error"),
-                }
-            } else if let Some(src) = &info.src {
-                if !src.is_empty() && !src.starts_with("javascript:") {
-                    if let Some(full_src) = Self::resolve_url(url, src) {
-                        let (referrer, ancestors) = frame_embedding(url, &full_src);
-                        match iframe::ChildIframe::from_url(
-                            info.node_id,
-                            &full_src,
-                            client,
-                            Some(profile),
-                            None,
-                            "",
-                            &referrer,
-                            &ancestors,
-                        )
-                        .await
-                        {
-                            Ok(child) => children.push(child),
-                            Err(e) => {
-                                tracing::warn!(src = %full_src, error = %e, "iframe src error")
-                            }
-                        }
-                    }
-                } else if src.starts_with("javascript:") {
-                    // javascript:; or similar — create a blank frame so it can be written to
-                    match iframe::ChildIframe::from_srcdoc(
-                        info.node_id,
-                        "<!DOCTYPE html><html><body></body></html>",
-                        profile,
-                    )
-                    .await
-                    {
-                        Ok(child) => children.push(child),
-                        Err(e) => tracing::warn!(error = %e, "iframe javascript blank error"),
-                    }
-                }
-            }
-        }
+        // Materialize same-isolate iframe realms through the browser-visible
+        // `contentWindow` path. Remote frames are promoted into the frame tree
+        // by `rematerialize_iframes`/`drive_frame_tree`, never duplicated here.
+        event_loop
+            .execute_script(
+                "Array.from(document.querySelectorAll('iframe')).forEach(function(f){void f.contentWindow;});",
+            )
+            .ok();
 
         // Cancel the build-phase watcher's terminate so the runtime is
         // usable for the drain phase (and downstream execute_script calls).
@@ -4701,7 +4819,6 @@ impl Page {
             frame_tree: Vec::new(),
             top_frame_id: 0,
             top_waker: crate::js_runtime::frame_waker::FrameWaker::new_dirty(),
-            children,
             solvers: std::sync::Arc::from(Vec::<std::sync::Arc<dyn crate::ChallengeSolver>>::new()),
             http_client: None,
         })
@@ -4709,8 +4826,10 @@ impl Page {
 
     /// Consume the page and return the DOM.
     pub fn take_dom(mut self) -> Dom {
-        // Drop children first (V8 reverse order requirement)
-        self.children.clear();
+        // Drop frame-tree children first (V8 reverse order requirement).
+        while let Some(node) = self.frame_tree.pop() {
+            crate::js_runtime::extensions::frame_ext::dispose_frame(node.id);
+        }
         // Use ManuallyDrop to prevent the Drop impl from running
         let page = std::mem::ManuallyDrop::new(self);
         // SAFETY: `page` is `ManuallyDrop`, so its destructor will not

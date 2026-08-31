@@ -71,6 +71,29 @@
           }
         : () => {};
 
+    // Chrome reports an uncaught timer-callback error through the window
+    // `error` event and the console. deno_core's internal rejected-promise
+    // path is invisible to both (`window.onerror` never fires for it), so
+    // mirror the Chrome behavior: dispatch the event when the constructor
+    // exists, call the installed onerror hook, and always console-trace.
+    function _reportTimerError(e) {
+        try {
+            globalThis.dispatchEvent(
+                new ErrorEvent("error", {
+                    error: e,
+                    message: String((e && e.message) || e),
+                }),
+            );
+        } catch (_) {}
+        try {
+            window.onerror &&
+                window.onerror(String((e && e.message) || e), "", 0, 0, e);
+        } catch (_) {}
+        try {
+            ops.op_console_error("Uncaught " + String((e && e.stack) || e));
+        } catch (_) {}
+    }
+
     globalThis.setTimeout = function setTimeout(callback, delay = 0, ...args) {
         if (typeof callback !== "function") {
             callback = new Function(String(callback));
@@ -84,7 +107,11 @@
         p.then(() => {
             if (myGen !== _timerGen) return; // post `__cancelAllTimers`, drop
             if (!_cancelledTimers.has(id)) {
-                callback(...args);
+                try {
+                    callback(...args);
+                } catch (e) {
+                    _reportTimerError(e);
+                }
             }
         });
         return id;
@@ -112,7 +139,11 @@
         p.then(() => {
             if (myGen !== _timerGen) return;
             if (!_cancelledTimers.has(id)) {
-                callback(...args);
+                try {
+                    callback(...args);
+                } catch (e) {
+                    _reportTimerError(e);
+                }
             }
         });
         return id;
@@ -135,7 +166,11 @@
             p.then(() => {
                 if (myGen !== _timerGen) return;
                 if (!_cancelledTimers.has(id)) {
-                    callback(...args);
+                    try {
+                        callback(...args);
+                    } catch (e) {
+                        _reportTimerError(e);
+                    }
                     tick();
                 }
             });

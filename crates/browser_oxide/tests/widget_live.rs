@@ -15,6 +15,7 @@ async fn cloudflare_turnstile_always_passes() {
     let url =
         std::env::var("BROWSER_OXIDE_TARGET").unwrap_or_else(|_| DEFAULT_DEMO_URL.to_string());
     let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let widget_debug = std::env::var_os("BROWSER_OXIDE_WIDGET_DEBUG").is_some();
     let client = browser_oxide::net::HttpClient::shared(&profile).expect("http client");
     let mut page = browser_oxide::Page::navigate(&url, profile.clone(), 2)
         .await
@@ -43,6 +44,7 @@ async fn cloudflare_turnstile_always_passes() {
     let render = page
         .evaluate(&format!(
             r#"(function(){{
+                globalThis.__browser_oxide_debug={widget_debug};
                 globalThis.__oxTsResult={{callback:false,token:'',error:''}};
                 var host=document.createElement('div');
                 host.id='browser-oxide-always-pass';
@@ -80,6 +82,52 @@ async fn cloudflare_turnstile_always_passes() {
         ) {
             completed = true;
             break;
+        }
+    }
+    if !completed {
+        let top_state = page
+            .evaluate(
+                r#"JSON.stringify({
+                    api:typeof globalThis.turnstile,
+                    result:globalThis.__oxTsResult||null,
+                    widget:globalThis.__oxTsWidgetId||'',
+                    response:(globalThis.turnstile&&globalThis.__oxTsWidgetId)
+                        ? (turnstile.getResponse(__oxTsWidgetId)||'') : '',
+                    hidden:Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]'))
+                        .map(function(input){return input.value||'';}),
+                    iframes:Array.from(document.querySelectorAll('iframe')).map(function(frame){
+                        return {id:frame.id||'',name:frame.name||'',src:frame.src||frame.getAttribute('src')||'',connected:frame.isConnected};
+                    }),
+                    shadows:Array.from(globalThis.__oxideShadowDebug||[]).map(function(root){
+                        var frames=[];
+                        try { frames=Array.from(root.querySelectorAll('iframe')).map(function(frame){
+                            return {src:frame.src||frame.getAttribute('src')||'',connected:frame.isConnected,hasWindow:!!frame.contentWindow};
+                        }); } catch (_) {}
+                        return {mode:root.mode||'',html:String(root.innerHTML||'').slice(0,1200),iframes:frames};
+                    }),
+                    frameDebug:(globalThis.__oxideFrameDebug||[]).slice(-80),
+                    frameMappings:Object.assign({},globalThis.__frameIdForNode||{}),
+                    scriptErrors:(globalThis.__scriptErrors||[]).slice(0,8),
+                    rejections:(globalThis.__oxRejLog||[]).slice(0,8)
+                })"#,
+            )
+            .unwrap_or_else(|error| format!("EVAL_ERROR:{error}"));
+        eprintln!("TURNSTILE_TIMEOUT_TOP={top_state}");
+        eprintln!("TURNSTILE_TIMEOUT_FRAMES={}", page.frame_tree_count());
+        for index in 0..page.frame_tree_count() {
+            let state = page
+                .frame_tree_evaluate(
+                    index,
+                    r#"JSON.stringify({
+                        href:String(location.href),
+                        ready:document.readyState,
+                        bodyLength:(document.body&&document.body.innerHTML||'').length,
+                        scriptErrors:(globalThis.__scriptErrors||[]).slice(0,5),
+                        rejections:(globalThis.__oxRejLog||[]).slice(0,5)
+                    })"#,
+                )
+                .unwrap_or_else(|| "<missing frame>".to_string());
+            eprintln!("TURNSTILE_TIMEOUT_FRAME[{index}]={state}");
         }
     }
     assert!(completed, "always-pass Turnstile callback did not fire");

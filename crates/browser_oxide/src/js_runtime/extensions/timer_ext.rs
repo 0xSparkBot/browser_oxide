@@ -79,7 +79,24 @@ pub fn op_clear_timer(state: &mut OpState, #[smi] id: i32) {
 // matching Chrome's timer cadence.
 #[op2(async(deferred), fast)]
 pub async fn op_timer_sleep(#[smi] ms: i32) {
-    tokio::time::sleep(tokio::time::Duration::from_millis(ms.max(0) as u64)).await;
+    let sleep = {
+        // `tokio::time::sleep` binds to a reactor at creation time; bootstrap
+        // scripts schedule timers during `execute_script`, which is reachable
+        // from plain threads with no ambient runtime. Enter a process-lifetime
+        // fallback there — mirroring the V8 delayed-task fallback in
+        // `runtime.rs` — so timer ops never panic (a panic here aborts: V8
+        // calls the fn ptr through C++ frames that cannot unwind). The future
+        // itself is polled by the caller's event loop and needs no context.
+        let _guard = timer_reactor().enter();
+        tokio::time::sleep(tokio::time::Duration::from_millis(ms.max(0) as u64))
+    };
+    sleep.await;
+}
+
+/// Reactor for timer ops: the caller's tokio context when there is one,
+/// otherwise the shared process-lifetime fallback (see `tokio_fallback`).
+fn timer_reactor() -> tokio::runtime::Handle {
+    crate::js_runtime::tokio_fallback::reactor_handle()
 }
 
 deno_core::extension!(

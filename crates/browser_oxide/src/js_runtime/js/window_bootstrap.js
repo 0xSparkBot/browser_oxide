@@ -1,5 +1,9 @@
 ((globalThis) => {
     const ops = Deno.core.ops;
+    const _markTrustedEvent =
+        (globalThis.__browser_oxide && globalThis.__browser_oxide._markTrustedEvent)
+        || globalThis.__bo_mark_trusted
+        || ((event) => event);
     const _browser_oxide = {
         __documentReadyState: "loading",
         __pendingNavigation: null,
@@ -4369,25 +4373,73 @@
 
         globalThis.postMessage = ({
         postMessage(message, targetOrigin, transfer) {
+            let requestedOrigin = targetOrigin;
+            let transferList = transfer;
+            if (targetOrigin && typeof targetOrigin === 'object') {
+                requestedOrigin = targetOrigin.targetOrigin;
+                transferList = targetOrigin.transfer;
+            }
+            // When a same-isolate iframe calls `parent.postMessage()` or
+            // `top.postMessage()`, the receiver is this real WindowProxy but
+            // the sender is the currently executing child realm. Rust tracks
+            // that execution scope explicitly; capture the sender WindowProxy
+            // now because dispatch occurs later as a task.
+            let senderWindow = globalThis;
+            try {
+                const candidate = ops.op_current_child_realm_window
+                    ? ops.op_current_child_realm_window()
+                    : undefined;
+                if (candidate) senderWindow = candidate;
+            } catch (_) {}
+            let senderOrigin = globalThis.location?.origin || "";
+            let senderHref = globalThis.location?.href || "about:blank";
+            try {
+                if (senderWindow && senderWindow.location) {
+                    senderOrigin = senderWindow.location.origin || senderOrigin;
+                    senderHref = senderWindow.location.href || senderHref;
+                }
+            } catch (_) {}
+            const targetWindowOrigin = globalThis.location?.origin || "";
+            let normalizedTarget;
+            if (requestedOrigin === undefined || requestedOrigin === "/") {
+                normalizedTarget = senderOrigin;
+            } else if (requestedOrigin === "*") {
+                normalizedTarget = "*";
+            } else {
+                try {
+                    const rawTarget = String(requestedOrigin);
+                    const openBrackets = (rawTarget.match(/\[/g) || []).length;
+                    const closeBrackets = (rawTarget.match(/\]/g) || []).length;
+                    if (/\s/.test(rawTarget) || openBrackets !== closeBrackets) throw new Error("invalid URL");
+                    normalizedTarget = new URL(rawTarget, senderHref).origin;
+                    if (!normalizedTarget || normalizedTarget === "null") throw new Error("opaque origin");
+                } catch (_) {
+                    throw new DOMException("Invalid target origin", "SyntaxError");
+                }
+            }
+            if (normalizedTarget !== "*" && normalizedTarget !== targetWindowOrigin) return;
+
             // Use structuredClone if available to match browser behavior.
             // If not available (e.g. during very early bootstrap), fall back to reference.
             let cloned = message;
             try {
                 if (typeof globalThis.structuredClone === 'function') {
-                    cloned = globalThis.structuredClone(message, { transfer });
+                    cloned = globalThis.structuredClone(message, { transfer: transferList });
                 }
             } catch (e) {
                 // DataCloneError — propagate as-is (matches Chrome)
                 throw e;
             }
-            // Fire message event asynchronously
-            Promise.resolve().then(() => {
-                const event = new MessageEvent("message", {
+            // postMessage queues a task, not a microtask. Promise callbacks
+            // scheduled after this call must run before the message event.
+            setTimeout(() => {
+                const event = _markTrustedEvent(new MessageEvent("message", {
                     data: cloned,
-                    origin: targetOrigin || globalThis.location?.origin || "",
-                });
+                    origin: senderOrigin,
+                    source: senderWindow,
+                }));
                 globalThis.dispatchEvent(event);
-            });
+            }, 0);
         }
         }).postMessage;
         _maskFunction(globalThis.postMessage, "postMessage");

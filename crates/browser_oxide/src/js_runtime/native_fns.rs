@@ -28,6 +28,20 @@
 use deno_core::v8;
 use std::collections::HashMap;
 
+/// Realm-local helpers that perform Window/global reflection using JavaScript
+/// semantics inside the owning V8 context. Calling these functions from Rust is
+/// more reliable than using cross-context GlobalProxy C++ property APIs, whose
+/// behavior intentionally differs from HTML's WindowProxy exotic object.
+pub struct IframePropertyBridge {
+    pub get: v8::Global<v8::Function>,
+    pub set: v8::Global<v8::Function>,
+    pub has: v8::Global<v8::Function>,
+    pub delete: v8::Global<v8::Function>,
+    pub own_keys: v8::Global<v8::Function>,
+    pub descriptor: v8::Global<v8::Function>,
+    pub define: v8::Global<v8::Function>,
+}
+
 const NATIVE_TAG: &str = "__browser_oxide_native__";
 
 /// Per-runtime storage for child iframe realms (genuine v8::Context instances).
@@ -48,7 +62,33 @@ const NATIVE_TAG: &str = "__browser_oxide_native__";
 /// `v8::Symbol::for_api` is a DIFFERENT registry and will NOT find these tags.
 pub struct IframeRealmStore {
     pub contexts: HashMap<u32, v8::Global<v8::Context>>,
+    /// Raw V8 GlobalProxy returned to the realm/FrameContext path.
     pub globals: HashMap<u32, v8::Global<v8::Object>>,
+    /// Ordinary inner global behind each V8 GlobalProxy. Public HTML
+    /// WindowProxy wrappers forward data/reflection operations here.
+    pub inner_globals: HashMap<u32, v8::Global<v8::Object>>,
+    /// Host DOM node -> realm id. This is the canonical bridge between the
+    /// browser-visible `iframe.contentWindow` realm and Rust's frame API.
+    pub node_to_realm: HashMap<u32, u32>,
+    /// Reverse mapping used for deterministic teardown on iframe navigation or
+    /// removal. Keeping both directions avoids scanning the store on hot paths.
+    pub realm_to_node: HashMap<u32, u32>,
+    /// Stable V8 global proxy per iframe host. Creating a new Context with this
+    /// object resets its inner global while preserving `contentWindow` identity,
+    /// matching browser navigation semantics.
+    pub window_proxies: HashMap<u32, v8::Global<v8::Object>>,
+    /// Browser-visible WindowProxy wrapper for each live same-isolate realm.
+    /// This is distinct from the V8 GlobalProxy: the wrapper implements HTML's
+    /// WindowProxy reflection semantics while the raw GlobalProxy remains the
+    /// realm's unique execution global.
+    pub public_windows: HashMap<u32, v8::Global<v8::Object>>,
+    /// Cached reflection helpers created in each child realm.
+    pub property_bridges: HashMap<u32, IframePropertyBridge>,
+    /// Stack of same-isolate iframe realms whose JavaScript is currently being
+    /// executed by the embedder. postMessage uses the top entry as the sender
+    /// browsing context; nested eval/message delivery therefore composes
+    /// naturally instead of relying on identity-changing JS routing proxies.
+    pub execution_stack: Vec<u32>,
     pub orig_fp_tostring: Option<v8::Global<v8::Function>>,
     pub native_tag_sym: Option<v8::Global<v8::Symbol>>,
 }
@@ -59,11 +99,32 @@ impl Default for IframeRealmStore {
     }
 }
 
+impl Drop for IframeRealmStore {
+    fn drop(&mut self) {
+        // Realm-local functions and public wrappers retain creation-context
+        // references. Release those handles before Context globals so V8's
+        // weak Context callbacks never observe an already-cleared persistent.
+        self.property_bridges.clear();
+        self.public_windows.clear();
+        self.inner_globals.clear();
+        self.globals.clear();
+        self.contexts.clear();
+        self.execution_stack.clear();
+    }
+}
+
 impl IframeRealmStore {
     pub fn new() -> Self {
         Self {
             contexts: HashMap::new(),
             globals: HashMap::new(),
+            inner_globals: HashMap::new(),
+            node_to_realm: HashMap::new(),
+            realm_to_node: HashMap::new(),
+            window_proxies: HashMap::new(),
+            public_windows: HashMap::new(),
+            property_bridges: HashMap::new(),
+            execution_stack: Vec::new(),
             orig_fp_tostring: None,
             native_tag_sym: None,
         }
@@ -545,6 +606,123 @@ mod tests {
         assert!(
             s2.contains("[native code]"),
             "real native should return [native code]; got: {s2}"
+        );
+    }
+
+    /// V8's embedder-supported WindowProxy handoff: reuse the prior global
+    /// object when creating a fresh Context. V8 resets its state while retaining
+    /// object identity, matching browser navigation semantics.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reused_global_proxy_can_back_a_new_context() {
+        let mut rt = JsRuntime::new(RuntimeOptions::default());
+        let main_ctx = rt.main_context();
+        v8::scope_with_context!(let scope, rt.v8_isolate(), &main_ctx);
+
+        let first = v8::Context::new(scope, v8::ContextOptions::default());
+        let proxy = first.global(scope);
+        let proxy_g = v8::Global::new(scope, proxy);
+        {
+            let cs = &mut v8::ContextScope::new(scope, first);
+            let source = v8::String::new(cs, "globalThis.beforeNavigation = 1").unwrap();
+            v8::Script::compile(cs, source, None)
+                .unwrap()
+                .run(cs)
+                .unwrap();
+        }
+        let proxy = v8::Local::new(scope, &proxy_g);
+        let second = v8::Context::new(
+            scope,
+            v8::ContextOptions {
+                global_object: Some(proxy.into()),
+                ..Default::default()
+            },
+        );
+        let second_proxy = second.global(scope);
+        assert!(second_proxy.strict_equals(proxy.into()));
+
+        let cs = &mut v8::ContextScope::new(scope, second);
+        let source = v8::String::new(
+            cs,
+            "JSON.stringify({old:typeof beforeNavigation,fresh:Array !== undefined})",
+        )
+        .unwrap();
+        let value = v8::Script::compile(cs, source, None)
+            .unwrap()
+            .run(cs)
+            .unwrap()
+            .to_rust_string_lossy(cs);
+        assert_eq!(value, r#"{"old":"undefined","fresh":true}"#);
+    }
+
+    /// Validate whether V8 accepts a real JS Proxy as the context global
+    /// object without inserting a distinct identity in front of it. If this
+    /// holds, BrowserOxide can model HTML's WindowProxy exotic methods on the
+    /// V8 absorbs a supplied JS Proxy into its native GlobalProxy machinery.
+    /// The identity is reused, but the original JS Proxy traps do not remain
+    /// the realm-global internal methods. This contract is why BrowserOxide
+    /// keeps HTML WindowProxy reflection in a public wrapper instead of trying
+    /// to make that wrapper the child Context's actual global object.
+    #[tokio::test(flavor = "current_thread")]
+    async fn js_proxy_global_object_is_absorbed_by_v8() {
+        let mut rt = JsRuntime::new(RuntimeOptions::default());
+        let main_ctx = rt.main_context();
+        v8::scope_with_context!(let scope, rt.v8_isolate(), &main_ctx);
+
+        let proxy = {
+            let source = v8::String::new(
+                scope,
+                r#"new Proxy({}, {
+                    isExtensible(t) { return Reflect.isExtensible(t); },
+                    preventExtensions() { return false; },
+                    defineProperty(t, p, d) { return Reflect.defineProperty(t, p, d); }
+                })"#,
+            )
+            .unwrap();
+            let value = v8::Script::compile(scope, source, None)
+                .unwrap()
+                .run(scope)
+                .unwrap();
+            v8::Local::<v8::Object>::try_from(value).unwrap()
+        };
+        let proxy_g = v8::Global::new(scope, proxy);
+        let proxy = v8::Local::new(scope, &proxy_g);
+        let child = v8::Context::new(
+            scope,
+            v8::ContextOptions {
+                global_object: Some(proxy.into()),
+                ..Default::default()
+            },
+        );
+        assert!(child.global(scope).strict_equals(proxy.into()));
+
+        let cs = &mut v8::ContextScope::new(scope, child);
+        let source = v8::String::new(
+            cs,
+            r#"(() => {
+                let preventError='';
+                try { Object.preventExtensions(globalThis); } catch(e) { preventError=e.name; }
+                const soft=Reflect.defineProperty(globalThis,'soft',{value:7,configurable:true});
+                const hard=Reflect.defineProperty(globalThis,'hard',{value:9,configurable:false});
+                return JSON.stringify({
+                    thisIdentity:this===globalThis,
+                    extensible:Object.isExtensible(globalThis),
+                    preventError,
+                    soft,
+                    softValue:globalThis.soft,
+                    hard,
+                    hardValue:globalThis.hard,
+                });
+            })()"#,
+        )
+        .unwrap();
+        let result = v8::Script::compile(cs, source, None)
+            .unwrap()
+            .run(cs)
+            .unwrap()
+            .to_rust_string_lossy(cs);
+        assert_eq!(
+            result,
+            r#"{"thisIdentity":true,"extensible":false,"preventError":"","soft":false,"hard":false}"#
         );
     }
 }

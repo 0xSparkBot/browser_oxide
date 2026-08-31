@@ -477,10 +477,10 @@ pub fn op_cookie_set_sync(#[string] url: String, #[string] cookie: String) {
 pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> String {
     // CSP `script-src-elem` enforcement. Sync-fetch is the path
     // `document.write('<script src=...>')` and dynamic
-    // `appendChild(script)` use. Real Chrome enforces CSP on these
-    // identically to parser-injected scripts. Without a nonce on the
-    // dynamically-inserted script (we don't track them today), under
-    // strict-dynamic this fetch will block.
+    // `appendChild(script)` use. CSP3 `strict-dynamic` propagates trust to
+    // these run-time-created elements, so `match_sources` allows them
+    // (parser_inserted=false) even without a nonce; host lists still gate
+    // parser-inserted scripts.
     if let Ok(parsed) = Url::parse(&url) {
         if let Err(violated) = check_csp(
             crate::net::csp::Directive::ScriptSrcElem,
@@ -599,12 +599,13 @@ fn fetch_sync_core(url: String, referer: String) -> String {
         rt.block_on(async move {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                client.get_with_headers(&url_clone, &extra_headers),
+                client.get_follow_with_headers(&url_clone, &extra_headers, 10),
             )
             .await
             {
                 Ok(Ok(resp)) => resp.text(),
                 Ok(Err(e)) => {
+                    eprintln!("[syncfetch] ERR {} {}", url_clone, e);
                     tracing::debug!(url = %url_clone, error = %e, "sync fetch failed");
                     String::new()
                 }
