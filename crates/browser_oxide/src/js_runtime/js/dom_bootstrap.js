@@ -5369,6 +5369,30 @@
             } else {
                 globalThis.__oxGateN = 0;
             }
+            // Time floor: the challenge's first message handler reads lazy
+            // lookup tables that later timers / phases finish building; a
+            // dispatch before ~1.5s realm-age throws inside the CF VM
+            // ("reading 'call' of undefined"), the widget's own wrapper then
+            // declares the realm crashed and renavigates — a loop. c22
+            // proved a +1.2s replay of the same message runs clean, so the
+            // tables exist by then: simply hold the FIRST delivery window
+            // until the realm has had 1.5s of Timer-eligible life. Leaves
+            // messages queued (driver re-pumps); bounded like the gate.
+            {
+                const now = performance.now();
+                if (globalThis.__oxT0 === undefined) globalThis.__oxT0 = now;
+                const age = now - globalThis.__oxT0;
+                if (age < 1500) {
+                    const n2 = (globalThis.__oxGateT = (globalThis.__oxGateT || 0) + 1);
+                    if (n2 < 400) {
+                        try {
+                            const gt = globalThis.__oxGT || (globalThis.__oxGT = []);
+                            if (gt.length < 6) gt.push("t" + n2 + "@" + Math.round(now));
+                        } catch (_) {}
+                        return;
+                    }
+                }
+            }
             let arr;
             try { arr = JSON.parse(ops.op_frame_take_messages(globalThis.__frameId || 0)); }
             catch (_) { return; }

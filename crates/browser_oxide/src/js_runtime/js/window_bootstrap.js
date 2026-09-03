@@ -2074,6 +2074,9 @@
                         };
                         try { self._fireEvent('message', event); }
                         catch (_) {}
+                        try {
+                            globalThis.__oxWRX = (globalThis.__oxWRX || 0) + 1;
+                        } catch (_) {}
                         _drainOnce(); // chain next await
                     }).catch(() => {});
                 };
@@ -2095,6 +2098,18 @@
 
             postMessage(message, transfer) {
                 if (!this._id) return;
+                // Engine-level call counter: survives probe wrap-timing (a
+                // page that captured Worker before the probe's wrap still
+                // counts here). Distinguishes "parent never posted" from
+                // "probe missed the calls".
+                try {
+                    globalThis.__oxWTX = (globalThis.__oxWTX || 0) + 1;
+                    globalThis.__oxWTXLast = String(
+                        (typeof message === "object" && message !== null)
+                            ? Object.keys(message).slice(0, 6).join(",")
+                            : typeof message
+                    ).slice(0, 60);
+                } catch (_) {}
                 // Transferables: accepted as an array. Each entry (an
                 // ArrayBuffer or view) is reachable from the message
                 // and will be serialized with it. Real browsers

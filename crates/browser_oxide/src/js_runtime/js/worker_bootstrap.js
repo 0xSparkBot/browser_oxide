@@ -235,6 +235,7 @@
         } catch (_e) {
             payload = JSON.stringify({ data: null });
         }
+        try { ops.op_worker_diag_note("tx len=" + payload.length + " @" + Math.round(performance.now())); } catch (_) {}
         ops.op_worker_self_post(payload);
     };
 
@@ -252,6 +253,7 @@
         try {
             payload = JSON.parse(s);
         } catch (_e) {
+            try { ops.op_worker_diag_note("rx-parse-fail len=" + s.length); } catch (_) {}
             return;
         }
         const deserializer =
@@ -259,6 +261,13 @@
         const data = deserializer
             ? deserializer(payload && payload.data)
             : payload && payload.data;
+        let shape = typeof data;
+        try {
+            if (data && typeof data === "object") {
+                shape = "object:" + Object.keys(data).slice(0, 5).join(",");
+            }
+        } catch (_) {}
+        try { ops.op_worker_diag_note("rx " + shape + " @" + Math.round(performance.now())); } catch (_) {}
         self.dispatchEvent(new MessageEvent("message", { data }));
     }
 
