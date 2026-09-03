@@ -753,6 +753,7 @@ impl Page {
             if !script.code.is_empty() {
                 // W2.7 — name inline scripts with document URL (Chrome
                 // parity) instead of letting V8 default to <anonymous>.
+                event_loop.note_executed_script(url, &script.code);
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
                 event_loop.set_current_script(Some(script.node_id));
                 if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
@@ -802,6 +803,7 @@ impl Page {
                 continue;
             }
             // W2.7 — Chrome parity: inline scripts report the document URL.
+            self.event_loop.note_executed_script(&self.url, &script.code);
             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
             self.event_loop.set_current_script(Some(script.node_id));
             if let Err(e) = self
@@ -880,17 +882,19 @@ impl Page {
 
         // Execute scripts in document order
         for (i, script) in scripts.iter().enumerate() {
-            if let Some(src) = &script.src {
-                if let Some(full_url) = Self::resolve_url(url, src) {
+            if let Some(n) = &script.src {
+                if let Some(full_url) = Self::resolve_url(url, n) {
                     // CSP gate — same enforcement point as the parallel
                     // pre-fetch path in `build_page_with_scripts_init_and_storage`.
                     if let Ok(parsed_url) = url::Url::parse(&full_url) {
-                        if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_csp(
-                            crate::net::csp::Directive::ScriptSrcElem,
-                            &parsed_url,
-                            script.nonce.as_deref(),
-                            true,
-                        ) {
+                        if let Err(violated) =
+                            crate::js_runtime::extensions::fetch_ext::check_csp(
+                                crate::net::csp::Directive::ScriptSrcElem,
+                                &parsed_url,
+                                script.nonce.as_deref(),
+                                true,
+                            )
+                        {
                             eprintln!(
                                 "[csp] Refused to load the script '{}' because it violates the following Content Security Policy directive: \"{}\".",
                                 full_url, violated
@@ -901,19 +905,22 @@ impl Page {
                     match client.get_follow(&full_url, 10).await {
                         Ok(resp) => {
                             let code = resp.text();
+                            event_loop.note_executed_script(&full_url, &code);
                             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
                             event_loop.set_current_script(Some(script.node_id));
                             if let Err(e) = event_loop.execute_script(&code) {
-                                tracing::warn!(script_src = %src, error = %e, "Script error in external script");
+                                tracing::warn!(script_src = %n, error = %e, "Script error in external script");
                             }
                             event_loop.set_current_script(None);
                         }
                         Err(e) => {
-                            tracing::warn!(script_src = %src, error = %e, "Failed to fetch script")
+                            tracing::warn!(script_src = %n, error = %e, "Failed to fetch script")
                         }
                     }
                 }
             } else if !script.code.is_empty() {
+                event_loop
+                    .note_executed_script(&format!("<inline>#{i}"), &script.code);
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
                 event_loop.set_current_script(Some(script.node_id));
                 if let Err(e) = event_loop.execute_script(&script.code) {
@@ -933,6 +940,11 @@ impl Page {
             .ok();
 
         event_loop.complete_document_lifecycle();
+        // Top realm initial load settled: release deferred frame-message
+        // delivery gated in `__pumpFrameMessages`.
+        event_loop
+            .execute_script("try{globalThis.__oxFrameReady=1}catch(_){}")
+            .ok();
 
         // Synthetic builder: run all inline JS to full idle (callers of `from_html`
         // expect every script to have run), not the render-quiescence early-out.
@@ -1012,6 +1024,42 @@ impl Page {
     /// Number of materialized frames in the frame tree (excludes the top page).
     pub fn frame_tree_count(&self) -> usize {
         self.frame_tree.len()
+    }
+
+    /// Snapshot the top document's executed-script diagnostic ring
+    /// `(name, code)` pairs — the exact sources the engine ran, for
+    /// resolving obfuscated-bundle stack frames against runtime text.
+    pub fn executed_scripts(&self) -> Vec<(String, String)> {
+        let state = self.event_loop.runtime().op_state();
+        let state = state.borrow();
+        match state.try_borrow::<crate::js_runtime::state::DomState>() {
+            Some(dom_state) => dom_state
+                .executed_scripts
+                .iter()
+                .map(|s| (s.name.clone(), s.code.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Snapshot one materialized frame's executed-script ring by
+    /// frame-tree index (challenge frames run in their own realm).
+    pub fn frame_executed_scripts(&mut self, index: usize) -> Vec<(String, String)> {
+        self.frame_tree
+            .get_mut(index)
+            .map(|node| {
+                let op_state = node.iframe.event_loop.runtime().op_state();
+                let state = op_state.borrow();
+                match state.try_borrow::<crate::js_runtime::state::DomState>() {
+                    Some(dom_state) => dom_state
+                        .executed_scripts
+                        .iter()
+                        .map(|s| (s.name.clone(), s.code.clone()))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            })
+            .unwrap_or_default()
     }
 
     /// Evaluate JS inside a frame-tree frame (by index) — proves the frame is a
@@ -2576,6 +2624,7 @@ impl Page {
                 continue;
             }
             let name = script.src.clone().unwrap_or_else(|| resp_url.clone());
+            self.event_loop.note_executed_script(&name, &code);
             if script.is_module {
                 // Mirror the cold path (navigate_loop_internal): route
                 // `<script type="module">` through the ES-module loader instead
@@ -2617,6 +2666,7 @@ impl Page {
                     }
                 }
             } else {
+                self.event_loop.note_executed_script(&name, &code);
                 self.event_loop.set_current_script(Some(script.node_id));
                 if let Err(e) = self.event_loop.execute_script_with_name(&code, &name) {
                     tracing::warn!(script = %name, error = %e, "warm script error");
@@ -2637,6 +2687,12 @@ impl Page {
             .execute_script(include_str!("js/humanize.js"));
 
         self.event_loop.complete_document_lifecycle();
+        // Top realm initial load settled (main navigation path).
+        {
+            let _ = self.event_loop.execute_script(
+                "try{globalThis.__oxFrameReady=1}catch(_){}",
+            );
+        }
 
         // Meta-refresh scanner — sets `__pendingNavigation` if the page
         // has one. The caller doesn't loop on it (warm path skips the
@@ -4705,6 +4761,11 @@ impl Page {
         mark!("cleanup_bootstrap.js");
 
         event_loop.complete_document_lifecycle();
+        // Top realm initial load settled (page-builder path): release the
+        // deferred frame-message delivery gate in `__pumpFrameMessages`.
+        event_loop
+            .execute_script("try{globalThis.__oxFrameReady=1}catch(_){}")
+            .ok();
         mark!("DOMContentLoaded/load dispatch");
 
         // Scan for <meta http-equiv="refresh" content="N;url=..."> and

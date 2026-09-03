@@ -2088,6 +2088,28 @@
             } catch (_) {}
             return mode || "open";
         }
+        get adoptedStyleSheets() {
+            return this._oxAdopted || (this._oxAdopted = []);
+        }
+        set adoptedStyleSheets(v) {
+            const list = Array.prototype.slice.call(v || []).filter(Boolean);
+            this._oxAdopted = list;
+            this._oxAdoptedEls = this._oxAdoptedEls || new Map();
+            for (const sheet of list) {
+                let el = this._oxAdoptedEls.get(sheet);
+                if (!el || !el.parentNode) {
+                    el = this.ownerDocument
+                        ? this.ownerDocument.createElement("style")
+                        : document.createElement("style");
+                    el.setAttribute("data-ox-adopted", "");
+                    this.appendChild(el);
+                    this._oxAdoptedEls.set(sheet, el);
+                    if (!sheet._roots) sheet._roots = [];
+                    if (!sheet._roots.includes(el)) sheet._roots.push(el);
+                }
+                if (typeof sheet._sync === "function") sheet._sync();
+            }
+        }
         get innerHTML() { return ops.op_dom_get_inner_html(_getNodeId(this)); }
         set innerHTML(html) {
             // Replacing a connected shadow subtree must destroy any previous
@@ -2452,6 +2474,33 @@
                 sheets.push(new CSSStyleSheet(i));
             }
             return sheets;
+        }
+        // Constructable Stylesheets: materialize each adopted sheet as a
+        // <style> in <head> so the regular stylesheet pipeline applies it.
+        get adoptedStyleSheets() {
+            return this._oxAdopted || (this._oxAdopted = []);
+        }
+        set adoptedStyleSheets(v) {
+            const list = Array.prototype.slice.call(v || []).filter(Boolean);
+            this._oxAdopted = list;
+            const head = this.head || this.documentElement;
+            if (!head) return;
+            this._oxAdoptedEls = this._oxAdoptedEls || new Map();
+            for (const sheet of list) {
+                let el = this._oxAdoptedEls.get(sheet);
+                if (!el || !el.parentNode) {
+                    el = this.createElement("style");
+                    el.setAttribute("data-ox-adopted", "");
+                    head.appendChild(el);
+                    this._oxAdoptedEls.set(sheet, el);
+                    if (!sheet._roots) sheet._roots = [];
+                    if (!sheet._roots.includes(el)) sheet._roots.push(el);
+                }
+                if (typeof sheet._sync === "function") sheet._sync();
+                else {
+                    try { el.textContent = Array.prototype.slice.call(sheet.cssRules || []).join("\n"); } catch (_e) { /* ignore */ }
+                }
+            }
         }
         get fullscreenElement() { return null; }
         get pointerLockElement() { return null; }
@@ -3532,6 +3581,49 @@
                     const index=list.findIndex(item=>item.callback===callback&&item.capture===capture);
                     if(index>=0)list.splice(index,1);
                 }
+                let _reportingListenerError=false;
+                const _redeliveredEvents=new WeakSet();
+                function _reportListenerError(target,event,error){
+                    if(_reportingListenerError)return;
+                    _reportingListenerError=true;
+                    try{
+                        const isErrEvent=event&&event.type==='error';
+                        if(!isErrEvent&&typeof globalThis.ErrorEvent==='function'){
+                            const msg=(error&&error.message)?String(error.message):String(error);
+                            const loc=(error&&error.stack)?String(error.stack).split('\n')[1]||'':'';
+                            const m=loc&&loc.match(/(\d+):(\d+)\)?\s*$/);
+                            const ev=new ErrorEvent('error',{
+                                message:'Uncaught '+msg,
+                                filename:target===globalThis?'':String((globalThis.location&&globalThis.location.href)||''),
+                                lineno:m?+m[1]:0,
+                                colno:m?+m[2]:0,
+                                error:error,
+                            });
+                            _markFrameMessageTrusted&&_markFrameMessageTrusted(ev);
+                            globalThis.dispatchEvent(ev);
+                        }
+                        if(typeof globalThis.console!=='undefined'&&console.error)console.error('Uncaught (in event listener)',error);
+                    }catch(_){}
+                    // A frame message handler that crashes on first delivery
+                    // (init race inside the page's own code) leaves the
+                    // widget's state machine wedged: every later message
+                    // crashes on the same half-initialized state. Requeue the
+                    // failed message once, delayed, so the handler reruns
+                    // after the pending init has completed (observed to
+                    // unstick Turnstile's parent->frame handshake).
+                    try{
+                        if(event&&event.type==='message'&&typeof setTimeout==='function'&&!_redeliveredEvents.has(event)){
+                            _redeliveredEvents.add(event);
+                            setTimeout(function(){
+                                try{
+                                    const t=(target&&typeof target.dispatchEvent==='function')?target:globalThis;
+                                    t.dispatchEvent(event);
+                                }catch(_){}
+                            },1200);
+                        }
+                    }catch(_){}
+                    _reportingListenerError=false;
+                }
                 function fire(target,event,capture){
                     if(!capture&&!event._stoppedImmediate){
                         const handler=target&&target['on'+event.type];
@@ -3542,8 +3634,20 @@
                     for(let i=0;i<list.length;i++){
                         const item=list[i];if(item.capture!==capture)continue;
                         if(event._stoppedImmediate)break;
-                        if(typeof item.callback==='function')item.callback.call(target,event);
-                        else item.callback.handleEvent(event);
+                        // Browser semantics: an exception in one listener is
+                        // reported as an uncaught error on the window and must
+                        // not abort the dispatch — later listeners still run
+                        // and dispatchEvent returns normally. Letting it
+                        // propagate starves every later listener and kills
+                        // the frame message pump (observed: Turnstile's
+                        // parent->frame handshake dies on the first soft
+                        // error and the widget loops on crashed_retry).
+                        try{
+                            if(typeof item.callback==='function')item.callback.call(target,event);
+                            else item.callback.handleEvent(event);
+                        }catch(listenerError){
+                            _reportListenerError(target,event,listenerError);
+                        }
                         if(item.once)remove.push(i);
                     }
                     for(let i=remove.length-1;i>=0;i--)list.splice(remove[i],1);
@@ -4158,6 +4262,18 @@
             const _sp = (k, v) => {
                 try { ops.op_set_child_realm_prop(_realmId, k, v); } catch (_) {}
             };
+            // Eval-source tap: challenge VMs (Turnstile) assemble their whole
+            // program with `new Function` INSIDE this realm and crash inside
+            // the result ('call' at <anonymous>:N). The parent-realm tap never
+            // sees those realms, so install the same recorder here, before any
+            // frame script can run. `String(fn)` keeps a single source of truth
+            // with the main-realm definition at the bottom of this file.
+            try {
+                ops.op_eval_in_child_realm(
+                    _realmId,
+                    "(" + String(globalThis.__oxInstallEvalTap) + ")()",
+                );
+            } catch (_) {}
             // ── Populate child realm with DOM/FP properties ───────────────
             // CRITICAL: use op_set_child_realm_prop for properties that must be
             // visible to code running INSIDE the child realm (e.g. srcdoc
@@ -4450,6 +4566,19 @@
                         : new DOMException("The object could not be cloned.", "DataCloneError");
                 }
                 setTimeout(() => {
+                    // Deferred delivery gate: the child realm's *initial*
+                    // load runs its scripts across many event-loop turns.
+                    // A message queued early (Turnstile challenges deliver
+                    // their init/config message within ms of frame
+                    // insertion) can land in a gap while handlers exist but
+                    // the widget's internal state machine is still being
+                    // assembled -- its first dispatch then throws and the
+                    // widget wedges in a retry loop. Poll for the
+                    // load-settled flag that `ChildIframe` sets after the
+                    // lifecycle completes; after a bounded number of ticks,
+                    // deliver anyway (real browsers queue on the task
+                    // source, they never drop).
+                    const _deliver = () => {
                     try {
                         const _oj = JSON.stringify(sender.origin);
                         try {
@@ -4466,6 +4595,17 @@
                     } catch (e) {
                         if (globalThis.__browser_oxide_debug) console.error("postMessage->child", e);
                     }
+                    };
+                    let _tries = 0;
+                    const _pump = () => {
+                        let ready = true;
+                        try {
+                            ready = ops.op_child_realm_has_property(_realmId, "__oxFrameReady") ||
+                                (++_tries > 150);
+                        } catch (_) { ready = true; }
+                        if (ready) { _deliver(); } else { setTimeout(_pump, 4); }
+                    };
+                    _pump();
                 });
             };
             _sp("postMessage", _pm);
@@ -5209,22 +5349,151 @@
         }
         globalThis.__frameHandleFor = _frameHandle;
         globalThis.__pumpFrameMessages = function() {
+            // Deferred-delivery gate: hold queued cross-frame messages until
+            // this realm's initial load has settled. The driver calls this
+            // pump as soon as the mailbox is non-empty, which during page load
+            // lands between this realm's per-script event-loop turns — the
+            // gap that wedges Turnstile-style challenge state machines
+            // (first handler dispatch throws -> crashed_retry loop).
+            // `__oxFrameReady` is set by the driver / ChildIframe right
+            // after the document lifecycle completes. Bounded: after 400
+            // gate passes (~sweeps, not ms) deliver anyway so a realm that
+            // never settles still receives its mail (browsers never drop).
+            if (!globalThis.__oxFrameReady) {
+                const n = (globalThis.__oxGateN = (globalThis.__oxGateN || 0) + 1);
+                try {
+                    const gp = globalThis.__oxGP || (globalThis.__oxGP = []);
+                    if (gp.length < 8) gp.push("g" + n + "@" + Math.round(performance.now()));
+                } catch (_) {}
+                if (n < 400) return;
+            } else {
+                globalThis.__oxGateN = 0;
+            }
             let arr;
             try { arr = JSON.parse(ops.op_frame_take_messages(globalThis.__frameId || 0)); }
             catch (_) { return; }
+            const ring = globalThis.__oxFrameMsgLog
+                || (globalThis.__oxFrameMsgLog = []);
             for (const m of arr) {
                 let data;
                 try {
                     data = (_browser_oxide && _browser_oxide.deserializeFromWire)
                         ? _browser_oxide.deserializeFromWire(m.d) : m.d;
                 } catch (_) { data = m.d; }
+                let shape = typeof data;
+                try {
+                    if (data && typeof data === "object") {
+                        shape = "object:" + Object.keys(data).slice(0, 6).join(",");
+                    }
+                } catch (_) { shape = "object:?"; }
+                const entry = (m.t || "").slice(0, 24) + "|" + (m.o || "").slice(0, 24)
+                    + "|" + shape + "|" + String(typeof data === "string" ? data.slice(0, 80) : "").slice(0, 80);
+                const last = ring[ring.length - 1];
+                const lastShape = last && typeof last === "string" ? last.split("|")[2] : null;
+                if (lastShape === shape && shape.indexOf("event,seq") >= 0 && last.indexOf("DISPATCH") < 0) {
+                    const at = last.lastIndexOf(" x");
+                    const base = at > 0 ? last.slice(0, at) : last;
+                    const cnt = at > 0 ? (parseInt(last.slice(at + 2), 10) || 1) : 1;
+                    ring[ring.length - 1] = base + " x" + (cnt + 1);
+                } else {
+                    if (ring.length >= 24) ring.shift();
+                    ring.push(entry);
+                }
                 try {
                     const ev = new MessageEvent("message", { data: data, origin: m.o || "", source: _frameSourceHandle(m.s) });
                     if (_markFrameMessageTrusted) _markFrameMessageTrusted(ev);
                     globalThis.dispatchEvent(ev);
-                } catch (_) {}
+                } catch (e) {
+                    let full = "";
+                    try { full = JSON.stringify(data).slice(0, 1200); } catch (_) { full = "unserializable"; }
+                    ring.shift();
+                    ring.push("DISPATCH_FAIL:" + (e && e.message) + "|DATA:" + full
+                        + "|STACK:" + (e && e.stack ? String(e.stack).replace(/\n/g, " ~ ").slice(0, 900) : ""));
+                    // Redelivery: Turnstile-style challenge bundles register
+                    // their message handler before the VM string tables are
+                    // finished; the first dispatch in the load window throws, and a plain drop wedges the state machine until
+                    // its own crashed_retry renavigates. A single late
+                    // redelivery (the handler is idempotent from a second
+                    // dispatch, verified empirically) lets the same realm
+                    // recover without a renavigation. Bounded and once-only
+                    // per failure so a deterministically-broken handler can't
+                    // spin the loop.
+                    try {
+                        const rd = globalThis.__oxMsgRD
+                            || (globalThis.__oxMsgRD = { n: 0 });
+                        if (rd.n < 24) {
+                            rd.n++;
+                            setTimeout(function () {
+                                try {
+                                    const ev2 = new MessageEvent("message", {
+                                        data: data,
+                                        origin: m.o || "",
+                                        source: _frameSourceHandle(m.s),
+                                    });
+                                    if (_markFrameMessageTrusted) _markFrameMessageTrusted(ev2);
+                                    globalThis.dispatchEvent(ev2);
+                                    if (ring.length >= 24) ring.shift();
+                                    ring.push("RD_OK@" + Math.round(performance.now()));
+                                } catch (e2) {
+                                    ring.push("RD_FAIL:" + (e2 && e2.message));
+                                }
+                            }, 1200);
+                        }
+                    } catch (_) {}
+                }
             }
         };
+        // Turnstile-style challenge code assembles large program strings at
+        // runtime and runs them through the Function constructor — those
+        // sources are invisible to any static dump of the page's <script>
+        // text. Transparently tap the constructor and mirror big sources to
+        // the parent/top window (which survives the challenge frame's
+        // crashed_retry renavigation) so timeouts can dump them.
+        try {
+            const _NativeFunction = globalThis.Function;
+            const _recordEvalSource = (src) => {
+                try {
+                    if (typeof src !== "string" || src.length < 512) return;
+                    const log = globalThis.__oxEvalSrcLog
+                        || (globalThis.__oxEvalSrcLog = []);
+                    if (log.length >= 6) return;
+                    for (let i = 0; i < log.length; i++) {
+                        if (log[i] && log[i].length === src.length) return;
+                    }
+                    log.push(src);
+                    const payload = {
+                        __oxEvalSrc: {
+                            href: String((globalThis.location && globalThis.location.href) || "").slice(-80),
+                            code: src,
+                        },
+                    };
+                    for (const w of [globalThis.parent, globalThis.top]) {
+                        try {
+                            if (w && w !== globalThis && typeof w.postMessage === "function") {
+                                w.postMessage(payload, "*");
+                            }
+                        } catch (_) {}
+                    }
+                } catch (_) {}
+            };
+            // Proxy keeps the native Function identity: instanceof, .prototype,
+            // .name and .length all behave exactly as before; we only observe
+            // calls/constructs to mirror dynamically assembled sources.
+            globalThis.Function = new Proxy(_NativeFunction, {
+                apply(target, thisArg, args) {
+                    try {
+                        _recordEvalSource(typeof args[0] === "string" ? args[0] : (args[0] != null ? String(args[0]) : ""));
+                    } catch (_) {}
+                    return Reflect.apply(target, thisArg, args);
+                },
+                construct(target, args, newTarget) {
+                    try {
+                        _recordEvalSource(typeof args[0] === "string" ? args[0] : (args[0] != null ? String(args[0]) : ""));
+                    } catch (_) {}
+                    return Reflect.construct(target, args, newTarget);
+                },
+            });
+        } catch (_) {}
         globalThis.__oxFrameSetup = function(frameId, parentId, topId) {
             globalThis.__frameId = frameId;
             globalThis.__parentFrameId = parentId;
@@ -5610,9 +5879,80 @@
             // the singleton `_document` for the document node id, which
             // `replace_dom` preserves.
             try { _nodeCache.set(ops.op_dom_document_node(), new WeakRef(_document)); } catch (_) {}
+            try { globalThis.__oxInstallEvalTap(); } catch (_) {}
         },
         writable: true,
         configurable: true,
         enumerable: false,
     });
+
+    // Runtime-assembled program sources (new Function / indirect eval) are
+    // invisible to any static <script> dump, yet crash stacks point into
+    // them ('call' at <anonymous>:7:18868 in the Turnstile challenge). The
+    // recorder is a plain Proxy over the realm's own Function: identity
+    // semantics (instanceof, prototype, name, length) are untouched, we
+    // only mirror big sources into __oxEvalSrcLog for the probe to dump.
+    // NOT wrapping direct `eval(` — a wrapper would break its
+    // scope-capture semantics, and the Function constructor covers the
+    // crash sites we chase.
+    globalThis.__oxInstallEvalTap = function __oxInstallEvalTap() {
+        if (globalThis.__oxEvalTapReady) return;
+        globalThis.__oxEvalTapReady = true;
+        const log = globalThis.__oxEvalSrcLog
+            || (globalThis.__oxEvalSrcLog = []);
+        const record = (src) => {
+            try {
+                globalThis.__oxTapN = (globalThis.__oxTapN | 0) + 1;
+                if (typeof src !== "string" || src.length < 512) return;
+                if (log.length >= 8) return;
+                for (let i = 0; i < log.length; i++) {
+                    if (log[i] && log[i].length === src.length) return;
+                }
+                log.push(src);
+            } catch (_) {}
+        };
+        try {
+            const NativeFunction = globalThis.Function;
+            globalThis.Function = new Proxy(NativeFunction, {
+                apply(target, thisArg, args) {
+                    record(typeof args[0] === "string"
+                        ? args[0]
+                        : (args[0] != null ? String(args[0]) : ""));
+                    return Reflect.apply(target, thisArg, args);
+                },
+                construct(target, args, newTarget) {
+                    record(typeof args[0] === "string"
+                        ? args[0]
+                        : (args[0] != null ? String(args[0]) : ""));
+                    return Reflect.construct(target, args, newTarget);
+                },
+            });
+        } catch (_) {}
+    };
+    // Fresh pages never go through __resetDomRegistries (pool-reuse only),
+    // so the wrap must be installed here at bootstrap — the fn is
+    // idempotent via __oxEvalTapReady.
+    try { globalThis.__oxInstallEvalTap(); } catch (_) {}
+
+    // Parent-side sink for `{__oxEvalSrc:{href,code}}` mirrors that doomed
+    // child realms postMessage before a crashed_retry renavigation replaces
+    // them (their realm-local __oxEvalSrcLog dies with the realm; this
+    // survives in the top window for the end-of-run dump).
+    try {
+        globalThis.addEventListener("message", (ev) => {
+            try {
+                const d = ev && ev.data;
+                if (!d || typeof d !== "object" || !d.__oxEvalSrc) return;
+                const log = globalThis.__oxParentEvalSrc
+                    || (globalThis.__oxParentEvalSrc = []);
+                if (log.length >= 8) return;
+                const code = d.__oxEvalSrc.code;
+                for (let i = 0; i < log.length; i++) {
+                    if (log[i] && log[i].code
+                        && log[i].code.length === code.length) return;
+                }
+                log.push(d.__oxEvalSrc);
+            } catch (_) {}
+        });
+    } catch (_) {}
 })(globalThis);

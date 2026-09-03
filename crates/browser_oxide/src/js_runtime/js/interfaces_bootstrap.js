@@ -89,6 +89,9 @@
         "Touch", "TouchEvent", "TouchList",
         // URL pair (real impls in shared_apis_bootstrap.js)
         "URL", "URLSearchParams",
+        // Constructable stylesheet (installed below — CF Turnstile challenge
+        // builds its UI through `new CSSStyleSheet()` + adoptedStyleSheets)
+        "CSSStyleSheet",
     ]);
     for (const name of _rest) {
         if (!(name in globalThis)) {
@@ -111,6 +114,61 @@
             _define(name, _stub(name));
         }
     }
+
+    // ---- Constructable Stylesheets ----
+    // `new CSSStyleSheet()` + `root.adoptedStyleSheets = [sheet]`. The
+    // challenge iframe of Cloudflare Turnstile mounts its entire UI through
+    // this API; the stub threw "Illegal constructor" and the widget died
+    // right after building its spinner (observed on accounts.x.ai sign-up).
+    class CSSStyleSheet {
+        constructor() {
+            this._rules = [];
+            this._roots = [];
+            this.disabled = false;
+            this.href = null;
+            this.ownerNode = null;
+            this.parentStyleSheet = null;
+            this.title = null;
+            this.type = "text/css";
+            this.media = { length: 0, mediaText: "all", appendMedium() {}, deleteMedium() {}, item() { return null; } };
+        }
+        get cssRules() { return this._rules; }
+        get rules() { return this._rules; }
+        insertRule(rule, index = 0) {
+            this._rules.splice(index, 0, String(rule));
+            this._sync();
+            return index;
+        }
+        deleteRule(index) {
+            this._rules.splice(index, 1);
+            this._sync();
+        }
+        replace(text) {
+            this._replaceSync(text);
+            return Promise.resolve(this);
+        }
+        replaceSync(text) {
+            this._replaceSync(text);
+        }
+        _replaceSync(text) {
+            const t = String(text == null ? "" : text);
+            const parts = t.split("}");
+            this._rules = [];
+            for (let i = 0; i < parts.length; i++) {
+                const body = i < parts.length - 1 ? parts[i] + "}" : parts[i];
+                if (body.trim()) this._rules.push(body.trim());
+            }
+            this._sync();
+        }
+        _sync() {
+            const css = this._rules.join("\n");
+            for (const el of this._roots) {
+                try { el.textContent = css; } catch (_e) { /* detached */ }
+            }
+        }
+    }
+    Object.defineProperty(CSSStyleSheet.prototype, Symbol.toStringTag, { value: "CSSStyleSheet", configurable: true });
+    globalThis.CSSStyleSheet = CSSStyleSheet;
 
     // ---- Event handlers (120) ----
     (() => {

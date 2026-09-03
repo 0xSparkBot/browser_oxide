@@ -2042,6 +2042,27 @@
                         const data = deserializer
                             ? deserializer(payload && payload.data)
                             : payload && payload.data;
+                        // Mirror dedicated-worker eval-source captures into the
+                        // top-window sink (worker isolates die with the page's
+                        // interest in them; this survives for end-of-run dumps).
+                        try {
+                            if (data && typeof data === "object" && data.__oxEvalSrc) {
+                                const sink = globalThis.__oxParentEvalSrc
+                                    || (globalThis.__oxParentEvalSrc = []);
+                                if (sink.length < 8) {
+                                    const code = data.__oxEvalSrc.code;
+                                    let dup = false;
+                                    for (let i = 0; i < sink.length; i++) {
+                                        if (sink[i] && sink[i].code
+                                            && sink[i].code.length === code.length) {
+                                            dup = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!dup) sink.push(data.__oxEvalSrc);
+                                }
+                            }
+                        } catch (_) {}
                         const event = {
                             type: 'message',
                             data,

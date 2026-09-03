@@ -158,12 +158,22 @@ impl ChildIframe {
             if script.code.trim().is_empty() {
                 continue;
             }
+            event_loop
+                .note_executed_script("about:srcdoc", &script.code);
             if let Err(e) = event_loop.execute_script_with_name(&script.code, "about:srcdoc") {
                 tracing::warn!(script_index = i, error = %e, "iframe script error");
             }
         }
 
         complete_document_lifecycle(&mut event_loop);
+        // Mark the child realm's initial load as settled so deferred
+        // parent->child messages (postMessage) wait for full initialization
+        // instead of landing between this realm's per-script event-loop gaps.
+        event_loop
+            .execute_script(
+                "try{Object.defineProperty(globalThis,'__oxFrameReady',{value:1,writable:true,configurable:true,enumerable:false})}catch(_){try{globalThis.__oxFrameReady=1}catch(_){}}",
+            )
+            .ok();
 
         // Bound child-frame startup by the same deployment-configurable
         // navigation deadline as top-level pages. An explicit "off" keeps the
@@ -378,12 +388,20 @@ impl ChildIframe {
             } else {
                 url.to_string()
             };
+            event_loop.note_executed_script(&name, &code);
             if let Err(e) = event_loop.execute_script_with_name(&code, &name) {
                 tracing::warn!(script_index = i, error = %e, "iframe script error");
             }
         }
 
         complete_document_lifecycle(&mut event_loop);
+        // See from_isolated_html: gate parent->child postMessage delivery on
+        // completed initial load.
+        event_loop
+            .execute_script(
+                "try{Object.defineProperty(globalThis,'__oxFrameReady',{value:1,writable:true,configurable:true,enumerable:false})}catch(_){try{globalThis.__oxFrameReady=1}catch(_){}}",
+            )
+            .ok();
 
         // `run_until_settled` returns once the frame has loaded with no in-flight
         // fetch, ignoring the perpetual short timers a live frame keeps running.

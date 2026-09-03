@@ -52,18 +52,19 @@
     // atob / btoa — Chrome-shaped.
     // ================================================================
     if (!globalThis.atob) {
+        const __B64C = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const __b64err = () => new DOMException("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", "InvalidCharacterError");
         globalThis.atob = function atob(s) {
             if (arguments.length === 0) throw new TypeError("Failed to execute 'atob' on 'Window': 1 argument required, but only 0 present.");
-            const input = String(s).replace(/[\t\n\f\r ]/g, "");
-            if (input.length === 0) return "";
-            const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            const input = String(s).replace(/[\t\n\v\f\r ]/g, "");
+            const L = input.length;
+            if (L % 4 === 1) throw __b64err();
             let out = "";
-            for (let i = 0; i < input.length; i += 4) {
-                const a = chars.indexOf(input[i]), b = chars.indexOf(input[i+1]);
-                const c = chars.indexOf(input[i+2]), d = chars.indexOf(input[i+3]);
+            for (let i = 0; i < L; i += 4) {
+                const N = (k) => { const v = __B64C.indexOf(input[i + k]); if (v < 0) throw __b64err(); return v; };
+                const a = N(0), b = N(1);
                 out += String.fromCharCode((a << 2) | (b >> 4));
-                if (c !== -1 && c !== 64) out += String.fromCharCode(((b & 15) << 4) | (c >> 2));
-                if (d !== -1 && d !== 64) out += String.fromCharCode(((c & 3) << 6) | d);
+                if (i + 2 < L && input[i + 2] !== "=") { const c = N(2); out += String.fromCharCode(((b & 15) << 4) | (c >> 2)); if (i + 3 < L && input[i + 3] !== "=") { const d = N(3); out += String.fromCharCode(((c & 3) << 6) | d); } }
             }
             return out;
         };

@@ -434,6 +434,15 @@ impl BrowserEventLoop {
         self.runtime.execute_script(code, None)
     }
 
+    /// Record `code` in the executed-scripts diagnostic ring (used by the
+    /// probe to resolve obfuscated-bundle stack frames against the text
+    /// that actually ran).
+    pub fn note_executed_script(&mut self, name: &str, code: &str) {
+        let op_state = self.runtime.op_state();
+        let mut state = op_state.borrow_mut();
+        crate::js_runtime::state::record_executed_script(&mut state, name, code);
+    }
+
     /// Set or clear `document.currentScript` without exposing an internal JS
     /// bridge to page code.
     pub fn set_current_script(&mut self, node_id: Option<u32>) {

@@ -22,6 +22,73 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 
 // ============================================================================
+// Worker diagnostics — page-readable record of every worker spawn and
+// worker-realm notes. Challenge scripts crash inside their blob workers with
+// stacks like `<anonymous>:1:19417` whose source exists nowhere in the
+// page's DOM; these records are the only way to reconstruct the failure.
+// ============================================================================
+
+const WORKER_SOURCE_CAP: usize = 512 * 1024;
+const WORKER_DIAG_CAP: usize = 48;
+const WORKER_DIAG_NOTE_CAP: usize = 4096;
+
+fn worker_spawn_log() -> &'static Mutex<Vec<(String, String)>> {
+    static INST: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+    INST.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn worker_diag_log() -> &'static Mutex<Vec<String>> {
+    static INST: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    INST.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn worker_diag_note(note: String) {
+    let mut log = worker_diag_log().lock().unwrap_or_else(|e| e.into_inner());
+    if log.len() >= WORKER_DIAG_CAP {
+        log.remove(0);
+    }
+    log.push(note.chars().take(WORKER_DIAG_NOTE_CAP).collect());
+}
+
+/// Record one worker spawn (url + resolved script, script capped). Keeps the
+/// last 3 spawns.
+fn record_worker_spawn(url: &str, script: &str) {
+    let mut log = worker_spawn_log().lock().unwrap_or_else(|e| e.into_inner());
+    if log.len() >= 3 {
+        log.remove(0);
+    }
+    let capped: String = script.chars().take(WORKER_SOURCE_CAP).collect();
+    log.push((url.to_string(), capped));
+}
+
+/// Last worker spawns as `[url, script]` pairs (script capped at 512 KB).
+#[op2]
+#[serde]
+pub fn op_worker_last_spawn() -> Vec<(String, String)> {
+    worker_spawn_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Worker-realm note (diagnostics). Callable from the worker isolate.
+#[op2(fast)]
+pub fn op_worker_diag_note(#[string] note: String) {
+    worker_diag_note(note);
+}
+
+/// Drain-clone of worker-realm notes; oldest first. Notes are kept (not
+/// cleared) so repeated polls see a stable history.
+#[op2]
+#[serde]
+pub fn op_worker_diag_read() -> Vec<String> {
+    worker_diag_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+// ============================================================================
 // BlobRegistry — backs URL.createObjectURL / .revokeObjectURL / blob: loader.
 // ============================================================================
 
@@ -244,6 +311,7 @@ pub fn op_worker_spawn(
     is_module: bool,
     #[string] url: String,
 ) -> i32 {
+    record_worker_spawn(&url, &script);
     // 0.403: #[state] removed — borrow the three (immutable) states from OpState.
     let state = op_state.borrow::<DomState>();
     let stealth = op_state.borrow::<StealthState>();
@@ -386,7 +454,13 @@ pub fn op_worker_spawn(
                         }
                     }
                 } else if let Err(e) = runtime.execute_script("<anonymous>", script) {
+                    worker_diag_note(format!(
+                        "eval-fail err={}",
+                        format!("{e}").chars().take(600).collect::<String>()
+                    ));
                     tracing::warn!(worker_id = worker_id, error = %e, "worker script error");
+                } else {
+                    worker_diag_note("eval-ok".to_string());
                 }
 
                 // When the event loop drains (worker idle), park on `notify_worker`
@@ -658,5 +732,8 @@ deno_core::extension!(
         op_worker_self_url,
         op_worker_self_recv,
         op_worker_self_await_message,
+        op_worker_last_spawn,
+        op_worker_diag_note,
+        op_worker_diag_read,
     ],
 );

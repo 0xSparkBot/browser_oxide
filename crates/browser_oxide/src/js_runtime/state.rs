@@ -31,6 +31,56 @@ pub struct DomState {
     pub csp_origin: Option<url::Url>,
     /// Resource timings for performance.getEntriesByType('resource')
     pub resource_timings: Vec<crate::net::TimingStats>,
+    /// Diagnostics ring: the exact sources the engine executed as
+    /// top-level `<script>` code, named by URL (or `<inline>#i`). Bounded
+    /// (see `EXEC_SCRIPT_RING_CAP`); exists because stack frames in
+    /// obfuscated bundles (`v6@1:50607`) can only be resolved against the
+    /// text that actually ran — CDN bundles are regenerated per fetch, so
+    /// a later re-fetch of the same URL does not match.
+    pub executed_scripts: Vec<ExecutedScript>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutedScript {
+    pub name: String,
+    pub code: String,
+}
+
+/// Keep the last N executed scripts per realm. Large enough to cover a
+/// page's main bundle + a widget's challenge script; small enough that
+/// `Page::executed_scripts` snapshots stay cheap.
+pub const EXEC_SCRIPT_RING_CAP: usize = 8;
+
+impl ExecutedScript {
+    pub fn new(name: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            code: code.into(),
+        }
+    }
+}
+
+/// Record an executed top-level script into the realm's diagnostic ring.
+/// No-op when no DomState is installed (bare runtimes in unit tests).
+pub fn record_executed_script(state: &mut deno_core::OpState, name: &str, code: &str) {
+    if let Some(dom_state) = state.try_borrow_mut::<DomState>() {
+        // One entry per distinct source length is enough for stack
+        // resolution and keeps repeated tiny bootstraps from
+        // crowding out the big bundles we chase.
+        if dom_state
+            .executed_scripts
+            .iter()
+            .any(|s| s.code.len() == code.len())
+        {
+            return;
+        }
+        if dom_state.executed_scripts.len() >= EXEC_SCRIPT_RING_CAP {
+            dom_state.executed_scripts.remove(0);
+        }
+        dom_state
+            .executed_scripts
+            .push(ExecutedScript::new(name, code));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +122,7 @@ impl DomState {
             csp_policy: None,
             csp_origin: None,
             resource_timings: Vec::new(),
+            executed_scripts: Vec::new(),
         }
     }
 

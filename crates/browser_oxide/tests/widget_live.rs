@@ -2,6 +2,10 @@
 //!
 //! Network-dependent and intentionally ignored by default. Run with:
 //! `BROWSER_OXIDE_FRAME_TREE=1 cargo test -p browser_oxide --test widget_live -- --ignored --test-threads=1 --nocapture`
+//!
+//! Production-mode check against any real sitekey (the engine's clean path —
+//! no seed wrappers, no probe hooks):
+//! `BROWSER_OXIDE_TARGET='https://accounts.x.ai/sign-up' BROWSER_OXIDE_SK='0x4AAAAAAAhr9JGVDZbrZOo0' cargo test -p browser_oxide --test widget_live -- --ignored --nocapture`
 
 use std::time::Duration;
 
@@ -14,6 +18,9 @@ const DUMMY_TOKEN: &str = "XXXX.DUMMY.TOKEN.XXXX";
 async fn cloudflare_turnstile_always_passes() {
     let url =
         std::env::var("BROWSER_OXIDE_TARGET").unwrap_or_else(|_| DEFAULT_DEMO_URL.to_string());
+    let sitekey =
+        std::env::var("BROWSER_OXIDE_SK").unwrap_or_else(|_| ALWAYS_PASS_SITEKEY.to_string());
+    let always_pass = sitekey == ALWAYS_PASS_SITEKEY;
     let profile = browser_oxide::stealth::presets::chrome_148_macos();
     let widget_debug = std::env::var_os("BROWSER_OXIDE_WIDGET_DEBUG").is_some();
     let client = browser_oxide::net::HttpClient::shared(&profile).expect("http client");
@@ -46,11 +53,41 @@ async fn cloudflare_turnstile_always_passes() {
             r#"(function(){{
                 globalThis.__browser_oxide_debug={widget_debug};
                 globalThis.__oxTsResult={{callback:false,token:'',error:''}};
+                window.addEventListener('message',function(ev){{
+                    try{{
+                        if(ev.data&&typeof ev.data==='object'&&ev.data.__oxEvalSrc){{
+                            var arr=globalThis.__oxParentEvalSrc=(globalThis.__oxParentEvalSrc||[]);
+                            var d=ev.data.__oxEvalSrc,dup=false;
+                            for(var i=0;i<arr.length;i++){{if(arr[i]&&arr[i].code&&arr[i].code.length===d.code.length){{dup=true;break;}}}}
+                            if(!dup&&arr.length<6)arr.push(d);
+                            return;
+                        }}
+                        var log=globalThis.__oxParentMsgLog=(globalThis.__oxParentMsgLog||[]);
+                        var entry=String(ev.origin||'')+'|'+String(
+                            typeof ev.data==='string'?ev.data:(JSON.stringify(ev.data)||'typeof'+typeof ev.data)
+                        ).slice(0,240);
+                        var shape='?';
+                        try{{shape=(typeof ev.data==='object'&&ev.data)?Object.keys(ev.data).slice(0,6).join(','):String(typeof ev.data);}}catch(_x){{}}
+                        var last=log.length?log[log.length-1]:'';
+                        if(last&&shape==='event,seq'&&entry.indexOf('food')>=0&&last.indexOf('food')>=0){{
+                            var at=last.lastIndexOf(' x');var base=at>0?last.slice(0,at):last;var cnt=at>0?(parseInt(last.slice(at+2),10)||1):1;
+                            log[log.length-1]=base+' x'+(cnt+1);
+                        }} else if(log.length<40){{log.push(entry);}}
+                    }}catch(_e){{
+                    }}
+                }});
+                window.addEventListener('error',function(ev){{
+                    try{{
+                        var log=globalThis.__oxParentErr=(globalThis.__oxParentErr||[]);
+                        if(log.length<10)log.push(String((ev&&ev.message)||'non-uncaught'));
+                    }}catch(_e){{
+                    }}
+                }});
                 var host=document.createElement('div');
                 host.id='browser-oxide-always-pass';
                 document.body.appendChild(host);
                 globalThis.__oxTsWidgetId=turnstile.render(host,{{
-                    sitekey:'{ALWAYS_PASS_SITEKEY}',
+                    sitekey:'{sitekey}',
                     callback:function(token){{
                         __oxTsResult.callback=true;
                         __oxTsResult.token=String(token||'');
@@ -69,7 +106,10 @@ async fn cloudflare_turnstile_always_passes() {
     );
 
     let mut completed = false;
-    for _ in 0..48 {
+    // The managed-challenge flow used by production keys runs notably longer
+    // than the always-pass demo key; give it the same budget the probe uses.
+    let attempts = if always_pass { 48 } else { 240 };
+    for _ in 0..attempts {
         page.drive_frame_tree(&client, &profile).await;
         let _ = page
             .event_loop()
@@ -107,12 +147,20 @@ async fn cloudflare_turnstile_always_passes() {
                     }),
                     frameDebug:(globalThis.__oxideFrameDebug||[]).slice(-80),
                     frameMappings:Object.assign({},globalThis.__frameIdForNode||{}),
+                    hostOuter:(function(){var h=document.getElementById('browser-oxide-always-pass');return h?h.outerHTML.slice(0,500):'MISSING';})(),
+                    hostShadow:(function(){var h=document.getElementById('browser-oxide-always-pass');return (h&&h.shadowRoot)?String(h.shadowRoot.innerHTML).slice(0,600):'none';})(),
                     scriptErrors:(globalThis.__scriptErrors||[]).slice(0,8),
-                    rejections:(globalThis.__oxRejLog||[]).slice(0,8)
+                    rejections:(globalThis.__oxRejLog||[]).slice(0,8),
+                    parentMsgLog:(globalThis.__oxParentMsgLog||[]).slice(-14),
+                    parentErr:(globalThis.__oxParentErr||[]).slice(0,6)
                 })"#,
             )
             .unwrap_or_else(|error| format!("EVAL_ERROR:{error}"));
         eprintln!("TURNSTILE_TIMEOUT_TOP={top_state}");
+        let eval_src = page.evaluate("JSON.stringify(globalThis.__oxParentEvalSrc||[])").unwrap_or_default();
+        if eval_src.len() > 4 {
+            eprintln!("TURNSTILE_EVAL_SRC={eval_src}");
+        }
         eprintln!("TURNSTILE_TIMEOUT_FRAMES={}", page.frame_tree_count());
         for index in 0..page.frame_tree_count() {
             let state = page
@@ -122,6 +170,8 @@ async fn cloudflare_turnstile_always_passes() {
                         href:String(location.href),
                         ready:document.readyState,
                         bodyLength:(document.body&&document.body.innerHTML||'').length,
+                        big:(function(){var s=document.querySelectorAll('script'),b='';for(var i=0;i<s.length;i++){var t=s[i].textContent||'';if(t.length>b.length)b=t;}var p=b.indexOf('uaqdv');return [b.length,p,b.slice(0,120),b.slice(-120)].join('~');})(),
+                        msgLog:(function(){try{return (globalThis.__oxFrameMsgLog||[]).join(' ;; ').slice(0,1500);}catch(e){return 'E';}})(),
                         scriptErrors:(globalThis.__scriptErrors||[]).slice(0,5),
                         rejections:(globalThis.__oxRejLog||[]).slice(0,5)
                     })"#,
@@ -130,6 +180,22 @@ async fn cloudflare_turnstile_always_passes() {
             eprintln!("TURNSTILE_TIMEOUT_FRAME[{index}]={state}");
         }
     }
+    let last_frame = page
+        .frame_tree_evaluate(
+            0,
+            r#"JSON.stringify({
+                href:String(location.href),
+                ready:document.readyState,
+                bodyLength:(document.body&&document.body.innerHTML||'').length,
+                big:(function(){var s=document.querySelectorAll('script'),b='';for(var i=0;i<s.length;i++){var t=s[i].textContent||'';if(t.length>b.length)b=t;}var p=b.indexOf('uaqdv');return [b.length,p,b.slice(0,120),b.slice(-120)].join('~');})(),
+                hasStage:!!document.getElementById('stage'),
+                msgLog:(function(){try{return (globalThis.__oxFrameMsgLog||[]).join(' ;; ').slice(0,1500);}catch(e){return 'E';}})(),
+                bigFull:(function(){var s=document.querySelectorAll('script'),b='';for(var i=0;i<s.length;i++){var t=s[i].textContent||'';if(t.length>b.length)b=t;}return b;})(),
+               CE:(function(){try{return (window.__oxCEc||0)+'/'+(document.body?document.body.children.length:0);}catch(e){return 'E';}})()
+            })"#,
+        )
+        .unwrap_or_else(|| "<missing frame>".to_string());
+    eprintln!("TURNSTILE_LAST_FRAME[0]={last_frame}");
     assert!(completed, "always-pass Turnstile callback did not fire");
 
     let verification = page
@@ -140,19 +206,36 @@ async fn cloudflare_turnstile_always_passes() {
                 error:__oxTsResult.error,
                 response:turnstile.getResponse(__oxTsWidgetId)||'',
                 hidden:Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]'))
-                    .some(function(input){return input.value==='XXXX.DUMMY.TOKEN.XXXX';})
+                    .some(function(input){var v=input.value||'';return !!v&&v===__oxTsResult.token;})
             })"#,
         )
         .expect("read Turnstile result");
-    assert_eq!(
-        verification,
-        format!(
-            r#"{{"callback":true,"token":"{DUMMY_TOKEN}","error":"","response":"{DUMMY_TOKEN}","hidden":true}}"#
-        )
-    );
+    if always_pass {
+        assert_eq!(
+            verification,
+            format!(
+                r#"{{"callback":true,"token":"{DUMMY_TOKEN}","error":"","response":"{DUMMY_TOKEN}","hidden":true}}"#
+            )
+        );
+    } else {
+        assert!(
+            verification.contains(r#""callback":true"#)
+                && verification.contains(r#""error":""#)
+                && verification.contains(r#""hidden":true"#)
+                && !verification.contains(r#""token":""#),
+            "real-sitekey run incomplete: {verification}"
+        );
+        assert!(
+            !verification.contains(DUMMY_TOKEN),
+            "dummy token in real-sitekey run: {verification}"
+        );
+    }
 
+    let token = page
+        .evaluate("String(__oxTsResult&&__oxTsResult.token||'')")
+        .unwrap_or_default();
     println!(
-        "TURNSTILE_E2E_PASS url={url} frames={} token={DUMMY_TOKEN}",
+        "TURNSTILE_E2E_PASS url={url} key={sitekey} frames={} token={token}",
         page.frame_tree_count()
     );
 }

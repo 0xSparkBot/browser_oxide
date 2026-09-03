@@ -386,4 +386,86 @@
             globalThis.crypto.subtle = subtle;
         }
     }
+
+    // Diagnostics: snapshot the worker-realm surface right after bootstrap,
+    // before the worker script runs. If the worker script dies during its
+    // own synchronous init (challenge PoW workers do), this is the record of
+    // what the realm looked like when it started.
+    // Eval-source tap (single source of truth lives in dom_bootstrap.js as
+    // __oxInstallEvalTap; duplicated here because workers are a separate
+    // isolate that never loads the document bootstrap). Dedicated workers
+    // host the Turnstile challenge VM — its runtime-assembled `new Function`
+    // programs are where the 'call' crashes unwrap. Mirror each capture to
+    // the owner window; the Worker pump in window_bootstrap.js relays
+    // `__oxEvalSrc` payloads into globalThis.__oxParentEvalSrc.
+    try {
+        if (!globalThis.__oxEvalTapReady) {
+            globalThis.__oxEvalTapReady = true;
+            const log = globalThis.__oxEvalSrcLog
+                || (globalThis.__oxEvalSrcLog = []);
+            const record = (src) => {
+                try {
+                    globalThis.__oxTapN = (globalThis.__oxTapN | 0) + 1;
+                    if (typeof src !== "string" || src.length < 512) return;
+                    if (log.length >= 8) return;
+                    let dup = false;
+                    for (let i = 0; i < log.length; i++) {
+                        if (log[i] && log[i].length === src.length) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) return;
+                    log.push(src);
+                    try {
+                        self.postMessage({
+                            __oxEvalSrc: {
+                                href: String(
+                                    (self.location && self.location.href) || "",
+                                ).slice(0, 80),
+                                code: src,
+                            },
+                        });
+                    } catch (_) {}
+                } catch (_) {}
+            };
+            const NativeFunction = globalThis.Function;
+            globalThis.Function = new Proxy(NativeFunction, {
+                apply(target, thisArg, args) {
+                    record(typeof args[0] === "string"
+                        ? args[0]
+                        : (args[0] != null ? String(args[0]) : ""));
+                    return Reflect.apply(target, thisArg, args);
+                },
+                construct(target, args, newTarget) {
+                    record(typeof args[0] === "string"
+                        ? args[0]
+                        : (args[0] != null ? String(args[0]) : ""));
+                    return Reflect.construct(target, args, newTarget);
+                },
+            });
+        }
+    } catch (_) {}
+
+    try {
+        const _dk = [
+            'location', 'navigator', 'crypto', 'performance', 'fetch', 'Request',
+            'Response', 'Headers', 'URL', 'URLSearchParams', 'Blob', 'FileReader',
+            'TextEncoder', 'TextDecoder', 'atob', 'btoa', 'setTimeout', 'setInterval',
+            'clearTimeout', 'queueMicrotask', 'structuredClone', 'MessageChannel',
+            'WebSocket', 'XMLHttpRequest', 'localStorage', 'indexedDB', 'caches',
+            'AbortController', 'Event', 'EventTarget', 'onmessage', 'postMessage',
+            'close', 'importScripts', 'Promise', 'Reflect', 'Proxy',
+        ];
+        const _typeofs = _dk.map(k => k + ':' + typeof self[k]).join(',');
+        ops.op_worker_diag_note(JSON.stringify({
+            phase: 'bootstrap-end',
+            g: _typeofs,
+            subtle: typeof (self.crypto && self.crypto.subtle),
+            loc: self.location ? String(self.location.href).slice(0, 120) : 'none',
+            ua: self.navigator ? String(self.navigator.userAgent).slice(0, 48) : 'none',
+        }));
+    } catch (e) {
+        try { ops.op_worker_diag_note('diag-fail ' + e); } catch (_) {}
+    }
 })(globalThis);
