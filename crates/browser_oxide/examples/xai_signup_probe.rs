@@ -672,7 +672,7 @@ async fn main() {
         }
         let done = matches!(
             page.evaluate(
-                "String(Array.from(document.querySelectorAll('input[name=cf-turnstile-response]')).some(function(i){return (i.value||'').length > 20;}))"
+                "String((Array.from(document.querySelectorAll('input[name=cf-turnstile-response]')).some(function(i){return (i.value||'').length > 20;})) || (String(window.__oxToken||'').length>20))"
             )
             .as_deref(),
             Ok("true")
@@ -914,7 +914,7 @@ return 4;})()"#,
             );
             println!("FRAME0_S{poll}={sample:?}");
             let pst = page.evaluate(
-                r#"JSON.stringify((function(){try{var c=document.querySelector('#ox-ts-box,[class*=cf-turnstile],[data-sitekey]');if(!c)return{noc:1};var r=c.getBoundingClientRect();var fr=c.querySelector('iframe');var gr='';try{gr=(window.turnstile&&window.turnstile.getResponse)?String(window.turnstile.getResponse()||'').slice(0,36):'';}catch(e){gr='E';}return {pm:window.__oxPMO|0,w:Math.round(r.width),h:Math.round(r.height),ifr:!!fr,vis:String(document.visibilityState),gr:gr,bs:(c.innerHTML||'').length};}catch(e){return {E:String(e).slice(0,50)};}})())"#,
+                r#"JSON.stringify((function(){try{var c=document.querySelector('#ox-ts-box,[class*=cf-turnstile],[data-sitekey]');if(!c)return{noc:1};var r=c.getBoundingClientRect();var fr=c.querySelector('iframe');var gr='';try{gr=(window.turnstile&&window.turnstile.getResponse)?String(window.turnstile.getResponse()||'').slice(0,36):'';}catch(e){gr='E';}return {pm:(window.__oxPmL||[]).length,w:Math.round(r.width),h:Math.round(r.height),ifr:!!fr,vis:String(document.visibilityState),gr:gr,bs:(c.innerHTML||'').length};}catch(e){return {E:String(e).slice(0,50)};}})())"#,
             );
             println!("PST{poll}={pst:?}");
         }
@@ -930,6 +930,18 @@ return 4;})()"#,
                 );
                 println!("FCEN{poll}[{ci}]={:?}", h.unwrap_or_default());
             }
+        }
+        // Parent-realm periodic sample: the child sample (FRAME0_S*) cannot
+        // see parent->child traffic, parent console errors, or parent-side
+        // network activity. All of those are captured by the seed taps
+        // (__oxTopIn / __oxPmL / __oxCE / __oxPnet / __oxCWQ) but were
+        // previously only reachable via the end-of-run deep eval, which
+        // the crashed_retry loop made useless.
+        if poll % 10 == 4 {
+            let top = page.evaluate(
+                r#"JSON.stringify({tin:(window.__oxTopIn||[]).slice(-5),pm:(window.__oxPmL||[]).slice(-8),ce:(window.__oxCE||[]).slice(-3),pn:(function(){var p=window.__oxPnet||{};return 'f'+(p.f||0)+'/'+((p.fe||[]).length)+' x'+(p.x||0)+' w'+(p.w||0);})(),pf:(window.__oxPnet&&window.__oxPnet.ft||[]).slice(0,3),tsR:!!window.__oxTsRendered,gr:(function(){try{return window.turnstile&&window.turnstile.getResponse?String(window.turnstile.getResponse()||'').slice(0,24):'noTS'}catch(e){return 'E:'+String((e&&e.message)||e).slice(0,48)}})(),grN:window.__oxGrN||0,cwN:(window.__oxCWQ||[]).length,cwL:(window.__oxCWQ||[]).slice(-2).map(function(p){return p.t+' '+p.id+' c'+(p.conn?1:0)+' '+(p.v===undefined?'und':(p.v===null?'null':'obj'))}),ifrN:(function(){try{return document.querySelectorAll('iframe').length}catch(e){return -1}})(),hE:(window.__oxHdlErr||[]).slice(0,2)})"#,
+            );
+            println!("TOP_S{poll}={top:?}");
         }
 
         // Live eval-source sweep: realm logs die with their realm (challenge
