@@ -1759,6 +1759,98 @@ async fn rtc_ice_candidates_reach_event_target_listeners() {
 }
 
 #[tokio::test]
+async fn rtc_peer_connection_and_data_channel_match_chrome_surface() {
+    assert_eq!(
+        check(
+            r#"(() => {
+                const pcNames = [
+                    'localDescription', 'currentLocalDescription',
+                    'pendingLocalDescription', 'remoteDescription',
+                    'currentRemoteDescription', 'pendingRemoteDescription',
+                    'signalingState', 'iceGatheringState',
+                    'iceConnectionState', 'connectionState',
+                    'canTrickleIceCandidates', 'onnegotiationneeded',
+                    'onicecandidate', 'onsignalingstatechange',
+                    'oniceconnectionstatechange', 'onconnectionstatechange',
+                    'onicegatheringstatechange', 'onicecandidateerror',
+                    'ontrack', 'sctp', 'ondatachannel', 'onaddstream',
+                    'onremovestream', 'addIceCandidate', 'addStream',
+                    'addTrack', 'addTransceiver', 'close', 'createAnswer',
+                    'createDTMFSender', 'createDataChannel', 'createOffer',
+                    'getConfiguration', 'getLocalStreams', 'getReceivers',
+                    'getRemoteStreams', 'getSenders', 'getStats',
+                    'getTransceivers', 'removeStream', 'removeTrack',
+                    'restartIce', 'setConfiguration', 'setLocalDescription',
+                    'setRemoteDescription', 'constructor'
+                ];
+                const channelNames = [
+                    'label', 'ordered', 'maxPacketLifeTime', 'maxRetransmits',
+                    'protocol', 'negotiated', 'id', 'readyState',
+                    'bufferedAmount', 'bufferedAmountLowThreshold', 'onopen',
+                    'onbufferedamountlow', 'onerror', 'onclosing', 'onclose',
+                    'onmessage', 'binaryType', 'reliable', 'close', 'send',
+                    'constructor'
+                ];
+                const candidateNames = [
+                    'candidate', 'sdpMid', 'sdpMLineIndex', 'foundation',
+                    'component', 'priority', 'address', 'protocol', 'port',
+                    'type', 'tcpType', 'relatedAddress', 'relatedPort',
+                    'usernameFragment', 'relayProtocol', 'url', 'toJSON',
+                    'constructor'
+                ];
+                const pc = new RTCPeerConnection({ iceServers: [] });
+                const channel = pc.createDataChannel('probe');
+                const candidate = new RTCIceCandidate({
+                    candidate: 'candidate:1 1 udp 9 host.local 1234 typ host',
+                    sdpMid: '0', sdpMLineIndex: 0
+                });
+                const description = new RTCSessionDescription({ type: 'offer', sdp: '' });
+                const iceEvent = new RTCPeerConnectionIceEvent('icecandidate', { candidate });
+                let channelConstructorThrows = false;
+                try { new RTCDataChannel(); } catch (error) {
+                    channelConstructorThrows = error instanceof TypeError;
+                }
+                const ok = Object.getOwnPropertyNames(pc).length === 0
+                    && Object.getOwnPropertyNames(channel).length === 0
+                    && Object.getOwnPropertyNames(candidate).length === 0
+                    && Object.getOwnPropertyNames(description).length === 0
+                    && JSON.stringify(Object.getOwnPropertyNames(RTCPeerConnection.prototype)) === JSON.stringify(pcNames)
+                    && JSON.stringify(Object.getOwnPropertyNames(RTCDataChannel.prototype)) === JSON.stringify(channelNames)
+                    && JSON.stringify(Object.getOwnPropertyNames(RTCIceCandidate.prototype)) === JSON.stringify(candidateNames)
+                    && JSON.stringify(Object.getOwnPropertyNames(RTCSessionDescription.prototype)) === JSON.stringify(['type', 'sdp', 'toJSON', 'constructor'])
+                    && JSON.stringify(Object.getOwnPropertyNames(RTCPeerConnectionIceEvent.prototype)) === JSON.stringify(['candidate', 'constructor'])
+                    && JSON.stringify(Object.getOwnPropertyNames(RTCPeerConnection)) === JSON.stringify(['length', 'name', 'prototype', 'generateCertificate'])
+                    && JSON.stringify(Object.getOwnPropertyNames(RTCDataChannel)) === JSON.stringify(['length', 'name', 'prototype'])
+                    && Object.getPrototypeOf(RTCPeerConnection) === EventTarget
+                    && Object.getPrototypeOf(RTCPeerConnection.prototype) === EventTarget.prototype
+                    && Object.getPrototypeOf(RTCDataChannel) === EventTarget
+                    && Object.getPrototypeOf(RTCDataChannel.prototype) === EventTarget.prototype
+                    && Object.prototype.toString.call(pc) === '[object RTCPeerConnection]'
+                    && Object.prototype.toString.call(channel) === '[object RTCDataChannel]'
+                    && Object.prototype.toString.call(candidate) === '[object RTCIceCandidate]'
+                    && Object.prototype.toString.call(description) === '[object RTCSessionDescription]'
+                    && Object.prototype.toString.call(iceEvent) === '[object RTCPeerConnectionIceEvent]'
+                    && channel.label === 'probe'
+                    && channel.ordered === true
+                    && channel.readyState === 'connecting'
+                    && candidate.foundation === '1'
+                    && candidate.component === 'rtp'
+                    && candidate.protocol === 'udp'
+                    && candidate.address === 'host.local'
+                    && candidate.port === 1234
+                    && candidate.type === 'host'
+                    && iceEvent.candidate === candidate
+                    && channelConstructorThrows;
+                pc.close();
+                return ok;
+            })()"#
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn perf_timing_is_present() {
     // performance.timing (deprecated but the challenge vendor + CreepJS still probe)
     assert_eq!(

@@ -5836,113 +5836,510 @@
     // ================================================================
     // WebRTC leak prevention — block real IP exposure via ICE candidates
     // ================================================================
-    globalThis.RTCDataChannel = class RTCDataChannel extends EventTarget {
-        constructor() { super(); this.label = ""; this.readyState = "connecting"; this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null; }
-        send() {}
-        close() {}
+    const _rtcDataChannelState = new WeakMap();
+    const _rtcPeerConnectionState = new WeakMap();
+    const _rtcState = (states, value) => {
+        const state = states.get(value);
+        if (!state) throw new TypeError('Illegal invocation');
+        return state;
     };
+    const _rtcGetter = (proto, name, getter, setter) => {
+        _maskFunction(getter, `get ${name}`);
+        if (setter) _maskFunction(setter, `set ${name}`);
+        Object.defineProperty(proto, name, {
+            get: getter,
+            set: setter,
+            enumerable: true,
+            configurable: true,
+        });
+    };
+    const _rtcMethod = (proto, name, method) => {
+        _maskFunction(method, name);
+        Object.defineProperty(proto, name, {
+            value: method,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+    };
+    const _rtcHandler = (proto, states, name) => {
+        _rtcGetter(
+            proto,
+            name,
+            function handler() { return _rtcState(states, this).handlers[name]; },
+            function handler(value) {
+                _rtcState(states, this).handlers[name] = typeof value === 'function' ? value : null;
+            },
+        );
+    };
+
+    class RTCDataChannel extends EventTarget {
+        constructor() {
+            super();
+            throw new TypeError('Illegal constructor');
+        }
+    }
+    const _RTCDataChannelProto = RTCDataChannel.prototype;
+    delete _RTCDataChannelProto.constructor;
+    for (const [name, fallback] of [
+        ['label', ''],
+        ['ordered', true],
+        ['maxPacketLifeTime', null],
+        ['maxRetransmits', null],
+        ['protocol', ''],
+        ['negotiated', false],
+        ['id', null],
+        ['readyState', 'connecting'],
+        ['bufferedAmount', 0],
+    ]) {
+        _rtcGetter(
+            _RTCDataChannelProto,
+            name,
+            function channelState() { return _rtcState(_rtcDataChannelState, this)[name] ?? fallback; },
+        );
+    }
+    _rtcGetter(
+        _RTCDataChannelProto,
+        'bufferedAmountLowThreshold',
+        function channelState() {
+            return _rtcState(_rtcDataChannelState, this).bufferedAmountLowThreshold;
+        },
+        function channelState(value) {
+            const number = Number(value);
+            _rtcState(_rtcDataChannelState, this).bufferedAmountLowThreshold =
+                Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+        },
+    );
+    for (const name of [
+        'onopen',
+        'onbufferedamountlow',
+        'onerror',
+        'onclosing',
+        'onclose',
+        'onmessage',
+    ]) {
+        _rtcHandler(_RTCDataChannelProto, _rtcDataChannelState, name);
+    }
+    _rtcGetter(
+        _RTCDataChannelProto,
+        'binaryType',
+        function channelState() { return _rtcState(_rtcDataChannelState, this).binaryType; },
+        function channelState(value) {
+            const type = String(value);
+            if (type !== 'blob' && type !== 'arraybuffer') return;
+            _rtcState(_rtcDataChannelState, this).binaryType = type;
+        },
+    );
+    _rtcGetter(
+        _RTCDataChannelProto,
+        'reliable',
+        function channelState() { return _rtcState(_rtcDataChannelState, this).reliable; },
+    );
+    _rtcMethod(_RTCDataChannelProto, 'close', function close() {
+        const state = _rtcState(_rtcDataChannelState, this);
+        if (state.readyState === 'closed') return;
+        state.readyState = 'closing';
+        setTimeout(() => {
+            if (state.readyState !== 'closing') return;
+            state.readyState = 'closed';
+            this.dispatchEvent(_markTrustedEvent(new Event('close')));
+        }, 0);
+    });
+    _rtcMethod(_RTCDataChannelProto, 'send', function send(data) {
+        const state = _rtcState(_rtcDataChannelState, this);
+        if (state.readyState !== 'open') {
+            throw new DOMException('RTCDataChannel.readyState is not \'open\'', 'InvalidStateError');
+        }
+    });
+    Object.defineProperty(_RTCDataChannelProto, 'constructor', {
+        value: RTCDataChannel, writable: true, configurable: true,
+    });
+    Object.defineProperty(_RTCDataChannelProto, Symbol.toStringTag, {
+        value: 'RTCDataChannel', configurable: true,
+    });
+    _maskFunction(RTCDataChannel, 'RTCDataChannel');
+    globalThis.RTCDataChannel = RTCDataChannel;
     {
         const _iceEventState = new WeakMap();
-        globalThis.RTCPeerConnectionIceEvent = class RTCPeerConnectionIceEvent extends Event {
+        class RTCPeerConnectionIceEvent extends Event {
             constructor(type, options = {}) {
                 super(type, options);
                 _iceEventState.set(this, options.candidate ?? null);
             }
             get candidate() { return _iceEventState.get(this) ?? null; }
-        };
-        Object.defineProperty(globalThis.RTCPeerConnectionIceEvent.prototype, Symbol.toStringTag, {
+        }
+        const proto = RTCPeerConnectionIceEvent.prototype;
+        delete proto.constructor;
+        delete proto.candidate;
+        _rtcGetter(
+            proto,
+            'candidate',
+            function candidate() {
+                if (!_iceEventState.has(this)) throw new TypeError('Illegal invocation');
+                return _iceEventState.get(this) ?? null;
+            },
+        );
+        Object.defineProperty(proto, 'constructor', {
+            value: RTCPeerConnectionIceEvent, writable: true, configurable: true,
+        });
+        Object.defineProperty(proto, Symbol.toStringTag, {
             value: 'RTCPeerConnectionIceEvent', configurable: true,
         });
+        _maskFunction(RTCPeerConnectionIceEvent, 'RTCPeerConnectionIceEvent');
+        globalThis.RTCPeerConnectionIceEvent = RTCPeerConnectionIceEvent;
     }
-    globalThis.RTCPeerConnection = class RTCPeerConnection extends EventTarget {
-        constructor(config) {
+    class RTCPeerConnection extends EventTarget {
+        constructor(config = {}) {
             super();
-            this.localDescription = null;
-            this.remoteDescription = null;
-            this.signalingState = "stable";
-            this.iceConnectionState = "new";
-            this.iceGatheringState = "new";
-            this.connectionState = "new";
-            this.onicecandidate = null;
-            this.oniceconnectionstatechange = null;
-            this.onsignalingstatechange = null;
-            this.ondatachannel = null;
-            this.ontrack = null;
-            this._channels = [];
-        }
-        createDataChannel(label, options) {
-            const ch = new RTCDataChannel();
-            ch.label = label;
-            this._channels.push(ch);
-            return ch;
-        }
-        createOffer() {
-            return Promise.resolve({ type: "offer", sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n" });
-        }
-        createAnswer() {
-            return Promise.resolve({ type: "answer", sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n" });
-        }
-        setLocalDescription(desc) {
-            this.localDescription = desc;
-            // Real Chrome (since 2019, mDNS-anonymized) emits an mDNS host
-            // candidate followed by `null` to signal gathering complete.
-            // Returning ONLY `{candidate: null}` is itself a tell — every
-            // legitimate Chrome session yields at least one mDNS host.
-            // The `<uuid>.local` form is privacy-preserving (no real IP).
-            // Some fingerprint scripts probe candidate
-            // length; one mDNS host closes the parity gap without leaking.
-            const _hex = (n) => Math.floor(Math.random() * 16).toString(16);
-            const _uuid4 = () => {
-                let s = '';
-                for (let i = 0; i < 36; i++) {
-                    if (i === 8 || i === 13 || i === 18 || i === 23) s += '-';
-                    else if (i === 14) s += '4';
-                    else if (i === 19) s += (8 + Math.floor(Math.random() * 4)).toString(16);
-                    else s += _hex();
-                }
-                return s;
-            };
-            const mdnsHost = _uuid4() + '.local';
-            const foundation = String(Math.floor(Math.random() * 4_000_000_000));
-            const candidate = `candidate:${foundation} 1 udp 2113937151 ${mdnsHost} ${1024 + Math.floor(Math.random() * 60000)} typ host generation 0 network-cost 999`;
-            const iceCandidate = new globalThis.RTCIceCandidate({
-                candidate, sdpMid: '0', sdpMLineIndex: 0,
+            _rtcPeerConnectionState.set(this, {
+                configuration: Object.assign({}, config || {}),
+                localDescription: null,
+                currentLocalDescription: null,
+                pendingLocalDescription: null,
+                remoteDescription: null,
+                currentRemoteDescription: null,
+                pendingRemoteDescription: null,
+                signalingState: 'stable',
+                iceGatheringState: 'new',
+                iceConnectionState: 'new',
+                connectionState: 'new',
+                canTrickleIceCandidates: null,
+                sctp: null,
+                handlers: Object.create(null),
+                channels: [],
             });
+        }
+    }
+    const _RTCPeerConnectionProto = RTCPeerConnection.prototype;
+    delete _RTCPeerConnectionProto.constructor;
+    for (const name of [
+        'localDescription',
+        'currentLocalDescription',
+        'pendingLocalDescription',
+        'remoteDescription',
+        'currentRemoteDescription',
+        'pendingRemoteDescription',
+        'signalingState',
+        'iceGatheringState',
+        'iceConnectionState',
+        'connectionState',
+        'canTrickleIceCandidates',
+    ]) {
+        _rtcGetter(
+            _RTCPeerConnectionProto,
+            name,
+            function connectionState() { return _rtcState(_rtcPeerConnectionState, this)[name]; },
+        );
+    }
+    for (const name of [
+        'onnegotiationneeded',
+        'onicecandidate',
+        'onsignalingstatechange',
+        'oniceconnectionstatechange',
+        'onconnectionstatechange',
+        'onicegatheringstatechange',
+        'onicecandidateerror',
+        'ontrack',
+    ]) {
+        _rtcHandler(_RTCPeerConnectionProto, _rtcPeerConnectionState, name);
+    }
+    _rtcGetter(
+        _RTCPeerConnectionProto,
+        'sctp',
+        function connectionState() { return _rtcState(_rtcPeerConnectionState, this).sctp; },
+    );
+    for (const name of ['ondatachannel', 'onaddstream', 'onremovestream']) {
+        _rtcHandler(_RTCPeerConnectionProto, _rtcPeerConnectionState, name);
+    }
+    _rtcMethod(_RTCPeerConnectionProto, 'addIceCandidate', function addIceCandidate(candidate) {
+        _rtcState(_rtcPeerConnectionState, this);
+        return Promise.resolve();
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'addStream', function addStream(stream) {
+        _rtcState(_rtcPeerConnectionState, this);
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'addTrack', function addTrack(track, ...streams) {
+        _rtcState(_rtcPeerConnectionState, this);
+        return typeof globalThis.RTCRtpSender === 'function'
+            ? Object.create(globalThis.RTCRtpSender.prototype)
+            : { track: track || null };
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'addTransceiver', function addTransceiver(trackOrKind, init) {
+        _rtcState(_rtcPeerConnectionState, this);
+        return typeof globalThis.RTCRtpTransceiver === 'function'
+            ? Object.create(globalThis.RTCRtpTransceiver.prototype)
+            : {};
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'close', function close() {
+        const state = _rtcState(_rtcPeerConnectionState, this);
+        state.signalingState = 'closed';
+        state.iceConnectionState = 'closed';
+        state.connectionState = 'closed';
+        for (const channel of state.channels) {
+            const channelState = _rtcDataChannelState.get(channel);
+            if (channelState) channelState.readyState = 'closed';
+        }
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'createAnswer', function createAnswer() {
+        _rtcState(_rtcPeerConnectionState, this);
+        return Promise.resolve({ type: 'answer', sdp: 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n' });
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'createDTMFSender', function createDTMFSender(track) {
+        _rtcState(_rtcPeerConnectionState, this);
+        return typeof globalThis.RTCDTMFSender === 'function'
+            ? Object.create(globalThis.RTCDTMFSender.prototype)
+            : {};
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'createDataChannel', function createDataChannel(label, options = {}) {
+        const connection = _rtcState(_rtcPeerConnectionState, this);
+        const channel = Object.create(_RTCDataChannelProto);
+        _rtcDataChannelState.set(channel, {
+            label: String(label),
+            ordered: options.ordered !== false,
+            maxPacketLifeTime: options.maxPacketLifeTime ?? null,
+            maxRetransmits: options.maxRetransmits ?? null,
+            protocol: String(options.protocol || ''),
+            negotiated: options.negotiated === true,
+            id: options.id ?? null,
+            readyState: 'connecting',
+            bufferedAmount: 0,
+            bufferedAmountLowThreshold: 0,
+            binaryType: 'arraybuffer',
+            reliable: true,
+            handlers: Object.create(null),
+        });
+        connection.channels.push(channel);
+        return channel;
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'createOffer', function createOffer() {
+        _rtcState(_rtcPeerConnectionState, this);
+        return Promise.resolve({ type: 'offer', sdp: 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n' });
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'getConfiguration', function getConfiguration() {
+        return Object.assign({}, _rtcState(_rtcPeerConnectionState, this).configuration);
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'getLocalStreams', function getLocalStreams() {
+        _rtcState(_rtcPeerConnectionState, this);
+        return [];
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'getReceivers', function getReceivers() {
+        _rtcState(_rtcPeerConnectionState, this);
+        return [];
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'getRemoteStreams', function getRemoteStreams() {
+        _rtcState(_rtcPeerConnectionState, this);
+        return [];
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'getSenders', function getSenders() {
+        _rtcState(_rtcPeerConnectionState, this);
+        return [];
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'getStats', function getStats(selector) {
+        _rtcState(_rtcPeerConnectionState, this);
+        return Promise.resolve(new Map());
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'getTransceivers', function getTransceivers() {
+        _rtcState(_rtcPeerConnectionState, this);
+        return [];
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'removeStream', function removeStream(stream) {
+        _rtcState(_rtcPeerConnectionState, this);
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'removeTrack', function removeTrack(sender) {
+        _rtcState(_rtcPeerConnectionState, this);
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'restartIce', function restartIce() {
+        const state = _rtcState(_rtcPeerConnectionState, this);
+        if (state.signalingState === 'closed') {
+            throw new DOMException('The RTCPeerConnection is closed.', 'InvalidStateError');
+        }
+        this.dispatchEvent(_markTrustedEvent(new Event('negotiationneeded')));
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'setConfiguration', function setConfiguration(config = {}) {
+        _rtcState(_rtcPeerConnectionState, this).configuration = Object.assign({}, config || {});
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'setLocalDescription', function setLocalDescription(desc) {
+        const state = _rtcState(_rtcPeerConnectionState, this);
+        const description = desc == null ? null : new globalThis.RTCSessionDescription(desc);
+        state.localDescription = description;
+        state.currentLocalDescription = description;
+        // Real Chrome (since 2019, mDNS-anonymized) emits an mDNS host
+        // candidate followed by `null` to signal gathering complete.
+        // Returning ONLY `{candidate: null}` is itself a tell — every
+        // legitimate Chrome session yields at least one mDNS host.
+        // The `<uuid>.local` form is privacy-preserving (no real IP).
+        // Some fingerprint scripts probe candidate
+        // length; one mDNS host closes the parity gap without leaking.
+        const _hex = (n) => Math.floor(Math.random() * 16).toString(16);
+        const _uuid4 = () => {
+            let s = '';
+            for (let i = 0; i < 36; i++) {
+                if (i === 8 || i === 13 || i === 18 || i === 23) s += '-';
+                else if (i === 14) s += '4';
+                else if (i === 19) s += (8 + Math.floor(Math.random() * 4)).toString(16);
+                else s += _hex();
+            }
+            return s;
+        };
+        const mdnsHost = _uuid4() + '.local';
+        const foundation = String(Math.floor(Math.random() * 4_000_000_000));
+        const candidate = `candidate:${foundation} 1 udp 2113937151 ${mdnsHost} ${1024 + Math.floor(Math.random() * 60000)} typ host generation 0 network-cost 999`;
+        const iceCandidate = new globalThis.RTCIceCandidate({
+            candidate, sdpMid: '0', sdpMLineIndex: 0,
+        });
+        setTimeout(() => {
+            state.iceGatheringState = 'gathering';
+            const candidateEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
+                'icecandidate', { candidate: iceCandidate }
+            ));
+            this.dispatchEvent(candidateEvent);
             setTimeout(() => {
-                this.iceGatheringState = 'gathering';
-                const candidateEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
-                    'icecandidate', { candidate: iceCandidate }
+                state.iceGatheringState = 'complete';
+                const completeEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
+                    'icecandidate', { candidate: null }
                 ));
-                this.dispatchEvent(candidateEvent);
-                setTimeout(() => {
-                    this.iceGatheringState = "complete";
-                    const completeEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
-                        'icecandidate', { candidate: null }
-                    ));
-                    this.dispatchEvent(completeEvent);
-                }, 12);
-            }, 8);
-            return Promise.resolve();
-        }
-        setRemoteDescription(desc) { this.remoteDescription = desc; return Promise.resolve(); }
-        addIceCandidate(c) { return Promise.resolve(); }
-        addTrack() { return { track: null }; }
-        addStream() {}
-        removeTrack() {}
-        getStats() { return Promise.resolve(new Map()); }
-        getSenders() { return []; }
-        getReceivers() { return []; }
-        getTransceivers() { return []; }
-        close() {
-            this.signalingState = "closed";
-            this.iceConnectionState = "closed";
-            this.connectionState = "closed";
-        }
+                this.dispatchEvent(completeEvent);
+            }, 12);
+        }, 8);
+        return Promise.resolve();
+    });
+    _rtcMethod(_RTCPeerConnectionProto, 'setRemoteDescription', function setRemoteDescription(desc) {
+        const state = _rtcState(_rtcPeerConnectionState, this);
+        const description = desc == null ? null : new globalThis.RTCSessionDescription(desc);
+        state.remoteDescription = description;
+        state.currentRemoteDescription = description;
+        state.canTrickleIceCandidates = null;
+        return Promise.resolve();
+    });
+    Object.defineProperty(_RTCPeerConnectionProto, 'constructor', {
+        value: RTCPeerConnection, writable: true, configurable: true,
+    });
+    Object.defineProperty(_RTCPeerConnectionProto, Symbol.toStringTag, {
+        value: 'RTCPeerConnection', configurable: true,
+    });
+    const _generateCertificate = function generateCertificate(algorithm) {
+        return Promise.resolve(
+            typeof globalThis.RTCCertificate === 'function'
+                ? Object.create(globalThis.RTCCertificate.prototype)
+                : {},
+        );
     };
-    globalThis.RTCPeerConnection.generateCertificate = () => Promise.resolve({});
+    _maskFunction(_generateCertificate, 'generateCertificate');
+    Object.defineProperty(RTCPeerConnection, 'generateCertificate', {
+        value: _generateCertificate, writable: true, configurable: true,
+    });
+    _maskFunction(RTCPeerConnection, 'RTCPeerConnection');
+    globalThis.RTCPeerConnection = RTCPeerConnection;
     globalThis.webkitRTCPeerConnection = globalThis.RTCPeerConnection;
-    globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d) { this.type = d?.type; this.sdp = d?.sdp; } };
-    globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(c) { this.candidate = c?.candidate || ""; this.sdpMid = c?.sdpMid; this.sdpMLineIndex = c?.sdpMLineIndex; } };
+
+    const _rtcSessionDescriptionState = new WeakMap();
+    class RTCSessionDescription {
+        constructor(description = {}) {
+            _rtcSessionDescriptionState.set(this, {
+                type: description.type === undefined ? null : String(description.type),
+                sdp: description.sdp === undefined ? '' : String(description.sdp),
+            });
+        }
+    }
+    const _RTCSessionDescriptionProto = RTCSessionDescription.prototype;
+    delete _RTCSessionDescriptionProto.constructor;
+    for (const name of ['type', 'sdp']) {
+        _rtcGetter(
+            _RTCSessionDescriptionProto,
+            name,
+            function descriptionState() {
+                return _rtcState(_rtcSessionDescriptionState, this)[name];
+            },
+            function descriptionState(value) {
+                _rtcState(_rtcSessionDescriptionState, this)[name] = String(value);
+            },
+        );
+    }
+    _rtcMethod(_RTCSessionDescriptionProto, 'toJSON', function toJSON() {
+        const state = _rtcState(_rtcSessionDescriptionState, this);
+        return { type: state.type, sdp: state.sdp };
+    });
+    Object.defineProperty(_RTCSessionDescriptionProto, 'constructor', {
+        value: RTCSessionDescription, writable: true, configurable: true,
+    });
+    Object.defineProperty(_RTCSessionDescriptionProto, Symbol.toStringTag, {
+        value: 'RTCSessionDescription', configurable: true,
+    });
+    _maskFunction(RTCSessionDescription, 'RTCSessionDescription');
+    globalThis.RTCSessionDescription = RTCSessionDescription;
+
+    const _rtcIceCandidateState = new WeakMap();
+    class RTCIceCandidate {
+        constructor(init = {}) {
+            const candidate = init.candidate === undefined ? '' : String(init.candidate);
+            const tokens = candidate.replace(/^candidate:/i, '').trim().split(/\s+/);
+            const extension = (key) => {
+                const index = tokens.indexOf(key);
+                return index >= 0 && index + 1 < tokens.length ? tokens[index + 1] : null;
+            };
+            _rtcIceCandidateState.set(this, {
+                candidate,
+                sdpMid: init.sdpMid === undefined ? null : String(init.sdpMid),
+                sdpMLineIndex: init.sdpMLineIndex === undefined ? null : Number(init.sdpMLineIndex),
+                foundation: tokens[0] || null,
+                component: tokens[1] === '1' ? 'rtp' : (tokens[1] === '2' ? 'rtcp' : null),
+                priority: tokens[3] === undefined ? null : Number(tokens[3]),
+                address: tokens[4] || null,
+                protocol: tokens[2] ? tokens[2].toLowerCase() : null,
+                port: tokens[5] === undefined ? null : Number(tokens[5]),
+                type: extension('typ'),
+                tcpType: extension('tcptype'),
+                relatedAddress: extension('raddr'),
+                relatedPort: extension('rport') === null ? null : Number(extension('rport')),
+                usernameFragment: init.usernameFragment ?? extension('ufrag'),
+                relayProtocol: init.relayProtocol ?? null,
+                url: init.url ?? null,
+            });
+        }
+    }
+    const _RTCIceCandidateProto = RTCIceCandidate.prototype;
+    delete _RTCIceCandidateProto.constructor;
+    for (const name of [
+        'candidate',
+        'sdpMid',
+        'sdpMLineIndex',
+        'foundation',
+        'component',
+        'priority',
+        'address',
+        'protocol',
+        'port',
+        'type',
+        'tcpType',
+        'relatedAddress',
+        'relatedPort',
+        'usernameFragment',
+        'relayProtocol',
+        'url',
+    ]) {
+        _rtcGetter(
+            _RTCIceCandidateProto,
+            name,
+            function candidateState() { return _rtcState(_rtcIceCandidateState, this)[name]; },
+        );
+    }
+    _rtcMethod(_RTCIceCandidateProto, 'toJSON', function toJSON() {
+        const state = _rtcState(_rtcIceCandidateState, this);
+        return {
+            candidate: state.candidate,
+            sdpMid: state.sdpMid,
+            sdpMLineIndex: state.sdpMLineIndex,
+            usernameFragment: state.usernameFragment,
+        };
+    });
+    Object.defineProperty(_RTCIceCandidateProto, 'constructor', {
+        value: RTCIceCandidate, writable: true, configurable: true,
+    });
+    Object.defineProperty(_RTCIceCandidateProto, Symbol.toStringTag, {
+        value: 'RTCIceCandidate', configurable: true,
+    });
+    _maskFunction(RTCIceCandidate, 'RTCIceCandidate');
+    globalThis.RTCIceCandidate = RTCIceCandidate;
 
     // ================================================================
     // Font enumeration spoofing — return OS-appropriate fonts
