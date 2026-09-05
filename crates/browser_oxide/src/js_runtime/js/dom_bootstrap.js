@@ -24,6 +24,8 @@
     const _imageBytes = new WeakMap();
     const _imageDecodeWaiters = new WeakMap();
     let _markFrameMessageTrusted = null;
+    let _getFrameEventState = null;
+    let _setFrameEventState = null;
 
     function _debugImageLoad(entry) {
         if (!globalThis.__browser_oxide_debug) return;
@@ -3997,7 +3999,8 @@
                     _reportingListenerError=false;
                 }
                 function fire(target,event,capture){
-                    if(!capture&&!event._stoppedImmediate){
+                    const eventState=()=>{try{return _getFrameEventState?_getFrameEventState(event):{stopped:!!event._stopped,stoppedImmediate:!!event._stoppedImmediate};}catch(_){return {stopped:false,stoppedImmediate:false};}};
+                    if(!capture&&!eventState().stoppedImmediate){
                         const handler=target&&target['on'+event.type];
                         if(typeof handler==='function')handler.call(target,event);
                     }
@@ -4005,7 +4008,7 @@
                     const remove=[];
                     for(let i=0;i<list.length;i++){
                         const item=list[i];if(item.capture!==capture)continue;
-                        if(event._stoppedImmediate)break;
+                        if(eventState().stoppedImmediate)break;
                         // Browser semantics: an exception in one listener is
                         // reported as an uncaught error on the window and must
                         // not abort the dispatch — later listeners still run
@@ -4026,7 +4029,10 @@
                 }
                 function dispatchEvent(event){
                     if(!(event instanceof built.Event))throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
-                    try{event.target=this;}catch(_){}
+                    const state=()=>{try{return _getFrameEventState?_getFrameEventState(event):{stopped:!!event._stopped,stoppedImmediate:!!event._stoppedImmediate,bubbles:!!event.bubbles,defaultPrevented:!!event.defaultPrevented};}catch(_){return {stopped:false,stoppedImmediate:false,bubbles:!!event.bubbles,defaultPrevented:!!event.defaultPrevented};}};
+                    const setState=patch=>{try{if(_setFrameEventState)_setFrameEventState(event,patch);else for(const key of Object.keys(patch))event[key]=patch[key];}catch(_){}};
+                    if(state().dispatching)throw new DOMException('The event is already being dispatched.','InvalidStateError');
+                    setState({target:this,dispatching:true});
                     const path=[];let current=this;
                     try{while(current){path.push(current);current=current.parentNode||null;}}catch(_){}
                     // DOM standard: the propagation path of an event at the
@@ -4038,19 +4044,28 @@
                         const doc=globalThis.document;
                         if(path.length>0&&path[path.length-1]===doc&&globalThis.window&&typeof globalThis.window.addEventListener==='function'&&path.indexOf(globalThis.window)<0)path.push(globalThis.window);
                     }catch(_){}
-                    if(path.length>1&&!event._stopped){
-                        for(let i=path.length-1;i>0;i--){event.currentTarget=path[i];event.eventPhase=1;fire(path[i],event,true);if(event._stopped)break;}
+                    if(path.length===0)path.push(this);
+                    setState({path:path});
+                    if(path.length>1&&!state().stopped){
+                        for(let i=path.length-1;i>0;i--){setState({currentTarget:path[i],eventPhase:1});fire(path[i],event,true);if(state().stopped)break;}
                     }
-                    if(!event._stopped){event.currentTarget=this;event.eventPhase=2;fire(this,event,false);fire(this,event,true);}
-                    if(path.length>1&&!event._stopped&&event.bubbles){
-                        for(let i=1;i<path.length;i++){event.currentTarget=path[i];event.eventPhase=3;fire(path[i],event,false);if(event._stopped)break;}
+                    if(!state().stopped){setState({currentTarget:this,eventPhase:2});fire(this,event,false);fire(this,event,true);}
+                    if(path.length>1&&!state().stopped&&state().bubbles){
+                        for(let i=1;i<path.length;i++){setState({currentTarget:path[i],eventPhase:3});fire(path[i],event,false);if(state().stopped)break;}
                     }
-                    event.currentTarget=null;event.eventPhase=0;
-                    return !event.defaultPrevented;
+                    const prevented=state().defaultPrevented;
+                    setState({currentTarget:null,eventPhase:0,path:[],dispatching:false});
+                    return !prevented;
                 }
-                try{Object.defineProperty(built.EventTarget.prototype,'addEventListener',{value:nativeShape(addEventListener,'addEventListener'),writable:true,enumerable:true,configurable:true});}catch(_){}
-                try{Object.defineProperty(built.EventTarget.prototype,'removeEventListener',{value:nativeShape(removeEventListener,'removeEventListener'),writable:true,enumerable:true,configurable:true});}catch(_){}
-                try{Object.defineProperty(built.EventTarget.prototype,'dispatchEvent',{value:nativeShape(dispatchEvent,'dispatchEvent'),writable:true,enumerable:true,configurable:true});}catch(_){}
+                try{
+                    const proto=built.EventTarget.prototype;
+                    const ctor=Object.getOwnPropertyDescriptor(proto,'constructor');
+                    try{delete proto.constructor;}catch(_){}
+                    Object.defineProperty(proto,'addEventListener',{value:nativeShape(addEventListener,'addEventListener'),writable:true,enumerable:true,configurable:true});
+                    Object.defineProperty(proto,'dispatchEvent',{value:nativeShape(dispatchEvent,'dispatchEvent'),writable:true,enumerable:true,configurable:true});
+                    Object.defineProperty(proto,'removeEventListener',{value:nativeShape(removeEventListener,'removeEventListener'),writable:true,enumerable:true,configurable:true});
+                    if(ctor)Object.defineProperty(proto,'constructor',ctor);
+                }catch(_){}
             }
             if(built.Node){
                 try{Object.defineProperty(built.Node.prototype,'ownerDocument',{get:nativeShape(function(){return globalThis.document;},'get ownerDocument'),enumerable:true,configurable:true});}catch(_){}
@@ -4814,16 +4829,20 @@
                         _markFrameMessageTrusted,
                     );
                 }
+                if (_getFrameEventState && _setFrameEventState) {
+                    ops.op_set_child_realm_prop(_realmId, "__oxideGetEventState", _getFrameEventState);
+                    ops.op_set_child_realm_prop(_realmId, "__oxideSetEventState", _setFrameEventState);
+                }
                 ops.op_eval_in_child_realm(_realmId,
-                    "(function(){var _nt=Symbol.for('__browser_oxide_native__');var _L=Object.create(null);var _mt=globalThis.__oxideMarkTrusted;try{delete globalThis.__oxideMarkTrusted;}catch(_){};"
+                    "(function(){var _nt=Symbol.for('__browser_oxide_native__');var _L=Object.create(null);var _mt=globalThis.__oxideMarkTrusted;var _ges=globalThis.__oxideGetEventState;var _ses=globalThis.__oxideSetEventState;try{delete globalThis.__oxideMarkTrusted;delete globalThis.__oxideGetEventState;delete globalThis.__oxideSetEventState;}catch(_){};"
                     + "function _n(fn,nm){try{Object.defineProperty(fn,'name',{value:nm,configurable:true});"
                     + "Object.defineProperty(fn,_nt,{value:nm,configurable:true});var ts=function toString(){return 'function '+nm+'() { [native code] }'};"
                     + "Object.defineProperty(ts,_nt,{value:'toString',configurable:true});Object.defineProperty(ts,'name',{value:'toString',configurable:true});"
                     + "Object.defineProperty(fn,'toString',{value:ts,configurable:true});}catch(_){}return fn;}"
                     + "function ael(type,fn){if(!(typeof fn==='function'||(fn&&typeof fn.handleEvent==='function')))return;var t=String(type);(_L[t]||(_L[t]=[])).push(fn);}"
                     + "function rel(type,fn){var a=_L[String(type)];if(a){var i=a.indexOf(fn);if(i>=0)a.splice(i,1);}}"
-                    + "function de(ev){try{var t=ev&&ev.type;var a=_L[t];if(a)a.slice().forEach(function(h){try{(typeof h==='function'?h:h.handleEvent).call(globalThis,ev);}catch(_){}});"
-                    + "var on=globalThis['on'+t];if(typeof on==='function'){try{on.call(globalThis,ev);}catch(_){}}}catch(_){}return true;}"
+                    + "function de(ev){try{if(typeof _ses==='function')_ses(ev,{target:globalThis,currentTarget:globalThis,eventPhase:2,path:[globalThis],dispatching:true});var t=ev&&ev.type;var a=_L[t];if(a)a.slice().forEach(function(h){try{(typeof h==='function'?h:h.handleEvent).call(globalThis,ev);}catch(_){}});"
+                    + "var on=globalThis['on'+t];if(typeof on==='function'){try{on.call(globalThis,ev);}catch(_){}}}catch(_){}finally{try{if(typeof _ses==='function')_ses(ev,{currentTarget:null,eventPhase:0,path:[],dispatching:false});}catch(_){}}return !(typeof _ges==='function'&&_ges(ev).defaultPrevented);}"
                     + "Object.defineProperty(globalThis,'addEventListener',{value:_n(ael,'addEventListener'),writable:true,configurable:true});"
                     + "Object.defineProperty(globalThis,'removeEventListener',{value:_n(rel,'removeEventListener'),writable:true,configurable:true});"
                     + "Object.defineProperty(globalThis,'dispatchEvent',{value:_n(de,'dispatchEvent'),writable:true,configurable:true});"
@@ -6289,6 +6308,10 @@
     };
     _internalBridge._installFrameMessageTrustMarker = function(fn) {
         if (typeof fn === 'function') _markFrameMessageTrusted = fn;
+    };
+    _internalBridge._installFrameEventStateAccessors = function(getter, setter) {
+        if (typeof getter === 'function') _getFrameEventState = getter;
+        if (typeof setter === 'function') _setFrameEventState = setter;
     };
     Object.defineProperty(globalThis, '__browser_oxide', {
         value: _internalBridge,

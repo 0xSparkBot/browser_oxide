@@ -1048,6 +1048,56 @@ async fn cls_event_source() {
     assert_eq!(check("EventSource.CLOSED").await, "2");
 }
 
+#[tokio::test]
+async fn event_and_message_event_match_chrome_148_webidl_surface() {
+    let result = check(
+        r#"(() => {
+            const event = new Event('probe', { bubbles: true, cancelable: true, composed: true });
+            const message = new MessageEvent('message', { data: 'x', origin: 'https://example.com' });
+            const target = new EventTarget();
+            let during = null;
+            target.addEventListener('probe', value => {
+                during = {
+                    target: value.target === target,
+                    currentTarget: value.currentTarget === target,
+                    phase: value.eventPhase,
+                    path: value.composedPath().length,
+                };
+            });
+            target.dispatchEvent(event);
+            const trusted = Object.getOwnPropertyDescriptor(event, 'isTrusted');
+            return JSON.stringify({
+                eventOwn: Object.getOwnPropertyNames(event),
+                eventKeys: Object.keys(event),
+                eventProto: Object.getOwnPropertyNames(Event.prototype),
+                eventTag: Object.prototype.toString.call(event),
+                trusted: {
+                    own: !!trusted,
+                    enumerable: trusted && trusted.enumerable,
+                    configurable: trusted && trusted.configurable,
+                    getter: trusted && String(trusted.get),
+                },
+                messageOwn: Object.getOwnPropertyNames(message),
+                messageProto: Object.getOwnPropertyNames(MessageEvent.prototype),
+                messageTag: Object.prototype.toString.call(message),
+                eventTargetProto: Object.getOwnPropertyNames(EventTarget.prototype),
+                during,
+                after: {
+                    target: event.target === target,
+                    currentTarget: event.currentTarget,
+                    phase: event.eventPhase,
+                    path: event.composedPath().length,
+                },
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"eventOwn":["isTrusted"],"eventKeys":["isTrusted"],"eventProto":["type","target","currentTarget","eventPhase","bubbles","cancelable","defaultPrevented","composed","timeStamp","srcElement","returnValue","cancelBubble","NONE","CAPTURING_PHASE","AT_TARGET","BUBBLING_PHASE","composedPath","initEvent","preventDefault","stopImmediatePropagation","stopPropagation","constructor"],"eventTag":"[object Event]","trusted":{"own":true,"enumerable":true,"configurable":false,"getter":"function get isTrusted() { [native code] }"},"messageOwn":["isTrusted"],"messageProto":["data","origin","lastEventId","source","ports","userActivation","initMessageEvent","constructor"],"messageTag":"[object MessageEvent]","eventTargetProto":["addEventListener","dispatchEvent","removeEventListener","when","constructor"],"during":{"target":true,"currentTarget":true,"phase":2,"path":1},"after":{"target":true,"currentTarget":null,"phase":0,"path":0}}"#
+    );
+}
+
 // WebRTC
 #[tokio::test]
 async fn cls_rtc_peer_connection() {

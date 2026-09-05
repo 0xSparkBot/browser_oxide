@@ -1,10 +1,8 @@
 ((globalThis) => {
     // ---- Trusted-event authenticity (v0.1.0 behavioral E1) ----------------
     // `isTrusted` MUST be both unforgeable and shaped like a real browser's:
-    //   * a GETTER on Event.prototype — NOT an own data property. Scripts
-    //     that read `getOwnPropertyDescriptor(evt,'isTrusted')` can flag an
-    //     own-data `isTrusted` as synthetic (real browsers expose it via
-    //     the prototype).
+    //   * an own, enumerable, non-configurable GETTER on every Event instance.
+    //     Chrome 148 exposes no Event.prototype.isTrusted property at all.
     //   * backed by a MODULE-PRIVATE WeakSet that page JS cannot reach. The
     //     old design keyed trust off `Symbol.for('__bo_trusted__')` — the
     //     GLOBAL symbol registry — so any page could re-derive the symbol and
@@ -13,6 +11,44 @@
     // off below through a temp global they capture-and-delete before any page
     // script runs. There is no in-band (options/symbol) path from page JS.
     const _trustedEvents = new WeakSet();
+    const _eventState = new WeakMap();
+    const _customEventState = new WeakMap();
+    const _uiEventState = new WeakMap();
+    const _mouseEventState = new WeakMap();
+    const _messageEventState = new WeakMap();
+
+    const _stateFor = (map, value) => {
+        const state = map.get(value);
+        if (!state) throw new TypeError('Illegal invocation');
+        return state;
+    };
+    const _native = (fn, name) => {
+        try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_) {}
+        if (typeof _maskFunction === 'function') _maskFunction(fn, name);
+        return fn;
+    };
+    const _getter = (name, read) => {
+        const holder = { get [name]() { return read(this); } };
+        return _native(Object.getOwnPropertyDescriptor(holder, name).get, `get ${name}`);
+    };
+    const _setter = (name, write) => {
+        const holder = { set [name](value) { write(this, value); } };
+        return _native(Object.getOwnPropertyDescriptor(holder, name).set, `set ${name}`);
+    };
+    const _defineGetter = (prototype, name, map, stateKey = name) => {
+        Object.defineProperty(prototype, name, {
+            configurable: true,
+            enumerable: true,
+            get: _getter(name, value => _stateFor(map, value)[stateKey]),
+        });
+    };
+    const _moveConstructorLast = (Ctor) => {
+        const descriptor = Object.getOwnPropertyDescriptor(Ctor.prototype, 'constructor');
+        try { delete Ctor.prototype.constructor; } catch (_) {}
+        Object.defineProperty(Ctor.prototype, 'constructor', descriptor);
+    };
+
+    const _getIsTrusted = _getter('isTrusted', value => _trustedEvents.has(value));
     const _markTrusted = (ev) => {
         try { if (ev && typeof ev === 'object') _trustedEvents.add(ev); } catch (_) {}
         return ev;
@@ -20,97 +56,209 @@
 
     class Event {
         constructor(type, options = {}) {
-            this.type = type;
-            this.bubbles = !!options.bubbles;
-            this.cancelable = !!options.cancelable;
-            this.composed = !!options.composed;
-            this.defaultPrevented = false;
-            this.target = null;
-            this.currentTarget = null;
-            this.eventPhase = 0;
-            // NOTE: `isTrusted` is intentionally NOT set here. It is a prototype
-            // getter (installed below) reading the private WeakSet — default
-            // false for page-constructed events; trusted only when our
-            // privileged dispatch path calls `_markTrusted(ev)`.
-            this.timeStamp = performance.now();
-            this._stopped = false;
-            this._stoppedImmediate = false;
+            _eventState.set(this, {
+                type: String(type),
+                target: null,
+                currentTarget: null,
+                eventPhase: 0,
+                bubbles: !!options.bubbles,
+                cancelable: !!options.cancelable,
+                defaultPrevented: false,
+                composed: !!options.composed,
+                timeStamp: performance.now(),
+                stopped: false,
+                stoppedImmediate: false,
+                dispatching: false,
+                path: [],
+            });
+            // Blink exposes isTrusted as the Event instance's sole own
+            // property. Reusing one closure also matches getter identity
+            // across different events.
+            Object.defineProperty(this, 'isTrusted', {
+                configurable: false,
+                enumerable: true,
+                get: _getIsTrusted,
+            });
         }
-        preventDefault() {
-            if (this.cancelable) this.defaultPrevented = true;
-        }
-        stopPropagation() { this._stopped = true; }
-        stopImmediatePropagation() { this._stopped = true; this._stoppedImmediate = true; }
-        composedPath() {
-            const path = [];
-            let node = this.target;
-            while (node) { path.push(node); node = node.parentNode; }
-            return path;
-        }
-        // Phase constants
-        static NONE = 0;
-        static CAPTURING_PHASE = 1;
-        static AT_TARGET = 2;
-        static BUBBLING_PHASE = 3;
     }
 
-    // isTrusted as an inherited, native-masked prototype accessor backed by the
-    // private WeakSet. Subclasses (CustomEvent, MouseEvent, …) inherit it. The
-    // descriptor shape matches real Chrome: {get: ƒ, set: undefined,
-    // enumerable: true, configurable: true}.
-    Object.defineProperty(Event.prototype, 'isTrusted', {
+    // WebIDL state lives in WeakMaps, never as JS-visible expando fields. This
+    // makes Object.getOwnPropertyNames(new Event('x')) exactly ['isTrusted'].
+    for (const name of ['type', 'target', 'currentTarget', 'eventPhase', 'bubbles',
+        'cancelable', 'defaultPrevented', 'composed', 'timeStamp']) {
+        _defineGetter(Event.prototype, name, _eventState);
+    }
+    _defineGetter(Event.prototype, 'srcElement', _eventState, 'target');
+    Object.defineProperty(Event.prototype, 'returnValue', {
         configurable: true,
         enumerable: true,
-        get: (typeof _maskFunction === 'function')
-            ? _maskFunction(function () { return _trustedEvents.has(this); }, 'get isTrusted')
-            : function () { return _trustedEvents.has(this); },
+        get: _getter('returnValue', value => !_stateFor(_eventState, value).defaultPrevented),
+        set: _setter('returnValue', (value, next) => {
+            const state = _stateFor(_eventState, value);
+            if (!next && state.cancelable) state.defaultPrevented = true;
+        }),
     });
+    Object.defineProperty(Event.prototype, 'cancelBubble', {
+        configurable: true,
+        enumerable: true,
+        get: _getter('cancelBubble', value => _stateFor(_eventState, value).stopped),
+        set: _setter('cancelBubble', (value, next) => {
+            if (next) _stateFor(_eventState, value).stopped = true;
+        }),
+    });
+    for (const [name, value] of [['NONE', 0], ['CAPTURING_PHASE', 1],
+        ['AT_TARGET', 2], ['BUBBLING_PHASE', 3]]) {
+        Object.defineProperty(Event.prototype, name, {
+            value, writable: false, enumerable: true, configurable: false,
+        });
+        Object.defineProperty(Event, name, {
+            value, writable: false, enumerable: true, configurable: false,
+        });
+    }
+    const _eventComposedPath = { composedPath() {
+        return _stateFor(_eventState, this).path.slice();
+    } }.composedPath;
+    const _eventInit = { initEvent(type, bubbles = false, cancelable = false) {
+        const state = _stateFor(_eventState, this);
+        if (state.dispatching) return;
+        state.type = String(type);
+        state.bubbles = !!bubbles;
+        state.cancelable = !!cancelable;
+        state.defaultPrevented = false;
+        state.stopped = false;
+        state.stoppedImmediate = false;
+    } }.initEvent;
+    const _eventPreventDefault = { preventDefault() {
+        const state = _stateFor(_eventState, this);
+        if (state.cancelable) state.defaultPrevented = true;
+    } }.preventDefault;
+    const _eventStopImmediate = { stopImmediatePropagation() {
+        const state = _stateFor(_eventState, this);
+        state.stopped = true;
+        state.stoppedImmediate = true;
+    } }.stopImmediatePropagation;
+    const _eventStop = { stopPropagation() {
+        _stateFor(_eventState, this).stopped = true;
+    } }.stopPropagation;
+    for (const [name, fn] of [
+        ['composedPath', _eventComposedPath], ['initEvent', _eventInit],
+        ['preventDefault', _eventPreventDefault],
+        ['stopImmediatePropagation', _eventStopImmediate],
+        ['stopPropagation', _eventStop],
+    ]) {
+        Object.defineProperty(Event.prototype, name, {
+            value: _native(fn, name), writable: true, enumerable: true, configurable: true,
+        });
+    }
+    _moveConstructorLast(Event);
 
     class CustomEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.detail = options.detail !== undefined ? options.detail : null;
-        }
-        initCustomEvent(type, bubbles, cancelable, detail) {
-            this.type = type;
-            this.bubbles = bubbles;
-            this.cancelable = cancelable;
-            this.detail = detail;
+            _customEventState.set(this, {
+                detail: options.detail !== undefined ? options.detail : null,
+            });
         }
     }
+    _defineGetter(CustomEvent.prototype, 'detail', _customEventState);
+    const _initCustomEvent = { initCustomEvent(type, bubbles, cancelable, detail) {
+        _eventInit.call(this, type, bubbles, cancelable);
+        _stateFor(_customEventState, this).detail = detail;
+    } }.initCustomEvent;
+    Object.defineProperty(CustomEvent.prototype, 'initCustomEvent', {
+        value: _native(_initCustomEvent, 'initCustomEvent'),
+        writable: true, enumerable: true, configurable: true,
+    });
+    _moveConstructorLast(CustomEvent);
 
     // --- UI Event hierarchy ---
     class UIEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.view = options.view || globalThis;
-            this.detail = options.detail || 0;
+            _uiEventState.set(this, {
+                view: options.view !== undefined ? options.view : null,
+                detail: Number(options.detail) || 0,
+                which: 0,
+            });
         }
     }
+    for (const name of ['view', 'detail', 'which']) {
+        _defineGetter(UIEvent.prototype, name, _uiEventState);
+    }
+    const _initUIEvent = { initUIEvent(type, bubbles, cancelable, view, detail) {
+        _eventInit.call(this, type, bubbles, cancelable);
+        Object.assign(_stateFor(_uiEventState, this), { view: view || null, detail: Number(detail) || 0 });
+    } }.initUIEvent;
+    Object.defineProperty(UIEvent.prototype, 'initUIEvent', {
+        value: _native(_initUIEvent, 'initUIEvent'),
+        writable: true, enumerable: true, configurable: true,
+    });
+    _moveConstructorLast(UIEvent);
 
     class MouseEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, { bubbles: true, cancelable: true, ...options });
-            this.screenX = options.screenX || 0;
-            this.screenY = options.screenY || 0;
-            this.clientX = options.clientX || 0;
-            this.clientY = options.clientY || 0;
-            this.pageX = options.pageX || this.clientX;
-            this.pageY = options.pageY || this.clientY;
-            this.offsetX = options.offsetX || 0;
-            this.offsetY = options.offsetY || 0;
-            this.button = options.button || 0;
-            this.buttons = options.buttons || 0;
-            this.ctrlKey = !!options.ctrlKey;
-            this.shiftKey = !!options.shiftKey;
-            this.altKey = !!options.altKey;
-            this.metaKey = !!options.metaKey;
-            this.relatedTarget = options.relatedTarget || null;
-            this.movementX = options.movementX || 0;
-            this.movementY = options.movementY || 0;
+            const clientX = Number(options.clientX) || 0;
+            const clientY = Number(options.clientY) || 0;
+            _mouseEventState.set(this, {
+                screenX: Number(options.screenX) || 0,
+                screenY: Number(options.screenY) || 0,
+                clientX,
+                clientY,
+                ctrlKey: !!options.ctrlKey,
+                shiftKey: !!options.shiftKey,
+                altKey: !!options.altKey,
+                metaKey: !!options.metaKey,
+                button: Number(options.button) || 0,
+                buttons: Number(options.buttons) || 0,
+                relatedTarget: options.relatedTarget || null,
+                pageX: options.pageX !== undefined ? Number(options.pageX) || 0 : clientX,
+                pageY: options.pageY !== undefined ? Number(options.pageY) || 0 : clientY,
+                offsetX: Number(options.offsetX) || 0,
+                offsetY: Number(options.offsetY) || 0,
+                movementX: Number(options.movementX) || 0,
+                movementY: Number(options.movementY) || 0,
+                fromElement: null,
+                toElement: null,
+                layerX: Number(options.layerX) || 0,
+                layerY: Number(options.layerY) || 0,
+            });
         }
-        getModifierState(key) { return false; }
     }
+    for (const name of ['screenX', 'screenY', 'clientX', 'clientY', 'ctrlKey',
+        'shiftKey', 'altKey', 'metaKey', 'button', 'buttons', 'relatedTarget',
+        'pageX', 'pageY']) {
+        _defineGetter(MouseEvent.prototype, name, _mouseEventState);
+    }
+    _defineGetter(MouseEvent.prototype, 'x', _mouseEventState, 'clientX');
+    _defineGetter(MouseEvent.prototype, 'y', _mouseEventState, 'clientY');
+    for (const name of ['offsetX', 'offsetY', 'movementX', 'movementY',
+        'fromElement', 'toElement', 'layerX', 'layerY']) {
+        _defineGetter(MouseEvent.prototype, name, _mouseEventState);
+    }
+    const _mouseGetModifierState = { getModifierState(key) {
+        const state = _stateFor(_mouseEventState, this);
+        return !!state[`${String(key).toLowerCase()}Key`];
+    } }.getModifierState;
+    const _initMouseEvent = { initMouseEvent(type, bubbles, cancelable, view, detail,
+        screenX, screenY, clientX, clientY, ctrlKey, altKey, shiftKey, metaKey,
+        button, relatedTarget) {
+        _initUIEvent.call(this, type, bubbles, cancelable, view, detail);
+        Object.assign(_stateFor(_mouseEventState, this), {
+            screenX: Number(screenX) || 0, screenY: Number(screenY) || 0,
+            clientX: Number(clientX) || 0, clientY: Number(clientY) || 0,
+            ctrlKey: !!ctrlKey, altKey: !!altKey, shiftKey: !!shiftKey,
+            metaKey: !!metaKey, button: Number(button) || 0,
+            relatedTarget: relatedTarget || null,
+        });
+    } }.initMouseEvent;
+    for (const [name, fn] of [['getModifierState', _mouseGetModifierState],
+        ['initMouseEvent', _initMouseEvent]]) {
+        Object.defineProperty(MouseEvent.prototype, name, {
+            value: _native(fn, name), writable: true, enumerable: true, configurable: true,
+        });
+    }
+    _moveConstructorLast(MouseEvent);
 
     class KeyboardEvent extends UIEvent {
         constructor(type, options = {}) {
@@ -192,13 +340,33 @@
     class MessageEvent extends Event {
         constructor(type, options = {}) {
             super(type, options);
-            this.data = options.data !== undefined ? options.data : null;
-            this.origin = options.origin || "";
-            this.lastEventId = options.lastEventId || "";
-            this.source = options.source || null;
-            this.ports = options.ports || [];
+            _messageEventState.set(this, {
+                data: options.data !== undefined ? options.data : null,
+                origin: String(options.origin || ''),
+                lastEventId: String(options.lastEventId || ''),
+                source: options.source || null,
+                ports: options.ports ? Array.from(options.ports) : [],
+                userActivation: options.userActivation || null,
+            });
         }
     }
+    for (const name of ['data', 'origin', 'lastEventId', 'source', 'ports', 'userActivation']) {
+        _defineGetter(MessageEvent.prototype, name, _messageEventState);
+    }
+    const _initMessageEvent = { initMessageEvent(type, bubbles, cancelable, data,
+        origin, lastEventId, source, ports) {
+        _eventInit.call(this, type, bubbles, cancelable);
+        Object.assign(_stateFor(_messageEventState, this), {
+            data: data === undefined ? null : data,
+            origin: String(origin || ''), lastEventId: String(lastEventId || ''),
+            source: source || null, ports: ports ? Array.from(ports) : [],
+        });
+    } }.initMessageEvent;
+    Object.defineProperty(MessageEvent.prototype, 'initMessageEvent', {
+        value: _native(_initMessageEvent, 'initMessageEvent'),
+        writable: true, enumerable: true, configurable: true,
+    });
+    _moveConstructorLast(MessageEvent);
 
     class ErrorEvent extends Event {
         constructor(type, options = {}) {
@@ -292,6 +460,25 @@
         }
     }
 
+    // Every WebIDL event interface owns its @@toStringTag. This is invisible
+    // to getOwnPropertyNames(), but controls Object#toString in both the top
+    // page and the mirrored iframe realms.
+    for (const Ctor of [Event, CustomEvent, UIEvent, MouseEvent,
+        KeyboardEvent, InputEvent, FocusEvent,
+        PointerEvent, WheelEvent, TouchEvent, MessageEvent, ErrorEvent,
+        ProgressEvent, AnimationEvent, TransitionEvent, ClipboardEvent,
+        PopStateEvent, HashChangeEvent, StorageEvent, PageTransitionEvent,
+        BeforeUnloadEvent, DragEvent]) {
+        try {
+            Object.defineProperty(Ctor.prototype, Symbol.toStringTag, {
+                value: Ctor.name,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+        } catch (_) {}
+    }
+
     // --- EventTarget core logic ---
     const _nodeListeners = new Map(); // nodeId → Map<eventType, [{callback, capture, once}]>
     let _objListeners = new WeakMap(); // object → Map<eventType, [{callback, capture, once}]>
@@ -377,7 +564,12 @@
         if (!(event instanceof Event)) {
             throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
         }
-        event.target = this;
+        const eventState = _stateFor(_eventState, event);
+        if (eventState.dispatching) {
+            throw new DOMException('The event is already being dispatched.', 'InvalidStateError');
+        }
+        eventState.dispatching = true;
+        eventState.target = this;
         const nodeId = _getNodeIdOrMinusOne(this);
 
         // Build propagation path (target → root) if it's a DOM node.
@@ -391,43 +583,50 @@
                 current = current.parentNode;
             }
         }
+        // Non-Node EventTargets still expose themselves while dispatch is in
+        // progress. Blink clears the composed path immediately afterwards.
+        if (path.length === 0) path.push(this);
+        eventState.path = path.slice();
 
         // Capture phase (root → target)
-        if (path.length > 0 && !event._stopped) {
+        if (path.length > 0 && !eventState.stopped) {
             for (let i = path.length - 1; i > 0; i--) {
-                event.currentTarget = path[i];
-                event.eventPhase = 1;
+                eventState.currentTarget = path[i];
+                eventState.eventPhase = 1;
                 _fireListeners(path[i], event, true);
-                if (event._stopped) break;
+                if (eventState.stopped) break;
             }
         }
 
         // Target phase
-        if (!event._stopped) {
-            event.currentTarget = this;
-            event.eventPhase = 2;
+        if (!eventState.stopped) {
+            eventState.currentTarget = this;
+            eventState.eventPhase = 2;
             _fireListeners(this, event, false);
             _fireListeners(this, event, true);
         }
 
         // Bubble phase (target → root)
-        if (path.length > 0 && !event._stopped && event.bubbles) {
+        if (path.length > 0 && !eventState.stopped && eventState.bubbles) {
             for (let i = 1; i < path.length; i++) {
-                event.currentTarget = path[i];
-                event.eventPhase = 3;
+                eventState.currentTarget = path[i];
+                eventState.eventPhase = 3;
                 _fireListeners(path[i], event, false);
-                if (event._stopped) break;
+                if (eventState.stopped) break;
             }
         }
 
-        event.eventPhase = 0;
-        event.currentTarget = null;
-        return !event.defaultPrevented;
+        eventState.eventPhase = 0;
+        eventState.currentTarget = null;
+        eventState.path = [];
+        eventState.dispatching = false;
+        return !eventState.defaultPrevented;
     };
 
     function _fireListeners(target, event, capturePhase) {
         // --- 1. Fire on* handler (Target phase only, not capture phase) ---
-        if (!capturePhase && !event._stoppedImmediate) {
+        const eventState = _stateFor(_eventState, event);
+        if (!capturePhase && !eventState.stoppedImmediate) {
             const handlerName = `on${event.type}`;
             const handler = target[handlerName];
             if (typeof handler === "function") {
@@ -445,7 +644,7 @@
         for (let i = 0; i < listeners.length; i++) {
             const l = listeners[i];
             if (l.capture !== capturePhase) continue;
-            if (event._stoppedImmediate) break;
+            if (eventState.stoppedImmediate) break;
             if (typeof l.callback === "function") {
                 l.callback.call(target, event);
             } else if (l.callback && typeof l.callback.handleEvent === "function") {
@@ -463,15 +662,42 @@
     const _ET = globalThis.EventTarget;
     if (_ET && _ET.prototype) {
         const proto = _ET.prototype;
+        const constructorDescriptor = Object.getOwnPropertyDescriptor(proto, 'constructor');
+        try { delete proto.constructor; } catch (_) {}
         Object.defineProperty(proto, 'addEventListener', {
             value: _addEventListener, writable: true, enumerable: true, configurable: true,
-        });
-        Object.defineProperty(proto, 'removeEventListener', {
-            value: _removeEventListener, writable: true, enumerable: true, configurable: true,
         });
         Object.defineProperty(proto, 'dispatchEvent', {
             value: _dispatchEvent, writable: true, enumerable: true, configurable: true,
         });
+        Object.defineProperty(proto, 'removeEventListener', {
+            value: _removeEventListener, writable: true, enumerable: true, configurable: true,
+        });
+        const _when = { when(type, options = {}) {
+            const target = this;
+            return new Promise((resolve, reject) => {
+                const signal = options && options.signal;
+                const done = event => {
+                    target.removeEventListener(type, done);
+                    resolve(event);
+                };
+                if (signal && signal.aborted) {
+                    reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+                    return;
+                }
+                target.addEventListener(type, done, { once: true });
+                if (signal && typeof signal.addEventListener === 'function') {
+                    signal.addEventListener('abort', () => {
+                        target.removeEventListener(type, done);
+                        reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+                    }, { once: true });
+                }
+            });
+        } }.when;
+        Object.defineProperty(proto, 'when', {
+            value: _native(_when, 'when'), writable: true, enumerable: true, configurable: true,
+        });
+        Object.defineProperty(proto, 'constructor', constructorDescriptor);
     }
 
     // Ensure Node.prototype does NOT shadow these. Real Chrome's
@@ -546,6 +772,14 @@
             this.columnNumber = +i.columnNumber || 0;
         }
     }
+    try {
+        Object.defineProperty(SecurityPolicyViolationEvent.prototype, Symbol.toStringTag, {
+            value: 'SecurityPolicyViolationEvent',
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        });
+    } catch (_) {}
 
     globalThis.Event = Event;
     globalThis.CustomEvent = CustomEvent;
@@ -581,6 +815,34 @@
         const bo = globalThis.__browser_oxide;
         if (bo && typeof bo._installFrameMessageTrustMarker === 'function') {
             bo._installFrameMessageTrustMarker(_markTrusted);
+        }
+        if (bo && typeof bo._installFrameEventStateAccessors === 'function') {
+            bo._installFrameEventStateAccessors(
+                function getEventState(event) {
+                    const state = _stateFor(_eventState, event);
+                    return {
+                        target: state.target,
+                        currentTarget: state.currentTarget,
+                        eventPhase: state.eventPhase,
+                        bubbles: state.bubbles,
+                        defaultPrevented: state.defaultPrevented,
+                        stopped: state.stopped,
+                        stoppedImmediate: state.stoppedImmediate,
+                        dispatching: state.dispatching,
+                    };
+                },
+                function setEventState(event, patch) {
+                    const state = _stateFor(_eventState, event);
+                    if (!patch || typeof patch !== 'object') return;
+                    for (const name of ['target', 'currentTarget', 'eventPhase',
+                        'stopped', 'stoppedImmediate', 'dispatching']) {
+                        if (Object.prototype.hasOwnProperty.call(patch, name)) {
+                            state[name] = patch[name];
+                        }
+                    }
+                    if (Array.isArray(patch.path)) state.path = patch.path.slice();
+                },
+            );
         }
         if (bo) {
             bo._markTrustedEvent = _markTrusted;
