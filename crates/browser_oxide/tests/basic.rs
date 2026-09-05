@@ -346,6 +346,17 @@ async fn url_blob_scheme_protocol_and_origin() {
         .execute_script(r#"new URL("blob:null/7aeb61c9-deadbeef").href"#, None)
         .unwrap();
     assert_eq!(href, "blob:null/7aeb61c9-deadbeef");
+
+    let inherited = rt
+        .execute_script(
+            r#"JSON.stringify((()=>{const u=new URL("blob:https://example.com/id?q=1#h");return {origin:u.origin,pathname:u.pathname,search:u.search,hash:u.hash};})())"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        inherited,
+        r##"{"origin":"https://example.com","pathname":"https://example.com/id","search":"?q=1","hash":"#h"}"##
+    );
 }
 
 /// `data:` URLs are opaque per WHATWG URL spec: protocol="data:",

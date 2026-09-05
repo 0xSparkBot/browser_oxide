@@ -5186,6 +5186,33 @@
                         full = b.replace(/[^/]*$/, '') + full;
                     }
                 }
+                const _opaqueMatch = full.match(/^(blob|data|javascript|about):/i);
+                if (_opaqueMatch) {
+                    const scheme = _opaqueMatch[1].toLowerCase();
+                    const remainder = full.slice(scheme.length + 1);
+                    const hashAt = remainder.indexOf('#');
+                    const beforeHash = hashAt < 0 ? remainder : remainder.slice(0, hashAt);
+                    const queryAt = beforeHash.indexOf('?');
+                    this.protocol = scheme + ':';
+                    this.href = full;
+                    this.pathname = queryAt < 0 ? beforeHash : beforeHash.slice(0, queryAt);
+                    this.search = queryAt < 0 ? '' : beforeHash.slice(queryAt);
+                    this.hash = hashAt < 0 ? '' : remainder.slice(hashAt);
+                    this.host = '';
+                    this.hostname = '';
+                    this.port = '';
+                    this.origin = 'null';
+                    if (scheme === 'blob') {
+                        const inherited = this.pathname.match(/^(https?):\/\/([^\/?#]+)/i);
+                        if (inherited) {
+                            this.origin = inherited[1].toLowerCase() + '://' + inherited[2];
+                        }
+                    }
+                    this.username = '';
+                    this.password = '';
+                    this.searchParams = new URLSearchParams(this.search);
+                    return;
+                }
                 const m = full.match(/^([a-z]+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
                 if (m) {
                     this.protocol = m[1].toLowerCase() + ':';

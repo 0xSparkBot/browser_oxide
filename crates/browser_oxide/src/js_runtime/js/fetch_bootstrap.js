@@ -184,9 +184,24 @@
         return out;
     }
 
+    function _responseHeaderValue(headers, name) {
+        if (!headers || typeof headers !== "object") return null;
+        const lower = String(name).toLowerCase();
+        for (const [key, value] of Object.entries(headers)) {
+            if (String(key).toLowerCase() === lower) return String(value);
+        }
+        return null;
+    }
+
+    function _originForUrl(url) {
+        try { return new URL(url).origin; } catch (_) { return ""; }
+    }
+
     // Real fetch() using Rust op
     globalThis.fetch = async function fetch(input, init = {}) {
         let url, method, body, headers;
+
+        init = init || {};
 
         if (typeof input === "string") {
             url = input;
@@ -265,6 +280,8 @@
         }
 
         method = (init.method ?? "GET").toUpperCase();
+        const requestMode = init.mode == null ? "cors" : String(init.mode);
+        const credentialsMode = init.credentials == null ? "same-origin" : String(init.credentials);
         // Body can be: string, ArrayBuffer, TypedArray (Uint8Array), Blob,
         // FormData, URLSearchParams, or null. We must preserve binary
         // fidelity for `application/octet-stream` POSTs.
@@ -380,6 +397,16 @@
 
         try {
             const startTime = performance.now();
+            let documentOrigin = "";
+            try { documentOrigin = String(globalThis.location?.origin || ""); } catch (_) {}
+            const requestOrigin = _originForUrl(url);
+            const crossOrigin = !!documentOrigin
+                && documentOrigin !== "null"
+                && !!requestOrigin
+                && requestOrigin !== documentOrigin;
+            if (requestMode === "same-origin" && crossOrigin) {
+                throw new TypeError("Failed to fetch");
+            }
             _pushFetchDiag({
                 phase: "request",
                 method,
@@ -406,6 +433,40 @@
                     .map(([name, value]) => [name, String(value).length])
                     .sort((a, b) => a[0].localeCompare(b[0])),
             });
+
+            // Fetch CORS is a renderer-side response gate. The network stack
+            // still performs the request, but a cross-origin `mode: "cors"`
+            // promise rejects unless Access-Control-Allow-Origin authorizes
+            // the calling realm. Challenge workers deliberately probe this:
+            // exposing a readable 204 response where Chrome reports
+            // `TypeError: Failed to fetch` changes their proof branch.
+            if (result.status === 0) {
+                throw new TypeError("Failed to fetch");
+            }
+            if (crossOrigin && requestMode === "cors") {
+                const allowedOrigin = _responseHeaderValue(
+                    result.headers,
+                    "access-control-allow-origin",
+                );
+                const allowsCredentials = _responseHeaderValue(
+                    result.headers,
+                    "access-control-allow-credentials",
+                );
+                const wildcardAllowed = allowedOrigin === "*" && credentialsMode !== "include";
+                const explicitOriginAllowed = allowedOrigin === documentOrigin
+                    && (credentialsMode !== "include" || allowsCredentials === "true");
+                if (!wildcardAllowed && !explicitOriginAllowed) {
+                    throw new TypeError("Failed to fetch");
+                }
+            }
+            if (crossOrigin && requestMode === "no-cors") {
+                return new Response("", {
+                    status: 0,
+                    statusText: "",
+                    headers: {},
+                    url: "",
+                });
+            }
             
             const browser_oxide = globalThis._browser_oxide;
             const fetchLog = browser_oxide && browser_oxide.__fetchLog;
@@ -441,6 +502,7 @@
             if (fetchLog) {
                 fetchLog.push({ method, url, status: 0, error: e.message });
             }
+            if (e instanceof TypeError && e.message === "Failed to fetch") throw e;
             throw new TypeError("Failed to fetch: " + e.message);
         }
     };

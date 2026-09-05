@@ -275,22 +275,34 @@
                     else if (full.startsWith('/')) { const m = b.match(/^([a-z]+:\/\/[^/]+)/i); full = m ? m[1] + full : full; }
                     else { full = b.replace(/[^/]*$/, '') + full; }
                 }
-                // Opaque-scheme handling (WHATWG URL spec: blob, data,
-                // javascript, about). Real Chrome returns the scheme + ":"
-                // as `.protocol` and "null" for `.origin`; our http-style
-                // regex below would emit "" for both. vNext/10.
+                // Non-special-scheme handling (WHATWG URL spec: blob, data,
+                // javascript, about). Blob URLs are the exception to the
+                // otherwise opaque origin rule: a blob:http(s) URL inherits
+                // the embedded origin. This is observable inside blob-backed
+                // workers through self.location.origin and is also the origin
+                // used by their fetch CORS checks.
                 const _opaqueMatch = full.match(/^(blob|data|javascript|about):/i);
                 if (_opaqueMatch) {
                     const scheme = _opaqueMatch[1].toLowerCase();
+                    const remainder = full.slice(scheme.length + 1);
+                    const hashAt = remainder.indexOf('#');
+                    const beforeHash = hashAt < 0 ? remainder : remainder.slice(0, hashAt);
+                    const queryAt = beforeHash.indexOf('?');
                     this.protocol = scheme + ':';
                     this.href = full;
-                    this.pathname = full.slice(scheme.length + 1);
-                    this.search = '';
-                    this.hash = '';
+                    this.pathname = queryAt < 0 ? beforeHash : beforeHash.slice(0, queryAt);
+                    this.search = queryAt < 0 ? '' : beforeHash.slice(queryAt);
+                    this.hash = hashAt < 0 ? '' : remainder.slice(hashAt);
                     this.host = '';
                     this.hostname = '';
                     this.port = '';
                     this.origin = 'null';
+                    if (scheme === 'blob') {
+                        const inherited = this.pathname.match(/^(https?):\/\/([^\/?#]+)/i);
+                        if (inherited) {
+                            this.origin = inherited[1].toLowerCase() + '://' + inherited[2];
+                        }
+                    }
                     this.username = '';
                     this.password = '';
                     this.searchParams = new URLSearchParams('');
