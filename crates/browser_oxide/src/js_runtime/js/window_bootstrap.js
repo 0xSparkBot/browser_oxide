@@ -5973,6 +5973,164 @@
             },
         );
     };
+    const _rtcRandomToken = (length, alphabet) => {
+        let value = '';
+        for (let i = 0; i < length; i++) {
+            value += alphabet[Math.floor(Math.random() * alphabet.length)];
+        }
+        return value;
+    };
+    const _rtcIdentity = () => ({
+        sessionId: String(1 + Math.floor(Math.random() * 9))
+            + _rtcRandomToken(18, '0123456789'),
+        iceUfrag: _rtcRandomToken(4, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'),
+        icePassword: _rtcRandomToken(24, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'),
+        fingerprint: Array.from(
+            { length: 32 },
+            () => _rtcRandomToken(2, '0123456789ABCDEF'),
+        ).join(':'),
+    });
+    const _rtcMediaPreamble = (mid, identity, rtp) => [
+        'c=IN IP4 0.0.0.0',
+        ...(rtp ? ['a=rtcp:9 IN IP4 0.0.0.0'] : []),
+        `a=ice-ufrag:${identity.iceUfrag}`,
+        `a=ice-pwd:${identity.icePassword}`,
+        'a=ice-options:trickle',
+        `a=fingerprint:sha-256 ${identity.fingerprint}`,
+        'a=setup:actpass',
+        `a=mid:${mid}`,
+    ];
+    const _rtcAudioSection = identity => [
+        'm=audio 9 UDP/TLS/RTP/SAVPF 111 63 9 0 8 13 110 126',
+        ..._rtcMediaPreamble('0', identity, true),
+        'a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level',
+        'a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time',
+        'a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01',
+        'a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid',
+        'a=recvonly',
+        'a=rtcp-mux',
+        'a=rtcp-rsize',
+        'a=rtpmap:111 opus/48000/2',
+        'a=rtcp-fb:111 transport-cc',
+        'a=fmtp:111 minptime=10;useinbandfec=1',
+        'a=rtpmap:63 red/48000/2',
+        'a=fmtp:63 111/111',
+        'a=rtpmap:9 G722/8000',
+        'a=rtpmap:0 PCMU/8000',
+        'a=rtpmap:8 PCMA/8000',
+        'a=rtpmap:13 CN/8000',
+        'a=rtpmap:110 telephone-event/48000',
+        'a=rtpmap:126 telephone-event/8000',
+    ];
+    const _rtcVideoSection = identity => {
+        const lines = [
+            'm=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101 35 36 37 38 103 104 107 108 109 114 115 116 117 118 39 40 41 42 43 44 45 46 47 48 119 120 121 49',
+            ..._rtcMediaPreamble('1', identity, true),
+            'a=extmap:14 urn:ietf:params:rtp-hdrext:toffset',
+            'a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time',
+            'a=extmap:13 urn:3gpp:video-orientation',
+            'a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01',
+            'a=extmap:5 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay',
+            'a=extmap:6 http://www.webrtc.org/experiments/rtp-hdrext/video-content-type',
+            'a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/video-timing',
+            'a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/color-space',
+            'a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid',
+            'a=extmap:10 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id',
+            'a=extmap:11 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id',
+            'a=recvonly',
+            'a=rtcp-mux',
+            'a=rtcp-rsize',
+        ];
+        const feedback = codec => [
+            `a=rtcp-fb:${codec} goog-remb`,
+            `a=rtcp-fb:${codec} transport-cc`,
+            `a=rtcp-fb:${codec} ccm fir`,
+            `a=rtcp-fb:${codec} nack`,
+            `a=rtcp-fb:${codec} nack pli`,
+        ];
+        const primary = (payload, codec, fmtp) => {
+            lines.push(`a=rtpmap:${payload} ${codec}/90000`, ...feedback(payload));
+            if (fmtp) lines.push(`a=fmtp:${payload} ${fmtp}`);
+        };
+        const rtx = (payload, source) => lines.push(
+            `a=rtpmap:${payload} rtx/90000`,
+            `a=fmtp:${payload} apt=${source}`,
+        );
+        primary(96, 'VP8'); rtx(97, 96);
+        primary(98, 'VP9', 'profile-id=0'); rtx(99, 98);
+        primary(100, 'VP9', 'profile-id=2'); rtx(101, 100);
+        primary(35, 'VP9', 'profile-id=1'); rtx(36, 35);
+        primary(37, 'VP9', 'profile-id=3'); rtx(38, 37);
+        for (const [payload, retry, profile] of [
+            [103, 104, '42001f'], [107, 108, '42001f'],
+            [109, 114, '42e01f'], [115, 116, '42e01f'],
+            [117, 118, '4d001f'], [39, 40, '4d001f'],
+            [41, 42, 'f4001f'], [43, 44, 'f4001f'],
+        ]) {
+            const packetization = [103, 109, 117, 41].includes(payload) ? 1 : 0;
+            primary(
+                payload,
+                'H264',
+                `level-asymmetry-allowed=1;packetization-mode=${packetization};profile-level-id=${profile}`,
+            );
+            rtx(retry, payload);
+        }
+        primary(45, 'AV1', 'level-idx=5;profile=0;tier=0'); rtx(46, 45);
+        primary(47, 'AV1', 'level-idx=5;profile=1;tier=0'); rtx(48, 47);
+        lines.push(
+            'a=rtpmap:119 red/90000',
+            'a=rtpmap:120 rtx/90000',
+            'a=fmtp:120 apt=119',
+            'a=rtpmap:121 ulpfec/90000',
+            'a=rtpmap:49 flexfec-03/90000',
+            'a=rtcp-fb:49 goog-remb',
+            'a=rtcp-fb:49 transport-cc',
+            'a=fmtp:49 repair-window=10000000',
+        );
+        return lines;
+    };
+    const _rtcDataSection = (mid, identity) => [
+        'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
+        ..._rtcMediaPreamble(mid, identity, false),
+        'a=sctp-port:5000',
+        'a=max-message-size:262144',
+    ];
+    const _rtcBuildOffer = (state, options = {}) => {
+        const identity = state.iceIdentity || (state.iceIdentity = _rtcIdentity());
+        const audio = options.offerToReceiveAudio === true;
+        const video = options.offerToReceiveVideo === true;
+        const mids = [];
+        if (audio) mids.push('0');
+        if (video) mids.push(String(mids.length));
+        if (state.channels.length) mids.push(String(mids.length));
+        const lines = [
+            'v=0',
+            `o=- ${identity.sessionId} 2 IN IP4 127.0.0.1`,
+            's=-',
+            't=0 0',
+        ];
+        if (mids.length) {
+            lines.push(`a=group:BUNDLE ${mids.join(' ')}`, 'a=extmap-allow-mixed', 'a=msid-semantic: WMS');
+        }
+        if (audio) lines.push(..._rtcAudioSection(identity));
+        if (video) {
+            const section = _rtcVideoSection(identity);
+            if (!audio) {
+                for (let i = 0; i < section.length; i++) {
+                    if (section[i] === 'a=mid:1') section[i] = 'a=mid:0';
+                }
+            }
+            lines.push(...section);
+        }
+        if (state.channels.length) lines.push(..._rtcDataSection(String(mids.length - 1), identity));
+        return lines.join('\r\n') + '\r\n';
+    };
+    const _rtcAppendCandidate = (sdp, mid, candidate) => sdp
+        .split(/(?=m=)/)
+        .map(section => section.includes(`a=mid:${mid}\r\n`)
+            ? section.replace(/c=IN IP4 0\.0\.0\.0\r\n/, `$&a=${candidate}\r\n`)
+            : section)
+        .join('');
 
     class RTCDataChannel extends EventTarget {
         constructor() {
@@ -6108,6 +6266,8 @@
                 sctp: null,
                 handlers: Object.create(null),
                 channels: [],
+                iceIdentity: null,
+                negotiationNeededScheduled: false,
             });
         }
     }
@@ -6210,11 +6370,26 @@
             handlers: Object.create(null),
         });
         connection.channels.push(channel);
+        if (!connection.negotiationNeededScheduled) {
+            connection.negotiationNeededScheduled = true;
+            setTimeout(() => {
+                connection.negotiationNeededScheduled = false;
+                if (connection.signalingState !== 'stable') return;
+                this.dispatchEvent(_markTrustedEvent(new Event('negotiationneeded')));
+            }, 0);
+        }
         return channel;
     });
-    _rtcMethod(_RTCPeerConnectionProto, 'createOffer', function createOffer() {
-        _rtcState(_rtcPeerConnectionState, this);
-        return Promise.resolve({ type: 'offer', sdp: 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n' });
+    _rtcMethod(_RTCPeerConnectionProto, 'createOffer', function createOffer(options = {}) {
+        const state = _rtcState(_rtcPeerConnectionState, this);
+        if (state.signalingState === 'closed') {
+            return Promise.reject(new DOMException('The RTCPeerConnection is closed.', 'InvalidStateError'));
+        }
+        const description = new globalThis.RTCSessionDescription({
+            type: 'offer',
+            sdp: _rtcBuildOffer(state, options || {}),
+        });
+        return new Promise(resolve => setTimeout(() => resolve(description), 0));
     });
     _rtcMethod(_RTCPeerConnectionProto, 'getConfiguration', function getConfiguration() {
         return Object.assign({}, _rtcState(_rtcPeerConnectionState, this).configuration);
@@ -6261,9 +6436,23 @@
     });
     _rtcMethod(_RTCPeerConnectionProto, 'setLocalDescription', function setLocalDescription(desc) {
         const state = _rtcState(_rtcPeerConnectionState, this);
-        const description = desc == null ? null : new globalThis.RTCSessionDescription(desc);
+        if (state.signalingState === 'closed') {
+            return Promise.reject(new DOMException('The RTCPeerConnection is closed.', 'InvalidStateError'));
+        }
+        const description = desc == null
+            ? new globalThis.RTCSessionDescription({ type: 'offer', sdp: _rtcBuildOffer(state) })
+            : new globalThis.RTCSessionDescription(desc);
         state.localDescription = description;
-        state.currentLocalDescription = description;
+        if (description.type === 'offer') {
+            state.pendingLocalDescription = description;
+            state.currentLocalDescription = null;
+            state.signalingState = 'have-local-offer';
+        } else {
+            state.currentLocalDescription = description;
+            state.pendingLocalDescription = null;
+            state.signalingState = 'stable';
+        }
+        this.dispatchEvent(_markTrustedEvent(new Event('signalingstatechange')));
         // Real Chrome (since 2019, mDNS-anonymized) emits an mDNS host
         // candidate followed by `null` to signal gathering complete.
         // Returning ONLY `{candidate: null}` is itself a tell — every
@@ -6284,24 +6473,41 @@
         };
         const mdnsHost = _uuid4() + '.local';
         const foundation = String(Math.floor(Math.random() * 4_000_000_000));
-        const candidate = `candidate:${foundation} 1 udp 2113937151 ${mdnsHost} ${1024 + Math.floor(Math.random() * 60000)} typ host generation 0 network-cost 999`;
-        const iceCandidate = new globalThis.RTCIceCandidate({
-            candidate, sdpMid: '0', sdpMLineIndex: 0,
-        });
+        const identity = state.iceIdentity || (state.iceIdentity = _rtcIdentity());
+        const mids = [...description.sdp.matchAll(/a=mid:([^\r\n]+)/g)].map(match => match[1]);
+        if (!mids.length) mids.push('0');
         setTimeout(() => {
             state.iceGatheringState = 'gathering';
-            const candidateEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
-                'icecandidate', { candidate: iceCandidate }
-            ));
-            this.dispatchEvent(candidateEvent);
+            this.dispatchEvent(_markTrustedEvent(new Event('icegatheringstatechange')));
+            for (let index = 0; index < mids.length; index++) {
+                const mid = mids[index];
+                const candidate = `candidate:${foundation} 1 udp 2113937151 ${mdnsHost} ${1024 + Math.floor(Math.random() * 60000)} typ host generation 0 ufrag ${identity.iceUfrag} network-cost 999`;
+                const iceCandidate = new globalThis.RTCIceCandidate({
+                    candidate, sdpMid: mid, sdpMLineIndex: index,
+                    usernameFragment: identity.iceUfrag,
+                });
+                const updatedSdp = _rtcAppendCandidate(state.localDescription.sdp, mid, candidate);
+                const updatedDescription = new globalThis.RTCSessionDescription({
+                    type: state.localDescription.type,
+                    sdp: updatedSdp,
+                });
+                state.localDescription = updatedDescription;
+                if (state.pendingLocalDescription) state.pendingLocalDescription = updatedDescription;
+                if (state.currentLocalDescription) state.currentLocalDescription = updatedDescription;
+                const candidateEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
+                    'icecandidate', { candidate: iceCandidate }
+                ));
+                this.dispatchEvent(candidateEvent);
+            }
             setTimeout(() => {
                 state.iceGatheringState = 'complete';
+                this.dispatchEvent(_markTrustedEvent(new Event('icegatheringstatechange')));
                 const completeEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
                     'icecandidate', { candidate: null }
                 ));
                 this.dispatchEvent(completeEvent);
-            }, 12);
-        }, 8);
+            }, 24);
+        }, 0);
         return Promise.resolve();
     });
     _rtcMethod(_RTCPeerConnectionProto, 'setRemoteDescription', function setRemoteDescription(desc) {

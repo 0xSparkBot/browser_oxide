@@ -1927,6 +1927,99 @@ async fn rtc_ice_candidates_reach_event_target_listeners() {
 }
 
 #[tokio::test]
+async fn rtc_offer_and_state_machine_match_chrome_148() {
+    let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"globalThis.__rtcParity = null;
+        (async () => {
+            const pc = new RTCPeerConnection({
+                iceCandidatePoolSize: 1,
+                iceServers: [
+                    { urls: 'stun:stun.cloudflare.com:3478' },
+                    { urls: 'stun:stun.l.google.com:19302' },
+                ],
+            });
+            const events = [];
+            for (const type of [
+                'negotiationneeded', 'signalingstatechange',
+                'icegatheringstatechange', 'icecandidate'
+            ]) {
+                pc.addEventListener(type, event => events.push({
+                    type,
+                    gathering: pc.iceGatheringState,
+                    candidate: event.candidate && event.candidate.toJSON(),
+                }));
+            }
+            pc.createDataChannel('');
+            const offer = await pc.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true,
+            });
+            const offerChecks = {
+                instance: offer instanceof RTCSessionDescription,
+                length: offer.sdp.length,
+                audio: offer.sdp.includes('m=audio 9 UDP/TLS/RTP/SAVPF'),
+                video: offer.sdp.includes('m=video 9 UDP/TLS/RTP/SAVPF'),
+                data: offer.sdp.includes('m=application 9 UDP/DTLS/SCTP webrtc-datachannel'),
+                bundle: offer.sdp.includes('a=group:BUNDLE 0 1 2'),
+                ice: /a=ice-ufrag:[A-Za-z0-9+/]{4}\r\n/.test(offer.sdp),
+                fingerprint: /a=fingerprint:sha-256(?: [0-9A-F]{2}(?::[0-9A-F]{2}){31})\r\n/.test(offer.sdp),
+            };
+            await pc.setLocalDescription(offer);
+            const afterSet = {
+                signaling: pc.signalingState,
+                current: pc.currentLocalDescription,
+                pendingType: pc.pendingLocalDescription && pc.pendingLocalDescription.type,
+            };
+            await new Promise(resolve => setTimeout(resolve, 100));
+            globalThis.__rtcParity = { offerChecks, afterSet, events, localSdp: pc.localDescription.sdp };
+        })();"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.evaluate(
+            r#"(() => {
+                const result = globalThis.__rtcParity;
+                if (!result) return false;
+                const candidates = result.events.filter(event => event.type === 'icecandidate');
+                const gathering = result.events
+                    .filter(event => event.type === 'icegatheringstatechange')
+                    .map(event => event.gathering);
+                return result.offerChecks.instance
+                    && result.offerChecks.length > 6000
+                    && result.offerChecks.audio
+                    && result.offerChecks.video
+                    && result.offerChecks.data
+                    && result.offerChecks.bundle
+                    && result.offerChecks.ice
+                    && result.offerChecks.fingerprint
+                    && result.afterSet.signaling === 'have-local-offer'
+                    && result.afterSet.current === null
+                    && result.afterSet.pendingType === 'offer'
+                    && result.events.some(event => event.type === 'negotiationneeded')
+                    && result.events.some(event => event.type === 'signalingstatechange')
+                    && JSON.stringify(gathering) === JSON.stringify(['gathering', 'complete'])
+                    && candidates.length === 4
+                    && candidates.slice(0, 3).every((event, index) =>
+                        event.candidate
+                        && event.candidate.sdpMid === String(index)
+                        && event.candidate.sdpMLineIndex === index
+                        && /\.local /.test(event.candidate.candidate))
+                    && candidates[3].candidate === null
+                    && (result.localSdp.match(/a=candidate:/g) || []).length === 3;
+            })()"#,
+        )
+        .unwrap(),
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn rtc_peer_connection_and_data_channel_match_chrome_surface() {
     assert_eq!(
         check(
