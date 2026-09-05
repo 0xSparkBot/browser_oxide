@@ -1790,11 +1790,11 @@ async fn perf_navigation_entry_has_timing_fields() {
 
 #[tokio::test]
 async fn perf_get_entries_by_type_resource() {
-    // getEntriesByType('resource') should return at least 3 entries
-    // (we synthesize 5 typical page resources)
+    // A blank document has loaded no subresources. Chrome returns an empty
+    // resource list; invented favicon/bundle/analytics records are detectable.
     assert_eq!(
-        check("performance.getEntriesByType('resource').length >= 3").await,
-        "true"
+        check("performance.getEntriesByType('resource').length").await,
+        "0"
     );
 }
 
@@ -1803,6 +1803,9 @@ async fn perf_resource_entry_shape() {
     assert_eq!(
         check(
             r#"(() => {
+                const script = document.createElement('script');
+                script.src = 'https://example.com/app.js';
+                document.head.appendChild(script);
                 const r = performance.getEntriesByType('resource')[0];
                 return r.entryType === 'resource'
                     && typeof r.initiatorType === 'string'
@@ -1812,6 +1815,22 @@ async fn perf_resource_entry_shape() {
         )
         .await,
         "true"
+    );
+}
+
+#[tokio::test]
+async fn perf_navigation_name_tracks_installed_location() {
+    assert_eq!(
+        check_secure("performance.getEntriesByType('navigation')[0].name").await,
+        "https://example.com/"
+    );
+}
+
+#[tokio::test]
+async fn perf_entries_do_not_invent_vendor_resources() {
+    assert_eq!(
+        check("performance.getEntries().some(e => /qauth|wbaas/.test(e.name))").await,
+        "false"
     );
 }
 

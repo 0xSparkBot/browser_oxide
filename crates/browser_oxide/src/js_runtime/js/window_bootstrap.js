@@ -3364,7 +3364,6 @@
 
         const _buildResourceEntries = () => {
             const entries = [];
-            const origin = globalThis.location?.origin || "https://example.com";
             const base = _perfNav.fetchStart;
             let offset = 10;
             const _internalEntries = _browser_oxide.__perfResourceEntries || [];
@@ -3444,7 +3443,7 @@
                 e.domainLookupStart = rt.domain_lookup_start;
                 e.domainLookupEnd = rt.domain_lookup_end;
                 e.connectStart = rt.connect_start;
-                e.connect_end = rt.connect_end;
+                e.connectEnd = rt.connect_end;
                 e.secureConnectionStart = rt.secure_connection_start;
                 e.requestStart = rt.request_start;
                 e.responseStart = rt.response_start;
@@ -3452,22 +3451,15 @@
                 entries.push(e);
             }
 
-            if (entries.length === 0) {
-                // Some scripts probe
-                // `performance.getEntriesByType('resource').length` and
-                // a near-empty list is a tell. Synthesize the typical
-                // resource shape of a generic page: favicon + main JS
-                // bundle + main CSS bundle + analytics ping + sw.
-                entries.push(mk(`${origin}/favicon.ico`, 25, 42, "img", 1024));
-                entries.push(mk(`${origin}/main.js`, 12, 87, "script", 58600));
-                entries.push(mk(`${origin}/main.css`, 8, 33, "link", 14200));
-                entries.push(mk(`${origin}/analytics.gif?t=` + (Date.now() % 1_000_000), 65, 18, "img", 35));
-                entries.push(mk(`${origin}/sw.js`, 95, 14, "script", 1840));
-            }
             return entries;
         };
         const _navEntry = () => {
             const entry = Object.assign({}, _perfNav);
+            // Runtime bootstrap precedes Page's location install. Capturing
+            // the name once above would freeze it as about:blank even for a
+            // subsequently navigated document. Chromium reports the current
+            // document URL in PerformanceNavigationTiming.name.
+            entry.name = globalThis.location?.href || entry.name;
             entry.duration = performance.now();
             
             if (globalThis.document && globalThis.document.readyState !== 'complete') {
@@ -3568,39 +3560,7 @@
         );
 
         _defProtoMethod(_PerfProto, 'getEntries', function getEntries() {
-            const entries = [_navEntry(), ..._buildResourceEntries()];
-            const origin = globalThis.location ? globalThis.location.origin : "";
-            
-            // Add challenge-resource fallback entries if not present
-            if (!entries.some(e => e.name.includes('qauth') || e.name.includes('wbaas'))) {
-                const start = 12.5;
-                const dur = 45.2;
-                entries.push({
-                    name: `${origin}/__qrator/qauth_utm_v2d_v9118.js`,
-                    entryType: 'resource',
-                    startTime: start,
-                    duration: dur,
-                    initiatorType: 'script',
-                    nextHopProtocol: 'h2',
-                    workerStart: 0,
-                    redirectStart: 0,
-                    redirectEnd: 0,
-                    fetchStart: start,
-                    domainLookupStart: start,
-                    domainLookupEnd: start,
-                    connectStart: start,
-                    connectEnd: start,
-                    secureConnectionStart: start,
-                    requestStart: start + 1,
-                    responseStart: start + 5,
-                    responseEnd: start + dur,
-                    transferSize: 349878,
-                    encodedBodySize: 349800,
-                    decodedBodySize: 349800,
-                    serverTiming: []
-                });
-            }
-            return entries;
+            return [_navEntry(), ..._buildResourceEntries()];
         });
         _defProtoMethod(_PerfProto, 'getEntriesByType', function getEntriesByType(type) {
             if (type === "navigation") return [_navEntry()];
