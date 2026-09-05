@@ -33,6 +33,10 @@ pub struct BrowserRuntimeOptions {
     pub base_url: Option<url::Url>,
     pub stealth_profile: Option<StealthProfile>,
     pub stylesheets: Vec<String>,
+    /// Network timing and transfer sizes for the document navigation. When
+    /// present, PerformanceNavigationTiming is derived from the real response
+    /// rather than the synthetic-HTML fallback.
+    pub navigation_timing: Option<crate::net::TimingStats>,
     /// Scripts evaluated AFTER all built-in bootstraps but BEFORE any
     /// parsed-HTML `<script>` tags. Mirrors Chromium's
     /// `Page.addScriptToEvaluateOnNewDocument` CDP command — the driver
@@ -280,7 +284,10 @@ pub fn create_runtime_with_signals(
     // Insert states into OpState
     runtime.op_state().borrow_mut().put(state);
     runtime.op_state().borrow_mut().put(TimerState::new());
-    runtime.op_state().borrow_mut().put(PerfState::new());
+    runtime
+        .op_state()
+        .borrow_mut()
+        .put(PerfState::with_navigation(options.navigation_timing));
     runtime
         .op_state()
         .borrow_mut()

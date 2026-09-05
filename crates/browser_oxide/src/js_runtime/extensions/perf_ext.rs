@@ -9,7 +9,7 @@
 use crate::js_runtime::state::DomState;
 use deno_core::op2;
 use deno_core::OpState;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Per-runtime state for the humanized clock.
 pub struct PerfState {
@@ -26,6 +26,9 @@ pub struct PerfState {
     origin_unix_ms: f64,
     /// Last returned value in µs — enforces monotonicity per HRT spec.
     last_us: f64,
+    /// Network-backed navigation metadata, when this realm was created from
+    /// an HTTP response rather than synthetic HTML/about:blank.
+    navigation_timing: Option<crate::net::TimingStats>,
 }
 
 impl PerfState {
@@ -41,6 +44,31 @@ impl PerfState {
             origin: Instant::now(),
             origin_unix_ms,
             last_us: 0.0,
+            navigation_timing: None,
+        }
+    }
+
+    pub fn with_navigation(navigation_timing: Option<crate::net::TimingStats>) -> Self {
+        let Some(timing) = navigation_timing else {
+            return Self::new();
+        };
+        if !timing.time_origin_unix_ms.is_finite() || timing.time_origin_unix_ms <= 0.0 {
+            return Self::new();
+        }
+
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64() * 1000.0)
+            .unwrap_or(timing.time_origin_unix_ms);
+        let age_ms = (now_unix_ms - timing.time_origin_unix_ms).max(0.0);
+        let origin = Instant::now()
+            .checked_sub(Duration::from_secs_f64(age_ms / 1000.0))
+            .unwrap_or_else(Instant::now);
+        Self {
+            origin,
+            origin_unix_ms: timing.time_origin_unix_ms,
+            last_us: 0.0,
+            navigation_timing: Some(timing),
         }
     }
 
@@ -76,6 +104,12 @@ pub fn op_perf_time_origin_ms(s: &mut OpState) -> f64 {
     s.origin_unix_ms
 }
 
+#[op2]
+#[serde]
+pub fn op_perf_get_navigation_timing(state: &mut OpState) -> Option<crate::net::TimingStats> {
+    state.borrow::<PerfState>().navigation_timing.clone()
+}
+
 #[derive(serde::Serialize)]
 pub struct JsResourceTiming {
     pub name: String,
@@ -99,27 +133,35 @@ pub struct JsResourceTiming {
 #[op2]
 #[serde]
 pub fn op_perf_get_resource_timings(state: &mut OpState) -> Vec<JsResourceTiming> {
-    let state = state.borrow::<DomState>();
-    state
+    let perf_origin_unix_ms = state.borrow::<PerfState>().origin_unix_ms;
+    let dom_state = state.borrow::<DomState>();
+    dom_state
         .resource_timings
         .iter()
-        .map(|t| JsResourceTiming {
-            name: "https://example.com/placeholder".to_string(),
-            entry_type: "resource".to_string(),
-            start_time: t.request_start_ms,
-            duration: t.response_end_ms - t.request_start_ms,
-            fetch_start: t.request_start_ms,
-            domain_lookup_start: t.dns_start_ms,
-            domain_lookup_end: t.dns_end_ms,
-            connect_start: t.connect_start_ms,
-            connect_end: t.connect_end_ms,
-            secure_connection_start: t.tls_start_ms,
-            request_start: t.request_start_ms,
-            response_start: t.response_start_ms,
-            response_end: t.response_end_ms,
-            transfer_size: 0,
-            encoded_body_size: 0,
-            decoded_body_size: 0,
+        .map(|t| {
+            let origin_offset = if t.time_origin_unix_ms > 0.0 {
+                t.time_origin_unix_ms - perf_origin_unix_ms
+            } else {
+                0.0
+            };
+            JsResourceTiming {
+                name: t.name.clone(),
+                entry_type: "resource".to_string(),
+                start_time: origin_offset + t.request_start_ms,
+                duration: t.response_end_ms - t.request_start_ms,
+                fetch_start: origin_offset,
+                domain_lookup_start: origin_offset + t.dns_start_ms,
+                domain_lookup_end: origin_offset + t.dns_end_ms,
+                connect_start: origin_offset + t.connect_start_ms,
+                connect_end: origin_offset + t.connect_end_ms,
+                secure_connection_start: origin_offset + t.tls_start_ms,
+                request_start: origin_offset + t.request_start_ms,
+                response_start: origin_offset + t.response_start_ms,
+                response_end: origin_offset + t.response_end_ms,
+                transfer_size: t.transfer_size,
+                encoded_body_size: t.encoded_body_size,
+                decoded_body_size: t.decoded_body_size,
+            }
         })
         .collect()
 }
@@ -128,6 +170,7 @@ deno_core::extension!(
     perf_extension,
     ops = [
         op_perf_now_humanized,
+        op_perf_get_navigation_timing,
         op_perf_get_resource_timings,
         op_perf_time_origin_ms,
     ],

@@ -290,6 +290,7 @@ impl ChildIframe {
 
         let mut options = BrowserRuntimeOptions {
             stylesheets,
+            navigation_timing: Some(resp.timings.clone()),
             is_secure_context: crate::page::is_secure_url(url),
             ..Default::default()
         };

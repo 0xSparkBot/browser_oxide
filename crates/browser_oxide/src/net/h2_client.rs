@@ -15,6 +15,7 @@ use crate::stealth::{DeviceClass, StealthProfile};
 use bytes::Bytes;
 use http2::client::{Builder, Connection, SendRequest};
 use http2::frame::{PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId};
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::net::error::NetError;
@@ -233,12 +234,12 @@ where
 /// Send a GET request over an HTTP/2 connection.
 ///
 /// `headers` is an ordered list of (name, value) pairs to include.
-pub async fn send_get(
+pub(crate) async fn send_get(
     sender: &mut SendRequest<Bytes>,
     uri: &str,
     _host: &str,
     headers: &[(String, String)],
-) -> Result<(http::response::Parts, Vec<u8>), NetError> {
+) -> Result<(http::response::Parts, Vec<u8>, crate::net::WireTiming), NetError> {
     let mut ready_sender = sender
         .clone()
         .ready()
@@ -257,6 +258,7 @@ pub async fn send_get(
         .body(())
         .map_err(|e| NetError::Http(format!("failed to build request: {e}")))?;
 
+    let request_start = Instant::now();
     let (response, _) = ready_sender
         .send_request(request, true) // true = end of stream (no body)
         .map_err(|e| NetError::Http(format!("failed to send request: {e}")))?;
@@ -264,6 +266,7 @@ pub async fn send_get(
     let response = response
         .await
         .map_err(|e| NetError::Http(format!("HTTP/2 response error: {e}")))?;
+    let response_start = Instant::now();
 
     let (parts, mut body) = response.into_parts();
 
@@ -275,17 +278,26 @@ pub async fn send_get(
         data.extend_from_slice(&chunk);
     }
 
-    Ok((parts, data))
+    let response_end = Instant::now();
+    Ok((
+        parts,
+        data,
+        crate::net::WireTiming {
+            request_start,
+            response_start,
+            response_end,
+        },
+    ))
 }
 
 /// Send a POST request over an HTTP/2 connection.
-pub async fn send_post(
+pub(crate) async fn send_post(
     sender: &mut SendRequest<Bytes>,
     uri: &str,
     _host: &str,
     headers: &[(String, String)],
     body: &[u8],
-) -> Result<(http::response::Parts, Vec<u8>), NetError> {
+) -> Result<(http::response::Parts, Vec<u8>, crate::net::WireTiming), NetError> {
     let mut ready_sender = sender
         .clone()
         .ready()
@@ -305,6 +317,7 @@ pub async fn send_post(
         .body(())
         .map_err(|e| NetError::Http(format!("failed to build request: {e}")))?;
 
+    let request_start = Instant::now();
     let (response, mut send_stream) = ready_sender
         .send_request(request, false) // false = body follows
         .map_err(|e| NetError::Http(format!("failed to send request: {e}")))?;
@@ -317,6 +330,7 @@ pub async fn send_post(
     let response = response
         .await
         .map_err(|e| NetError::Http(format!("HTTP/2 response error: {e}")))?;
+    let response_start = Instant::now();
 
     let (parts, mut resp_body) = response.into_parts();
 
@@ -327,7 +341,16 @@ pub async fn send_post(
         data.extend_from_slice(&chunk);
     }
 
-    Ok((parts, data))
+    let response_end = Instant::now();
+    Ok((
+        parts,
+        data,
+        crate::net::WireTiming {
+            request_start,
+            response_start,
+            response_end,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -359,9 +382,10 @@ mod tests {
             }
         });
 
-        let (parts, body) = send_get(&mut sender, "https://httpbin.org/get", "httpbin.org", &[])
-            .await
-            .unwrap();
+        let (parts, body, _timing) =
+            send_get(&mut sender, "https://httpbin.org/get", "httpbin.org", &[])
+                .await
+                .unwrap();
 
         assert_eq!(parts.status, 200);
         assert!(!body.is_empty());

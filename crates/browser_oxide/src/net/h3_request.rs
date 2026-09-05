@@ -3,10 +3,11 @@
 use crate::net::error::NetError;
 use crate::net::headers;
 use crate::net::Response;
-use crate::net::TimingStats;
+use crate::net::{RequestTimingOrigin, WireTiming};
 use crate::stealth::profile::StealthProfile;
 use bytes::Buf;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::net::Method;
 
@@ -18,6 +19,7 @@ pub async fn h3_request(
     profile: &StealthProfile,
     extra_headers: &[(String, String)],
 ) -> Result<(Response, Option<String>), NetError> {
+    let timing_origin = RequestTimingOrigin::now();
     let h3_conn = h3_quinn::Connection::new(connection);
     let (mut driver, mut send_request) = h3::client::new(h3_conn)
         .await
@@ -66,6 +68,7 @@ pub async fn h3_request(
         .body(())
         .map_err(|e| NetError::H3(e.to_string()))?;
 
+    let request_start = Instant::now();
     let mut stream = send_request
         .send_request(req)
         .await
@@ -87,6 +90,7 @@ pub async fn h3_request(
         .recv_response()
         .await
         .map_err(|e| NetError::H3(e.to_string()))?;
+    let response_start = Instant::now();
 
     let status = resp.status().as_u16();
     let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
@@ -125,6 +129,23 @@ pub async fn h3_request(
             buf.advance(len);
         }
     }
+    let response_end = Instant::now();
+    let encoded_body_size = body.len();
+    let encoding = headers
+        .get("content-encoding")
+        .map(String::as_str)
+        .unwrap_or("");
+    let body = crate::net::compression::decompress(&body, encoding)?;
+    let timings = timing_origin.finish(
+        url.as_str(),
+        WireTiming {
+            request_start,
+            response_start,
+            response_end,
+        },
+        encoded_body_size,
+        body.len(),
+    );
 
     Ok((
         Response {
@@ -135,7 +156,7 @@ pub async fn h3_request(
             body,
             url: url.to_string(),
             accept_ch_upgrade: false,
-            timings: TimingStats::default(),
+            timings,
         },
         alt_svc_value,
     ))

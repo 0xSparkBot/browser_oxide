@@ -3273,9 +3273,9 @@
     // expected Chrome distributions. Returning empty arrays differs from
     // a real browser.
     //
-    // We synthesize a realistic set of entries based on the time the page
-    // has been loaded, with sub-timings that look like a real Chrome on
-    // broadband.
+    // Network-backed documents read measurements captured by the HTTP stack.
+    // Synthetic HTML/about:blank retains a stable fallback because it has no
+    // transport from which real values could be measured.
     // =========================================================
     if (globalThis.performance) {
         // Anchor performance.timeOrigin to the
@@ -3329,6 +3329,32 @@
             redirectCount: 0,
             activationStart: 0,
         };
+        const _readNavigationTiming = () => {
+            try {
+                const timing = ops.op_perf_get_navigation_timing &&
+                    ops.op_perf_get_navigation_timing();
+                if (!timing || !(timing.response_end_ms >= timing.response_start_ms)) {
+                    return null;
+                }
+                return {
+                    name: timing.name || globalThis.location?.href || "about:blank",
+                    fetchStart: 0,
+                    domainLookupStart: timing.dns_start_ms || 0,
+                    domainLookupEnd: timing.dns_end_ms || 0,
+                    connectStart: timing.connect_start_ms || 0,
+                    secureConnectionStart: timing.tls_start_ms || 0,
+                    connectEnd: timing.connect_end_ms || 0,
+                    requestStart: timing.request_start_ms || 0,
+                    responseStart: timing.response_start_ms || 0,
+                    responseEnd: timing.response_end_ms || 0,
+                    transferSize: timing.transfer_size || 0,
+                    encodedBodySize: timing.encoded_body_size || 0,
+                    decodedBodySize: timing.decoded_body_size || 0,
+                };
+            } catch (_) {
+                return null;
+            }
+        };
         const _perfTimingStart = _perfOrigin - Math.round(_perfNav.loadEventEnd);
         const _perfTiming = {
             navigationStart: _perfTimingStart,
@@ -3362,6 +3388,22 @@
             TYPE_RESERVED: 255,
         };
 
+        // interfaces_bootstrap installs illegal-constructor Web IDL stubs for
+        // these interfaces. Link their prototypes according to the Performance
+        // Timeline inheritance hierarchy, then use those prototypes for the
+        // records returned below. A plain object has the right fields but fails
+        // the observable `entry instanceof PerformanceResourceTiming` check
+        // used by real-world resource timing consumers.
+        const _PerfEntryProto = globalThis.PerformanceEntry.prototype;
+        const _PerfResourceProto = globalThis.PerformanceResourceTiming.prototype;
+        const _PerfNavigationProto = globalThis.PerformanceNavigationTiming.prototype;
+        if (Object.getPrototypeOf(_PerfResourceProto) !== _PerfEntryProto) {
+            Object.setPrototypeOf(_PerfResourceProto, _PerfEntryProto);
+        }
+        if (Object.getPrototypeOf(_PerfNavigationProto) !== _PerfResourceProto) {
+            Object.setPrototypeOf(_PerfNavigationProto, _PerfResourceProto);
+        }
+
         const _buildResourceEntries = () => {
             const entries = [];
             const base = _perfNav.fetchStart;
@@ -3369,31 +3411,34 @@
             const _internalEntries = _browser_oxide.__perfResourceEntries || [];
             const _rustEntries = (ops.op_perf_get_resource_timings && ops.op_perf_get_resource_timings()) || [];
 
-            const mk = (name, startOffset, duration, type, size) => ({
-                name,
-                entryType: "resource",
-                startTime: base + startOffset,
-                duration,
-                initiatorType: type,
-                nextHopProtocol: "h2",
-                workerStart: 0,
-                redirectStart: 0,
-                redirectEnd: 0,
-                fetchStart: base + startOffset,
-                domainLookupStart: base + startOffset,
-                domainLookupEnd: base + startOffset,
-                connectStart: base + startOffset,
-                connectEnd: base + startOffset,
-                secureConnectionStart: base + startOffset,
-                requestStart: base + startOffset + 5,
-                responseStart: base + startOffset + duration - 15,
-                responseEnd: base + startOffset + duration,
-                transferSize: size + 300,
-                encodedBodySize: size,
-                decodedBodySize: size * 3,
-                serverTiming: [],
-                renderBlockingStatus: "non-blocking",
-            });
+            const mk = (name, startOffset, duration, type, size) => Object.assign(
+                Object.create(_PerfResourceProto),
+                {
+                    name,
+                    entryType: "resource",
+                    startTime: base + startOffset,
+                    duration,
+                    initiatorType: type,
+                    nextHopProtocol: "h2",
+                    workerStart: 0,
+                    redirectStart: 0,
+                    redirectEnd: 0,
+                    fetchStart: base + startOffset,
+                    domainLookupStart: base + startOffset,
+                    domainLookupEnd: base + startOffset,
+                    connectStart: base + startOffset,
+                    connectEnd: base + startOffset,
+                    secureConnectionStart: base + startOffset,
+                    requestStart: base + startOffset + 5,
+                    responseStart: base + startOffset + duration - 15,
+                    responseEnd: base + startOffset + duration,
+                    transferSize: size + 300,
+                    encodedBodySize: size,
+                    decodedBodySize: size * 3,
+                    serverTiming: [],
+                    renderBlockingStatus: "non-blocking",
+                },
+            );
 
             if (globalThis.document) {
                 const scripts = globalThis.document.scripts || [];
@@ -3454,7 +3499,9 @@
             return entries;
         };
         const _navEntry = () => {
-            const entry = Object.assign({}, _perfNav);
+            const entry = Object.assign(Object.create(_PerfNavigationProto), _perfNav);
+            const measured = _readNavigationTiming();
+            if (measured) Object.assign(entry, measured);
             // Runtime bootstrap precedes Page's location install. Capturing
             // the name once above would freeze it as about:blank even for a
             // subsequently navigated document. Chromium reports the current
@@ -3520,6 +3567,26 @@
         });
         _defProtoGetter(_PerfProto, 'timing', () => {
             const timing = Object.assign({}, _perfTiming);
+            const measured = _readNavigationTiming();
+            if (measured) {
+                let navigationStart = _perfOrigin;
+                try {
+                    const liveOrigin = ops.op_perf_time_origin_ms &&
+                        ops.op_perf_time_origin_ms();
+                    if (typeof liveOrigin === 'number' && isFinite(liveOrigin)) {
+                        navigationStart = liveOrigin;
+                    }
+                } catch (_) {}
+                timing.navigationStart = navigationStart;
+                for (const key of [
+                    'fetchStart', 'domainLookupStart', 'domainLookupEnd',
+                    'connectStart', 'secureConnectionStart', 'connectEnd',
+                    'requestStart', 'responseStart', 'responseEnd',
+                ]) {
+                    timing[key] = navigationStart + Math.round(measured[key]);
+                }
+                timing.domLoading = timing.responseStart;
+            }
             if (globalThis.document && globalThis.document.readyState !== 'complete') {
                 timing.domComplete = 0;
                 timing.loadEventStart = 0;

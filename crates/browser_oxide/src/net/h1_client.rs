@@ -2,6 +2,7 @@
 //!
 //! Used when ALPN negotiates `http/1.1` instead of `h2`.
 
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::net::error::NetError;
@@ -12,6 +13,7 @@ pub struct RawResponse {
     pub status_text: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub(crate) timing: crate::net::WireTiming,
 }
 
 /// Send an HTTP/1.1 GET request over a stream.
@@ -75,6 +77,7 @@ where
     }
     request.push_str("\r\n");
 
+    let request_start = Instant::now();
     stream
         .write_all(request.as_bytes())
         .await
@@ -93,15 +96,16 @@ where
         .map_err(|e| NetError::Http(format!("failed to flush: {e}")))?;
 
     // Read the response
-    read_response(stream).await
+    read_response(stream, request_start).await
 }
 
-async fn read_response<S>(stream: &mut S) -> Result<RawResponse, NetError>
+async fn read_response<S>(stream: &mut S, request_start: Instant) -> Result<RawResponse, NetError>
 where
     S: AsyncReadExt + Unpin,
 {
     let mut buf = Vec::with_capacity(8192);
     let header_len;
+    let response_start;
 
     // Read until we find the end of headers (\r\n\r\n)
     loop {
@@ -119,6 +123,7 @@ where
 
         if let Some(pos) = find_header_end(&buf) {
             header_len = pos + 4; // include \r\n\r\n
+            response_start = Instant::now();
             break;
         }
 
@@ -164,11 +169,17 @@ where
         read_until_close(stream, body_start).await?
     };
 
+    let response_end = Instant::now();
     Ok(RawResponse {
         status,
         status_text,
         headers,
         body,
+        timing: crate::net::WireTiming {
+            request_start,
+            response_start,
+            response_end,
+        },
     })
 }
 

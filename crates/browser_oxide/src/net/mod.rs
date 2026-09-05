@@ -34,6 +34,7 @@ use http2::client::SendRequest;
 use pool::ConnectionPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -44,8 +45,12 @@ pub enum Method {
 }
 
 /// HTTP response.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TimingStats {
+    /// Final response URL. Resource Timing exposes this as `name`.
+    pub name: String,
+    /// UNIX epoch milliseconds corresponding to timing value zero.
+    pub time_origin_unix_ms: f64,
     pub dns_start_ms: f64,
     pub dns_end_ms: f64,
     pub connect_start_ms: f64,
@@ -55,6 +60,65 @@ pub struct TimingStats {
     pub request_start_ms: f64,
     pub response_start_ms: f64,
     pub response_end_ms: f64,
+    pub transfer_size: u64,
+    pub encoded_body_size: u64,
+    pub decoded_body_size: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WireTiming {
+    pub request_start: Instant,
+    pub response_start: Instant,
+    pub response_end: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestTimingOrigin {
+    monotonic: Instant,
+    unix_ms: f64,
+}
+
+impl RequestTimingOrigin {
+    fn now() -> Self {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        Self {
+            monotonic: Instant::now(),
+            unix_ms,
+        }
+    }
+
+    fn finish(
+        self,
+        url: &str,
+        wire: WireTiming,
+        encoded_body_size: usize,
+        decoded_body_size: usize,
+    ) -> TimingStats {
+        let elapsed_ms = |instant: Instant| {
+            instant
+                .saturating_duration_since(self.monotonic)
+                .as_secs_f64()
+                * 1000.0
+        };
+        let encoded_body_size = encoded_body_size as u64;
+        TimingStats {
+            name: url.to_string(),
+            time_origin_unix_ms: self.unix_ms,
+            request_start_ms: elapsed_ms(wire.request_start),
+            response_start_ms: elapsed_ms(wire.response_start),
+            response_end_ms: elapsed_ms(wire.response_end),
+            // Chromium adds a fixed 300-byte header allowance for same-origin
+            // network resources. This is the Resource Timing specification's
+            // transferSize shape, not the raw socket byte count.
+            transfer_size: encoded_body_size.saturating_add(300),
+            encoded_body_size,
+            decoded_body_size: decoded_body_size as u64,
+            ..TimingStats::default()
+        }
+    }
 }
 
 pub struct Response {
@@ -726,6 +790,7 @@ impl HttpClient {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<Response, NetError> {
+        let timing_origin = RequestTimingOrigin::now();
         let parsed = Url::parse(url)?;
         let host = parsed
             .host_str()
@@ -761,8 +826,10 @@ impl HttpClient {
                     };
                     let uri = parsed.as_str();
                     match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
-                        Ok((parts, body)) => {
-                            let resp = self.build_response(parts, body, url).await?;
+                        Ok((parts, body, wire_timing)) => {
+                            let resp = self
+                                .build_response(parts, body, url, timing_origin, wire_timing)
+                                .await?;
                             break 'h2 Some(resp);
                         }
                         Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -798,7 +865,8 @@ impl HttpClient {
                 let raw = self
                     .send_h1_get_for_url(&parsed, host, port, &path, &hdrs)
                     .await?;
-                self.build_response_from_raw(raw, url).await?
+                self.build_response_from_raw(raw, url, timing_origin)
+                    .await?
             }
         };
         self.learn_alt_svc(url, &response.headers).await;
@@ -838,6 +906,7 @@ impl HttpClient {
         url: &str,
         extra_headers: &[(String, String)],
     ) -> Result<Response, NetError> {
+        let timing_origin = RequestTimingOrigin::now();
         let parsed = Url::parse(url)?;
         // HTTP/3 and HTTP/2 require TLS. Plain HTTP goes directly to the H1
         // path instead of attempting a TLS handshake against the cleartext
@@ -885,8 +954,10 @@ impl HttpClient {
                     };
                     let uri = parsed.as_str();
                     match h2_client::send_get(&mut sender, uri, host, &hdrs).await {
-                        Ok((parts, body)) => {
-                            let resp = self.build_response(parts, body, url).await?;
+                        Ok((parts, body, wire_timing)) => {
+                            let resp = self
+                                .build_response(parts, body, url, timing_origin, wire_timing)
+                                .await?;
                             break 'h2 Some(resp);
                         }
                         Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -925,7 +996,8 @@ impl HttpClient {
                 let raw = self
                     .send_h1_get_for_url(&parsed, host, port, &path, &hdrs)
                     .await?;
-                self.build_response_from_raw(raw, url).await?
+                self.build_response_from_raw(raw, url, timing_origin)
+                    .await?
             }
         };
 
@@ -1108,6 +1180,7 @@ impl HttpClient {
         body: &[u8],
         headers: &[(String, String)],
     ) -> Result<Response, NetError> {
+        let timing_origin = RequestTimingOrigin::now();
         let parsed = Url::parse(url)?;
         let host = parsed
             .host_str()
@@ -1140,7 +1213,7 @@ impl HttpClient {
         let raw = self
             .send_h1_post_for_url(&parsed, host, port, &path, &hdrs, body)
             .await?;
-        self.build_response_from_raw(raw, url).await
+        self.build_response_from_raw(raw, url, timing_origin).await
     }
 
     /// POST with a raw byte body and ONLY the caller-provided headers plus cookies.
@@ -1150,6 +1223,7 @@ impl HttpClient {
         body: &[u8],
         headers: &[(String, String)],
     ) -> Result<Response, NetError> {
+        let timing_origin = RequestTimingOrigin::now();
         let parsed = Url::parse(url)?;
         let host = parsed
             .host_str()
@@ -1232,8 +1306,10 @@ impl HttpClient {
                         );
                     }
                     match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
-                        Ok((parts, resp_body)) => {
-                            let resp = self.build_response(parts, resp_body, url).await?;
+                        Ok((parts, resp_body, wire_timing)) => {
+                            let resp = self
+                                .build_response(parts, resp_body, url, timing_origin, wire_timing)
+                                .await?;
                             break 'h2 Some(resp);
                         }
                         Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -1272,7 +1348,8 @@ impl HttpClient {
                 let raw = self
                     .send_h1_post_for_url(&parsed, host, port, &path, &hdrs, body)
                     .await?;
-                self.build_response_from_raw(raw, url).await?
+                self.build_response_from_raw(raw, url, timing_origin)
+                    .await?
             }
         };
 
@@ -1294,6 +1371,7 @@ impl HttpClient {
         body: &[u8],
         extra_headers: &[(String, String)],
     ) -> Result<Response, NetError> {
+        let timing_origin = RequestTimingOrigin::now();
         let parsed = Url::parse(url)?;
         // QUIC/H2 are HTTPS-only; cleartext HTTP goes straight to H1.
         if parsed.scheme() == "https" {
@@ -1375,8 +1453,10 @@ impl HttpClient {
                     };
                     let uri = parsed.as_str();
                     match h2_client::send_post(&mut sender, uri, host, &hdrs, body).await {
-                        Ok((parts, resp_body)) => {
-                            let resp = self.build_response(parts, resp_body, url).await?;
+                        Ok((parts, resp_body, wire_timing)) => {
+                            let resp = self
+                                .build_response(parts, resp_body, url, timing_origin, wire_timing)
+                                .await?;
                             break 'h2 Some(resp);
                         }
                         Err(e) if attempt == 0 && is_stale_conn_error(&e) => {
@@ -1402,7 +1482,8 @@ impl HttpClient {
                 let raw = self
                     .send_h1_post_for_url(&parsed, host, port, &path, &hdrs, body)
                     .await?;
-                self.build_response_from_raw(raw, url).await?
+                self.build_response_from_raw(raw, url, timing_origin)
+                    .await?
             }
         };
 
@@ -1477,6 +1558,8 @@ impl HttpClient {
         parts: http::response::Parts,
         body: Vec<u8>,
         url: &str,
+        timing_origin: RequestTimingOrigin,
+        wire_timing: WireTiming,
     ) -> Result<Response, NetError> {
         let status = parts.status.as_u16();
         let status_text = parts.status.canonical_reason().unwrap_or("").to_string();
@@ -1500,7 +1583,9 @@ impl HttpClient {
             .get("content-encoding")
             .map(|s| s.as_str())
             .unwrap_or("");
+        let encoded_body_size = body.len();
         let decompressed = compression::decompress(&body, encoding)?;
+        let timings = timing_origin.finish(url, wire_timing, encoded_body_size, decompressed.len());
 
         Ok(Response {
             status,
@@ -1510,7 +1595,7 @@ impl HttpClient {
             body: decompressed,
             url: url.to_string(),
             accept_ch_upgrade: false,
-            timings: TimingStats::default(),
+            timings,
         })
     }
 
@@ -1519,6 +1604,7 @@ impl HttpClient {
         &self,
         raw: h1_client::RawResponse,
         url: &str,
+        timing_origin: RequestTimingOrigin,
     ) -> Result<Response, NetError> {
         let mut resp_headers = HashMap::new();
         let mut set_cookies = Vec::new();
@@ -1534,7 +1620,9 @@ impl HttpClient {
             .get("content-encoding")
             .map(|s| s.as_str())
             .unwrap_or("");
+        let encoded_body_size = raw.body.len();
         let decompressed = compression::decompress(&raw.body, encoding)?;
+        let timings = timing_origin.finish(url, raw.timing, encoded_body_size, decompressed.len());
 
         Ok(Response {
             status: raw.status,
@@ -1544,7 +1632,7 @@ impl HttpClient {
             body: decompressed,
             url: url.to_string(),
             accept_ch_upgrade: false,
-            timings: TimingStats::default(),
+            timings,
         })
     }
 }

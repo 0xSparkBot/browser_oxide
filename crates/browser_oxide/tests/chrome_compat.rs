@@ -1819,11 +1819,105 @@ async fn perf_resource_entry_shape() {
 }
 
 #[tokio::test]
+async fn perf_resource_entry_has_web_idl_prototype_chain() {
+    assert_eq!(
+        check(
+            r#"(() => {
+                const script = document.createElement('script');
+                script.src = 'https://example.com/app.js';
+                document.head.appendChild(script);
+                const entry = performance.getEntriesByType('resource')[0];
+                return entry instanceof PerformanceResourceTiming
+                    && entry instanceof PerformanceEntry
+                    && Object.prototype.toString.call(entry)
+                        === '[object PerformanceResourceTiming]';
+            })()"#
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn perf_navigation_entry_has_web_idl_prototype_chain() {
+    assert_eq!(
+        check(
+            r#"(() => {
+                const entry = performance.getEntriesByType('navigation')[0];
+                return entry instanceof PerformanceNavigationTiming
+                    && entry instanceof PerformanceResourceTiming
+                    && entry instanceof PerformanceEntry
+                    && Object.prototype.toString.call(entry)
+                        === '[object PerformanceNavigationTiming]';
+            })()"#
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn perf_navigation_name_tracks_installed_location() {
     assert_eq!(
         check_secure("performance.getEntriesByType('navigation')[0].name").await,
         "https://example.com/"
     );
+}
+
+#[tokio::test]
+async fn perf_navigation_uses_network_measurements_when_available() {
+    let time_origin_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        * 1000.0
+        - 500.0;
+    let dom = browser_oxide::html_parser::parse_html("<html><body></body></html>");
+    let mut runtime = browser_oxide::js_runtime::BrowserJsRuntime::with_options(
+        dom,
+        browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
+            navigation_timing: Some(browser_oxide::net::TimingStats {
+                name: "https://example.test/measured".into(),
+                time_origin_unix_ms,
+                request_start_ms: 7.0,
+                response_start_ms: 113.0,
+                response_end_ms: 241.0,
+                transfer_size: 90_300,
+                encoded_body_size: 90_000,
+                decoded_body_size: 240_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let result = runtime
+        .execute_script(
+            r#"(() => {
+                const e = performance.getEntriesByType('navigation')[0];
+                return JSON.stringify({
+                    requestStart: Math.round(e.requestStart),
+                    responseStart: Math.round(e.responseStart),
+                    responseEnd: Math.round(e.responseEnd),
+                    transferSize: e.transferSize,
+                    encodedBodySize: e.encodedBodySize,
+                    decodedBodySize: e.decodedBodySize,
+                    oldResponseStart: performance.timing.responseStart
+                        - performance.timing.navigationStart,
+                    durationCoversResponse: e.duration >= e.responseEnd,
+                });
+            })()"#,
+            None,
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["requestStart"], 7);
+    assert_eq!(value["responseStart"], 113);
+    assert_eq!(value["responseEnd"], 241);
+    assert_eq!(value["transferSize"], 90_300);
+    assert_eq!(value["encodedBodySize"], 90_000);
+    assert_eq!(value["decodedBodySize"], 240_000);
+    assert_eq!(value["oldResponseStart"], 113);
+    assert_eq!(value["durationCoversResponse"], true);
 }
 
 #[tokio::test]
