@@ -1,5 +1,15 @@
 ((globalThis) => {
     const ops = Deno.core.ops;
+    const _diagnosticsEnabled = globalThis.__browser_oxide_debug === true;
+
+    function _pushFetchDiag(entry) {
+        if (!_diagnosticsEnabled) return;
+        try {
+            const log = globalThis.__oxFetchDiag || (globalThis.__oxFetchDiag = []);
+            if (log.length >= 96) log.shift();
+            log.push({ ...entry, at: performance.now() });
+        } catch (_) {}
+    }
 
     class Headers {
         #map;
@@ -72,7 +82,10 @@
         get bodyUsed() {
             return !!this.#bodyStream && this.#bodyStream.locked;
         }
-        async text() { return this.#body; }
+        async text() {
+            _pushFetchDiag({ phase: "consume-text", url: this.#url, bodyLength: String(this.#body).length });
+            return this.#body;
+        }
         async json() { return JSON.parse(this.#body); }
         async arrayBuffer() {
             if (this.#rawBytes && this.#rawBytes.buffer) {
@@ -367,7 +380,32 @@
 
         try {
             const startTime = performance.now();
+            _pushFetchDiag({
+                phase: "request",
+                method,
+                url,
+                rawBodyType: rawBody == null
+                    ? String(rawBody)
+                    : Object.prototype.toString.call(rawBody),
+                rawBodyLength: rawBody && typeof rawBody.length === "number"
+                    ? rawBody.length
+                    : rawBody && typeof rawBody.byteLength === "number"
+                        ? rawBody.byteLength
+                        : null,
+                encodedBodyLength: body.length,
+                headerNames: Object.keys(headers).sort(),
+            });
             const result = await ops.op_fetch(url, method, headers, body);
+            _pushFetchDiag({
+                phase: "response",
+                method,
+                url,
+                status: result.status,
+                bodyLength: result.body ? result.body.length : 0,
+                headers: Object.entries(result.headers || {})
+                    .map(([name, value]) => [name, String(value).length])
+                    .sort((a, b) => a[0].localeCompare(b[0])),
+            });
             
             const browser_oxide = globalThis._browser_oxide;
             const fetchLog = browser_oxide && browser_oxide.__fetchLog;

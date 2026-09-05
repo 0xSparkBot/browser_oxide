@@ -449,11 +449,18 @@ pub async fn op_fetch(
         (request_type_hint.as_deref() == Some("image")).then(|| resp.body.clone());
     let body_text = resp.text();
     if fetch_trace {
+        let mut response_headers = resp
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.len()))
+            .collect::<Vec<_>>();
+        response_headers.sort_unstable_by_key(|(name, _)| *name);
         eprintln!(
-            "[browser-oxide-fetch] response status={} url={} body_len={} body={}",
+            "[browser-oxide-fetch] response status={} url={} body_len={} headers={:?} body={}",
             resp.status,
             resp.url,
             body_text.len(),
+            response_headers,
             body_text.chars().take(1200).collect::<String>()
         );
     }

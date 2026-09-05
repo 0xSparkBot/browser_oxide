@@ -490,6 +490,25 @@ async fn nav_storage() {
     assert_eq!(check_secure("typeof navigator.storage").await, "object");
 }
 #[tokio::test]
+async fn nav_storage_exposes_origin_private_file_system() {
+    assert_eq!(
+        check_secure(
+            r#"JSON.stringify({
+                getDirectory: typeof navigator.storage.getDirectory,
+                handleTag: FileSystemHandle.prototype[Symbol.toStringTag],
+                directoryTag: FileSystemDirectoryHandle.prototype[Symbol.toStringTag],
+                fileTag: FileSystemFileHandle.prototype[Symbol.toStringTag],
+                rootMethods: ['getDirectoryHandle','getFileHandle','removeEntry','resolve','entries','keys','values']
+                    .every(name => typeof FileSystemDirectoryHandle.prototype[name] === 'function'),
+                fileMethods: ['createWritable','getFile','move']
+                    .every(name => typeof FileSystemFileHandle.prototype[name] === 'function'),
+            })"#,
+        )
+        .await,
+        r#"{"getDirectory":"function","handleTag":"FileSystemHandle","directoryTag":"FileSystemDirectoryHandle","fileTag":"FileSystemFileHandle","rootMethods":true,"fileMethods":true}"#
+    );
+}
+#[tokio::test]
 async fn nav_service_worker() {
     assert_eq!(
         check_secure("typeof navigator.serviceWorker").await,
@@ -1272,6 +1291,24 @@ async fn cls_resize_observer() {
 #[tokio::test]
 async fn cls_xml_http_request() {
     assert_eq!(check("typeof XMLHttpRequest").await, "function");
+}
+#[tokio::test]
+async fn xhr_dispatches_onreadystatechange_once_per_transition() {
+    assert_eq!(
+        check(
+            "(() => { \
+              const xhr = new XMLHttpRequest(); \
+              let propertyCalls = 0; \
+              let listenerCalls = 0; \
+              xhr.onreadystatechange = () => propertyCalls++; \
+              xhr.addEventListener('readystatechange', () => listenerCalls++); \
+              xhr.open('GET', 'https://example.com/', true); \
+              return JSON.stringify([propertyCalls, listenerCalls, xhr.readyState]); \
+             })()"
+        )
+        .await,
+        "[1,1,1]"
+    );
 }
 #[tokio::test]
 async fn cls_websocket() {
@@ -3745,14 +3782,12 @@ async fn biquad_get_frequency_response_writes_n_values() {
 }
 
 // ================================================================
-// performance.now() humanized jitter
+// performance.now() resolution
 // ----------------------------------------------------------------
-// Real Chrome shows ~10–30 µs jitter around the 100 µs grid step. A
-// pure quantizer (set(diffs).size === 1) is detectable. We verify:
+// Chrome 148 uses a 100 µs grid in a non-cross-origin-isolated page. We verify:
 //   - Returns finite number
-//   - Is monotonic across calls (the underlying clock floor + non-negative
-//     jitter ensures this for any practical inter-call spacing)
-//   - Hot loop produces multiple distinct values (jitter is real)
+//   - Is monotonic across calls
+//   - Positive hot-loop deltas stay on the 0.1 ms grid
 // ================================================================
 
 #[tokio::test]
@@ -3779,14 +3814,31 @@ async fn perf_now_is_finite_non_negative() {
 
 #[tokio::test]
 async fn perf_now_hot_loop_produces_distinct_values() {
-    // 500 hot calls; expect more than 10 distinct values (real Chrome shows
-    // dozens-to-hundreds; pure quantizer shows ~1).
+    // Crossing multiple 100 µs buckets confirms the clock is advancing.
     assert_eq!(
         check(
             "(() => { \
               const xs = []; \
-              for (let i = 0; i < 500; i++) xs.push(performance.now()); \
+              for (let i = 0; i < 5000; i++) xs.push(performance.now()); \
               return new Set(xs).size > 10; \
+             })()"
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn perf_now_hot_loop_has_chrome_resolution() {
+    assert_eq!(
+        check(
+            "(() => { \
+              const xs = []; \
+              for (let i = 0; i < 5000; i++) xs.push(performance.now()); \
+              const positive = xs.slice(1).map((x, i) => x - xs[i]).filter(x => x > 0); \
+              if (!positive.length) return false; \
+              const min = Math.min(...positive); \
+              return min >= 0.099 && positive.every(x => Math.abs(x * 10 - Math.round(x * 10)) < 1e-6); \
              })()"
         )
         .await,

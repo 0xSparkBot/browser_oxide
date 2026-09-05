@@ -728,7 +728,10 @@
     _workerStub('DecompressionStream');
     _workerStub('EventSource', ['close']);
     _workerStub('FileReaderSync', ['readAsArrayBuffer', 'readAsBinaryString', 'readAsDataURL', 'readAsText']);
-    _workerStub('FileSystemSyncAccessHandle', ['close', 'flush', 'getSize', 'read', 'truncate', 'write']);
+    const FileSystemSyncAccessHandle = _workerStub(
+        'FileSystemSyncAccessHandle',
+        ['close', 'flush', 'getSize', 'read', 'truncate', 'write']
+    );
     _workerStub('PerformanceEntry', ['toJSON']);
     const PerformanceObserver = _workerStub('PerformanceObserver', ['disconnect', 'observe', 'takeRecords']);
     if (!Object.prototype.hasOwnProperty.call(PerformanceObserver, 'supportedEntryTypes')) {
@@ -741,12 +744,202 @@
     _workerStub('RTCRtpScriptTransformer', ['generateKeyFrame', 'sendKeyFrameRequest']);
     _workerStub('RTCTransformEvent');
     _workerStub('ReportingObserver', ['disconnect', 'observe', 'takeRecords']);
+    // Origin-private file system (OPFS). Turnstile runs a synchronous-access
+    // timing probe in a dedicated worker:
+    // navigator.storage.getDirectory() -> getFileHandle() ->
+    // createSyncAccessHandle() -> write()/flush()/close(). Returning a plain
+    // object from getDirectory() leaves that promise chain stuck before its
+    // worker can answer, which in turn prevents the next challenge POST.
+    const FileSystemHandle = globalThis.FileSystemHandle;
+    const FileSystemDirectoryHandle = globalThis.FileSystemDirectoryHandle;
+    const FileSystemFileHandle = globalThis.FileSystemFileHandle;
+    const _opfsHandleState = new WeakMap();
+    const _opfsAccessState = new WeakMap();
+
+    const _opfsDefineMethod = (prototype, name, implementation) => {
+        Object.defineProperty(prototype, name, {
+            value: implementation,
+            configurable: true,
+            enumerable: true,
+            writable: true,
+        });
+        if (typeof _maskFunction === 'function') _maskFunction(implementation, name);
+    };
+    const _opfsDefineGetter = (prototype, name, getter) => {
+        Object.defineProperty(prototype, name, {
+            get: getter,
+            configurable: true,
+            enumerable: true,
+        });
+        if (typeof _maskFunction === 'function') _maskFunction(getter, 'get ' + name);
+    };
+    const _opfsDirectory = (name = '') => {
+        const handle = Object.create(FileSystemDirectoryHandle.prototype);
+        _opfsHandleState.set(handle, { kind: 'directory', name, entries: new Map() });
+        return handle;
+    };
+    const _opfsFile = (name) => {
+        const handle = Object.create(FileSystemFileHandle.prototype);
+        _opfsHandleState.set(handle, { kind: 'file', name, bytes: new Uint8Array(0) });
+        return handle;
+    };
+
+    Object.setPrototypeOf(FileSystemDirectoryHandle.prototype, FileSystemHandle.prototype);
+    Object.setPrototypeOf(FileSystemFileHandle.prototype, FileSystemHandle.prototype);
+    _opfsDefineGetter(FileSystemHandle.prototype, 'kind', function kind() {
+        return _opfsHandleState.get(this)?.kind || '';
+    });
+    _opfsDefineGetter(FileSystemHandle.prototype, 'name', function name() {
+        return _opfsHandleState.get(this)?.name || '';
+    });
+    _opfsDefineMethod(FileSystemHandle.prototype, 'isSameEntry', function isSameEntry(other) {
+        return Promise.resolve(this === other);
+    });
+    _opfsDefineMethod(FileSystemHandle.prototype, 'queryPermission', function queryPermission() {
+        return Promise.resolve('granted');
+    });
+    _opfsDefineMethod(FileSystemHandle.prototype, 'remove', function remove() {
+        return Promise.resolve();
+    });
+    _opfsDefineMethod(FileSystemHandle.prototype, 'requestPermission', function requestPermission() {
+        return Promise.resolve('granted');
+    });
+    _opfsDefineMethod(FileSystemDirectoryHandle.prototype, 'getDirectoryHandle', function getDirectoryHandle(name, options = {}) {
+        const state = _opfsHandleState.get(this);
+        const key = String(name);
+        let handle = state?.entries.get(key);
+        if (!handle && options.create) {
+            handle = _opfsDirectory(key);
+            state.entries.set(key, handle);
+        }
+        return handle
+            ? Promise.resolve(handle)
+            : Promise.reject(new DOMException('A requested file or directory could not be found', 'NotFoundError'));
+    });
+    _opfsDefineMethod(FileSystemDirectoryHandle.prototype, 'getFileHandle', function getFileHandle(name, options = {}) {
+        const state = _opfsHandleState.get(this);
+        const key = String(name);
+        let handle = state?.entries.get(key);
+        if (!handle && options.create) {
+            handle = _opfsFile(key);
+            state.entries.set(key, handle);
+        }
+        return handle
+            ? Promise.resolve(handle)
+            : Promise.reject(new DOMException('A requested file or directory could not be found', 'NotFoundError'));
+    });
+    _opfsDefineMethod(FileSystemDirectoryHandle.prototype, 'removeEntry', function removeEntry(name) {
+        _opfsHandleState.get(this)?.entries.delete(String(name));
+        return Promise.resolve();
+    });
+    _opfsDefineMethod(FileSystemDirectoryHandle.prototype, 'resolve', function resolve(handle) {
+        const state = _opfsHandleState.get(this);
+        for (const [name, candidate] of state?.entries || []) {
+            if (candidate === handle) return Promise.resolve([name]);
+        }
+        return Promise.resolve(null);
+    });
+    const _opfsIterator = (kind) => async function* iterator() {
+        const entries = _opfsHandleState.get(this)?.entries || new Map();
+        if (kind === 'keys') yield* entries.keys();
+        else if (kind === 'values') yield* entries.values();
+        else yield* entries.entries();
+    };
+    _opfsDefineMethod(FileSystemDirectoryHandle.prototype, 'entries', _opfsIterator('entries'));
+    _opfsDefineMethod(FileSystemDirectoryHandle.prototype, 'keys', _opfsIterator('keys'));
+    _opfsDefineMethod(FileSystemDirectoryHandle.prototype, 'values', _opfsIterator('values'));
+    Object.defineProperty(FileSystemDirectoryHandle.prototype, Symbol.asyncIterator, {
+        value: FileSystemDirectoryHandle.prototype.entries,
+        configurable: true,
+        writable: true,
+    });
+
+    _opfsDefineMethod(FileSystemFileHandle.prototype, 'getFile', function getFile() {
+        const state = _opfsHandleState.get(this);
+        return Promise.resolve(new File([state?.bytes || new Uint8Array(0)], state?.name || ''));
+    });
+    _opfsDefineMethod(FileSystemFileHandle.prototype, 'createWritable', function createWritable() {
+        return Promise.resolve(Object.create(globalThis.FileSystemWritableFileStream.prototype));
+    });
+    _opfsDefineMethod(FileSystemFileHandle.prototype, 'move', function move(name) {
+        const state = _opfsHandleState.get(this);
+        if (state) state.name = String(name);
+        return Promise.resolve();
+    });
+    _opfsDefineMethod(FileSystemFileHandle.prototype, 'createSyncAccessHandle', function createSyncAccessHandle() {
+        const access = Object.create(FileSystemSyncAccessHandle.prototype);
+        _opfsAccessState.set(access, { file: _opfsHandleState.get(this), closed: false, mode: 'readwrite' });
+        return Promise.resolve(access);
+    });
+    _opfsDefineMethod(FileSystemSyncAccessHandle.prototype, 'close', function close() {
+        const state = _opfsAccessState.get(this);
+        if (state) state.closed = true;
+    });
+    _opfsDefineMethod(FileSystemSyncAccessHandle.prototype, 'flush', function flush() {
+        const state = _opfsAccessState.get(this);
+        if (!state || state.closed) {
+            throw new DOMException('The access handle is closed', 'InvalidStateError');
+        }
+        // A real synchronous OPFS flush blocks on storage. Chrome 148 on the
+        // macOS profile reports roughly 4.6 ms for Turnstile's one-byte probe;
+        // an instantaneous no-op is a strong automation fingerprint.
+        const started = performance.now();
+        while (performance.now() - started < 4.5) {}
+    });
+    _opfsDefineMethod(FileSystemSyncAccessHandle.prototype, 'getSize', function getSize() {
+        return _opfsAccessState.get(this)?.file?.bytes.length || 0;
+    });
+    _opfsDefineMethod(FileSystemSyncAccessHandle.prototype, 'read', function read(buffer, options = {}) {
+        const state = _opfsAccessState.get(this);
+        const target = ArrayBuffer.isView(buffer)
+            ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+            : new Uint8Array(buffer);
+        const at = Math.max(0, Number(options.at) || 0);
+        const source = state?.file?.bytes || new Uint8Array(0);
+        const length = Math.min(target.length, Math.max(0, source.length - at));
+        target.set(source.subarray(at, at + length));
+        return length;
+    });
+    _opfsDefineMethod(FileSystemSyncAccessHandle.prototype, 'truncate', function truncate(size) {
+        const state = _opfsAccessState.get(this);
+        if (!state?.file) return;
+        const length = Math.max(0, Number(size) || 0);
+        const bytes = new Uint8Array(length);
+        bytes.set(state.file.bytes.subarray(0, length));
+        state.file.bytes = bytes;
+    });
+    _opfsDefineMethod(FileSystemSyncAccessHandle.prototype, 'write', function write(buffer, options = {}) {
+        const state = _opfsAccessState.get(this);
+        if (!state?.file) return 0;
+        const source = ArrayBuffer.isView(buffer)
+            ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+            : new Uint8Array(buffer);
+        const at = Math.max(0, Number(options.at) || 0);
+        const length = Math.max(state.file.bytes.length, at + source.length);
+        const bytes = new Uint8Array(length);
+        bytes.set(state.file.bytes);
+        bytes.set(source, at);
+        state.file.bytes = bytes;
+        return source.length;
+    });
+    _opfsDefineGetter(FileSystemSyncAccessHandle.prototype, 'mode', function mode() {
+        return _opfsAccessState.get(this)?.mode || 'readwrite';
+    });
+
+    const _opfsRoot = _opfsDirectory('');
     const StorageManager = _workerStub('StorageManager', ['estimate', 'getDirectory', 'persisted']);
+    // WorkerNavigator is assembled before worker-only interfaces are
+    // installed. Upgrade its eagerly-created storage singleton now that the
+    // real StorageManager prototype exists.
+    Object.setPrototypeOf(globalThis.navigator.storage, StorageManager.prototype);
     StorageManager.prototype.estimate = function estimate() {
         return Promise.resolve({ quota: 10 * 1024 * 1024 * 1024, usage: 0, usageDetails: {} });
     };
     StorageManager.prototype.persisted = function persisted() { return Promise.resolve(false); };
-    StorageManager.prototype.getDirectory = function getDirectory() { return Promise.resolve({}); };
+    StorageManager.prototype.getDirectory = function getDirectory() { return Promise.resolve(_opfsRoot); };
+    if (typeof _maskAsNative === 'function') {
+        _maskAsNative(StorageManager.prototype, 'estimate', 'getDirectory', 'persisted');
+    }
 
     if (typeof globalThis.BroadcastChannel !== 'function') {
         const _broadcasts = new Map();

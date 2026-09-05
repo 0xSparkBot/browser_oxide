@@ -1,4 +1,14 @@
 ((globalThis) => {
+    const _eventDiagNote = (() => {
+        if (globalThis.__browser_oxide_debug !== true
+            && globalThis.__oxideDiagnostics !== true) return null;
+        try {
+            const note = Deno.core.ops.op_worker_diag_note;
+            return typeof note === 'function' ? note : null;
+        } catch (_) {
+            return null;
+        }
+    })();
     // ---- Trusted-event authenticity (v0.1.0 behavioral E1) ----------------
     // `isTrusted` MUST be both unforgeable and shaped like a real browser's:
     //   * an own, enumerable, non-configurable GETTER on every Event instance.
@@ -633,6 +643,12 @@
                 try {
                     handler.call(target, event);
                 } catch (e) {
+                    try {
+                        _eventDiagNote && _eventDiagNote(
+                            "event-handler-error " + event.type + " "
+                            + String((e && e.stack) || e).slice(0, 1000)
+                        );
+                    } catch (_) {}
                     console.error(e);
                 }
             }

@@ -873,6 +873,120 @@
     StorageManager.prototype.persisted = ({ persisted() { return Promise.resolve(false); } }).persisted;
     _maskFunction(StorageManager.prototype.persisted, 'persisted');
 
+    // Minimal origin-private file system. Chrome exposes getDirectory() on
+    // Window's StorageManager even though synchronous access handles remain
+    // worker-only. Keep real FileSystemHandle-shaped objects here so feature
+    // probes do not branch away from the Chrome path before starting a worker.
+    const _opfsWindowState = new WeakMap();
+    const _opfsWindowDefine = (prototype, name, value) => {
+        Object.defineProperty(prototype, name, {
+            value, configurable: true, enumerable: true, writable: true,
+        });
+        _maskFunction(value, name);
+    };
+    const _opfsWindowGetter = (prototype, name, getter) => {
+        Object.defineProperty(prototype, name, {
+            get: getter, configurable: true, enumerable: true,
+        });
+        _maskFunction(getter, 'get ' + name);
+    };
+    const _FileSystemHandle = globalThis.FileSystemHandle;
+    const _FileSystemDirectoryHandle = globalThis.FileSystemDirectoryHandle;
+    const _FileSystemFileHandle = globalThis.FileSystemFileHandle;
+    Object.setPrototypeOf(_FileSystemDirectoryHandle.prototype, _FileSystemHandle.prototype);
+    Object.setPrototypeOf(_FileSystemFileHandle.prototype, _FileSystemHandle.prototype);
+    const _opfsWindowDirectory = (name = '') => {
+        const handle = Object.create(_FileSystemDirectoryHandle.prototype);
+        _opfsWindowState.set(handle, { kind: 'directory', name, entries: new Map() });
+        return handle;
+    };
+    const _opfsWindowFile = (name) => {
+        const handle = Object.create(_FileSystemFileHandle.prototype);
+        _opfsWindowState.set(handle, { kind: 'file', name, bytes: new Uint8Array(0) });
+        return handle;
+    };
+    _opfsWindowGetter(_FileSystemHandle.prototype, 'kind', function kind() {
+        return _opfsWindowState.get(this)?.kind || '';
+    });
+    _opfsWindowGetter(_FileSystemHandle.prototype, 'name', function name() {
+        return _opfsWindowState.get(this)?.name || '';
+    });
+    _opfsWindowDefine(_FileSystemHandle.prototype, 'isSameEntry', function isSameEntry(other) {
+        return Promise.resolve(this === other);
+    });
+    _opfsWindowDefine(_FileSystemHandle.prototype, 'queryPermission', function queryPermission() {
+        return Promise.resolve('granted');
+    });
+    _opfsWindowDefine(_FileSystemHandle.prototype, 'remove', function remove() { return Promise.resolve(); });
+    _opfsWindowDefine(_FileSystemHandle.prototype, 'requestPermission', function requestPermission() {
+        return Promise.resolve('granted');
+    });
+    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'getDirectoryHandle', function getDirectoryHandle(name, options = {}) {
+        const state = _opfsWindowState.get(this);
+        const key = String(name);
+        let handle = state?.entries.get(key);
+        if (!handle && options.create) {
+            handle = _opfsWindowDirectory(key);
+            state.entries.set(key, handle);
+        }
+        return handle
+            ? Promise.resolve(handle)
+            : Promise.reject(new DOMException('A requested file or directory could not be found', 'NotFoundError'));
+    });
+    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'getFileHandle', function getFileHandle(name, options = {}) {
+        const state = _opfsWindowState.get(this);
+        const key = String(name);
+        let handle = state?.entries.get(key);
+        if (!handle && options.create) {
+            handle = _opfsWindowFile(key);
+            state.entries.set(key, handle);
+        }
+        return handle
+            ? Promise.resolve(handle)
+            : Promise.reject(new DOMException('A requested file or directory could not be found', 'NotFoundError'));
+    });
+    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'removeEntry', function removeEntry(name) {
+        _opfsWindowState.get(this)?.entries.delete(String(name));
+        return Promise.resolve();
+    });
+    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'resolve', function resolve(handle) {
+        for (const [name, candidate] of _opfsWindowState.get(this)?.entries || []) {
+            if (candidate === handle) return Promise.resolve([name]);
+        }
+        return Promise.resolve(null);
+    });
+    const _opfsWindowIterator = (kind) => async function* iterator() {
+        const entries = _opfsWindowState.get(this)?.entries || new Map();
+        if (kind === 'keys') yield* entries.keys();
+        else if (kind === 'values') yield* entries.values();
+        else yield* entries.entries();
+    };
+    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'entries', _opfsWindowIterator('entries'));
+    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'keys', _opfsWindowIterator('keys'));
+    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'values', _opfsWindowIterator('values'));
+    Object.defineProperty(_FileSystemDirectoryHandle.prototype, Symbol.asyncIterator, {
+        value: _FileSystemDirectoryHandle.prototype.entries,
+        configurable: true,
+        writable: true,
+    });
+    _opfsWindowDefine(_FileSystemFileHandle.prototype, 'getFile', function getFile() {
+        const state = _opfsWindowState.get(this);
+        return Promise.resolve(new File([state?.bytes || new Uint8Array(0)], state?.name || ''));
+    });
+    _opfsWindowDefine(_FileSystemFileHandle.prototype, 'createWritable', function createWritable() {
+        return Promise.resolve(Object.create(FileSystemWritableFileStream.prototype));
+    });
+    _opfsWindowDefine(_FileSystemFileHandle.prototype, 'move', function move(name) {
+        const state = _opfsWindowState.get(this);
+        if (state) state.name = String(name);
+        return Promise.resolve();
+    });
+    const _opfsWindowRoot = _opfsWindowDirectory('');
+    StorageManager.prototype.getDirectory = ({
+        getDirectory() { return Promise.resolve(_opfsWindowRoot); }
+    }).getDirectory;
+    _maskFunction(StorageManager.prototype.getDirectory, 'getDirectory');
+
     globalThis.StorageManager = StorageManager;
     const _navStorage = Object.create(StorageManager.prototype);
 
@@ -4353,7 +4467,6 @@
             try {
                 const ev = new Event("readystatechange");
                 if (typeof this.dispatchEvent === 'function') this.dispatchEvent(ev);
-                if (this.onreadystatechange) this.onreadystatechange.call(this, ev);
             } catch {}
         }
         setRequestHeader(name, value) {
@@ -4368,8 +4481,6 @@
                 try {
                     const ev = new Event(type);
                     if (typeof xhr.dispatchEvent === 'function') xhr.dispatchEvent(ev);
-                    const handler = xhr['on' + type];
-                    if (typeof handler === 'function') handler.call(xhr, ev);
                 } catch {}
             };
 
@@ -4519,7 +4630,6 @@
             try {
                 const ev = new Event("abort");
                 if (typeof this.dispatchEvent === 'function') this.dispatchEvent(ev);
-                if (this.onabort) this.onabort.call(this, ev);
             } catch {}
         }
         getResponseHeader(name) {

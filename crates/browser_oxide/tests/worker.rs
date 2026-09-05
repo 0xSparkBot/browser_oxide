@@ -268,6 +268,101 @@ fn worker_message_channel_and_cache_storage_are_functional() {
     assert_eq!(v["cacheMatch"], serde_json::Value::Null, "{out}");
 }
 
+/// Chrome's origin-private file-system surface is available in secure
+/// dedicated workers. Managed Turnstile uses this exact chain as a timing
+/// probe and waits for the worker reply before submitting its next `/fo`.
+#[test]
+fn worker_origin_private_file_system_sync_access_round_trip() {
+    let code = r#"
+        const src = `
+            self.onmessage = async function() {
+              try {
+                const root = await navigator.storage.getDirectory();
+                const file = await root.getFileHandle('turnstile-probe', { create: true });
+                const access = await file.createSyncAccessHandle();
+                const bytes = new Uint8Array([7, 8, 9]);
+                const wrote = access.write(bytes, { at: 0 });
+                access.flush();
+                const read = new Uint8Array(3);
+                const readCount = access.read(read, { at: 0 });
+                const result = {
+                    getDirectoryType: typeof navigator.storage.getDirectory,
+                    rootTag: Object.prototype.toString.call(root),
+                    fileTag: Object.prototype.toString.call(file),
+                    accessTag: Object.prototype.toString.call(access),
+                    createSyncAccessHandleType: typeof file.createSyncAccessHandle,
+                    wrote,
+                    readCount,
+                    read: Array.from(read),
+                    size: access.getSize(),
+                    mode: access.mode,
+                    flush: access.flush(),
+                    close: access.close(),
+                };
+                self.postMessage(JSON.stringify(result));
+              } catch (error) {
+                self.postMessage(JSON.stringify({ error: String(error && error.stack || error) }));
+              }
+            };
+        `;
+        const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        const worker = new Worker(url);
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+        setTimeout(() => worker.postMessage('go'), 20);
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; raw={out}"));
+    assert_eq!(v["error"], serde_json::Value::Null, "{out}");
+    assert_eq!(v["getDirectoryType"], "function", "{out}");
+    assert_eq!(v["rootTag"], "[object FileSystemDirectoryHandle]", "{out}");
+    assert_eq!(v["fileTag"], "[object FileSystemFileHandle]", "{out}");
+    assert_eq!(
+        v["accessTag"], "[object FileSystemSyncAccessHandle]",
+        "{out}"
+    );
+    assert_eq!(v["createSyncAccessHandleType"], "function", "{out}");
+    assert_eq!(v["wrote"], 3, "{out}");
+    assert_eq!(v["readCount"], 3, "{out}");
+    assert_eq!(v["read"], serde_json::json!([7, 8, 9]), "{out}");
+    assert_eq!(v["size"], 3, "{out}");
+    assert_eq!(v["mode"], "readwrite", "{out}");
+}
+
+#[test]
+fn worker_origin_private_file_system_flush_has_storage_latency() {
+    let code = r#"
+        const src = `
+            self.onmessage = async function() {
+                const root = await navigator.storage.getDirectory();
+                const file = await root.getFileHandle('flush-latency', { create: true });
+                const handle = await file.createSyncAccessHandle();
+                const started = performance.now();
+                handle.flush();
+                const elapsed = performance.now() - started;
+                handle.close();
+                self.postMessage(String(elapsed));
+            };
+        `;
+        const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        const worker = new Worker(url);
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+        setTimeout(() => worker.postMessage('go'), 20);
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let elapsed: f64 = out
+        .parse()
+        .unwrap_or_else(|e| panic!("invalid latency: {e}; raw={out}"));
+    assert!(elapsed >= 4.4, "flush latency was {elapsed}ms");
+    assert!(elapsed < 20.0, "flush latency was {elapsed}ms");
+}
+
 /// Chrome exposes a deliberately smaller namespace inside a dedicated worker
 /// than on Window. Loading the shared interface bootstrap without a final
 /// worker-specific normalization leaks hundreds of DOM/HTML constructors and
