@@ -186,7 +186,12 @@
         }
     };
 
-    globalThis.clearInterval = globalThis.clearTimeout;
+    // Keep a distinct function object. Chromium exposes clearTimeout and
+    // clearInterval as separate natives; aliasing them causes masking one name
+    // to overwrite the other's Function#toString identity.
+    globalThis.clearInterval = function clearInterval(id) {
+        return globalThis.clearTimeout(id);
+    };
 
     let _rafId = 0;
     const _rafCallbacks = new Map();

@@ -346,9 +346,22 @@
             const loc = globalThis.location;
             if (loc && loc.origin && loc.origin !== "null") {
                 headers["x-browser-oxide-origin"] = loc.origin;
+                if (!headers["referer"]) {
+                    let targetOrigin = "";
+                    try { targetOrigin = new URL(url).origin; } catch (_) {}
+                    // Chromium's default strict-origin-when-cross-origin
+                    // policy sends the full document URL for same-origin
+                    // fetch/XHR/image requests and only the origin otherwise.
+                    headers["referer"] = targetOrigin === loc.origin
+                        ? String(loc.href || loc.origin).replace(/#.*$/, "")
+                        : loc.origin.replace(/\/$/, "") + "/";
+                }
             } else if (loc && loc.href && loc.href !== "about:blank") {
                 const u = new URL(loc.href);
                 headers["x-browser-oxide-origin"] = u.origin;
+                if (!headers["referer"]) {
+                    headers["referer"] = u.href.replace(/#.*$/, "");
+                }
             }
         } catch {}
 
@@ -364,7 +377,12 @@
 
             const entries = browser_oxide && browser_oxide.__perfResourceEntries;
             if (entries) {
-                entries.push({ url, type: "fetch", startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 });
+                const entry = { url, type: "fetch", startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 };
+                entries.push(entry);
+                try {
+                    const notify = globalThis[Symbol.for('__browser_oxide_performance_resource__')];
+                    if (typeof notify === 'function') notify(entry);
+                } catch (_) {}
             }
 
             // Sync cookies from the net jar into document.cookie so subsequent JS
@@ -372,6 +390,7 @@
             // values that arrived via this response.
             await _syncCookiesFromNet(url);
             return new Response(result.body, {
+                _rawBytes: result.body_bytes ? new Uint8Array(result.body_bytes) : null,
                 status: result.status,
                 statusText: result.status_text,
                 headers: result.headers,

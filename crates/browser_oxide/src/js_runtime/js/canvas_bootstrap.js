@@ -1,5 +1,123 @@
 ((globalThis) => {
     const ops = Deno.core.ops;
+    const _getImageBytes = globalThis.__bo_get_image_bytes;
+    try { delete globalThis.__bo_get_image_bytes; } catch (_) {}
+    const _decodedImageIds = new WeakMap();
+    const _imageBitmapState = new WeakMap();
+
+    const _debugCanvas = (entry) => {
+        if (!globalThis.__browser_oxide_debug) return;
+        try {
+            const log = globalThis.__oxCanvasDiag || (globalThis.__oxCanvasDiag = []);
+            if (log.length < 48) log.push(entry);
+        } catch (_) {}
+    };
+
+    const _decodeBytes = (bytes) => {
+        if (!bytes || bytes.length === 0) return -1;
+        const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        let binary = '';
+        const chunkSize = 0x8000;
+        for (let offset = 0; offset < view.length; offset += chunkSize) {
+            binary += String.fromCharCode(...view.subarray(offset, offset + chunkSize));
+        }
+        return ops.op_image_decode_base64(btoa(binary));
+    };
+
+    const _decodeImageSource = (source) => {
+        if (!source || typeof source !== 'object' || typeof _getImageBytes !== 'function') return -1;
+        const cached = _decodedImageIds.get(source);
+        if (cached !== undefined) return cached;
+        const bytes = _getImageBytes(source);
+        if (!bytes || bytes.length === 0) return -1;
+        const imageId = _decodeBytes(bytes);
+        if (imageId >= 0) _decodedImageIds.set(source, imageId);
+        return imageId;
+    };
+
+    // Replace the early shared-API placeholders with a functional
+    // ImageBitmap implementation. Cloudflare creates an ImageBitmap from
+    // its `/ci/` image, then reads the result back through a canvas; a zero
+    // sized placeholder turns that pixel challenge into a 0x0 sample.
+    function ImageBitmap() {
+        throw new TypeError("Failed to construct 'ImageBitmap': Illegal constructor");
+    }
+    delete ImageBitmap.prototype.constructor;
+    Object.defineProperty(ImageBitmap.prototype, 'width', {
+        get() { return (_imageBitmapState.get(this) || {}).width || 0; },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(ImageBitmap.prototype, 'height', {
+        get() { return (_imageBitmapState.get(this) || {}).height || 0; },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(ImageBitmap.prototype, 'close', {
+        value: function close() { _imageBitmapState.delete(this); },
+        writable: true, enumerable: true, configurable: true,
+    });
+    Object.defineProperty(ImageBitmap.prototype, 'constructor', {
+        value: ImageBitmap, writable: true, configurable: true,
+    });
+    Object.defineProperty(ImageBitmap.prototype, Symbol.toStringTag, {
+        value: 'ImageBitmap', configurable: true,
+    });
+    const _makeImageBitmap = (state) => {
+        const bitmap = Object.create(ImageBitmap.prototype);
+        _imageBitmapState.set(bitmap, state);
+        return bitmap;
+    };
+    globalThis.ImageBitmap = ImageBitmap;
+    globalThis.createImageBitmap = function createImageBitmap(image) {
+        const finish = () => {
+            if (image && image._canvasId !== undefined) {
+                return _makeImageBitmap({
+                    canvasId: image._canvasId,
+                    width: Number(image.width) || 0,
+                    height: Number(image.height) || 0,
+                });
+            }
+            if (image instanceof ImageData) {
+                const canvasId = ops.op_canvas_create(
+                    image.width, image.height, _getOsName(), _getCanvasSeed()
+                );
+                ops.op_canvas_put_image_data(
+                    canvasId, image.data, 0, 0, image.width, image.height
+                );
+                return _makeImageBitmap({
+                    canvasId, width: image.width, height: image.height,
+                });
+            }
+            const bytes = (typeof _getImageBytes === 'function' && _getImageBytes(image))
+                || (image && image._data)
+                || null;
+            const imageId = _decodeBytes(bytes);
+            if (imageId < 0) {
+                throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
+            }
+            const dimensions = ops.op_image_get_dimensions(imageId);
+            return _makeImageBitmap({
+                imageId,
+                width: Number(image && image.naturalWidth) || Number(dimensions[0]) || 0,
+                height: Number(image && image.naturalHeight) || Number(dimensions[1]) || 0,
+            });
+        };
+        if (image && image.complete === false && typeof image.decode === 'function') {
+            return image.decode().then(finish);
+        }
+        try { return Promise.resolve(finish()); }
+        catch (error) { return Promise.reject(error); }
+    };
+    if (typeof _maskAsNative === 'function') {
+        _maskAsNative(ImageBitmap.prototype, 'width', 'height', 'close');
+        if (typeof _maskFunction === 'function') {
+            _maskFunction(ImageBitmap, 'ImageBitmap');
+            _maskFunction(globalThis.createImageBitmap, 'createImageBitmap');
+        }
+    } else if (typeof _maskFunction === 'function') {
+        _maskFunction(ImageBitmap, 'ImageBitmap');
+        _maskFunction(ImageBitmap.prototype.close, 'close');
+        _maskFunction(globalThis.createImageBitmap, 'createImageBitmap');
+    }
 
     // -- Canvas-based font detection support -----------------------------
     // Some scripts detect installed fonts
@@ -224,6 +342,7 @@
 
         // Image data — real pixel ops
         getImageData(x, y, w, h) {
+            _debugCanvas({ op: 'getImageData', x, y, w, h });
             const raw = ops.op_canvas_get_image_data(this.#id, x, y, w, h);
             return new ImageData(new Uint8ClampedArray(raw), w, h);
         }
@@ -232,9 +351,39 @@
         }
         createImageData(w, h) { return new ImageData(w, h); }
         drawImage(source, dx, dy) {
+            const bitmapState = source && _imageBitmapState.get(source);
+            if (bitmapState) {
+                if (bitmapState.canvasId !== undefined) {
+                    ops.op_canvas_draw_image(this.#id, bitmapState.canvasId, dx || 0, dy || 0);
+                } else if (bitmapState.imageId !== undefined) {
+                    ops.op_canvas_draw_decoded_image(
+                        this.#id, bitmapState.imageId, dx || 0, dy || 0
+                    );
+                }
+                _debugCanvas({
+                    op: 'drawImageBitmap', argc: arguments.length,
+                    dx: dx || 0, dy: dy || 0,
+                    width: bitmapState.width, height: bitmapState.height,
+                });
+                return;
+            }
             // source can be another canvas element — get its internal ID
             if (source && source._canvasId !== undefined) {
                 ops.op_canvas_draw_image(this.#id, source._canvasId, dx || 0, dy || 0);
+                return;
+            }
+            // HTMLImageElement pixels are retained privately by the DOM
+            // image loader. Decode once per element and composite them onto
+            // the backing canvas, matching the common 3-argument overload.
+            const imageId = _decodeImageSource(source);
+            _debugCanvas({
+                op: 'drawImage', argc: arguments.length,
+                imageId, dx: dx || 0, dy: dy || 0,
+                width: source && source.naturalWidth,
+                height: source && source.naturalHeight,
+            });
+            if (imageId >= 0) {
+                ops.op_canvas_draw_decoded_image(this.#id, imageId, dx || 0, dy || 0);
             }
         }
 
@@ -1165,7 +1314,6 @@
     globalThis.AudioContext = AudioContext;
     globalThis.OfflineAudioContext = OfflineAudioContext;
     globalThis.BaseAudioContext = BaseAudioContext;
-    globalThis.webkitAudioContext = AudioContext;
     // Symbol.toStringTag for audio contexts — some scripts probe these.
     try {
         Object.defineProperty(AudioContext.prototype, Symbol.toStringTag, {

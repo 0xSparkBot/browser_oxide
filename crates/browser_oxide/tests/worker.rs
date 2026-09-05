@@ -6,6 +6,10 @@ use browser_oxide::js_runtime::BrowserJsRuntime;
 use std::time::Duration;
 
 fn drive_runtime(code: &str, wait_ms: u64) -> String {
+    drive_runtime_with_secure_context(code, wait_ms, false)
+}
+
+fn drive_runtime_with_secure_context(code: &str, wait_ms: u64, secure: bool) -> String {
     let dom = browser_oxide::html_parser::parse_html(
         "<html><head></head><body><div id=\"out\"></div></body></html>",
     );
@@ -15,7 +19,13 @@ fn drive_runtime(code: &str, wait_ms: u64) -> String {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
-        let mut runtime = BrowserJsRuntime::new(dom);
+        let mut runtime = BrowserJsRuntime::with_options(
+            dom,
+            browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
+                is_secure_context: secure,
+                ..Default::default()
+            },
+        );
         runtime.execute_script(code, None).unwrap();
         // Drive the event loop with a bounded timeout, allowing setInterval
         // polling (Worker uses 5 ms poll) time to deliver the reply.
@@ -69,20 +79,69 @@ fn worker_addeventlistener_roundtrip() {
     let code = r#"
         const src = `
             self.addEventListener('message', function(e) {
-                self.postMessage({ type: 'reply', n: e.data.n + 1 });
+                self.postMessage({
+                    type: 'reply',
+                    n: e.data.n + 1,
+                    incomingIsMessageEvent: e instanceof MessageEvent,
+                    incomingIsTrusted: e.isTrusted,
+                    incomingOrigin: e.origin,
+                    incomingSourceIsNull: e.source === null,
+                    incomingTargetIsSelf: e.target === self,
+                });
             });
         `;
         const blob = new Blob([src], { type: 'text/javascript' });
         const url = URL.createObjectURL(blob);
         const w = new Worker(url);
         w.addEventListener('message', function(e) {
-            document.querySelector('#out').textContent = JSON.stringify(e.data);
+            document.querySelector('#out').textContent = JSON.stringify({
+                data: e.data,
+                isMessageEvent: e instanceof MessageEvent,
+                isTrusted: e.isTrusted,
+                targetIsWorker: e.target === w,
+                currentTargetIsWorker: e.currentTarget === w,
+                workerIsEventTarget: w instanceof EventTarget,
+                workerPrototypeChain:
+                    Object.getPrototypeOf(Worker.prototype) === EventTarget.prototype,
+                workerConstructorChain: Object.getPrototypeOf(Worker) === EventTarget,
+                workerOwnNames: Object.getOwnPropertyNames(w),
+                workerPrototypeNames: Object.getOwnPropertyNames(Worker.prototype),
+                workerTag: Object.prototype.toString.call(w),
+            });
             w.terminate();
         });
         setTimeout(() => w.postMessage({ n: 41 }), 20);
     "#;
     let out = drive_runtime(code, 2000);
-    assert_eq!(out, "{\"type\":\"reply\",\"n\":42}");
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; raw={out}"));
+    assert_eq!(v["data"]["type"], "reply", "{out}");
+    assert_eq!(v["data"]["n"], 42, "{out}");
+    assert_eq!(v["data"]["incomingIsMessageEvent"], true, "{out}");
+    assert_eq!(v["data"]["incomingIsTrusted"], true, "{out}");
+    assert_eq!(v["data"]["incomingOrigin"], "", "{out}");
+    assert_eq!(v["data"]["incomingSourceIsNull"], true, "{out}");
+    assert_eq!(v["data"]["incomingTargetIsSelf"], true, "{out}");
+    assert_eq!(v["isMessageEvent"], true, "{out}");
+    assert_eq!(v["isTrusted"], true, "{out}");
+    assert_eq!(v["targetIsWorker"], true, "{out}");
+    assert_eq!(v["currentTargetIsWorker"], true, "{out}");
+    assert_eq!(v["workerIsEventTarget"], true, "{out}");
+    assert_eq!(v["workerPrototypeChain"], true, "{out}");
+    assert_eq!(v["workerConstructorChain"], true, "{out}");
+    assert_eq!(v["workerOwnNames"], serde_json::json!([]), "{out}");
+    assert_eq!(
+        v["workerPrototypeNames"],
+        serde_json::json!([
+            "onmessage",
+            "postMessage",
+            "terminate",
+            "constructor",
+            "onerror"
+        ]),
+        "{out}"
+    );
+    assert_eq!(v["workerTag"], "[object Worker]", "{out}");
 }
 
 /// `self.location` must be populated from the URL the
@@ -141,4 +200,231 @@ fn worker_self_location_populated_from_construction_url() {
         v["origin"], "null",
         "blob: URL must report origin=\"null\": {out}"
     );
+}
+
+/// MessageChannel and CacheStorage are both exposed in a secure dedicated
+/// worker in Chrome. Turnstile-class challenge workers use MessageChannel as a
+/// task scheduler and also include both names in their worker-realm capability
+/// probe, so an absent implementation is observable even when no cache write
+/// is attempted.
+#[test]
+fn worker_message_channel_and_cache_storage_are_functional() {
+    let code = r#"
+        const src = `
+            self.onmessage = async function() {
+              try {
+                const channel = new MessageChannel();
+                const channelResult = new Promise((resolve) => {
+                    channel.port1.onmessage = (event) => resolve(event.data);
+                });
+                channel.port2.postMessage({ answer: 42 });
+
+                const cache = await caches.open('probe');
+                const result = {
+                    workerScopeType: typeof WorkerGlobalScope,
+                    dedicatedScopeType: typeof DedicatedWorkerGlobalScope,
+                    channelType: typeof MessageChannel,
+                    portType: typeof MessagePort,
+                    channelTag: Object.prototype.toString.call(channel),
+                    portTag: Object.prototype.toString.call(channel.port1),
+                    channelValue: (await channelResult).answer,
+                    cachesType: typeof caches,
+                    cacheStorageTag: Object.prototype.toString.call(caches),
+                    cacheTag: Object.prototype.toString.call(cache),
+                    cacheNames: (await caches.keys()).length,
+                    cacheMatch: await caches.match('/missing'),
+                };
+                channel.port1.close();
+                channel.port2.close();
+                self.postMessage(JSON.stringify(result));
+              } catch (error) {
+                self.postMessage(JSON.stringify({ error: String(error && error.stack || error) }));
+              }
+            };
+        `;
+        const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        const w = new Worker(url);
+        w.onmessage = function(e) {
+            document.querySelector('#out').textContent = e.data;
+            w.terminate();
+        };
+        setTimeout(() => w.postMessage('go'), 20);
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; raw={out}"));
+    assert_eq!(v["error"], serde_json::Value::Null, "{out}");
+    assert_eq!(v["workerScopeType"], "function", "{out}");
+    assert_eq!(v["dedicatedScopeType"], "function", "{out}");
+    assert_eq!(v["channelType"], "function", "{out}");
+    assert_eq!(v["portType"], "function", "{out}");
+    assert_eq!(v["channelTag"], "[object MessageChannel]", "{out}");
+    assert_eq!(v["portTag"], "[object MessagePort]", "{out}");
+    assert_eq!(v["channelValue"], 42, "{out}");
+    assert_eq!(v["cachesType"], "object", "{out}");
+    assert_eq!(v["cacheStorageTag"], "[object CacheStorage]", "{out}");
+    assert_eq!(v["cacheTag"], "[object Cache]", "{out}");
+    assert_eq!(v["cacheNames"], 0, "{out}");
+    assert_eq!(v["cacheMatch"], serde_json::Value::Null, "{out}");
+}
+
+/// Chrome exposes a deliberately smaller namespace inside a dedicated worker
+/// than on Window. Loading the shared interface bootstrap without a final
+/// worker-specific normalization leaks hundreds of DOM/HTML constructors and
+/// is a high-signal cross-realm fingerprint.
+#[test]
+fn chrome_148_worker_namespace_and_prototype_shape() {
+    let code = r#"
+        const src = `
+            const trustedPolicy = trustedTypes.createPolicy('worker-regression', {
+                createScript(source) { return source; }
+            });
+            const trustedScript = trustedPolicy.createScript('21 * 2');
+            const names = value => Object.getOwnPropertyNames(value).sort();
+            self.postMessage(JSON.stringify({
+                globalCount: names(globalThis).length,
+                enumerableNames: Object.keys(globalThis).sort(),
+                hasDocument: 'document' in globalThis,
+                hasHtmlElement: 'HTMLElement' in globalThis,
+                requiredTypes: Object.fromEntries([
+                    'BroadcastChannel', 'PerformanceObserver', 'StorageManager',
+                    'Worker', 'WorkerLocation', 'WorkerNavigator',
+                    'requestAnimationFrame', 'cancelAnimationFrame'
+                ].map(name => [name, typeof globalThis[name]])),
+                globalProto: names(Object.getPrototypeOf(globalThis)),
+                workerGlobalProto: names(WorkerGlobalScope.prototype),
+                dedicatedProto: names(DedicatedWorkerGlobalScope.prototype),
+                navigatorOwn: names(navigator),
+                navigatorProto: names(WorkerNavigator.prototype),
+                uaDataEnumerable: Object.keys(Object.getPrototypeOf(navigator.userAgentData)).sort(),
+                workerScopeSetters: ['origin', 'performance', 'scheduler'].every((name) => {
+                    const descriptor = Object.getOwnPropertyDescriptor(WorkerGlobalScope.prototype, name);
+                    return !!descriptor && typeof descriptor.set === 'function';
+                }),
+                eventTargetWhen: typeof EventTarget.prototype.when === 'function',
+                trustedTypes: {
+                    createPolicy: typeof trustedTypes.createPolicy,
+                    isScript: trustedTypes.isScript(trustedScript),
+                    directEval: eval(trustedScript),
+                },
+                tag: Object.prototype.toString.call(self),
+                scopeChecks: [
+                    self === globalThis,
+                    self instanceof WorkerGlobalScope,
+                    self instanceof DedicatedWorkerGlobalScope,
+                    Object.getPrototypeOf(self) === DedicatedWorkerGlobalScope.prototype,
+                    Object.getPrototypeOf(WorkerGlobalScope.prototype) === EventTarget.prototype
+                ]
+            }));
+        `;
+        const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        const w = new Worker(url);
+        w.onmessage = function(e) {
+            document.querySelector('#out').textContent = e.data;
+            w.terminate();
+        };
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; raw={out}"));
+    assert_eq!(v["globalCount"], 335, "{out}");
+    assert_eq!(
+        v["enumerableNames"],
+        serde_json::json!([
+            "cancelAnimationFrame",
+            "close",
+            "name",
+            "onmessage",
+            "onmessageerror",
+            "onrtctransform",
+            "postMessage",
+            "requestAnimationFrame",
+            "webkitRequestFileSystem",
+            "webkitRequestFileSystemSync",
+            "webkitResolveLocalFileSystemSyncURL",
+            "webkitResolveLocalFileSystemURL"
+        ]),
+        "{out}"
+    );
+    assert_eq!(v["hasDocument"], false, "{out}");
+    assert_eq!(v["hasHtmlElement"], false, "{out}");
+    assert_eq!(v["tag"], "[object DedicatedWorkerGlobalScope]", "{out}");
+    assert_eq!(
+        v["scopeChecks"],
+        serde_json::json!([true, true, true, true, true]),
+        "{out}"
+    );
+    assert_eq!(
+        v["globalProto"],
+        serde_json::json!(["PERSISTENT", "TEMPORARY", "constructor"]),
+        "{out}"
+    );
+    assert_eq!(
+        v["dedicatedProto"],
+        serde_json::json!(["PERSISTENT", "TEMPORARY", "constructor"]),
+        "{out}"
+    );
+    assert_eq!(v["navigatorOwn"], serde_json::json!([]), "{out}");
+    assert_eq!(
+        v["uaDataEnumerable"],
+        serde_json::json!([
+            "brands",
+            "getHighEntropyValues",
+            "mobile",
+            "platform",
+            "toJSON"
+        ]),
+        "{out}"
+    );
+    assert_eq!(v["workerScopeSetters"], true, "{out}");
+    assert_eq!(v["eventTargetWhen"], true, "{out}");
+    assert_eq!(v["trustedTypes"]["createPolicy"], "function", "{out}");
+    assert_eq!(v["trustedTypes"]["isScript"], true, "{out}");
+    assert_eq!(v["trustedTypes"]["directEval"], 42, "{out}");
+    assert_eq!(
+        v["navigatorProto"],
+        serde_json::json!([
+            "appCodeName",
+            "appName",
+            "appVersion",
+            "connection",
+            "constructor",
+            "deviceMemory",
+            "gpu",
+            "hardwareConcurrency",
+            "hid",
+            "language",
+            "languages",
+            "locks",
+            "mediaCapabilities",
+            "onLine",
+            "permissions",
+            "platform",
+            "product",
+            "serial",
+            "storage",
+            "storageBuckets",
+            "usb",
+            "userAgent",
+            "userAgentData"
+        ]),
+        "{out}"
+    );
+    assert_eq!(
+        v["workerGlobalProto"].as_array().map(Vec::len),
+        Some(30),
+        "{out}"
+    );
+    for name in [
+        "BroadcastChannel",
+        "PerformanceObserver",
+        "StorageManager",
+        "Worker",
+        "WorkerLocation",
+        "WorkerNavigator",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
+    ] {
+        assert_eq!(v["requiredTypes"][name], "function", "{name}: {out}");
+    }
 }

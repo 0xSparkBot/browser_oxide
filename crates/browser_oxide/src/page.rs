@@ -803,7 +803,8 @@ impl Page {
                 continue;
             }
             // W2.7 — Chrome parity: inline scripts report the document URL.
-            self.event_loop.note_executed_script(&self.url, &script.code);
+            self.event_loop
+                .note_executed_script(&self.url, &script.code);
             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
             self.event_loop.set_current_script(Some(script.node_id));
             if let Err(e) = self
@@ -887,14 +888,12 @@ impl Page {
                     // CSP gate — same enforcement point as the parallel
                     // pre-fetch path in `build_page_with_scripts_init_and_storage`.
                     if let Ok(parsed_url) = url::Url::parse(&full_url) {
-                        if let Err(violated) =
-                            crate::js_runtime::extensions::fetch_ext::check_csp(
-                                crate::net::csp::Directive::ScriptSrcElem,
-                                &parsed_url,
-                                script.nonce.as_deref(),
-                                true,
-                            )
-                        {
+                        if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_csp(
+                            crate::net::csp::Directive::ScriptSrcElem,
+                            &parsed_url,
+                            script.nonce.as_deref(),
+                            true,
+                        ) {
                             eprintln!(
                                 "[csp] Refused to load the script '{}' because it violates the following Content Security Policy directive: \"{}\".",
                                 full_url, violated
@@ -919,8 +918,7 @@ impl Page {
                     }
                 }
             } else if !script.code.is_empty() {
-                event_loop
-                    .note_executed_script(&format!("<inline>#{i}"), &script.code);
+                event_loop.note_executed_script(&format!("<inline>#{i}"), &script.code);
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
                 event_loop.set_current_script(Some(script.node_id));
                 if let Err(e) = event_loop.execute_script(&script.code) {
@@ -2689,9 +2687,9 @@ impl Page {
         self.event_loop.complete_document_lifecycle();
         // Top realm initial load settled (main navigation path).
         {
-            let _ = self.event_loop.execute_script(
-                "try{globalThis.__oxFrameReady=1}catch(_){}",
-            );
+            let _ = self
+                .event_loop
+                .execute_script("try{globalThis.__oxFrameReady=1}catch(_){}");
         }
 
         // Meta-refresh scanner — sets `__pendingNavigation` if the page
@@ -4623,7 +4621,9 @@ impl Page {
             || html.contains("sec-cpt-if")
             || crate::classify::is_managed_challenge_doc(html);
         if doc_is_challenge {
-            let _ = event_loop.execute_script("globalThis.__keepLongTimersRefed = true;");
+            let _ = event_loop.execute_script(
+                "Object.defineProperty(globalThis, '__keepLongTimersRefed', { value: true, writable: true, configurable: true, enumerable: false });",
+            );
         }
 
         // Execute scripts in document order using pre-fetched code.

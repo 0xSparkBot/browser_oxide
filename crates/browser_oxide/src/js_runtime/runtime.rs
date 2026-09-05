@@ -330,11 +330,18 @@ pub fn create_runtime_with_signals(
         runtime.op_state().borrow_mut().put(realm_store);
     }
 
+    // Op wrapping and eval-source capture are diagnostics, not browser APIs.
+    // Keep them opt-in: exposing `__oxOps` or proxying the Function constructor
+    // changes the page-observable global surface and is itself a fingerprint.
+    if std::env::var_os("BROWSER_OXIDE_DIAGNOSTICS").is_some() {
+        runtime
+            .execute_script("<anonymous>", include_str!("js/ops_trap_bootstrap.js"))
+            .expect("diagnostics bootstrap failed");
+    }
+
     // Execute bootstrap JS only if NOT starting from snapshot
     if options.startup_snapshot.is_none() {
         const BOOTSTRAP_JS: &str = concat!(
-            include_str!("js/ops_trap_bootstrap.js"),
-            "\n",
             include_str!("js/console_bootstrap.js"),
             "\n",
             include_str!("js/stealth_bootstrap.js"),
@@ -580,6 +587,15 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/stealth_bootstrap.js"))
         .expect("worker: stealth bootstrap failed");
+
+    if std::env::var_os("BROWSER_OXIDE_DIAGNOSTICS").is_some() {
+        runtime
+            .execute_script(
+                "<anonymous>",
+                "Object.defineProperty(globalThis, '__oxideDiagnostics', { value: true, configurable: true });",
+            )
+            .expect("worker: diagnostics flag failed");
+    }
 
     runtime
         .execute_script("<anonymous>", include_str!("js/console_bootstrap.js"))

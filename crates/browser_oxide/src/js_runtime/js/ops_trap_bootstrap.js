@@ -9,6 +9,10 @@
     // Every other bootstrap reaches ops through property access on this
     // same object (`const ops = Deno.core.ops`), so the wrap covers them all.
     const ops = Deno.core.ops;
+    Object.defineProperty(globalThis, "__browser_oxide_debug", {
+        value: true,
+        configurable: true,
+    });
     // Survives the post-bootstrap `Deno` scrub so page code (and the
     // browser_oxide test probe) can still reach ops, e.g.
     // `__oxOps.op_worker_last_spawn()`.

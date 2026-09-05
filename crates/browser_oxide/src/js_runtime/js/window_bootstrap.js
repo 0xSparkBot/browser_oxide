@@ -1,5 +1,6 @@
 ((globalThis) => {
     const ops = Deno.core.ops;
+    const _diagnosticsEnabled = globalThis.__browser_oxide_debug === true;
     const _markTrustedEvent =
         (globalThis.__browser_oxide && globalThis.__browser_oxide._markTrustedEvent)
         || globalThis.__bo_mark_trusted
@@ -16,6 +17,7 @@
             return v;
         }
     };
+    if (_diagnosticsEnabled) _browser_oxide.__perfObserverDiag = [];
     Object.defineProperty(globalThis, '_browser_oxide', { value: _browser_oxide, configurable: true, enumerable: false, writable: true });
 
     // Exposed via a Symbol slot so it survives `cleanup_bootstrap` deleting the
@@ -75,6 +77,12 @@
             });
             Object.defineProperty(Window.prototype, Symbol.toStringTag, {
                 value: "Window", configurable: true,
+            });
+            Object.defineProperty(Window.prototype, "TEMPORARY", {
+                value: 0, writable: false, enumerable: true, configurable: false,
+            });
+            Object.defineProperty(Window.prototype, "PERSISTENT", {
+                value: 1, writable: false, enumerable: true, configurable: false,
             });
             if (typeof _maskFunction === "function") _maskFunction(Window, "Window");
             globalThis.Window = Window;
@@ -166,7 +174,7 @@
         Object.defineProperty(proto, name, {
             get: getter,
             set: setter,
-            enumerable: false,
+            enumerable: true,
             configurable: true,
         });
         _maskFunction(getter, `get ${name}`);
@@ -183,7 +191,7 @@
             Object.defineProperty(wrapped, 'length', { value: fn.length, configurable: true });
         } catch (_) {}
         Object.defineProperty(proto, name, {
-            value: wrapped, writable: true, enumerable: false, configurable: true,
+            value: wrapped, writable: true, enumerable: true, configurable: true,
         });
         _maskFunction(wrapped, name);
     };
@@ -311,7 +319,7 @@
         for (let i = 0; i < len; i++) if (_allPlugins[i].name === n) return _allPlugins[i];
         return null;
     });
-    
+
     // (Phase J) Add numeric accessors for navigator.plugins[0] etc.
     for (let i = 0; i < 5; i++) {
         Object.defineProperty(_PluginArrayProto, i, {
@@ -1045,9 +1053,6 @@
         configurable: true
     });
     _defNav('doNotTrack', () => null);
-    _defNav('msDoNotTrack', () => undefined);
-    _defNav('loadPurpose', () => undefined);
-    _defNav('sayswho', () => undefined);
 
     // Object getters — stable references.
     // navigator.connection (NetworkInformation API) — Chrome-only. Real
@@ -1228,7 +1233,6 @@
         return undefined;
     });
     _defNavMethod('webkitGetUserMedia', function webkitGetUserMedia(c, s, e) { if (e) e(new Error("Permission denied")); });
-    _defNavMethod('mozGetUserMedia', function mozGetUserMedia(c, s, e) { if (e) e(new Error("Permission denied")); });
     // Additional Navigator.prototype methods that some scripts walk via
     // computed names. Missing any of these causes
     // `obj[computed_name](...) is not a function` errors in such scripts.
@@ -1291,10 +1295,15 @@
         };
         return Promise.resolve(_access);
     });
-    _defNavMethod('canShare', function canShare(data) { return false; });
-    _defNavMethod('share', function share(data) {
-        return Promise.reject(new DOMException("Permission denied", "NotAllowedError"));
-    });
+    // Web Share is a [SecureContext] API. Defining these methods on an
+    // about:blank/data:/plain-http realm leaves a detectable prototype entry
+    // that Chromium does not expose there.
+    if (_secure()) {
+        _defNavMethod('canShare', function canShare(data) { return false; });
+        _defNavMethod('share', function share(data) {
+            return Promise.reject(new DOMException("Permission denied", "NotAllowedError"));
+        });
+    }
     _defNavMethod('clearAppBadge', function clearAppBadge() { return Promise.resolve(); });
     _defNavMethod('setAppBadge', function setAppBadge(count) { return Promise.resolve(); });
 
@@ -1477,6 +1486,147 @@
     } catch(e) {
         globalThis.location = _locationInstance;
     }
+
+    // Navigation API.  The generic interface bootstrap used to leave
+    // `navigation` as an Object-backed shell, so even the fundamental
+    // EventTarget methods were missing (`navigation.addEventListener` threw
+    // on real applications).  Keep the implementation intentionally small,
+    // but make its Web-IDL surface and inheritance match Chromium.
+    (() => {
+        const _ET = globalThis.EventTarget;
+        const _entryState = new WeakMap();
+        const _navState = new WeakMap();
+
+        function NavigationHistoryEntry() {
+            throw new TypeError("Failed to construct 'NavigationHistoryEntry': Illegal constructor");
+        }
+        Object.setPrototypeOf(NavigationHistoryEntry, _ET);
+        NavigationHistoryEntry.prototype = Object.create(_ET.prototype);
+        const _EntryProto = NavigationHistoryEntry.prototype;
+        const _entry = Object.create(_EntryProto);
+        _entryState.set(_entry, { state: undefined });
+
+        const _getEntry = (self) => {
+            const state = _entryState.get(self);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state;
+        };
+        _defProtoGetter(_EntryProto, 'key', function key() { _getEntry(this); return '0'; });
+        _defProtoGetter(_EntryProto, 'id', function id() { _getEntry(this); return '0'; });
+        _defProtoGetter(_EntryProto, 'url', function url() { _getEntry(this); return _locationData.href; });
+        _defProtoGetter(_EntryProto, 'index', function index() { _getEntry(this); return 0; });
+        _defProtoGetter(_EntryProto, 'sameDocument', function sameDocument() { _getEntry(this); return true; });
+        let _entryOnDispose = null;
+        _defProtoGetter(
+            _EntryProto,
+            'ondispose',
+            function ondispose() { _getEntry(this); return _entryOnDispose; },
+            function ondispose(value) { _getEntry(this); _entryOnDispose = typeof value === 'function' ? value : null; },
+        );
+        _defProtoMethod(_EntryProto, 'getState', function getState() { return _getEntry(this).state; });
+        Object.defineProperty(_EntryProto, 'constructor', {
+            value: NavigationHistoryEntry,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(_EntryProto, Symbol.toStringTag, {
+            value: 'NavigationHistoryEntry',
+            configurable: true,
+        });
+        _maskFunction(NavigationHistoryEntry, 'NavigationHistoryEntry');
+
+        function Navigation() {
+            throw new TypeError("Failed to construct 'Navigation': Illegal constructor");
+        }
+        Object.setPrototypeOf(Navigation, _ET);
+        Navigation.prototype = Object.create(_ET.prototype);
+        const _NavigationProto = Navigation.prototype;
+        const _navigation = Object.create(_NavigationProto);
+        _navState.set(_navigation, {
+            onnavigate: null,
+            onnavigatesuccess: null,
+            onnavigateerror: null,
+            oncurrententrychange: null,
+        });
+        const _getNavigation = (self) => {
+            const state = _navState.get(self);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state;
+        };
+        _defProtoGetter(_NavigationProto, 'currentEntry', function currentEntry() { _getNavigation(this); return _entry; });
+        _defProtoGetter(_NavigationProto, 'transition', function transition() { _getNavigation(this); return null; });
+        const _activation = globalThis.NavigationActivation
+            ? Object.create(globalThis.NavigationActivation.prototype)
+            : null;
+        _defProtoGetter(_NavigationProto, 'activation', function activation() { _getNavigation(this); return _activation; });
+        _defProtoGetter(_NavigationProto, 'canGoBack', function canGoBack() { _getNavigation(this); return false; });
+        _defProtoGetter(_NavigationProto, 'canGoForward', function canGoForward() { _getNavigation(this); return false; });
+        for (const name of ['navigate', 'navigatesuccess', 'navigateerror', 'currententrychange']) {
+            const slot = 'on' + name;
+            _defProtoGetter(
+                _NavigationProto,
+                slot,
+                function handler() { return _getNavigation(this)[slot]; },
+                function handler(value) { _getNavigation(this)[slot] = typeof value === 'function' ? value : null; },
+            );
+        }
+        const _navigationResult = () => ({
+            committed: Promise.resolve(_entry),
+            finished: Promise.resolve(_entry),
+        });
+        _defProtoMethod(_NavigationProto, 'back', function back() { _getNavigation(this); return _navigationResult(); });
+        _defProtoMethod(_NavigationProto, 'entries', function entries() { _getNavigation(this); return [_entry]; });
+        _defProtoMethod(_NavigationProto, 'forward', function forward() { _getNavigation(this); return _navigationResult(); });
+        _defProtoMethod(_NavigationProto, 'navigate', function navigate(url) {
+            _getNavigation(this);
+            _parseLocationUrl(url);
+            _browser_oxide.__pendingNavigation = { url: _locationData.href, kind: 'assign' };
+            _signalNav();
+            return _navigationResult();
+        });
+        _defProtoMethod(_NavigationProto, 'reload', function reload() {
+            _getNavigation(this);
+            _browser_oxide.__pendingNavigation = { url: _locationData.href, kind: 'reload' };
+            _signalNav();
+            return _navigationResult();
+        });
+        _defProtoMethod(_NavigationProto, 'traverseTo', function traverseTo() { _getNavigation(this); return _navigationResult(); });
+        _defProtoMethod(_NavigationProto, 'updateCurrentEntry', function updateCurrentEntry(options) {
+            _getNavigation(this);
+            _getEntry(_entry).state = options && options.state;
+        });
+        Object.defineProperty(_NavigationProto, 'constructor', {
+            value: Navigation,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(_NavigationProto, Symbol.toStringTag, {
+            value: 'Navigation',
+            configurable: true,
+        });
+        _maskFunction(Navigation, 'Navigation');
+
+        Object.defineProperty(globalThis, 'NavigationHistoryEntry', {
+            value: NavigationHistoryEntry,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(globalThis, 'Navigation', {
+            value: Navigation,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(globalThis, 'navigation', {
+            value: _navigation,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+    })();
 
     // Frame-tree globals: window/self/frames point to this window.
     for (const key of ['window', 'self', 'frames']) {
@@ -1758,6 +1908,49 @@
             configurable: true
         });
 
+        // Chrome 148 Protected Audience/MIDI and singleton-backed Navigator
+        // members. These are part of Navigator.prototype even when a call is
+        // later rejected by permissions or page policy.
+        for (const [name, result] of [
+            ['adAuctionComponents', []],
+            ['canLoadAdAuctionFencedFrame', false],
+            ['clearOriginJoinedAdInterestGroups', undefined],
+            ['createAuctionNonce', ''],
+            ['deprecatedReplaceInURN', undefined],
+            ['deprecatedURNToURL', null],
+            ['getInterestGroupAdAuctionData', null],
+            ['joinAdInterestGroup', undefined],
+            ['leaveAdInterestGroup', undefined],
+            ['requestMIDIAccess', null],
+            ['runAdAuction', null],
+            ['updateAdInterestGroups', undefined],
+        ]) {
+            if (!Object.getOwnPropertyDescriptor(_NavProto, name)) {
+                _defNavMethod(name, function() { return Promise.resolve(result); });
+            }
+        }
+        if (!Object.getOwnPropertyDescriptor(_NavProto, 'deprecatedRunAdAuctionEnforcesKAnonymity')) {
+            _defNav('deprecatedRunAdAuctionEnforcesKAnonymity', () => false);
+        }
+        const _navigatorSingletons = {
+            ink: globalThis.Ink,
+            login: globalThis.NavigatorLogin,
+            managed: globalThis.NavigatorManagedData,
+            presentation: globalThis.Presentation,
+            protectedAudience: globalThis.ProtectedAudience,
+            storageBuckets: globalThis.StorageBucketManager,
+            webkitPersistentStorage: globalThis.StorageManager,
+            webkitTemporaryStorage: globalThis.StorageManager,
+            xr: globalThis.XRSystem,
+        };
+        for (const [name, Ctor] of Object.entries(_navigatorSingletons)) {
+            if (Object.getOwnPropertyDescriptor(_NavProto, name)) continue;
+            const value = typeof Ctor === 'function' && Ctor.prototype
+                ? Object.create(Ctor.prototype)
+                : {};
+            _defNav(name, () => value);
+        }
+
         // navigator.plugins / mimeTypes are defined at the top of this file
         // (search for _allPlugins). Count is driven by profile.plugins_count
         // and profile.mime_types_count. Do not override here.
@@ -1778,10 +1971,16 @@
         _defProtoGetter(_ScreenProto, 'availTop', () => _pInt("screen_avail_top", 0));
         _defProtoGetter(_ScreenProto, 'colorDepth', () => _pInt("screen_color_depth", 24));
         _defProtoGetter(_ScreenProto, 'pixelDepth', () => _pInt("screen_color_depth", 24));
+        let _screenOnChange = null;
+        Object.defineProperty(_ScreenProto, 'onchange', {
+            get: _maskFunction(function() { return _screenOnChange; }, 'get onchange'),
+            set: _maskFunction(function(value) { _screenOnChange = typeof value === 'function' ? value : null; }, 'set onchange'),
+            enumerable: true,
+            configurable: true,
+        });
     }
 
     // Explicitly define documentMode as undefined to pass 'prop in document' checks quietly
-    Object.defineProperty(Document.prototype, 'documentMode', { value: undefined, enumerable: false, configurable: true });
 
     const _hunt = (obj, name) => {
         return obj;
@@ -1956,6 +2155,25 @@
     // a poll loop that delivers parent←worker messages to onmessage.
     if (!globalThis.Worker) {
         const _wops = Deno.core.ops;
+        const _workerState = new WeakMap();
+
+        function _getWorkerState(worker) {
+            const state = _workerState.get(worker);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state;
+        }
+
+        function _fireWorkerEvent(worker, type, eventOrInit) {
+            let event = eventOrInit;
+            if (!(event instanceof Event)) {
+                event = type === 'message'
+                    ? new MessageEvent(type, eventOrInit || {})
+                    : type === 'error'
+                        ? new ErrorEvent(type, eventOrInit || {})
+                        : new Event(type);
+            }
+            return worker.dispatchEvent(_markTrustedEvent(event));
+        }
 
         function _resolveWorkerScript(url) {
             const s = String(url);
@@ -1976,31 +2194,33 @@
             return '';
         }
 
-        globalThis.Worker = class Worker {
+        globalThis.Worker = class Worker extends EventTarget {
             constructor(scriptURL, options) {
-                this._url = String(scriptURL);
-                this._options = options || {};
-                this._name = (options && options.name) || '';
+                super();
+                const url = String(scriptURL);
+                const name = (options && options.name) || '';
                 // `type: 'module'` enables ES module semantics for the
                 // worker body (import.meta.url, async module eval,
                 // top-level await). Default is 'classic'.
-                this._type = (options && options.type) || 'classic';
-                const isModule = this._type === 'module';
-                this.onmessage = null;
-                this.onerror = null;
-                this.onmessageerror = null;
-                this._listeners = { message: [], messageerror: [], error: [] };
+                const type = (options && options.type) || 'classic';
+                const isModule = type === 'module';
+                const state = {
+                    id: 0,
+                    url,
+                    name,
+                    type,
+                    handlers: { message: null, error: null },
+                };
+                _workerState.set(this, state);
 
-                const script = _resolveWorkerScript(this._url);
+                const script = _resolveWorkerScript(url);
                 if (!script) {
                     // Script resolution failed; defer to next tick and fire error.
-                    this._id = 0;
                     const self = this;
                     Promise.resolve().then(() => {
-                        self._fireEvent('error', {
-                            type: 'error',
-                            message: 'Worker script could not be resolved: ' + self._url,
-                            filename: self._url,
+                        _fireWorkerEvent(self, 'error', {
+                            message: 'Worker script could not be resolved: ' + url,
+                            filename: url,
                             lineno: 0,
                             colno: 0,
                         });
@@ -2013,10 +2233,24 @@
                 // with real Chrome's WorkerLocation. Some workers
                 // read `self.location.origin` to
                 // gate execution; empty location silently bails.
-                this._id = _wops.op_worker_spawn(script, this._name, isModule, this._url);
-                if (this._id <= 0) {
-                    this._id = 0;
+                state.id = _wops.op_worker_spawn(script, name, isModule, url);
+                if (state.id <= 0) {
+                    state.id = 0;
                     return;
+                }
+                if (_diagnosticsEnabled) {
+                    try {
+                        const log = globalThis.__oxWorkerCtorDiag
+                            || (globalThis.__oxWorkerCtorDiag = []);
+                        if (log.length < 24) {
+                            log.push({
+                                id: state.id,
+                                url: url.slice(-100),
+                                stack: String(new Error().stack || '').slice(0, 800),
+                                at: Math.round(performance.now()),
+                            });
+                        }
+                    } catch (_) {}
                 }
 
                 // W5b-deep fix (commit pending): replace the prior
@@ -2031,9 +2265,9 @@
                 // pinning.
                 const self = this;
                 const _drainOnce = () => {
-                    if (!self._id) return;
-                    _wops.op_worker_await_message(self._id).then((raw) => {
-                        if (!raw || !self._id) return; // worker died
+                    if (!state.id) return;
+                    _wops.op_worker_await_message(state.id).then((raw) => {
+                        if (!raw || !state.id) return; // worker died
                         const deserializer =
                             _browser_oxide && _browser_oxide.deserializeFromWire;
                         let payload = null;
@@ -2063,16 +2297,34 @@
                                 }
                             }
                         } catch (_) {}
-                        const event = {
-                            type: 'message',
+                        const event = _markTrustedEvent(new MessageEvent('message', {
                             data,
                             origin: '',
                             lastEventId: '',
                             source: null,
                             ports: [],
-                            timeStamp: Date.now(),
-                        };
-                        try { self._fireEvent('message', event); }
+                        }));
+                        if (_diagnosticsEnabled) {
+                            try {
+                                const log = globalThis.__oxWorkerRxDiag
+                                    || (globalThis.__oxWorkerRxDiag = []);
+                                if (log.length < 48) {
+                                    log.push({
+                                        id: state.id,
+                                        keys: data && typeof data === 'object'
+                                            ? Object.keys(data).slice(0, 8).join(',')
+                                            : typeof data,
+                                        value: (() => {
+                                            try { return JSON.stringify(data).slice(0, 1200); }
+                                            catch (_) { return ''; }
+                                        })(),
+                                        trusted: event.isTrusted,
+                                        at: Math.round(performance.now()),
+                                    });
+                                }
+                            } catch (_) {}
+                        }
+                        try { _fireWorkerEvent(self, 'message', event); }
                         catch (_) {}
                         try {
                             globalThis.__oxWRX = (globalThis.__oxWRX || 0) + 1;
@@ -2083,21 +2335,9 @@
                 _drainOnce();
             }
 
-            _fireEvent(type, event) {
-                const arr = this._listeners[type];
-                if (arr) {
-                    for (const fn of arr.slice()) {
-                        try { fn.call(this, event); } catch (e) {}
-                    }
-                }
-                const on = this['on' + type];
-                if (typeof on === 'function') {
-                    try { on.call(this, event); } catch (e) {}
-                }
-            }
-
             postMessage(message, transfer) {
-                if (!this._id) return;
+                const state = _getWorkerState(this);
+                if (!state.id) return;
                 // Engine-level call counter: survives probe wrap-timing (a
                 // page that captured Worker before the probe's wrap still
                 // counts here). Distinguishes "parent never posted" from
@@ -2109,6 +2349,23 @@
                             ? Object.keys(message).slice(0, 6).join(",")
                             : typeof message
                     ).slice(0, 60);
+                } catch (_) {}
+                // Diagnostics-only capture of the dynamically generated
+                // worker programs used by challenge runtimes.  Blob worker
+                // sources are often only a tiny `eval(e.data)` loader, so
+                // recording the parent -> worker payload is the only way to
+                // inspect a worker failure without changing page-visible
+                // behaviour.
+                try {
+                    if ((_diagnosticsEnabled || Array.isArray(globalThis.__oxideShadowDebug))
+                        && typeof message === 'string') {
+                        const posts = globalThis.__oxWorkerPostSources
+                            || (globalThis.__oxWorkerPostSources = []);
+                        if (posts.length < 8
+                            && !posts.some((source) => source.length === message.length)) {
+                            posts.push(message);
+                        }
+                    }
                 } catch (_) {}
                 // Transferables: accepted as an array. Each entry (an
                 // ArrayBuffer or view) is reachable from the message
@@ -2149,35 +2406,53 @@
                 } catch (_e) {
                     payload = JSON.stringify({ data: null });
                 }
-                _wops.op_worker_post_to_worker(this._id, payload);
+                _wops.op_worker_post_to_worker(state.id, payload);
             }
 
             terminate() {
-                if (this._id) {
-                    try { _wops.op_worker_terminate(this._id); } catch (e) {}
-                    this._id = 0;
-                }
-                if (this._pollTimer) {
-                    clearInterval(this._pollTimer);
-                    this._pollTimer = null;
+                const state = _getWorkerState(this);
+                if (state.id) {
+                    try { _wops.op_worker_terminate(state.id); } catch (e) {}
+                    state.id = 0;
                 }
             }
 
-            addEventListener(type, listener) {
-                if (!this._listeners[type]) this._listeners[type] = [];
-                this._listeners[type].push(listener);
-            }
-            removeEventListener(type, listener) {
-                const arr = this._listeners[type];
-                if (!arr) return;
-                const i = arr.indexOf(listener);
-                if (i >= 0) arr.splice(i, 1);
-            }
-            dispatchEvent(event) {
-                this._fireEvent(event && event.type, event);
-                return true;
-            }
         };
+        // Chromium 148 exposes these five string-named properties in this
+        // exact insertion order. Keep implementation state in WeakMaps so a
+        // live Worker has no observable own string properties.
+        const _workerPostMessage = globalThis.Worker.prototype.postMessage;
+        const _workerTerminate = globalThis.Worker.prototype.terminate;
+        for (const name of Object.getOwnPropertyNames(globalThis.Worker.prototype)) {
+            delete globalThis.Worker.prototype[name];
+        }
+        const _defineWorkerHandler = (type) => {
+            Object.defineProperty(globalThis.Worker.prototype, 'on' + type, {
+                configurable: true,
+                enumerable: true,
+                get() {
+                    return _getWorkerState(this).handlers[type];
+                },
+                set(value) {
+                    _getWorkerState(this).handlers[type] =
+                        typeof value === 'function' ? value : null;
+                },
+            });
+        };
+        _defineWorkerHandler('message');
+        Object.defineProperty(globalThis.Worker.prototype, 'postMessage', {
+            value: _workerPostMessage,
+            writable: true, enumerable: true, configurable: true,
+        });
+        Object.defineProperty(globalThis.Worker.prototype, 'terminate', {
+            value: _workerTerminate,
+            writable: true, enumerable: true, configurable: true,
+        });
+        Object.defineProperty(globalThis.Worker.prototype, 'constructor', {
+            value: globalThis.Worker,
+            writable: true, enumerable: false, configurable: true,
+        });
+        _defineWorkerHandler('error');
         Object.defineProperty(globalThis.Worker.prototype, Symbol.toStringTag, {
             value: 'Worker',
             configurable: true,
@@ -2213,15 +2488,6 @@
             postMessage() {}
         };
     }
-    if (!globalThis.WorkerGlobalScope) {
-        // WorkerGlobalScope is the class that Worker's `self` is an instance
-        // of. fpCollect checks `typeof WorkerGlobalScope === 'function'`.
-        globalThis.WorkerGlobalScope = class WorkerGlobalScope {};
-    }
-    if (!globalThis.DedicatedWorkerGlobalScope) {
-        globalThis.DedicatedWorkerGlobalScope = class DedicatedWorkerGlobalScope extends globalThis.WorkerGlobalScope {};
-    }
-
     // ================================================================
     // Batch 2: additional Web API stubs for fingerprint coverage
     // Chrome 131 exposes these as globals; fingerprint probes do
@@ -3125,6 +3391,7 @@
         // and strip the legacy own properties.
         const _PerfProto = Performance.prototype;
         Object.defineProperty(_PerfProto, Symbol.toStringTag, { value: "Performance", configurable: true });
+        _defProtoGetter(_PerfProto, 'interactionCount', () => 0);
 
         // Preserve the native `now` before we reparent — deno_core installs
         // it as an own property on the instance with a native-code toString.
@@ -3187,7 +3454,13 @@
             return _perfOrigin;
         });
         _defProtoGetter(_PerfProto, 'navigation', () => _perfNavigation);
-        _defProtoGetter(_PerfProto, 'onresourcetimingbufferfull', () => null);
+        let _onResourceTimingBufferFull = null;
+        _defProtoGetter(
+            _PerfProto,
+            'onresourcetimingbufferfull',
+            () => _onResourceTimingBufferFull,
+            value => { _onResourceTimingBufferFull = typeof value === 'function' ? value : null; },
+        );
 
         _defProtoMethod(_PerfProto, 'getEntries', function getEntries() {
             const entries = [_navEntry(), ..._buildResourceEntries()];
@@ -3285,6 +3558,202 @@
         if (Object.getPrototypeOf(globalThis.performance) !== _PerfProto) {
             globalThis.performance = Object.create(_PerfProto);
         }
+
+        // PerformanceObserver must deliver resource entries rather than being
+        // a no-op shell. Telemetry and performance SDKs install an observer
+        // before issuing requests and consume the resulting entry list
+        // asynchronously.
+        const _observerState = new WeakMap();
+        const _observers = new Set();
+        const _entryListState = new WeakMap();
+
+        function PerformanceObserverEntryList() {
+            throw new TypeError("Failed to construct 'PerformanceObserverEntryList': Illegal constructor");
+        }
+        const _EntryListProto = PerformanceObserverEntryList.prototype;
+        delete _EntryListProto.constructor;
+        const _getEntryList = (self) => {
+            const entries = _entryListState.get(self);
+            if (!entries) throw new TypeError('Illegal invocation');
+            return entries;
+        };
+        _defProtoMethod(_EntryListProto, 'getEntries', function getEntries() {
+            return _getEntryList(this).slice();
+        });
+        _defProtoMethod(_EntryListProto, 'getEntriesByName', function getEntriesByName(name, type) {
+            name = String(name);
+            return _getEntryList(this).filter(entry =>
+                entry.name === name && (type === undefined || entry.entryType === String(type))
+            );
+        });
+        _defProtoMethod(_EntryListProto, 'getEntriesByType', function getEntriesByType(type) {
+            type = String(type);
+            return _getEntryList(this).filter(entry => entry.entryType === type);
+        });
+        Object.defineProperty(_EntryListProto, 'constructor', {
+            value: PerformanceObserverEntryList,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(_EntryListProto, Symbol.toStringTag, {
+            value: 'PerformanceObserverEntryList',
+            configurable: true,
+        });
+        _maskFunction(PerformanceObserverEntryList, 'PerformanceObserverEntryList');
+
+        const _newEntryList = (entries) => {
+            const list = Object.create(_EntryListProto);
+            _entryListState.set(list, entries);
+            return list;
+        };
+        const _queueObserverCallback = (observer, entry) => {
+            const state = _observerState.get(observer);
+            if (!state || !state.types.has(entry.entryType)) return;
+            state.records.push(entry);
+            if (state.queued) return;
+            state.queued = true;
+            queueMicrotask(() => {
+                state.queued = false;
+                if (!_observers.has(observer) || state.records.length === 0) return;
+                const records = state.records.splice(0);
+                try {
+                    if (_diagnosticsEnabled) {
+                        _browser_oxide.__perfObserverDiag.push({
+                            phase: 'deliver',
+                            types: records.map(entry => entry.entryType),
+                            at: performance.now(),
+                        });
+                    }
+                    state.callback(_newEntryList(records), observer, { droppedEntriesCount: 0 });
+                } catch (error) {
+                    setTimeout(() => { throw error; }, 0);
+                }
+            });
+        };
+
+        function PerformanceObserver(callback) {
+            if (!new.target) {
+                throw new TypeError("Failed to construct 'PerformanceObserver': Please use the 'new' operator");
+            }
+            if (typeof callback !== 'function') {
+                throw new TypeError("Failed to construct 'PerformanceObserver': parameter 1 is not of type 'Function'.");
+            }
+            _observerState.set(this, {
+                callback,
+                types: new Set(),
+                records: [],
+                queued: false,
+            });
+        }
+        const _ObserverProto = PerformanceObserver.prototype;
+        delete _ObserverProto.constructor;
+        _defProtoMethod(_ObserverProto, 'disconnect', function disconnect() {
+            const state = _observerState.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            if (_diagnosticsEnabled) {
+                _browser_oxide.__perfObserverDiag.push({ phase: 'disconnect', at: performance.now() });
+            }
+            state.types.clear();
+            state.records.length = 0;
+            _observers.delete(this);
+        });
+        _defProtoMethod(_ObserverProto, 'observe', function observe(options) {
+            const state = _observerState.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            if (!options || typeof options !== 'object') {
+                throw new TypeError("Failed to execute 'observe' on 'PerformanceObserver': parameter 1 is not of type 'Object'.");
+            }
+            const requested = options.entryTypes !== undefined
+                ? Array.from(options.entryTypes, String)
+                : (options.type !== undefined ? [String(options.type)] : []);
+            if (requested.length === 0) {
+                throw new TypeError("Failed to execute 'observe' on 'PerformanceObserver': An observe() call must include either entryTypes or type arguments.");
+            }
+            state.types = new Set(requested);
+            _observers.add(this);
+            if (_diagnosticsEnabled) {
+                _browser_oxide.__perfObserverDiag.push({
+                    phase: 'observe',
+                    requested,
+                    buffered: options.buffered === true,
+                    at: performance.now(),
+                    stack: String(new Error().stack || '').slice(0, 1200),
+                });
+            }
+            if (options.buffered === true) {
+                for (const type of requested) {
+                    for (const entry of globalThis.performance.getEntriesByType(type)) {
+                        _queueObserverCallback(this, entry);
+                    }
+                }
+            }
+        });
+        _defProtoMethod(_ObserverProto, 'takeRecords', function takeRecords() {
+            const state = _observerState.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state.records.splice(0);
+        });
+        Object.defineProperty(_ObserverProto, 'constructor', {
+            value: PerformanceObserver,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(_ObserverProto, Symbol.toStringTag, {
+            value: 'PerformanceObserver',
+            configurable: true,
+        });
+        Object.defineProperty(PerformanceObserver, 'supportedEntryTypes', {
+            get() {
+                return [
+                    'element', 'event', 'first-input', 'largest-contentful-paint',
+                    'layout-shift', 'long-animation-frame', 'longtask', 'mark',
+                    'measure', 'navigation', 'paint', 'resource', 'visibility-state',
+                ];
+            },
+            enumerable: true,
+            configurable: true,
+        });
+        _maskFunction(PerformanceObserver, 'PerformanceObserver');
+
+        Object.defineProperty(globalThis, 'PerformanceObserverEntryList', {
+            value: PerformanceObserverEntryList,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(globalThis, 'PerformanceObserver', {
+            value: PerformanceObserver,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(globalThis, Symbol.for('__browser_oxide_performance_resource__'), {
+            value(raw) {
+                if (_diagnosticsEnabled) {
+                    _browser_oxide.__perfObserverDiag.push({
+                        phase: 'resource', url: raw.url, at: performance.now(),
+                    });
+                }
+                const matches = globalThis.performance
+                    .getEntriesByType('resource')
+                    .filter(entry => entry.name === raw.url);
+                const entry = matches[matches.length - 1];
+                if (!entry) return;
+                for (const observer of _observers) {
+                    if (_diagnosticsEnabled) {
+                        _browser_oxide.__perfObserverDiag.push({
+                            phase: 'queue', url: raw.url, at: performance.now(),
+                        });
+                    }
+                    _queueObserverCallback(observer, entry);
+                }
+            },
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        });
     }
 
     // ================================================================
@@ -3980,7 +4449,12 @@
                     
                     const _internalEntries = _browser_oxide.__perfResourceEntries;
                     if (_internalEntries) {
-                        _internalEntries.push({ url: xhr._url, type: "xmlhttprequest", startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 });
+                        const entry = { url: xhr._url, type: "xmlhttprequest", startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 };
+                        _internalEntries.push(entry);
+                        try {
+                            const notify = globalThis[Symbol.for('__browser_oxide_performance_resource__')];
+                            if (typeof notify === 'function') notify(entry);
+                        } catch (_) {}
                     }
                     
                     xhr.status = result.status || 0;
@@ -5367,6 +5841,19 @@
         send() {}
         close() {}
     };
+    {
+        const _iceEventState = new WeakMap();
+        globalThis.RTCPeerConnectionIceEvent = class RTCPeerConnectionIceEvent extends Event {
+            constructor(type, options = {}) {
+                super(type, options);
+                _iceEventState.set(this, options.candidate ?? null);
+            }
+            get candidate() { return _iceEventState.get(this) ?? null; }
+        };
+        Object.defineProperty(globalThis.RTCPeerConnectionIceEvent.prototype, Symbol.toStringTag, {
+            value: 'RTCPeerConnectionIceEvent', configurable: true,
+        });
+    }
     globalThis.RTCPeerConnection = class RTCPeerConnection extends EventTarget {
         constructor(config) {
             super();
@@ -5422,10 +5909,17 @@
                 candidate, sdpMid: '0', sdpMLineIndex: 0,
             });
             setTimeout(() => {
-                if (this.onicecandidate) this.onicecandidate({ candidate: iceCandidate });
+                this.iceGatheringState = 'gathering';
+                const candidateEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
+                    'icecandidate', { candidate: iceCandidate }
+                ));
+                this.dispatchEvent(candidateEvent);
                 setTimeout(() => {
-                    if (this.onicecandidate) this.onicecandidate({ candidate: null });
                     this.iceGatheringState = "complete";
+                    const completeEvent = _markTrustedEvent(new globalThis.RTCPeerConnectionIceEvent(
+                        'icecandidate', { candidate: null }
+                    ));
+                    this.dispatchEvent(completeEvent);
                 }, 12);
             }, 8);
             return Promise.resolve();
@@ -5444,8 +5938,6 @@
             this.iceConnectionState = "closed";
             this.connectionState = "closed";
         }
-        addEventListener() {}
-        removeEventListener() {}
     };
     globalThis.RTCPeerConnection.generateCertificate = () => Promise.resolve({});
     globalThis.webkitRTCPeerConnection = globalThis.RTCPeerConnection;
@@ -6404,12 +6896,25 @@
         _TrustedScript.prototype.toString = function() { return this._v; };
         const _TrustedScriptURL = function TrustedScriptURL(v) { this._v = v; };
         _TrustedScriptURL.prototype.toString = function() { return this._v; };
+        const _trustedScriptSources = new Set(['']);
+        const _createEvalCompatibleTrustedScript = function(value) {
+            // Blink unwraps TrustedScript before V8's native eval sees it.
+            // This standalone V8 embedder has no equivalent host hook: passing
+            // a JavaScript wrapper to direct eval returns that object without
+            // compiling its source.  Keep the source primitive so direct eval
+            // (including its lexical-scope semantics) continues to work.
+            const source = String(value);
+            _trustedScriptSources.add(source);
+            return source;
+        };
         globalThis.trustedTypes = {
             createPolicy(name, rules) {
                 const p = {
                     name,
                     createHTML: (s) => typeof rules.createHTML === 'function' ? new _TrustedHTML(rules.createHTML(s)) : new _TrustedHTML(s),
-                    createScript: (s) => typeof rules.createScript === 'function' ? new _TrustedScript(rules.createScript(s)) : new _TrustedScript(s),
+                    createScript: (s) => _createEvalCompatibleTrustedScript(
+                        typeof rules.createScript === 'function' ? rules.createScript(s) : s
+                    ),
                     createScriptURL: (s) => typeof rules.createScriptURL === 'function' ? new _TrustedScriptURL(rules.createScriptURL(s)) : new _TrustedScriptURL(s),
                 };
                 _ttPolicies.set(name, p);
@@ -6417,13 +6922,16 @@
                 return p;
             },
             isHTML(v) { return v instanceof _TrustedHTML; },
-            isScript(v) { return v instanceof _TrustedScript; },
+            isScript(v) {
+                return v instanceof _TrustedScript
+                    || (typeof v === 'string' && _trustedScriptSources.has(v));
+            },
             isScriptURL(v) { return v instanceof _TrustedScriptURL; },
             getAttributeType() { return null; },
             getPropertyType() { return null; },
             defaultPolicy: null,
             emptyHTML: new _TrustedHTML(''),
-            emptyScript: new _TrustedScript(''),
+            emptyScript: '',
         };
         globalThis.TrustedHTML = _TrustedHTML;
         globalThis.TrustedScript = _TrustedScript;
@@ -6758,7 +7266,7 @@
         _maskFunction(ApplePaySession.canMakePaymentsWithActiveCard, 'canMakePaymentsWithActiveCard');
         _maskFunction(ApplePaySession.supportsVersion, 'supportsVersion');
         Object.defineProperty(globalThis, 'ApplePaySession', {
-            get: () => _p("os_name", "") === "macOS" ? ApplePaySession : undefined,
+            get: () => _p("browser_name", "") === "Safari" ? ApplePaySession : undefined,
             configurable: true, enumerable: false
         });
     })();
@@ -7173,24 +7681,23 @@
     });
     globalThis.clientInformation = globalThis.navigator;
     globalThis.offscreenBuffering = true;
-    globalThis.defaultStatus = "";
     globalThis.name = "";
     globalThis.status = "";
-    
-    // (Phase J) Iframe indexing parity: define window[0], window[1] etc.
-    // Real Chrome has numeric own-properties for each child frame.
+
+    // Lazy indexed access keeps window[N] available during the short gap
+    // between an iframe DOM insertion and child-realm materialization. The
+    // cleanup layer hides slots that are still beyond window.length so they
+    // do not appear as phantom frame properties during global enumeration.
     const _defineIframeGetter = (index) => {
         Object.defineProperty(globalThis, index, {
             get: () => {
-                // If we have iframes, return the contentWindow of the i-th one.
-                // Our Page layer manages the children.
                 const iframes = document.querySelectorAll('iframe');
                 return iframes[index] ? iframes[index].contentWindow : undefined;
             },
-            configurable: true, enumerable: true
+            configurable: true,
+            enumerable: false,
         });
     };
-    // Pre-define for common counts.
     for (let i = 0; i < 5; i++) _defineIframeGetter(i);
 
     Object.defineProperty(globalThis, Symbol.toStringTag, { value: "Window", configurable: true });

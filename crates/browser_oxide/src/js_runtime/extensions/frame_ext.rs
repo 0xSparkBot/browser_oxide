@@ -166,7 +166,7 @@ pub fn op_frame_post_message(
     if std::env::var_os("BROWSER_OXIDE_FT_DEBUG").is_some() {
         eprintln!(
             "[FT-msg] {source_id}->{target_id} origin={origin} target={target_origin} data={}",
-            &data[..data.len().min(90)]
+            &data[..data.len().min(2000)]
         );
     }
     if let Ok(mut m) = frame_mailboxes().lock() {

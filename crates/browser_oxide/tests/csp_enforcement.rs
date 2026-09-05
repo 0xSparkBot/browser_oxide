@@ -271,6 +271,45 @@ async fn connect_src_blocks_disallowed_hosts() {
     csp_state::clear_csp_policy();
 }
 
+/// A child frame runs on the same executor thread as its parent, but CSP is
+/// document-scoped. The parent's policy must not be reused for a request
+/// initiated by a cross-origin child document.
+#[tokio::test]
+async fn parent_csp_does_not_block_cross_origin_child_fetch() {
+    use browser_oxide::csp_collector::collect_csp;
+    use browser_oxide::html_parser::parse_html;
+    use browser_oxide::js_runtime::extensions::fetch_ext as csp_state;
+    use browser_oxide::net::csp::Directive;
+    use std::sync::Arc;
+    use url::Url;
+
+    let dom = parse_html(
+        r#"<html><head><meta http-equiv="Content-Security-Policy"
+        content="connect-src 'self'"></head></html>"#,
+    );
+    csp_state::set_csp_policy(
+        Arc::new(collect_csp(&[], &dom)),
+        Url::parse("https://parent.example/").unwrap(),
+        true,
+    );
+
+    let child_origin = Url::parse("https://child.example/").unwrap();
+    let child_request = Url::parse("https://child.example/challenge-flow").unwrap();
+    let decision = csp_state::check_csp_for_document_origin(
+        Directive::ConnectSrc,
+        &child_request,
+        None,
+        false,
+        Some(&child_origin),
+    );
+    assert!(
+        decision.is_ok(),
+        "the parent document's CSP must not leak into its child runtime"
+    );
+
+    csp_state::clear_csp_policy();
+}
+
 /// `frame-src` enforcement: iframe navigations against off-policy hosts
 /// must be refused. The `child-src` and `default-src` fallback chain
 /// applies — if `frame-src` is absent, those govern instead.

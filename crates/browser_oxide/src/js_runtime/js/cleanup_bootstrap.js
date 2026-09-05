@@ -93,6 +93,9 @@
         const _osName = (_hasProfile && ops.op_get_profile_value)
             ? (ops.op_get_profile_value("os_name") || "Linux")
             : "Linux";
+        const _browserName = (_hasProfile && ops.op_get_profile_value)
+            ? (ops.op_get_profile_value("browser_name") || "Chrome")
+            : "Chrome";
 
         // ApplePaySession — present only on macOS Chrome AND only on
         // secure contexts (Apple Pay requires https). A missing constructor
@@ -101,7 +104,7 @@
         // Chrome 147's ApplePaySession surface.
         const _ops2 = Deno && Deno.core && Deno.core.ops;
         const _isSecureForAP = _ops2 && _ops2.op_is_secure_context && _ops2.op_is_secure_context();
-        if (_osName === "macOS" && _isSecureForAP && typeof globalThis.ApplePaySession === "undefined") {
+        if (_browserName === "Safari" && _isSecureForAP && typeof globalThis.ApplePaySession === "undefined") {
             const _APP = function ApplePaySession(_version, _paymentRequest) {
                 this.onvalidatemerchant = null;
                 this.onpaymentauthorized = null;
@@ -140,6 +143,139 @@
                 configurable: true,
                 writable: true,
             });
+        }
+        if (_browserName !== "Safari") {
+            try { delete globalThis.ApplePaySession; } catch (_e) {}
+        }
+
+        // Window and worker Web IDL namespaces are disjoint. Chromium does
+        // not expose worker-global constructors in a document realm; sensor
+        // and legacy aliases below are likewise absent from current desktop
+        // Chrome. Their presence is more distinctive than a missing optional
+        // API and is directly visible to global namespace fingerprinting.
+        if (_browserName === "Chrome" && typeof globalThis.document !== 'undefined') {
+            for (const k of [
+                'WorkerGlobalScope', 'DedicatedWorkerGlobalScope',
+                'CSSPseudoElement',
+                'Magnetometer', 'SpeechRecognitionAlternative',
+                'USBIsochronousOutPacket', 'webkitAudioContext',
+                'defaultStatus',
+            ]) {
+                try { delete globalThis[k]; } catch (_e) {}
+            }
+
+            // Late-bound Window aliases/functions. interfaces_bootstrap runs
+            // before timers, URL and the Window API implementations, so the
+            // old eager aliases were permanently initialized to `undefined`.
+            // Install them here, after every bootstrap, and use method syntax
+            // so native Window operations remain non-constructable.
+            try {
+                const _gpuConstants = {
+                    GPUBufferUsage: {
+                        MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8,
+                        INDEX: 16, VERTEX: 32, UNIFORM: 64, STORAGE: 128,
+                        INDIRECT: 256, QUERY_RESOLVE: 512,
+                    },
+                    GPUColorWrite: { RED: 1, GREEN: 2, BLUE: 4, ALPHA: 8, ALL: 15 },
+                    GPUMapMode: { READ: 1, WRITE: 2 },
+                    GPUShaderStage: { VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 },
+                    GPUTextureUsage: {
+                        COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4,
+                        STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16,
+                        TRANSIENT_ATTACHMENT: 32,
+                    },
+                };
+                for (const [name, value] of Object.entries(_gpuConstants)) {
+                    if (typeof globalThis[name] !== 'object') {
+                        Object.defineProperty(globalThis, name, {
+                            value: Object.freeze(value),
+                            writable: false, enumerable: true, configurable: true,
+                        });
+                    }
+                }
+                const _lateWindowMethods = {
+                    blur() {},
+                    focus() {},
+                    moveBy() {},
+                    moveTo() {},
+                    resizeBy() {},
+                    resizeTo() {},
+                    captureEvents() {},
+                    releaseEvents() {},
+                    find() { return false; },
+                    fetchLater(input, init) {
+                        return globalThis.FetchLaterResult
+                            ? Object.create(globalThis.FetchLaterResult.prototype)
+                            : { activated: false, input, init };
+                    },
+                    queryLocalFonts() { return Promise.resolve([]); },
+                    showDirectoryPicker() { return Promise.reject(new DOMException('The request is not allowed by the user agent or the platform in the current context.', 'SecurityError')); },
+                    showOpenFilePicker() { return Promise.reject(new DOMException('The request is not allowed by the user agent or the platform in the current context.', 'SecurityError')); },
+                    showSaveFilePicker() { return Promise.reject(new DOMException('The request is not allowed by the user agent or the platform in the current context.', 'SecurityError')); },
+                    getScreenDetails() { return Promise.resolve({ screens: [globalThis.screen], currentScreen: globalThis.screen }); },
+                    webkitRequestFileSystem() {},
+                    webkitResolveLocalFileSystemURL() {},
+                };
+                const _mask = globalThis._maskFunction;
+                for (const [name, fn] of Object.entries(_lateWindowMethods)) {
+                    if (typeof globalThis[name] !== 'function') {
+                        if (typeof _mask === 'function') _mask(fn, name);
+                        Object.defineProperty(globalThis, name, {
+                            value: fn, writable: true, enumerable: true, configurable: true,
+                        });
+                    }
+                }
+                for (const [alias, name] of [
+                    ['webkitSpeechGrammar', 'SpeechGrammar'],
+                    ['webkitSpeechGrammarList', 'SpeechGrammarList'],
+                    ['webkitSpeechRecognition', 'SpeechRecognition'],
+                    ['webkitSpeechRecognitionError', 'SpeechRecognitionErrorEvent'],
+                    ['webkitSpeechRecognitionEvent', 'SpeechRecognitionEvent'],
+                ]) {
+                    if (typeof globalThis[alias] !== 'function' && typeof globalThis[name] === 'function') {
+                        Object.defineProperty(globalThis, alias, {
+                            value: globalThis[name], writable: true, enumerable: true, configurable: true,
+                        });
+                    }
+                }
+                if (typeof globalThis.cancelAnimationFrame === 'function') {
+                    globalThis.webkitCancelAnimationFrame = globalThis.cancelAnimationFrame;
+                }
+                if (typeof globalThis.requestAnimationFrame === 'function') {
+                    globalThis.webkitRequestAnimationFrame = globalThis.requestAnimationFrame;
+                }
+                if (typeof globalThis.URL === 'function') globalThis.webkitURL = globalThis.URL;
+                for (const name of ['event', 'ondevicemotion', 'ondeviceorientation',
+                    'ondeviceorientationabsolute', 'onerror']) {
+                    if (!Object.prototype.hasOwnProperty.call(globalThis, name)) {
+                        Object.defineProperty(globalThis, name, {
+                            value: name === 'event' ? undefined : null,
+                            writable: true, enumerable: true, configurable: true,
+                        });
+                    }
+                }
+                if (!globalThis.navigation && globalThis.Navigation) {
+                    globalThis.navigation = Object.create(globalThis.Navigation.prototype);
+                }
+                if (!globalThis.sharedStorage && globalThis.SharedStorage) {
+                    globalThis.sharedStorage = Object.create(globalThis.SharedStorage.prototype);
+                }
+                // Web-IDL interface members are enumerable in Chromium. Class
+                // syntax and several older bootstrap definitions defaulted to
+                // non-enumerable, producing a large descriptor-level mismatch
+                // even after the prototype member sets matched exactly.
+                for (const Ctor of [globalThis.Navigator, globalThis.Document]) {
+                    const proto = Ctor && Ctor.prototype;
+                    if (!proto) continue;
+                    for (const name of Object.getOwnPropertyNames(proto)) {
+                        if (name === 'constructor') continue;
+                        const desc = Object.getOwnPropertyDescriptor(proto, name);
+                        if (!desc || desc.enumerable) continue;
+                        desc.enumerable = true;
+                        try { Object.defineProperty(proto, name, desc); } catch (_e2) {}
+                    }
+                }
+            } catch (_e) {}
         }
 
         // -- iOS Safari profile: strip 16 declined APIs + add iOS globals --
@@ -603,10 +739,10 @@
             'personalbar', 'scrollbars', 'statusbar', 'toolbar', 'frames', 
             'parent', 'top', 'opener', 'frameElement', 'styleMedia', 
             'getComputedStyle', 'getSelection', 'matchMedia', 'alert', 
-            'confirm', 'prompt', 'print', 'stop', 'open', 'close', 
+            'confirm', 'prompt', 'print', 'stop', 'open',
             'focus', 'blur', 'moveBy', 'moveTo', 'resizeBy', 'resizeTo', 
-            'scroll', 'scrollBy', 'scrollTo', 'requestAnimationFrame', 
-            'cancelAnimationFrame', 'requestIdleCallback', 'cancelIdleCallback',
+            'scroll', 'scrollBy', 'scrollTo',
+            'requestIdleCallback', 'cancelIdleCallback',
             // Constructors
             'Node', 'Element', 'HTMLElement', 'HTMLDocument', 'Document', 
             'CharacterData', 'Text', 'Comment', 'CDATASection', 'DocumentFragment', 
@@ -632,6 +768,119 @@
             if (k.startsWith('HTML') || k.startsWith('SVG') || k.startsWith('CSS') || _workerPurge.includes(k)) {
                 try { delete globalThis[k]; } catch (_) {}
             }
+        }
+
+        // Chrome 148's DedicatedWorkerGlobalScope exposes a strict 335-name
+        // namespace. interfaces_bootstrap is intentionally shared with the
+        // document runtime, but its non-enumerable Window constructors escaped
+        // the old Object.keys-only purge and inflated workers past 1,000 names.
+        // Use the captured Chrome-for-Testing allowlist and
+        // Object.getOwnPropertyNames so worker/window namespace separation is
+        // deterministic rather than relying on descriptor enumerability.
+        // Capture the masking helper before the allowlist removes its private
+        // global binding. The function itself remains usable from this closure.
+        const _workerMaskFunction = globalThis._maskFunction;
+        const _chromeWorkerGlobals = new Set((
+            'AbortController AbortSignal AggregateError Array ArrayBuffer AsyncDisposableStack Atomics AudioData '
+            + 'AudioDecoder AudioEncoder BackgroundFetchManager BackgroundFetchRecord BackgroundFetchRegistration BarcodeDetector BigInt BigInt64Array '
+            + 'BigUint64Array Blob Boolean BroadcastChannel ByteLengthQueuingStrategy CSSSkewX CSSSkewY Cache '
+            + 'CacheStorage CanvasGradient CanvasPattern CloseEvent CompressionStream CountQueuingStrategy CreateMonitor CropTarget '
+            + 'Crypto CryptoKey CustomEvent DOMException DOMMatrix DOMMatrixReadOnly DOMPoint DOMPointReadOnly '
+            + 'DOMQuad DOMRect DOMRectReadOnly DOMStringList DataView Date DecompressionStream DedicatedWorkerGlobalScope '
+            + 'DisposableStack EncodedAudioChunk EncodedVideoChunk Error ErrorEvent EvalError Event EventSource '
+            + 'EventTarget File FileList FileReader FileReaderSync FileSystemDirectoryHandle FileSystemFileHandle FileSystemHandle '
+            + 'FileSystemObserver FileSystemSyncAccessHandle FileSystemWritableFileStream FinalizationRegistry Float16Array Float32Array Float64Array FontFace '
+            + 'FormData Function GPU GPUAdapter GPUAdapterInfo GPUBindGroup GPUBindGroupLayout GPUBuffer '
+            + 'GPUBufferUsage GPUCanvasContext GPUColorWrite GPUCommandBuffer GPUCommandEncoder GPUCompilationInfo GPUCompilationMessage GPUComputePassEncoder '
+            + 'GPUComputePipeline GPUDevice GPUDeviceLostInfo GPUError GPUExternalTexture GPUInternalError GPUMapMode GPUOutOfMemoryError '
+            + 'GPUPipelineError GPUPipelineLayout GPUQuerySet GPUQueue GPURenderBundle GPURenderBundleEncoder GPURenderPassEncoder GPURenderPipeline '
+            + 'GPUSampler GPUShaderModule GPUShaderStage GPUSupportedFeatures GPUSupportedLimits GPUTexture GPUTextureUsage GPUTextureView '
+            + 'GPUUncapturedErrorEvent GPUValidationError HID HIDConnectionEvent HIDDevice HIDInputReportEvent Headers IDBCursor '
+            + 'IDBCursorWithValue IDBDatabase IDBFactory IDBIndex IDBKeyRange IDBObjectStore IDBOpenDBRequest IDBRecord '
+            + 'IDBRequest IDBTransaction IDBVersionChangeEvent IdleDetector ImageBitmap ImageBitmapRenderingContext ImageData ImageDecoder '
+            + 'ImageTrack ImageTrackList Infinity Int16Array Int32Array Int8Array Intl Iterator '
+            + 'JSON Lock LockManager Map Math MediaCapabilities MediaSource MediaSourceHandle '
+            + 'MessageChannel MessageEvent MessagePort NaN NavigationPreloadManager NavigatorUAData NetworkInformation Notification '
+            + 'Number Object Observable OffscreenCanvas OffscreenCanvasRenderingContext2D Origin Path2D Performance '
+            + 'PerformanceEntry PerformanceMark PerformanceMeasure PerformanceObserver PerformanceObserverEntryList PerformanceResourceTiming PerformanceServerTiming PeriodicSyncManager '
+            + 'PermissionStatus Permissions PressureObserver PressureRecord ProgressEvent Promise PromiseRejectionEvent Proxy '
+            + 'PushManager PushSubscription PushSubscriptionOptions QuotaExceededError RTCDataChannel RTCEncodedAudioFrame RTCEncodedVideoFrame RTCRtpScriptTransformer '
+            + 'RTCTransformEvent RangeError ReadableByteStreamController ReadableStream ReadableStreamBYOBReader ReadableStreamBYOBRequest ReadableStreamDefaultController ReadableStreamDefaultReader '
+            + 'ReferenceError Reflect RegExp ReportBody ReportingObserver Request Response RestrictionTarget '
+            + 'Scheduler SecurityPolicyViolationEvent Serial SerialPort ServiceWorkerRegistration Set SourceBuffer SourceBufferList '
+            + 'StorageBucket StorageBucketManager StorageManager String Subscriber SubtleCrypto SuppressedError Symbol '
+            + 'SyncManager SyntaxError TaskController TaskPriorityChangeEvent TaskSignal Temporal TextDecoder TextDecoderStream '
+            + 'TextEncoder TextEncoderStream TextMetrics TransformStream TransformStreamDefaultController TrustedHTML TrustedScript TrustedScriptURL '
+            + 'TrustedTypePolicy TrustedTypePolicyFactory TypeError URIError URL URLPattern URLSearchParams USB '
+            + 'USBAlternateInterface USBConfiguration USBConnectionEvent USBDevice USBEndpoint USBInTransferResult USBInterface USBIsochronousInTransferPacket '
+            + 'USBIsochronousInTransferResult USBIsochronousOutTransferPacket USBIsochronousOutTransferResult USBOutTransferResult Uint16Array Uint32Array Uint8Array Uint8ClampedArray '
+            + 'UserActivation VideoColorSpace VideoDecoder VideoEncoder VideoFrame WGSLLanguageFeatures WeakMap WeakRef '
+            + 'WeakSet WebAssembly WebGL2RenderingContext WebGLActiveInfo WebGLBuffer WebGLContextEvent WebGLFramebuffer WebGLObject '
+            + 'WebGLProgram WebGLQuery WebGLRenderbuffer WebGLRenderingContext WebGLSampler WebGLShader WebGLShaderPrecisionFormat WebGLSync '
+            + 'WebGLTexture WebGLTransformFeedback WebGLUniformLocation WebGLVertexArrayObject WebSocket WebSocketError WebSocketStream WebTransport '
+            + 'WebTransportBidirectionalStream WebTransportDatagramDuplexStream WebTransportError Worker WorkerGlobalScope WorkerLocation WorkerNavigator WritableStream '
+            + 'WritableStreamDefaultController WritableStreamDefaultWriter XMLHttpRequest XMLHttpRequestEventTarget XMLHttpRequestUpload cancelAnimationFrame close console '
+            + 'decodeURI decodeURIComponent encodeURI encodeURIComponent escape eval globalThis isFinite '
+            + 'isNaN name onmessage onmessageerror onrtctransform parseFloat parseInt postMessage '
+            + 'requestAnimationFrame undefined unescape webkitRequestFileSystem webkitRequestFileSystemSync webkitResolveLocalFileSystemSyncURL webkitResolveLocalFileSystemURL'
+        ).split(' '));
+        for (const k of Object.getOwnPropertyNames(globalThis)) {
+            if (_chromeWorkerGlobals.has(k)) continue;
+            try { delete globalThis[k]; } catch (_) {}
+        }
+
+        // WebIDL constructors are non-enumerable own properties of a worker
+        // global. Only DedicatedWorkerGlobalScope's methods and event-handler
+        // attributes enumerate. Shared bootstraps used ordinary assignment for
+        // several interfaces, leaking dozens of entries through Object.keys().
+        const _enumerableWorkerGlobals = new Set((
+            'cancelAnimationFrame close name onmessage onmessageerror '
+            + 'onrtctransform postMessage requestAnimationFrame '
+            + 'webkitRequestFileSystem webkitRequestFileSystemSync '
+            + 'webkitResolveLocalFileSystemSyncURL webkitResolveLocalFileSystemURL'
+        ).split(' '));
+        const _readonlyEcmaGlobals = new Set(['Infinity', 'NaN', 'undefined']);
+        for (const k of _chromeWorkerGlobals) {
+            const descriptor = Object.getOwnPropertyDescriptor(globalThis, k);
+            if (!descriptor) continue;
+            const normalized = {
+                ...descriptor,
+                enumerable: _enumerableWorkerGlobals.has(k),
+            };
+            if ('value' in normalized && !_readonlyEcmaGlobals.has(k)) {
+                normalized.writable = true;
+            }
+            try { Object.defineProperty(globalThis, k, normalized); } catch (_) {}
+            if (typeof descriptor.value === 'function'
+                && typeof _workerMaskFunction === 'function') {
+                _workerMaskFunction(descriptor.value, k);
+            }
+        }
+
+        // DedicatedWorkerGlobalScope event attributes are accessor properties,
+        // not writable data slots. The accessors also preserve assignment for
+        // the EventTarget dispatcher used by the worker message pump.
+        const _eventAttributeValues = new Map([
+            ['name', typeof globalThis.name === 'string' ? globalThis.name : ''],
+            ['onmessage', globalThis.onmessage || null],
+            ['onmessageerror', globalThis.onmessageerror || null],
+            ['onrtctransform', globalThis.onrtctransform || null],
+        ]);
+        for (const k of _eventAttributeValues.keys()) {
+            const getter = function () { return _eventAttributeValues.get(k); };
+            const setter = function (value) { _eventAttributeValues.set(k, value); };
+            if (typeof _workerMaskFunction === 'function') {
+                _workerMaskFunction(getter, `get ${k}`);
+                _workerMaskFunction(setter, `set ${k}`);
+            }
+            try {
+                Object.defineProperty(globalThis, k, {
+                    configurable: true,
+                    enumerable: true,
+                    get: getter,
+                    set: setter,
+                });
+            } catch (_) {}
         }
     }
 
@@ -754,6 +1003,110 @@
         // the post-bootstrap instrumentation. The `internals` purge below
         // only ever REMOVES keys, so marking before it is safe.
         globalThis.__markGlobalsBaseline();
+    }
+
+    // -- Hide engine-owned bridge names from global namespace enumeration --
+    // Several runtime services still need a global rendezvous point because
+    // Rust drives them after bootstrap (frame setup/pumping, warm-page reset,
+    // navigation state). They are implementation details, not Web Platform
+    // globals, and exposing them through Object/Reflect enumeration is a
+    // strong and unnecessary fingerprint. Keep direct access for the driver,
+    // make the current properties non-enumerable, and filter only the engine's
+    // reserved names when page code enumerates the global object. Page-owned
+    // names such as `__NEXT_DATA__` remain visible.
+    if (!globalThis.__browserOxideOwnKeysPatched) {
+        const _hiddenExact = new Set([
+            '_browser_oxide',
+            '__bgSetTimeout', '__bo_input_events', '__cancelAllListeners',
+            '__cancelAllTimers', '__completeDocumentLifecycle',
+            '__cookieWrites', '__deliverMessage', '__ifAppendCount',
+            '__jsCookies', '__keepLongTimersRefed', '__markGlobalsBaseline',
+            '__onNodeInserted', '__pendingNavigation',
+            '__pumpFrameMessages', '__resetCustomElements',
+            '__resetDomRegistries', '__resetPageGlobals', '__scriptErrors',
+            '__syncCookiesFromNet', '__browserOxideOwnKeysPatched',
+        ]);
+        const _isEngineInternalName = (name) => typeof name === 'string' && (
+            _hiddenExact.has(name)
+            || name.startsWith('__bo_')
+            || name.startsWith('__frame')
+            || name.startsWith('__parentFrame')
+            || name.startsWith('__topFrame')
+            || name.startsWith('__ox')
+            || name.startsWith('__oxide')
+            || name.startsWith('__browser_oxide')
+            || name.startsWith('__OX')
+        );
+        const _isGlobalTarget = (target) => target === globalThis
+            || (globalThis.window && target === globalThis.window);
+        const _isPhantomFrameIndex = (name) => typeof name === 'string'
+            && /^(0|[1-9]\d*)$/.test(name)
+            && Number(name) >= Number(globalThis.length || 0);
+        const _isHiddenGlobalName = (name) => _isEngineInternalName(name)
+            || _isPhantomFrameIndex(name);
+
+        // Prevent for-in/Object.keys leaks for properties installed before
+        // cleanup. Properties installed later by Rust use non-enumerable
+        // descriptors at their creation sites.
+        for (const name of Object.getOwnPropertyNames(globalThis)) {
+            if (!_isEngineInternalName(name)) continue;
+            try {
+                const desc = Object.getOwnPropertyDescriptor(globalThis, name);
+                if (desc && desc.enumerable) {
+                    Object.defineProperty(globalThis, name, {
+                        ...desc,
+                        enumerable: false,
+                    });
+                }
+            } catch (_e) {}
+        }
+
+        const _objectGetOwnPropertyNames = Object.getOwnPropertyNames;
+        const _objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+        const _objectKeys = Object.keys;
+        const _reflectOwnKeys = Reflect.ownKeys;
+
+        const getOwnPropertyNames = function getOwnPropertyNames(target) {
+            const names = _objectGetOwnPropertyNames(target);
+            return _isGlobalTarget(target)
+                ? names.filter((name) => !_isHiddenGlobalName(name))
+                : names;
+        };
+        const getOwnPropertyDescriptors = function getOwnPropertyDescriptors(target) {
+            const descriptors = _objectGetOwnPropertyDescriptors(target);
+            if (_isGlobalTarget(target)) {
+                for (const name of Object.keys(descriptors)) {
+                    if (_isHiddenGlobalName(name)) delete descriptors[name];
+                }
+            }
+            return descriptors;
+        };
+        const keys = function keys(target) {
+            const names = _objectKeys(target);
+            return _isGlobalTarget(target)
+                ? names.filter((name) => !_isHiddenGlobalName(name))
+                : names;
+        };
+        const ownKeys = function ownKeys(target) {
+            const names = _reflectOwnKeys(target);
+            return _isGlobalTarget(target)
+                ? names.filter((name) => !_isHiddenGlobalName(name))
+                : names;
+        };
+
+        Object.getOwnPropertyNames = getOwnPropertyNames;
+        Object.getOwnPropertyDescriptors = getOwnPropertyDescriptors;
+        Object.keys = keys;
+        Reflect.ownKeys = ownKeys;
+        if (typeof globalThis._maskFunction === 'function') {
+            globalThis._maskFunction(getOwnPropertyNames, 'getOwnPropertyNames');
+            globalThis._maskFunction(getOwnPropertyDescriptors, 'getOwnPropertyDescriptors');
+            globalThis._maskFunction(keys, 'keys');
+            globalThis._maskFunction(ownKeys, 'ownKeys');
+        }
+        Object.defineProperty(globalThis, '__browserOxideOwnKeysPatched', {
+            value: true, configurable: true, enumerable: false,
+        });
     }
 
     for (const name of internals) {

@@ -677,8 +677,28 @@ impl HttpClient {
         url: &str,
         extra_headers: &[(String, String)],
         origin: Option<&str>,
+        request_type: Option<&str>,
     ) -> Result<Response, NetError> {
         let mut hdrs = headers::nav_headers_fetch(&self.profile, url, origin);
+        if request_type == Some("image") {
+            // An HTMLImageElement request is no-cors and carries an image
+            // destination/Accept shape. It also has no Origin header; Referer
+            // is supplied by the DOM loader according to referrer policy.
+            merge_headers(
+                &mut hdrs,
+                &[
+                    (
+                        "accept".to_string(),
+                        "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+                            .to_string(),
+                    ),
+                    ("sec-fetch-dest".to_string(), "image".to_string()),
+                    ("sec-fetch-mode".to_string(), "no-cors".to_string()),
+                    ("priority".to_string(), "i".to_string()),
+                ],
+            );
+            hdrs.retain(|(name, _)| !name.eq_ignore_ascii_case("origin"));
+        }
         merge_headers(&mut hdrs, extra_headers);
         self.get_with_exact_headers(url, &hdrs).await
     }

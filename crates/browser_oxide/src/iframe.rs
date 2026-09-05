@@ -158,8 +158,7 @@ impl ChildIframe {
             if script.code.trim().is_empty() {
                 continue;
             }
-            event_loop
-                .note_executed_script("about:srcdoc", &script.code);
+            event_loop.note_executed_script("about:srcdoc", &script.code);
             if let Err(e) = event_loop.execute_script_with_name(&script.code, "about:srcdoc") {
                 tracing::warn!(script_index = i, error = %e, "iframe script error");
             }
@@ -340,7 +339,7 @@ impl ChildIframe {
         };
         event_loop
             .execute_script(&format!(
-                "try{{globalThis.__frameReferrer='{ref_js}';globalThis.__frameAncestorOrigins={ao_js};}}catch(_){{}}"
+                "try{{Object.defineProperty(globalThis,'__frameReferrer',{{value:'{ref_js}',writable:true,configurable:true,enumerable:false}});Object.defineProperty(globalThis,'__frameAncestorOrigins',{{value:{ao_js},writable:true,configurable:true,enumerable:false}});}}catch(_){{}}"
             ))
             .ok();
 

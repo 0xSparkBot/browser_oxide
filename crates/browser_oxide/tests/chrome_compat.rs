@@ -63,6 +63,30 @@ async fn window_location_protocol() {
 async fn window_navigator() {
     assert_eq!(check("typeof navigator").await, "object");
 }
+
+#[tokio::test]
+async fn navigator_omits_non_chromium_legacy_members() {
+    let result = check(
+        r#"JSON.stringify({
+            msDoNotTrack: 'msDoNotTrack' in navigator,
+            loadPurpose: 'loadPurpose' in navigator,
+            sayswho: 'sayswho' in navigator,
+            mozGetUserMedia: 'mozGetUserMedia' in navigator,
+            insecureCanShare: 'canShare' in navigator,
+            insecureShare: 'share' in navigator
+        })"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"msDoNotTrack":false,"loadPurpose":false,"sayswho":false,"mozGetUserMedia":false,"insecureCanShare":false,"insecureShare":false}"#
+    );
+
+    assert_eq!(
+        check_secure("typeof navigator.canShare + ',' + typeof navigator.share").await,
+        "function,function"
+    );
+}
 #[tokio::test]
 async fn window_screen() {
     assert_eq!(check("typeof screen").await, "object");
@@ -1619,6 +1643,117 @@ async fn perf_resource_entry_shape() {
             })()"#
         )
         .await,
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn navigation_api_is_an_event_target_with_chrome_surface() {
+    assert_eq!(
+        check(
+            r#"(() => {
+                const expected = [
+                    'currentEntry', 'transition', 'activation', 'canGoBack',
+                    'canGoForward', 'onnavigate', 'onnavigatesuccess',
+                    'onnavigateerror', 'oncurrententrychange', 'back', 'entries',
+                    'forward', 'navigate', 'reload', 'traverseTo',
+                    'updateCurrentEntry', 'constructor'
+                ];
+                let fired = 0;
+                navigation.addEventListener('probe', () => fired++);
+                navigation.dispatchEvent(new Event('probe'));
+                return navigation instanceof EventTarget
+                    && Object.prototype.toString.call(navigation) === '[object Navigation]'
+                    && Object.getPrototypeOf(Navigation) === EventTarget
+                    && Object.getPrototypeOf(Navigation.prototype) === EventTarget.prototype
+                    && Object.getOwnPropertyNames(navigation).length === 0
+                    && JSON.stringify(Object.getOwnPropertyNames(Navigation.prototype)) === JSON.stringify(expected)
+                    && Object.prototype.toString.call(navigation.currentEntry) === '[object NavigationHistoryEntry]'
+                    && fired === 1;
+            })()"#
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn performance_observer_delivers_resource_entries() {
+    let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"globalThis.__observerResult = null;
+        const observer = new PerformanceObserver((list, self, options) => {
+            const entries = list.getEntries();
+            observer.disconnect();
+            globalThis.__observerResult = {
+                entries,
+                sameObserver: self === observer,
+                dropped: options.droppedEntriesCount,
+                listTag: Object.prototype.toString.call(list),
+            };
+        });
+        observer.observe({ entryTypes: ['resource'] });
+        const raw = {
+            url: 'https://example.test/probe.js',
+            type: 'script', startTime: 1, duration: 2, size: 3,
+        };
+        globalThis._browser_oxide.__perfResourceEntries.push(raw);
+        globalThis[Symbol.for('__browser_oxide_performance_resource__')](raw);"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(100))
+        .await
+        .unwrap();
+    let result = page
+        .evaluate(
+            r#"(() => {
+                const result = globalThis.__observerResult;
+                return Object.getOwnPropertyNames(PerformanceObserver.prototype).join(',')
+                    === 'disconnect,observe,takeRecords,constructor'
+                    && Object.getOwnPropertyNames(new PerformanceObserver(() => {})).length === 0
+                    && result && result.sameObserver
+                    && result.dropped === 0
+                    && result.listTag === '[object PerformanceObserverEntryList]'
+                    && result.entries.length === 1
+                    && result.entries[0].name === 'https://example.test/probe.js';
+            })()"#,
+        )
+        .unwrap();
+    assert_eq!(result, "true");
+}
+
+#[tokio::test]
+async fn rtc_ice_candidates_reach_event_target_listeners() {
+    let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"globalThis.__iceEvents = [];
+        const pc = new RTCPeerConnection();
+        pc.addEventListener('icecandidate', event => {
+            globalThis.__iceEvents.push({
+                trusted: event.isTrusted,
+                tag: Object.prototype.toString.call(event),
+                candidate: event.candidate && event.candidate.candidate,
+            });
+        });
+        pc.createOffer().then(offer => pc.setLocalDescription(offer));"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(100))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.evaluate(
+            r#"globalThis.__iceEvents.length === 2
+                && globalThis.__iceEvents[0].trusted === true
+                && globalThis.__iceEvents[0].tag === '[object RTCPeerConnectionIceEvent]'
+                && /\.local /.test(globalThis.__iceEvents[0].candidate)
+                && globalThis.__iceEvents[1].candidate === null"#
+        )
+        .unwrap(),
         "true"
     );
 }

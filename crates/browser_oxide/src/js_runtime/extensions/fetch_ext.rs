@@ -116,11 +116,34 @@ pub fn check_csp(
     nonce: Option<&str>,
     parser_inserted: bool,
 ) -> Result<(), &'static str> {
+    check_csp_for_document_origin(directive, url, nonce, parser_inserted, None)
+}
+
+/// The op-fetch variant of [`check_csp`], scoped to the document that
+/// initiated the request. Child frame runtimes share the same OS thread as
+/// their parent, so the thread-local active policy can belong to a different
+/// origin. Applying that parent policy to the child would incorrectly block
+/// otherwise same-origin iframe fetches.
+pub fn check_csp_for_document_origin(
+    directive: crate::net::csp::Directive,
+    url: &Url,
+    nonce: Option<&str>,
+    parser_inserted: bool,
+    document_origin: Option<&Url>,
+) -> Result<(), &'static str> {
     let decision = ACTIVE_CSP.with(|c| {
         let guard = c.borrow();
         let active = guard.as_ref()?;
         if !active.enforce {
             return None;
+        }
+        if let Some(document_origin) = document_origin {
+            let same_document_origin = active.origin.scheme() == document_origin.scheme()
+                && active.origin.host_str() == document_origin.host_str()
+                && active.origin.port_or_known_default() == document_origin.port_or_known_default();
+            if !same_document_origin {
+                return None;
+            }
         }
         let ctx = crate::net::csp::CheckCtx {
             directive,
@@ -220,6 +243,11 @@ pub struct FetchResponse {
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub body: String,
+    /// Exact response bytes for resource consumers that cannot round-trip
+    /// through UTF-8 (currently image loads). Ordinary fetches omit this to
+    /// avoid duplicating large text responses across the op boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<Vec<u8>>,
     pub url: String,
     pub ok: bool,
 }
@@ -248,6 +276,25 @@ pub async fn op_fetch(
     #[serde] headers: HashMap<String, String>,
     #[string] body: String,
 ) -> Result<FetchResponse, deno_error::JsErrorBox> {
+    // Pull JS-provided headers first. The pseudo origin both drives Fetch
+    // Metadata headers below and prevents a top document's thread-local CSP
+    // from being applied to a cross-origin child-frame runtime.
+    let mut extra_headers: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    let mut origin: Option<String> = None;
+    let mut request_type_hint: Option<String> = None;
+    for (k, v) in headers.into_iter() {
+        let lk = k.to_ascii_lowercase();
+        if lk == "x-browser-oxide-origin" {
+            origin = Some(v);
+            continue;
+        }
+        if lk == "x-browser-oxide-request-type" {
+            request_type_hint = Some(v.to_ascii_lowercase());
+            continue;
+        }
+        extra_headers.push((lk, v));
+    }
+
     // CSP `connect-src` enforcement — `window.fetch()` and XHR both
     // route through this op. Real Chrome blocks fetches that violate
     // the active policy by returning a 0-status, opaque, network-error
@@ -255,8 +302,14 @@ pub async fn op_fetch(
     // `try { await fetch(...) } catch (e) { ... }` path fires the same
     // way it would in Chrome.
     if let Ok(parsed) = Url::parse(&url) {
+        let document_origin = origin.as_deref().and_then(|value| Url::parse(value).ok());
+        let directive = if request_type_hint.as_deref() == Some("image") {
+            crate::net::csp::Directive::ImgSrc
+        } else {
+            crate::net::csp::Directive::ConnectSrc
+        };
         if let Err(violated) =
-            check_csp(crate::net::csp::Directive::ConnectSrc, &parsed, None, false)
+            check_csp_for_document_origin(directive, &parsed, None, false, document_origin.as_ref())
         {
             eprintln!(
                 "[csp] Refused to connect to '{}' because it violates the following Content Security Policy directive: \"{}\".",
@@ -267,6 +320,7 @@ pub async fn op_fetch(
                 status_text: "".to_string(),
                 headers: HashMap::new(),
                 body: String::new(),
+                body_bytes: None,
                 url: url.clone(),
                 ok: false,
             });
@@ -276,18 +330,15 @@ pub async fn op_fetch(
     // Resource blocker — short-circuit ad/tracker requests before TLS+JS.
     // Empty source_url is OK; the JS layer doesn't currently pass the page
     // origin here, but adblock's first-party rules degrade gracefully.
-    let request_type = crate::net::blocker::classify_request_type(
-        &url,
-        headers
-            .get("x-browser-oxide-request-type")
-            .map(|s| s.as_str()),
-    );
+    let request_type =
+        crate::net::blocker::classify_request_type(&url, request_type_hint.as_deref());
     if crate::net::blocker::should_block(&url, "", request_type) {
         return Ok(FetchResponse {
             status: 200,
             status_text: "OK".to_string(),
             headers: HashMap::new(),
             body: String::new(),
+            body_bytes: None,
             url: url.clone(),
             ok: true,
         });
@@ -307,20 +358,6 @@ pub async fn op_fetch(
         }
     };
 
-    // Pull JS-provided headers. JS may pass "x-browser-oxide-origin" as a pseudo
-    // header carrying the page's origin; strip it here and forward as the
-    // origin context so the net layer can compute sec-fetch-site correctly.
-    let mut extra_headers: Vec<(String, String)> = Vec::with_capacity(headers.len());
-    let mut origin: Option<String> = None;
-    for (k, v) in headers.into_iter() {
-        let lk = k.to_ascii_lowercase();
-        if lk == "x-browser-oxide-origin" {
-            origin = Some(v);
-            continue;
-        }
-        extra_headers.push((lk, v));
-    }
-
     // Decode the body marker. Legacy callers that don't set a marker send
     // plain UTF-8 strings; we treat those as 's' by default.
     let body_bytes: Vec<u8> = if let Some(rest) = body.strip_prefix("b:") {
@@ -333,6 +370,23 @@ pub async fn op_fetch(
     } else {
         body.as_bytes().to_vec()
     };
+    let fetch_trace = std::env::var_os("BROWSER_OXIDE_FETCH_TRACE").is_some();
+    if fetch_trace {
+        eprintln!(
+            "[browser-oxide-fetch] request method={} url={} body_len={} header_names={:?} body={}",
+            method,
+            url,
+            body_bytes.len(),
+            extra_headers
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            String::from_utf8_lossy(&body_bytes)
+                .chars()
+                .take(6000)
+                .collect::<String>()
+        );
+    }
 
     // Use fetch-API-style headers (accept: */*, sec-fetch-dest: empty, no
     // upgrade-insecure-requests) — this is a JS fetch() call, not a navigation.
@@ -357,7 +411,12 @@ pub async fn op_fetch(
             }
             _ => {
                 client
-                    .fetch_get(&url, &extra_headers, origin.as_deref())
+                    .fetch_get(
+                        &url,
+                        &extra_headers,
+                        origin.as_deref(),
+                        request_type_hint.as_deref(),
+                    )
                     .await
             }
         }
@@ -380,13 +439,25 @@ pub async fn op_fetch(
     };
 
     let ok = resp.ok();
+    let response_body_bytes =
+        (request_type_hint.as_deref() == Some("image")).then(|| resp.body.clone());
     let body_text = resp.text();
+    if fetch_trace {
+        eprintln!(
+            "[browser-oxide-fetch] response status={} url={} body_len={} body={}",
+            resp.status,
+            resp.url,
+            body_text.len(),
+            body_text.chars().take(1200).collect::<String>()
+        );
+    }
 
     let final_resp = FetchResponse {
         status: resp.status,
         status_text: resp.status_text.clone(),
         headers: resp.headers.clone(),
         body: body_text,
+        body_bytes: response_body_bytes,
         url: resp.url.clone(),
         ok,
     };

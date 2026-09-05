@@ -670,15 +670,92 @@
         globalThis.createImageBitmap = function() { return Promise.resolve(new globalThis.ImageBitmap()); };
         _maskAsNative(globalThis.createImageBitmap);
     }
-    if (!globalThis.DOMPoint) {
-        globalThis.DOMPoint = class DOMPoint {
-            constructor(x, y, z, w) { this.x = x || 0; this.y = y || 0; this.z = z || 0; this.w = w === undefined ? 1 : w; }
-            matrixTransform() { return new DOMPoint(this.x, this.y, this.z, this.w); }
-            toJSON() { return { x: this.x, y: this.y, z: this.z, w: this.w }; }
-            static fromPoint(p) { return new DOMPoint(p?.x, p?.y, p?.z, p?.w); }
+
+    // Trusted Types is exposed in both Window and dedicated-worker realms.
+    // Keep this in the shared bootstrap: a plain `{}` worker stub makes
+    // `trustedTypes.createPolicy(...)` throw, and CSP-hardened worker loaders
+    // report that failure instead of evaluating their message payload.
+    if (!globalThis.trustedTypes) {
+        const policies = new Map();
+        const TrustedHTML = function TrustedHTML(value) { this._value = value; };
+        const TrustedScript = function TrustedScript(value) { this._value = value; };
+        const TrustedScriptURL = function TrustedScriptURL(value) { this._value = value; };
+        const toString = function toString() { return this._value; };
+        TrustedHTML.prototype.toString = toString;
+        TrustedScript.prototype.toString = toString;
+        TrustedScriptURL.prototype.toString = toString;
+        const trustedScriptSources = new Set(['']);
+        const createEvalCompatibleScript = (value) => {
+            // Blink unwraps TrustedScript before native eval. Standalone V8
+            // has no host unwrapping hook, so retain the primitive string to
+            // preserve direct-eval lexical semantics while tracking trust.
+            const source = String(value);
+            trustedScriptSources.add(source);
+            return source;
         };
-        globalThis.DOMPointReadOnly = globalThis.DOMPoint;
-        _maskAsNative(globalThis.DOMPoint);
+        globalThis.trustedTypes = {
+            createPolicy(name, rules = {}) {
+                name = String(name);
+                const policy = {
+                    name,
+                    createHTML: (value) => new TrustedHTML(
+                        typeof rules.createHTML === 'function'
+                            ? rules.createHTML(value) : value
+                    ),
+                    createScript: (value) => createEvalCompatibleScript(
+                        typeof rules.createScript === 'function'
+                            ? rules.createScript(value) : value
+                    ),
+                    createScriptURL: (value) => new TrustedScriptURL(
+                        typeof rules.createScriptURL === 'function'
+                            ? rules.createScriptURL(value) : value
+                    ),
+                };
+                policies.set(name, policy);
+                if (name === 'default') globalThis.trustedTypes.defaultPolicy = policy;
+                return policy;
+            },
+            isHTML(value) { return value instanceof TrustedHTML; },
+            isScript(value) {
+                return value instanceof TrustedScript
+                    || (typeof value === 'string' && trustedScriptSources.has(value));
+            },
+            isScriptURL(value) { return value instanceof TrustedScriptURL; },
+            getAttributeType() { return null; },
+            getPropertyType() { return null; },
+            defaultPolicy: null,
+            emptyHTML: new TrustedHTML(''),
+            emptyScript: '',
+        };
+        globalThis.TrustedHTML = TrustedHTML;
+        globalThis.TrustedScript = TrustedScript;
+        globalThis.TrustedScriptURL = TrustedScriptURL;
+        _maskAsNative(globalThis.trustedTypes,
+            'createPolicy', 'isHTML', 'isScript', 'isScriptURL',
+            'getAttributeType', 'getPropertyType');
+        if (typeof _maskFunction === 'function') {
+            _maskFunction(TrustedHTML, 'TrustedHTML');
+            _maskFunction(TrustedScript, 'TrustedScript');
+            _maskFunction(TrustedScriptURL, 'TrustedScriptURL');
+        }
+    }
+    if (!globalThis.DOMPoint) {
+        globalThis.DOMPointReadOnly = class DOMPointReadOnly {
+            constructor(x, y, z, w) { this.x = x || 0; this.y = y || 0; this.z = z || 0; this.w = w === undefined ? 1 : w; }
+            matrixTransform() { return new globalThis.DOMPoint(this.x, this.y, this.z, this.w); }
+            toJSON() { return { x: this.x, y: this.y, z: this.z, w: this.w }; }
+            static fromPoint(p) { return new globalThis.DOMPointReadOnly(p?.x, p?.y, p?.z, p?.w); }
+        };
+        globalThis.DOMPoint = class DOMPoint extends globalThis.DOMPointReadOnly {
+            static fromPoint(p) { return new globalThis.DOMPoint(p?.x, p?.y, p?.z, p?.w); }
+        };
+        if (typeof _maskFunction === 'function') {
+            _maskFunction(globalThis.DOMPoint, 'DOMPoint');
+            _maskFunction(globalThis.DOMPointReadOnly, 'DOMPointReadOnly');
+        }
+        _maskAsNative(globalThis.DOMPoint.prototype, 'matrixTransform', 'toJSON');
+        _maskAsNative(globalThis.DOMPoint, 'fromPoint');
+        _maskAsNative(globalThis.DOMPointReadOnly, 'fromPoint');
     }
     if (!globalThis.DOMMatrix) {
         globalThis.DOMMatrix = class DOMMatrix {

@@ -617,6 +617,18 @@ pub fn op_image_decode_base64(state: &mut OpState, #[string] b64: &str) -> i32 {
     }
 }
 
+/// Return the intrinsic dimensions of a previously decoded image.
+#[op2]
+#[serde]
+pub fn op_image_get_dimensions(state: &mut OpState, #[smi] image_id: i32) -> Vec<u32> {
+    let state = state.borrow::<CanvasState>();
+    state
+        .images
+        .get(&image_id)
+        .map(|image| vec![image.width, image.height])
+        .unwrap_or_default()
+}
+
 /// Draw a decoded image onto a canvas.
 #[op2(fast)]
 pub fn op_canvas_draw_decoded_image(
@@ -679,6 +691,7 @@ deno_core::extension!(
         op_canvas_draw_image,
         op_canvas_set_fill_gradient,
         op_image_decode_base64,
+        op_image_get_dimensions,
         op_canvas_draw_decoded_image,
     ],
 );

@@ -16,7 +16,137 @@
     const _shadowHostNodeByRootNode = new Map();
     const _shadowModeByRootNode = new Map();
     const _closedFrameIds = new Set();
+    const _internalFetch = globalThis.fetch;
+    const _imageLoadGeneration = new WeakMap();
+    const _imageComplete = new WeakMap();
+    const _imageLoaded = new WeakMap();
+    const _imageNaturalSize = new WeakMap();
+    const _imageBytes = new WeakMap();
+    const _imageDecodeWaiters = new WeakMap();
     let _markFrameMessageTrusted = null;
+
+    function _debugImageLoad(entry) {
+        if (!globalThis.__browser_oxide_debug) return;
+        try {
+            const log = globalThis.__oxImageDiag || (globalThis.__oxImageDiag = []);
+            if (log.length < 24) log.push(entry);
+        } catch (_) {}
+    }
+
+    function _startImageLoad(image, rawValue) {
+        if (typeof _internalFetch !== 'function') return;
+        const previousWaiters = _imageDecodeWaiters.get(image);
+        if (previousWaiters) {
+            const error = new DOMException('The source image cannot be decoded.', 'EncodingError');
+            for (const waiter of previousWaiters) waiter.reject(error);
+            _imageDecodeWaiters.delete(image);
+        }
+        const generation = (_imageLoadGeneration.get(image) || 0) + 1;
+        _imageLoadGeneration.set(image, generation);
+        _imageLoaded.set(image, false);
+        _imageNaturalSize.set(image, { width: 0, height: 0 });
+        _imageBytes.delete(image);
+        const raw = String(rawValue || '');
+        if (!raw) {
+            _imageComplete.set(image, true);
+            return;
+        }
+        _imageComplete.set(image, false);
+        let url = raw;
+        try {
+            url = new URL(
+                raw,
+                (globalThis.location && globalThis.location.href) || 'about:blank'
+            ).href;
+        } catch (_) {}
+        _debugImageLoad({ phase: 'start', url: String(url).slice(-160), at: Math.round(performance.now()) });
+        Promise.resolve().then(() => _internalFetch(url, {
+            method: 'GET',
+            headers: {
+                'x-browser-oxide-request-type': 'image',
+                'accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                'sec-fetch-dest': 'image',
+                'sec-fetch-mode': 'no-cors',
+            },
+        })).then(async (response) => {
+            if (_imageLoadGeneration.get(image) !== generation) return;
+            _imageComplete.set(image, true);
+            const loaded = !!response && response.status >= 200 && response.status < 400;
+            _imageLoaded.set(image, loaded);
+            if (loaded) {
+                try {
+                    const bytes = new Uint8Array(await response.arrayBuffer());
+                    _imageBytes.set(image, bytes);
+                    let width = 0;
+                    let height = 0;
+                    // PNG IHDR stores unsigned big-endian dimensions at
+                    // offsets 16 and 20. Turnstile's challenge image is PNG;
+                    // GIF support covers another common pixel-probe format.
+                    if (bytes.length >= 24
+                        && bytes[0] === 0x89 && bytes[1] === 0x50
+                        && bytes[2] === 0x4e && bytes[3] === 0x47) {
+                        width = (((bytes[16] << 24) >>> 0)
+                            | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19]) >>> 0;
+                        height = (((bytes[20] << 24) >>> 0)
+                            | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23]) >>> 0;
+                    } else if (bytes.length >= 10
+                        && bytes[0] === 0x47 && bytes[1] === 0x49
+                        && bytes[2] === 0x46) {
+                        width = bytes[6] | (bytes[7] << 8);
+                        height = bytes[8] | (bytes[9] << 8);
+                    }
+                    _imageNaturalSize.set(image, { width, height });
+                } catch (_) {}
+            }
+            const decodeWaiters = _imageDecodeWaiters.get(image) || [];
+            _imageDecodeWaiters.delete(image);
+            if (loaded) {
+                for (const waiter of decodeWaiters) waiter.resolve();
+            } else {
+                const error = new DOMException(
+                    'The source image cannot be decoded.', 'EncodingError'
+                );
+                for (const waiter of decodeWaiters) waiter.reject(error);
+            }
+            const event = new Event(loaded ? 'load' : 'error');
+            if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
+            _debugImageLoad({
+                phase: 'response', status: response && response.status,
+                loaded, trusted: event.isTrusted,
+                onload: typeof image.onload, onerror: typeof image.onerror,
+                width: image.width, height: image.height,
+                naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight,
+                at: Math.round(performance.now()),
+            });
+            image.dispatchEvent(
+                event
+            );
+            _debugImageLoad({ phase: 'dispatched', type: event.type, at: Math.round(performance.now()) });
+        }).catch(() => {
+            if (_imageLoadGeneration.get(image) !== generation) return;
+            _imageComplete.set(image, true);
+            _imageLoaded.set(image, false);
+            const decodeWaiters = _imageDecodeWaiters.get(image) || [];
+            _imageDecodeWaiters.delete(image);
+            const error = new DOMException(
+                'The source image cannot be decoded.', 'EncodingError'
+            );
+            for (const waiter of decodeWaiters) waiter.reject(error);
+            const event = new Event('error');
+            if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
+            _debugImageLoad({ phase: 'catch', trusted: event.isTrusted, at: Math.round(performance.now()) });
+            image.dispatchEvent(event);
+        });
+    }
+
+    // canvas_bootstrap captures this closure and immediately removes the
+    // global property. Keeping the response bytes in a WeakMap lets
+    // drawImage() decode real HTMLImageElement pixels without adding any
+    // observable own properties to image elements.
+    Object.defineProperty(globalThis, '__bo_get_image_bytes', {
+        value(image) { return _imageBytes.get(image) || null; },
+        configurable: true,
+    });
 
     function _debugFrameLifecycle(entry) {
         if (!globalThis.__browser_oxide_debug) return;
@@ -1059,6 +1189,9 @@
             // virtual `setAttribute` here would recurse through the iframe
             // subclass override installed below.
             ops.op_dom_set_attribute(_getNodeId(this), "src", raw);
+            if (String(this.localName || '').toLowerCase() === 'img') {
+                _startImageLoad(this, raw);
+            }
             // A connected iframe navigates when its src IDL attribute changes.
             // Queue a new frame id immediately so contentWindow switches away
             // from the previous browsing context before the Rust driver fetches
@@ -1154,7 +1287,13 @@
         get firstElementChild() { return _wrapNode(ops.op_dom_get_first_element_child(_getNodeId(this))); }
         get lastElementChild() { return _wrapNode(ops.op_dom_get_last_element_child(_getNodeId(this))); }
         getAttribute(name) { return ops.op_dom_get_attribute(_getNodeId(this), name); }
-        setAttribute(name, value) { ops.op_dom_set_attribute(_getNodeId(this), name, String(value)); }
+        setAttribute(name, value) {
+            ops.op_dom_set_attribute(_getNodeId(this), name, String(value));
+            if (String(name).toLowerCase() === 'src'
+                && String(this.localName || '').toLowerCase() === 'img') {
+                _startImageLoad(this, value);
+            }
+        }
         removeAttribute(name) { ops.op_dom_remove_attribute(_getNodeId(this), name); }
         hasAttribute(name) { return ops.op_dom_has_attribute(_getNodeId(this), name); }
         // Namespaced / Attr-node APIs. react-dom's commit phase calls
@@ -1564,30 +1703,58 @@
     Object.defineProperty(HTMLImageElement.prototype, "width", {
         get() {
             const attr = this.getAttribute("width");
-            return attr ? parseInt(attr, 10) : 0;
+            if (attr) return parseInt(attr, 10) || 0;
+            const size = _imageNaturalSize.get(this);
+            return _imageLoaded.get(this) && size ? size.width : 0;
         },
         enumerable: true, configurable: true
     });
     Object.defineProperty(HTMLImageElement.prototype, "height", {
         get() {
             const attr = this.getAttribute("height");
-            return attr ? parseInt(attr, 10) : 0;
+            if (attr) return parseInt(attr, 10) || 0;
+            const size = _imageNaturalSize.get(this);
+            return _imageLoaded.get(this) && size ? size.height : 0;
         },
         enumerable: true, configurable: true
     });
     Object.defineProperty(HTMLImageElement.prototype, "naturalWidth", {
-        get() { return this.width; },
+        get() {
+            const size = _imageNaturalSize.get(this);
+            return _imageLoaded.get(this) && size ? size.width : 0;
+        },
         enumerable: true, configurable: true
     });
     Object.defineProperty(HTMLImageElement.prototype, "naturalHeight", {
-        get() { return this.height; },
+        get() {
+            const size = _imageNaturalSize.get(this);
+            return _imageLoaded.get(this) && size ? size.height : 0;
+        },
         enumerable: true, configurable: true
     });
     Object.defineProperty(HTMLImageElement.prototype, "complete", {
-        get() { return true; }, 
+        get() { return _imageComplete.get(this) !== false; },
         enumerable: true, configurable: true
     });
-    HTMLImageElement.prototype.decode = function() { return Promise.resolve(); };
+    HTMLImageElement.prototype.decode = function decode() {
+        const pending = _imageComplete.get(this) === false;
+        _debugImageLoad({
+            phase: 'decode', pending,
+            loaded: _imageLoaded.get(this) === true,
+            at: Math.round(performance.now()),
+        });
+        if (pending) {
+            return new Promise((resolve, reject) => {
+                const waiters = _imageDecodeWaiters.get(this) || [];
+                waiters.push({ resolve, reject });
+                _imageDecodeWaiters.set(this, waiters);
+            });
+        }
+        if (_imageLoaded.get(this)) return Promise.resolve();
+        return Promise.reject(new DOMException(
+            'The source image cannot be decoded.', 'EncodingError'
+        ));
+    };
     class HTMLInputElement extends HTMLElement {}
     class HTMLFormElement extends HTMLElement {
         submit() {
@@ -1944,6 +2111,16 @@
     }
     class HTMLPreElement extends HTMLElement {}
     class HTMLQuoteElement extends HTMLElement {}
+    class HTMLAreaElement extends HTMLElement {}
+    class HTMLBRElement extends HTMLElement {}
+    class HTMLBaseElement extends HTMLElement {}
+    class HTMLDListElement extends HTMLElement {}
+    class HTMLDataElement extends HTMLElement {}
+    class HTMLDataListElement extends HTMLElement {}
+    class HTMLDetailsElement extends HTMLElement {}
+    class HTMLDialogElement extends HTMLElement {}
+    class HTMLDirectoryElement extends HTMLElement {}
+    class HTMLSelectedContentElement extends HTMLElement {}
 
     // Tag → specific HTML*Element prototype map. Anything not listed falls
     // back to HTMLElement.prototype.
@@ -1991,6 +2168,16 @@
         pre: HTMLPreElement.prototype,
         blockquote: HTMLQuoteElement.prototype,
         q: HTMLQuoteElement.prototype,
+        area: HTMLAreaElement.prototype,
+        br: HTMLBRElement.prototype,
+        base: HTMLBaseElement.prototype,
+        dl: HTMLDListElement.prototype,
+        data: HTMLDataElement.prototype,
+        datalist: HTMLDataListElement.prototype,
+        details: HTMLDetailsElement.prototype,
+        dialog: HTMLDialogElement.prototype,
+        dir: HTMLDirectoryElement.prototype,
+        selectedcontent: HTMLSelectedContentElement.prototype,
     };
 
     // Adjust an Element instance's prototype to the tag-specific subclass
@@ -2175,6 +2362,13 @@
         }
     }
 
+    const _pointInViewport = (x, y) => {
+        x = +x; y = +y;
+        const w = globalThis.innerWidth || 0;
+        const h = globalThis.innerHeight || 0;
+        return x >= 0 && y >= 0 && x < w && y < h;
+    };
+
     class Document extends Node {
         constructor(nodeId) {
             // Forward the document node id to Node so _getNodeId returns
@@ -2203,6 +2397,7 @@
         get webkitVisibilityState() { return "visible"; }
         get webkitHidden() { return false; }
         get fullscreenEnabled() { return true; }
+        set fullscreenEnabled(_value) {}
         get webkitFullscreenEnabled() { return true; }
         get webkitIsFullScreen() { return false; }
 
@@ -2212,6 +2407,10 @@
         }
         get head() { return this.querySelector("head"); }
         get body() { return this.querySelector("body"); }
+        set body(value) {
+            const current = this.querySelector("body");
+            if (current && value && current !== value) current.replaceWith(value);
+        }
         get title() {
             const el = this.querySelector("title");
             return el ? el.textContent : "";
@@ -2348,18 +2547,12 @@
         // point still approximates the topmost element with body (falling back
         // to documentElement) — but the viewport-bounds null result, which is
         // the detectable behaviour, is now spec-correct.
-        _pointInViewport(x, y) {
-            x = +x; y = +y;
-            const w = globalThis.innerWidth || 0;
-            const h = globalThis.innerHeight || 0;
-            return x >= 0 && y >= 0 && x < w && y < h;
-        }
         elementFromPoint(x, y) {
-            if (!this._pointInViewport(x, y)) return null;
+            if (!_pointInViewport(x, y)) return null;
             return this.body || this.documentElement || null;
         }
         elementsFromPoint(x, y) {
-            if (!this._pointInViewport(x, y)) return [];
+            if (!_pointInViewport(x, y)) return [];
             return this.body ? [this.body] : [];
         }
         caretPositionFromPoint(x, y) { return null; }
@@ -2370,6 +2563,7 @@
         get URL() { return globalThis.location?.href || "about:blank"; }
         get documentURI() { return this.URL; }
         get domain() { return globalThis.location?.hostname || ""; }
+        set domain(_value) {}
         get location() { return globalThis.location; }
         set location(val) { if (globalThis.location) globalThis.location.href = val; }
         get referrer() { return globalThis.__frameReferrer || ""; }
@@ -2503,10 +2697,126 @@
             }
         }
         get fullscreenElement() { return null; }
+        set fullscreenElement(_value) {}
         get pointerLockElement() { return null; }
         exitFullscreen() { return Promise.resolve(); }
         exitPointerLock() {}
     }
+
+    // Document mixins and legacy HTMLDocument members exposed by Chrome 148.
+    // Keep them on the prototype (rather than one-off instance properties):
+    // fingerprinting code enumerates Document.prototype and child realms mirror
+    // these descriptors when constructing their own interface objects.
+    const _documentValues = new WeakMap();
+    const _documentValue = (doc, name, fallback) => {
+        const values = _documentValues.get(doc);
+        return values && values.has(name) ? values.get(name) : fallback;
+    };
+    const _setDocumentValue = (doc, name, value) => {
+        let values = _documentValues.get(doc);
+        if (!values) {
+            values = new Map();
+            _documentValues.set(doc, values);
+        }
+        values.set(name, value);
+    };
+    const _defineDocumentMethod = (name, fn) => {
+        if (!Object.getOwnPropertyDescriptor(Document.prototype, name)) {
+            Object.defineProperty(fn, 'name', { value: name, configurable: true });
+            Object.defineProperty(Document.prototype, name, {
+                value: fn, writable: true, enumerable: true, configurable: true,
+            });
+        }
+    };
+    const _defineDocumentGetter = (name, getter) => {
+        if (!Object.getOwnPropertyDescriptor(Document.prototype, name)) {
+            Object.defineProperty(Document.prototype, name, {
+                get: getter, enumerable: true, configurable: true,
+            });
+        }
+    };
+    const _defineDocumentAccessor = (name, fallback) => {
+        if (!Object.getOwnPropertyDescriptor(Document.prototype, name)) {
+            Object.defineProperty(Document.prototype, name, {
+                get() { return _documentValue(this, name, fallback); },
+                set(value) { _setDocumentValue(this, name, value); },
+                enumerable: true, configurable: true,
+            });
+        }
+    };
+
+    _defineDocumentMethod('append', function(...nodes) {
+        for (const node of nodes) this.appendChild(typeof node === 'string' ? this.createTextNode(node) : node);
+    });
+    _defineDocumentMethod('prepend', function(...nodes) {
+        const before = this.firstChild;
+        for (const node of nodes) this.insertBefore(typeof node === 'string' ? this.createTextNode(node) : node, before);
+    });
+    _defineDocumentMethod('replaceChildren', function(...nodes) {
+        while (this.firstChild) this.removeChild(this.firstChild);
+        this.append(...nodes);
+    });
+    _defineDocumentMethod('moveBefore', function(node, child) { return this.insertBefore(node, child); });
+    _defineDocumentMethod('ariaNotify', function() {});
+    _defineDocumentMethod('browsingTopics', function() { return Promise.resolve([]); });
+    _defineDocumentMethod('captureEvents', function() {});
+    _defineDocumentMethod('releaseEvents', function() {});
+    _defineDocumentMethod('clear', function() {});
+    _defineDocumentMethod('caretRangeFromPoint', function() { return null; });
+    _defineDocumentMethod('createAttributeNS', function(_namespace, name) { return this.createAttribute(name); });
+    _defineDocumentMethod('createCDATASection', function(data) { return this.createTextNode(data); });
+    _defineDocumentMethod('createProcessingInstruction', function(_target, data) { return this.createTextNode(data); });
+    _defineDocumentMethod('createExpression', function(expression, resolver) {
+        return { expression: String(expression), resolver: resolver || null, evaluate() { return null; } };
+    });
+    _defineDocumentMethod('createNSResolver', function(node) { return node; });
+    _defineDocumentMethod('evaluate', function() { return { resultType: 0, numberValue: 0, stringValue: '', booleanValue: false, singleNodeValue: null, invalidIteratorState: false, snapshotLength: 0, iterateNext() { return null; }, snapshotItem() { return null; } }; });
+    _defineDocumentMethod('exitPictureInPicture', function() { return Promise.resolve(); });
+    _defineDocumentMethod('getAnimations', function() { return []; });
+    _defineDocumentMethod('getElementsByTagNameNS', function(_namespace, name) { return this.getElementsByTagName(name); });
+    _defineDocumentMethod('hasUnpartitionedCookieAccess', function() { return Promise.resolve(false); });
+    _defineDocumentMethod('queryCommandIndeterm', function() { return false; });
+    _defineDocumentMethod('queryCommandState', function() { return false; });
+    _defineDocumentMethod('queryCommandValue', function() { return ''; });
+    _defineDocumentMethod('requestStorageAccessFor', function() { return Promise.reject(new DOMException('Permission denied', 'NotAllowedError')); });
+    _defineDocumentMethod('webkitCancelFullScreen', function() { return this.exitFullscreen(); });
+    _defineDocumentMethod('webkitExitFullscreen', function() { return this.exitFullscreen(); });
+
+    _defineDocumentGetter('activeViewTransition', function() { return null; });
+    _defineDocumentGetter('all', function() { return this.querySelectorAll('*'); });
+    _defineDocumentGetter('applets', function() { return this.querySelectorAll('applet'); });
+    _defineDocumentGetter('children', function() { return this.documentElement ? [this.documentElement] : []; });
+    _defineDocumentGetter('childElementCount', function() { return this.documentElement ? 1 : 0; });
+    _defineDocumentGetter('firstElementChild', function() { return this.documentElement; });
+    _defineDocumentGetter('lastElementChild', function() { return this.documentElement; });
+    _defineDocumentGetter('customElementRegistry', function() { return globalThis.customElements; });
+    _defineDocumentGetter('featurePolicy', function() { return globalThis.FeaturePolicy ? Object.create(globalThis.FeaturePolicy.prototype) : {}; });
+    _defineDocumentGetter('fonts', function() { return new Set(); });
+    _defineDocumentGetter('fragmentDirective', function() { return globalThis.FragmentDirective ? Object.create(globalThis.FragmentDirective.prototype) : {}; });
+    _defineDocumentGetter('inputEncoding', function() { return this.characterSet; });
+    _defineDocumentGetter('lastModified', function() { return '01/01/1970 00:00:00'; });
+    _defineDocumentGetter('pictureInPictureElement', function() { return null; });
+    _defineDocumentGetter('pictureInPictureEnabled', function() { return true; });
+    _defineDocumentGetter('plugins', function() { return this.querySelectorAll('embed,object'); });
+    _defineDocumentGetter('prerendering', function() { return false; });
+    _defineDocumentGetter('rootElement', function() { return this.documentElement; });
+    _defineDocumentGetter('scrollingElement', function() { return this.documentElement; });
+    _defineDocumentGetter('timeline', function() { return globalThis.DocumentTimeline ? Object.create(globalThis.DocumentTimeline.prototype) : {}; });
+    _defineDocumentGetter('wasDiscarded', function() { return false; });
+    _defineDocumentGetter('webkitCurrentFullScreenElement', function() { return this.fullscreenElement; });
+    _defineDocumentGetter('webkitFullscreenElement', function() { return this.fullscreenElement; });
+    _defineDocumentGetter('xmlEncoding', function() { return null; });
+
+    _defineDocumentAccessor('alinkColor', '');
+    _defineDocumentAccessor('bgColor', '');
+    _defineDocumentAccessor('designMode', 'off');
+    _defineDocumentAccessor('dir', '');
+    _defineDocumentAccessor('fgColor', '');
+    _defineDocumentAccessor('fullscreen', false);
+    _defineDocumentAccessor('linkColor', '');
+    _defineDocumentAccessor('vlinkColor', '');
+    _defineDocumentAccessor('xmlStandalone', false);
+    _defineDocumentAccessor('xmlVersion', '1.0');
 
     // --- CSSOM ---
     class CSSStyleSheet {
@@ -2593,6 +2903,15 @@
 
     // Create the global document
     const _document = new Document(ops.op_dom_document_node());
+    // Blink exposes document.location on the HTML document instance rather
+    // than as an own member of Document.prototype.
+    try {
+        const _locationDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'location');
+        if (_locationDescriptor) {
+            Object.defineProperty(_document, 'location', _locationDescriptor);
+            delete Document.prototype.location;
+        }
+    } catch (_) {}
     _nodeCache.set(ops.op_dom_document_node(), new WeakRef(_document));
     // The native HTML parser has already produced the initial DOM tree. Move
     // any parser-created template descendants into their inert contents before
@@ -2650,6 +2969,16 @@
     _tag(HTMLTemplateElement, "HTMLTemplateElement");
     _tag(HTMLPreElement, "HTMLPreElement");
     _tag(HTMLQuoteElement, "HTMLQuoteElement");
+    _tag(HTMLAreaElement, "HTMLAreaElement");
+    _tag(HTMLBRElement, "HTMLBRElement");
+    _tag(HTMLBaseElement, "HTMLBaseElement");
+    _tag(HTMLDListElement, "HTMLDListElement");
+    _tag(HTMLDataElement, "HTMLDataElement");
+    _tag(HTMLDataListElement, "HTMLDataListElement");
+    _tag(HTMLDetailsElement, "HTMLDetailsElement");
+    _tag(HTMLDialogElement, "HTMLDialogElement");
+    _tag(HTMLDirectoryElement, "HTMLDirectoryElement");
+    _tag(HTMLSelectedContentElement, "HTMLSelectedContentElement");
     _tag(Text, "Text");
     _tag(Comment, "Comment");
     _tag(DocumentFragment, "DocumentFragment");
@@ -2695,12 +3024,35 @@
         "ontransitionend", "ontransitionrun", "ontransitionstart", "onvolumechange",
         "onwaiting", "onwebkitanimationend", "onwebkitanimationiteration",
         "onwebkitanimationstart", "onwebkittransitionend", "onwheel",
+        "onanimationcancel", "onanimationend", "onanimationiteration",
+        "onanimationstart", "onbeforecopy", "onbeforecut", "onbeforematch",
+        "onbeforepaste", "onbeforexrselect", "oncommand",
+        "oncontentvisibilityautostatechange", "oncontextlost", "oncontextrestored",
+        "onfreeze", "onfullscreenchange", "onfullscreenerror",
+        "ongotpointercapture", "onlostpointercapture", "onpointerlockchange",
+        "onpointerlockerror", "onprerenderingchange", "onreadystatechange",
+        "onresume", "onscrollsnapchange", "onscrollsnapchanging", "onsearch",
+        "onvisibilitychange", "onwebkitfullscreenchange", "onwebkitfullscreenerror",
     ];
+    const _eventHandlerValues = new WeakMap();
     for (const _gehProto of [HTMLElement.prototype, Document.prototype]) {
         for (const _geh of _globalEventHandlerNames) {
             if (!Object.getOwnPropertyDescriptor(_gehProto, _geh)) {
                 Object.defineProperty(_gehProto, _geh, {
-                    value: null, writable: true, configurable: true, enumerable: true,
+                    get() {
+                        const values = _eventHandlerValues.get(this);
+                        return values && values.has(_geh) ? values.get(_geh) : null;
+                    },
+                    set(value) {
+                        let values = _eventHandlerValues.get(this);
+                        if (!values) {
+                            values = new Map();
+                            _eventHandlerValues.set(this, values);
+                        }
+                        values.set(_geh, typeof value === 'function' ? value : null);
+                    },
+                    configurable: true,
+                    enumerable: true,
                 });
             }
         }
@@ -2749,6 +3101,16 @@
     globalThis.HTMLTemplateElement = HTMLTemplateElement;
     globalThis.HTMLPreElement = HTMLPreElement;
     globalThis.HTMLQuoteElement = HTMLQuoteElement;
+    globalThis.HTMLAreaElement = HTMLAreaElement;
+    globalThis.HTMLBRElement = HTMLBRElement;
+    globalThis.HTMLBaseElement = HTMLBaseElement;
+    globalThis.HTMLDListElement = HTMLDListElement;
+    globalThis.HTMLDataElement = HTMLDataElement;
+    globalThis.HTMLDataListElement = HTMLDataListElement;
+    globalThis.HTMLDetailsElement = HTMLDetailsElement;
+    globalThis.HTMLDialogElement = HTMLDialogElement;
+    globalThis.HTMLDirectoryElement = HTMLDirectoryElement;
+    globalThis.HTMLSelectedContentElement = HTMLSelectedContentElement;
     globalThis.SVGElement = Element;
     globalThis.Text = Text;
     globalThis.Comment = Comment;
@@ -3205,7 +3567,11 @@
         "HTMLAnchorElement", "HTMLImageElement", "HTMLInputElement",
         "HTMLFormElement", "HTMLButtonElement", "HTMLSelectElement",
         "HTMLTextAreaElement", "HTMLCanvasElement", "HTMLScriptElement",
-        "HTMLIFrameElement", "Event", "CustomEvent", "MouseEvent",
+        "HTMLIFrameElement", "HTMLAreaElement", "HTMLBRElement",
+        "HTMLBaseElement", "HTMLDListElement", "HTMLDataElement",
+        "HTMLDataListElement", "HTMLDetailsElement", "HTMLDialogElement",
+        "HTMLDirectoryElement", "HTMLSelectedContentElement",
+        "Event", "CustomEvent", "MouseEvent",
         "KeyboardEvent", "MessageEvent", "Array", "Object", "Function",
         "String", "Number", "Boolean", "Promise", "Error", "TypeError",
         "RangeError", "Map", "Set", "WeakMap", "WeakSet", "Date",
@@ -3250,7 +3616,10 @@
         "HTMLAnchorElement", "HTMLImageElement", "HTMLInputElement",
         "HTMLFormElement", "HTMLButtonElement", "HTMLSelectElement",
         "HTMLTextAreaElement", "HTMLCanvasElement", "HTMLScriptElement",
-        "HTMLIFrameElement",
+        "HTMLIFrameElement", "HTMLAreaElement", "HTMLBRElement",
+        "HTMLBaseElement", "HTMLDListElement", "HTMLDataElement",
+        "HTMLDataListElement", "HTMLDetailsElement", "HTMLDialogElement",
+        "HTMLDirectoryElement", "HTMLSelectedContentElement",
     ]);
 
     function _mkMirroredConstructor(parentCtor, name, freshGrandparentProto) {
@@ -3436,7 +3805,10 @@
         "HTMLUListElement", "HTMLOListElement", "HTMLLIElement",
         "HTMLTableRowElement", "HTMLTableCellElement", "HTMLTableSectionElement",
         "HTMLLabelElement", "HTMLOptionElement", "HTMLTemplateElement",
-        "HTMLPreElement", "HTMLQuoteElement",
+        "HTMLPreElement", "HTMLQuoteElement", "HTMLAreaElement",
+        "HTMLBRElement", "HTMLBaseElement", "HTMLDListElement",
+        "HTMLDataElement", "HTMLDataListElement", "HTMLDetailsElement",
+        "HTMLDialogElement", "HTMLDirectoryElement", "HTMLSelectedContentElement",
     ];
 
     function _installChildRealmInterfaces(realmId) {
@@ -5348,7 +5720,14 @@
             return _frameHandle(fid);
         }
         globalThis.__frameHandleFor = _frameHandle;
+        let _frameReadyGatePasses = 0;
+        let _frameAgeGatePasses = 0;
+        let _framePumpStart = null;
+        let _frameRedeliveryCount = 0;
         globalThis.__pumpFrameMessages = function() {
+            if (globalThis.__oxOps) {
+                try { globalThis.__oxPumpC = (globalThis.__oxPumpC || 0) + 1; } catch (_) {}
+            }
             // Deferred-delivery gate: hold queued cross-frame messages until
             // this realm's initial load has settled. The driver calls this
             // pump as soon as the mailbox is non-empty, which during page load
@@ -5360,14 +5739,18 @@
             // gate passes (~sweeps, not ms) deliver anyway so a realm that
             // never settles still receives its mail (browsers never drop).
             if (!globalThis.__oxFrameReady) {
-                const n = (globalThis.__oxGateN = (globalThis.__oxGateN || 0) + 1);
-                try {
-                    const gp = globalThis.__oxGP || (globalThis.__oxGP = []);
-                    if (gp.length < 8) gp.push("g" + n + "@" + Math.round(performance.now()));
-                } catch (_) {}
-                if (n < 400) return;
+                _frameReadyGatePasses++;
+                if (globalThis.__oxOps) {
+                    try {
+                        globalThis.__oxGateN = _frameReadyGatePasses;
+                        const gp = globalThis.__oxGP || (globalThis.__oxGP = []);
+                        if (gp.length < 8) gp.push("g" + _frameReadyGatePasses + "@" + Math.round(performance.now()));
+                    } catch (_) {}
+                }
+                if (_frameReadyGatePasses < 400) return;
             } else {
-                globalThis.__oxGateN = 0;
+                _frameReadyGatePasses = 0;
+                if (globalThis.__oxOps) globalThis.__oxGateN = 0;
             }
             // Time floor: the challenge's first message handler reads lazy
             // lookup tables that later timers / phases finish building; a
@@ -5380,15 +5763,18 @@
             // messages queued (driver re-pumps); bounded like the gate.
             {
                 const now = performance.now();
-                if (globalThis.__oxT0 === undefined) globalThis.__oxT0 = now;
-                const age = now - globalThis.__oxT0;
+                if (_framePumpStart === null) _framePumpStart = now;
+                const age = now - _framePumpStart;
                 if (age < 1500) {
-                    const n2 = (globalThis.__oxGateT = (globalThis.__oxGateT || 0) + 1);
-                    if (n2 < 400) {
-                        try {
-                            const gt = globalThis.__oxGT || (globalThis.__oxGT = []);
-                            if (gt.length < 6) gt.push("t" + n2 + "@" + Math.round(now));
-                        } catch (_) {}
+                    _frameAgeGatePasses++;
+                    if (_frameAgeGatePasses < 400) {
+                        if (globalThis.__oxOps) {
+                            try {
+                                globalThis.__oxGateT = _frameAgeGatePasses;
+                                const gt = globalThis.__oxGT || (globalThis.__oxGT = []);
+                                if (gt.length < 6) gt.push("t" + _frameAgeGatePasses + "@" + Math.round(now));
+                            } catch (_) {}
+                        }
                         return;
                     }
                 }
@@ -5396,9 +5782,13 @@
             let arr;
             try { arr = JSON.parse(ops.op_frame_take_messages(globalThis.__frameId || 0)); }
             catch (_) { return; }
-            const ring = globalThis.__oxFrameMsgLog
-                || (globalThis.__oxFrameMsgLog = []);
+            const ring = globalThis.__oxOps
+                ? (globalThis.__oxFrameMsgLog || (globalThis.__oxFrameMsgLog = []))
+                : null;
             for (const m of arr) {
+                if (globalThis.__oxOps) {
+                    try { globalThis.__oxPumpD = (globalThis.__oxPumpD || 0) + 1; } catch (_) {}
+                }
                 let data;
                 try {
                     data = (_browser_oxide && _browser_oxide.deserializeFromWire)
@@ -5412,27 +5802,35 @@
                 } catch (_) { shape = "object:?"; }
                 const entry = (m.t || "").slice(0, 24) + "|" + (m.o || "").slice(0, 24)
                     + "|" + shape + "|" + String(typeof data === "string" ? data.slice(0, 80) : "").slice(0, 80);
-                const last = ring[ring.length - 1];
-                const lastShape = last && typeof last === "string" ? last.split("|")[2] : null;
-                if (lastShape === shape && shape.indexOf("event,seq") >= 0 && last.indexOf("DISPATCH") < 0) {
-                    const at = last.lastIndexOf(" x");
-                    const base = at > 0 ? last.slice(0, at) : last;
-                    const cnt = at > 0 ? (parseInt(last.slice(at + 2), 10) || 1) : 1;
-                    ring[ring.length - 1] = base + " x" + (cnt + 1);
-                } else {
-                    if (ring.length >= 24) ring.shift();
-                    ring.push(entry);
+                if (ring) {
+                    const last = ring[ring.length - 1];
+                    const lastShape = last && typeof last === "string" ? last.split("|")[2] : null;
+                    if (lastShape === shape && shape.indexOf("event,seq") >= 0 && last.indexOf("DISPATCH") < 0) {
+                        const at = last.lastIndexOf(" x");
+                        const base = at > 0 ? last.slice(0, at) : last;
+                        const cnt = at > 0 ? (parseInt(last.slice(at + 2), 10) || 1) : 1;
+                        ring[ring.length - 1] = base + " x" + (cnt + 1);
+                    } else {
+                        if (ring.length >= 24) ring.shift();
+                        ring.push(entry);
+                    }
                 }
                 try {
                     const ev = new MessageEvent("message", { data: data, origin: m.o || "", source: _frameSourceHandle(m.s) });
                     if (_markFrameMessageTrusted) _markFrameMessageTrusted(ev);
                     globalThis.dispatchEvent(ev);
                 } catch (e) {
-                    let full = "";
-                    try { full = JSON.stringify(data).slice(0, 1200); } catch (_) { full = "unserializable"; }
-                    ring.shift();
-                    ring.push("DISPATCH_FAIL:" + (e && e.message) + "|DATA:" + full
-                        + "|STACK:" + (e && e.stack ? String(e.stack).replace(/\n/g, " ~ ").slice(0, 900) : ""));
+                    if (globalThis.__oxOps) {
+                        try {
+                            const perr = globalThis.__oxPumpE || (globalThis.__oxPumpE = []);
+                            if (perr.length < 6) perr.push(String((e && e.message) || e).slice(0, 60) + "@" + Math.round(performance.now()));
+                        } catch (_) {}
+                        let full = "";
+                        try { full = JSON.stringify(data).slice(0, 1200); } catch (_) { full = "unserializable"; }
+                        ring.shift();
+                        ring.push("DISPATCH_FAIL:" + (e && e.message) + "|DATA:" + full
+                            + "|STACK:" + (e && e.stack ? String(e.stack).replace(/\n/g, " ~ ").slice(0, 900) : ""));
+                    }
                     // Redelivery: Turnstile-style challenge bundles register
                     // their message handler before the VM string tables are
                     // finished; the first dispatch in the load window throws, and a plain drop wedges the state machine until
@@ -5443,10 +5841,11 @@
                     // per failure so a deterministically-broken handler can't
                     // spin the loop.
                     try {
-                        const rd = globalThis.__oxMsgRD
-                            || (globalThis.__oxMsgRD = { n: 0 });
-                        if (rd.n < 24) {
-                            rd.n++;
+                        if (_frameRedeliveryCount < 24) {
+                            _frameRedeliveryCount++;
+                            if (globalThis.__oxOps) {
+                                globalThis.__oxMsgRD = { n: _frameRedeliveryCount };
+                            }
                             setTimeout(function () {
                                 try {
                                     const ev2 = new MessageEvent("message", {
@@ -5456,10 +5855,12 @@
                                     });
                                     if (_markFrameMessageTrusted) _markFrameMessageTrusted(ev2);
                                     globalThis.dispatchEvent(ev2);
-                                    if (ring.length >= 24) ring.shift();
-                                    ring.push("RD_OK@" + Math.round(performance.now()));
+                                    if (ring) {
+                                        if (ring.length >= 24) ring.shift();
+                                        ring.push("RD_OK@" + Math.round(performance.now()));
+                                    }
                                 } catch (e2) {
-                                    ring.push("RD_FAIL:" + (e2 && e2.message));
+                                    if (ring) ring.push("RD_FAIL:" + (e2 && e2.message));
                                 }
                             }, 1200);
                         }
@@ -5473,55 +5874,65 @@
         // text. Transparently tap the constructor and mirror big sources to
         // the parent/top window (which survives the challenge frame's
         // crashed_retry renavigation) so timeouts can dump them.
-        try {
-            const _NativeFunction = globalThis.Function;
-            const _recordEvalSource = (src) => {
-                try {
-                    if (typeof src !== "string" || src.length < 512) return;
-                    const log = globalThis.__oxEvalSrcLog
-                        || (globalThis.__oxEvalSrcLog = []);
-                    if (log.length >= 6) return;
-                    for (let i = 0; i < log.length; i++) {
-                        if (log[i] && log[i].length === src.length) return;
-                    }
-                    log.push(src);
-                    const payload = {
-                        __oxEvalSrc: {
-                            href: String((globalThis.location && globalThis.location.href) || "").slice(-80),
-                            code: src,
-                        },
-                    };
-                    for (const w of [globalThis.parent, globalThis.top]) {
+        if (globalThis.__oxOps) {
+            try {
+                const _NativeFunction = globalThis.Function;
+                const _recordEvalSource = (src) => {
+                    try {
+                        if (typeof src !== "string" || src.length < 512) return;
+                        const log = globalThis.__oxEvalSrcLog
+                            || (globalThis.__oxEvalSrcLog = []);
+                        if (log.length >= 6) return;
+                        for (let i = 0; i < log.length; i++) {
+                            if (log[i] && log[i].length === src.length) return;
+                        }
+                        log.push(src);
+                        const payload = {
+                            __oxEvalSrc: {
+                                href: String((globalThis.location && globalThis.location.href) || "").slice(-80),
+                                code: src,
+                            },
+                        };
+                        for (const w of [globalThis.parent, globalThis.top]) {
+                            try {
+                                if (w && w !== globalThis && typeof w.postMessage === "function") {
+                                    w.postMessage(payload, "*");
+                                }
+                            } catch (_) {}
+                        }
+                    } catch (_) {}
+                };
+                // Proxy keeps the native Function identity: instanceof,
+                // .prototype, .name and .length all behave as before; this is
+                // diagnostic-only because the Proxy identity itself is visible.
+                globalThis.Function = new Proxy(_NativeFunction, {
+                    apply(target, thisArg, args) {
                         try {
-                            if (w && w !== globalThis && typeof w.postMessage === "function") {
-                                w.postMessage(payload, "*");
-                            }
+                            _recordEvalSource(typeof args[0] === "string" ? args[0] : (args[0] != null ? String(args[0]) : ""));
                         } catch (_) {}
-                    }
-                } catch (_) {}
-            };
-            // Proxy keeps the native Function identity: instanceof, .prototype,
-            // .name and .length all behave exactly as before; we only observe
-            // calls/constructs to mirror dynamically assembled sources.
-            globalThis.Function = new Proxy(_NativeFunction, {
-                apply(target, thisArg, args) {
-                    try {
-                        _recordEvalSource(typeof args[0] === "string" ? args[0] : (args[0] != null ? String(args[0]) : ""));
-                    } catch (_) {}
-                    return Reflect.apply(target, thisArg, args);
-                },
-                construct(target, args, newTarget) {
-                    try {
-                        _recordEvalSource(typeof args[0] === "string" ? args[0] : (args[0] != null ? String(args[0]) : ""));
-                    } catch (_) {}
-                    return Reflect.construct(target, args, newTarget);
-                },
-            });
-        } catch (_) {}
+                        return Reflect.apply(target, thisArg, args);
+                    },
+                    construct(target, args, newTarget) {
+                        try {
+                            _recordEvalSource(typeof args[0] === "string" ? args[0] : (args[0] != null ? String(args[0]) : ""));
+                        } catch (_) {}
+                        return Reflect.construct(target, args, newTarget);
+                    },
+                });
+            } catch (_) {}
+        }
         globalThis.__oxFrameSetup = function(frameId, parentId, topId) {
-            globalThis.__frameId = frameId;
-            globalThis.__parentFrameId = parentId;
-            globalThis.__topFrameId = topId;
+            for (const [name, value] of [
+                ['__frameId', frameId],
+                ['__parentFrameId', parentId],
+                ['__topFrameId', topId],
+            ]) {
+                try {
+                    Object.defineProperty(globalThis, name, {
+                        value, writable: true, configurable: true, enumerable: false,
+                    });
+                } catch (_) { globalThis[name] = value; }
+            }
             try {
                 ops.op_frame_register_origin(
                     frameId,
@@ -5529,8 +5940,18 @@
                 );
             } catch (_) {}
             // window.parent / window.top are getters that read these overrides.
-            if (parentId !== frameId) globalThis.__frameParentOverride = _frameHandle(parentId);
-            if (topId !== frameId) globalThis.__frameTopOverride = _frameHandle(topId);
+            if (parentId !== frameId) {
+                Object.defineProperty(globalThis, '__frameParentOverride', {
+                    value: _frameHandle(parentId), writable: true,
+                    configurable: true, enumerable: false,
+                });
+            }
+            if (topId !== frameId) {
+                Object.defineProperty(globalThis, '__frameTopOverride', {
+                    value: _frameHandle(topId), writable: true,
+                    configurable: true, enumerable: false,
+                });
+            }
         };
         globalThis.__oxRegisterChildFrame = function(nodeId, childFrameId, childOrigin) {
             _debugFrameLifecycle({phase:'register',nodeId,fid:childFrameId,origin:childOrigin||'null'});
@@ -5819,6 +6240,9 @@
             'HTMLSourceElement', 'HTMLTrackElement', 'HTMLPictureElement',
             'HTMLTemplateElement', 'HTMLSlotElement', 'HTMLDialogElement',
             'HTMLDetailsElement', 'HTMLProgressElement', 'HTMLMeterElement',
+            'HTMLAreaElement', 'HTMLBRElement', 'HTMLBaseElement',
+            'HTMLDListElement', 'HTMLDataElement', 'HTMLDataListElement',
+            'HTMLDirectoryElement', 'HTMLSelectedContentElement',
         ];
         for (const name of _toMask) {
             const ctor = globalThis[name];
@@ -5919,6 +6343,7 @@
     // NOT wrapping direct `eval(` — a wrapper would break its
     // scope-capture semantics, and the Function constructor covers the
     // crash sites we chase.
+    if (globalThis.__oxOps) {
     globalThis.__oxInstallEvalTap = function __oxInstallEvalTap() {
         if (globalThis.__oxEvalTapReady) return;
         globalThis.__oxEvalTapReady = true;
@@ -5979,4 +6404,5 @@
             } catch (_) {}
         });
     } catch (_) {}
+    }
 })(globalThis);
