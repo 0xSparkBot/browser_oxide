@@ -83,8 +83,8 @@ async fn navigator_omits_non_chromium_legacy_members() {
     );
 
     assert_eq!(
-        check_secure("typeof navigator.canShare + ',' + typeof navigator.share").await,
-        "function,function"
+        check_secure("'canShare' in navigator || 'share' in navigator").await,
+        "false"
     );
 }
 #[tokio::test]

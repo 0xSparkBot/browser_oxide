@@ -1295,15 +1295,6 @@
         };
         return Promise.resolve(_access);
     });
-    // Web Share is a [SecureContext] API. Defining these methods on an
-    // about:blank/data:/plain-http realm leaves a detectable prototype entry
-    // that Chromium does not expose there.
-    if (_secure()) {
-        _defNavMethod('canShare', function canShare(data) { return false; });
-        _defNavMethod('share', function share(data) {
-            return Promise.reject(new DOMException("Permission denied", "NotAllowedError"));
-        });
-    }
     _defNavMethod('clearAppBadge', function clearAppBadge() { return Promise.resolve(); });
     _defNavMethod('setAppBadge', function setAppBadge(count) { return Promise.resolve(); });
 
