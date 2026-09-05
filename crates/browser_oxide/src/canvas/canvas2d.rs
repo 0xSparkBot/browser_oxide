@@ -24,8 +24,8 @@ use crate::canvas::text::{self, ParsedFont, TextMetrics};
 use skia_safe::gradient_shader;
 use skia_safe::{
     image_filters, surfaces, AlphaType, BlendMode, Canvas as SkCanvas, Color4f, ColorFilter,
-    ColorType, Font, FontHinting, FontMgr, ImageInfo, Matrix, Paint, PaintStyle, Point,
-    Rect as SkRect, TileMode,
+    ColorType, Font, FontHinting, FontMgr, ImageInfo, Matrix, Paint, PaintStyle, PathFillType,
+    Point, Rect as SkRect, TileMode,
 };
 
 /// Simple 0-255 RGBA color. This is the public color type exposed to
@@ -646,6 +646,17 @@ impl Canvas2D {
         self.height
     }
 
+    /// Resize the backing store. Canvas dimension changes clear all pixels
+    /// and reset the drawing state and current path in Chromium.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.pixels = vec![0; (self.width as usize) * (self.height as usize) * 4];
+        self.state = CanvasState::default();
+        self.state_stack.clear();
+        self.path = Path2D::new();
+    }
+
     /// Raw premultiplied-RGBA pixel buffer. Used for PNG encoding and
     /// direct compositing from `text::rasterize_text`.
     pub fn pixels(&self) -> &[u8] {
@@ -887,9 +898,16 @@ impl Canvas2D {
     }
 
     pub fn fill(&mut self) {
-        let Some(sk_path) = self.path.to_skia_path() else {
+        self.fill_with_rule(false);
+    }
+
+    pub fn fill_with_rule(&mut self, even_odd: bool) {
+        let Some(mut sk_path) = self.path.to_skia_path() else {
             return;
         };
+        if even_odd {
+            sk_path.set_fill_type(PathFillType::EvenOdd);
+        }
         let paint = self.build_fill_paint();
         let matrix = self.state.transform;
         self.with_canvas(|canvas| {
@@ -1327,8 +1345,66 @@ fn parse_css_color(s: &str) -> Option<Color> {
         "transparent" => Some(Color::from_rgba8(0, 0, 0, 0)),
         s if s.starts_with('#') => parse_hex_color(s),
         s if s.starts_with("rgb") => parse_rgb_color(s),
+        s if s.starts_with("color(display-p3 ") => parse_display_p3_color(s),
         _ => None,
     }
+}
+
+/// Convert a CSS `color(display-p3 r g b / a)` value into the canvas's
+/// sRGB backing color. The matrix and transfer functions are the CSS Color 4
+/// Display-P3 → XYZ D65 → sRGB conversion used by Chromium.
+fn parse_display_p3_color(s: &str) -> Option<Color> {
+    let inner = s
+        .strip_prefix("color(display-p3 ")?
+        .strip_suffix(')')?
+        .trim();
+    let (channels, alpha) = inner
+        .split_once('/')
+        .map_or((inner, 1.0), |(channels, alpha)| {
+            (channels.trim(), alpha.trim().parse::<f32>().unwrap_or(1.0))
+        });
+    let mut values = channels.split_ascii_whitespace();
+    let p3 = [
+        values.next()?.parse::<f32>().ok()?,
+        values.next()?.parse::<f32>().ok()?,
+        values.next()?.parse::<f32>().ok()?,
+    ];
+    if values.next().is_some() {
+        return None;
+    }
+
+    let linearize = |value: f32| {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let encode = |value: f32| {
+        if value <= 0.003_130_8 {
+            12.92 * value
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    let p = p3.map(linearize);
+    let xyz = [
+        0.486_571 * p[0] + 0.265_668 * p[1] + 0.198_217 * p[2],
+        0.228_975 * p[0] + 0.691_739 * p[1] + 0.079_287 * p[2],
+        0.045_113 * p[1] + 1.043_944 * p[2],
+    ];
+    let srgb = [
+        encode(3.240_97 * xyz[0] - 1.537_383 * xyz[1] - 0.498_611 * xyz[2]),
+        encode(-0.969_244 * xyz[0] + 1.875_968 * xyz[1] + 0.041_555 * xyz[2]),
+        encode(0.055_630 * xyz[0] - 0.203_977 * xyz[1] + 1.056_972 * xyz[2]),
+    ];
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Some(Color::from_rgba8(
+        byte(srgb[0]),
+        byte(srgb[1]),
+        byte(srgb[2]),
+        byte(alpha),
+    ))
 }
 
 fn parse_hex_color(s: &str) -> Option<Color> {
@@ -1497,6 +1573,10 @@ mod tests {
         assert!(parse_css_color("#f00").is_some());
         assert!(parse_css_color("rgb(255, 0, 0)").is_some());
         assert!(parse_css_color("rgba(255, 0, 0, 0.5)").is_some());
+        assert_eq!(
+            parse_css_color("color(display-p3 1 0.25 0.5)"),
+            Some(Color::from_rgba8(255, 27, 127, 255))
+        );
     }
 
     #[test]

@@ -1485,6 +1485,87 @@ async fn webgpu_adapter_has_real_limits_and_info() {
     );
 }
 #[tokio::test]
+async fn offscreen_canvas_resize_resets_and_resizes_backing_store() {
+    assert_eq!(
+        check(
+            "(() => { \
+              const canvas = new OffscreenCanvas(1, 1); \
+              const context = canvas.getContext('2d'); \
+              context.fillStyle = '#f00'; \
+              context.fillRect(0, 0, 1, 1); \
+              canvas.width = 2; \
+              canvas.height = 2; \
+              context.fillStyle = '#0f0'; \
+              context.fillRect(0, 0, 2, 2); \
+              const data = context.getImageData(0, 0, 2, 2).data; \
+              return JSON.stringify([canvas.width, canvas.height, data.length, \
+                Array.from(data).every((value, i) => value === [0,255,0,255][i % 4])]); \
+             })()"
+        )
+        .await,
+        "[2,2,16,true]"
+    );
+}
+#[tokio::test]
+async fn canvas_counterclockwise_full_circle_renders() {
+    assert_eq!(
+        check(
+            "(() => { \
+              const context = new OffscreenCanvas(10, 10).getContext('2d'); \
+              context.beginPath(); \
+              context.arc(5, 5, 4, 0, Math.PI * 2, true); \
+              context.fill(); \
+              const alpha = context.getImageData(0, 0, 10, 10).data.filter((_, i) => i % 4 === 3); \
+              return alpha.filter(value => value > 0).length > 40; \
+             })()"
+        )
+        .await,
+        "true"
+    );
+}
+#[tokio::test]
+async fn canvas_evenodd_fill_rule_preserves_inner_hole() {
+    assert_eq!(
+        check(
+            "(() => { \
+              const context = new OffscreenCanvas(20, 20).getContext('2d'); \
+              context.fillStyle = '#f00'; \
+              context.fillRect(0, 0, 20, 20); \
+              context.fillStyle = '#fff'; \
+              context.beginPath(); \
+              context.arc(10, 10, 8, 0, Math.PI * 2, true); \
+              context.arc(10, 10, 4, 0, Math.PI * 2, true); \
+              context.fill('evenodd'); \
+              return JSON.stringify(Array.from(context.getImageData(10, 10, 1, 1).data)); \
+             })()"
+        )
+        .await,
+        "[255,0,0,255]"
+    );
+}
+#[tokio::test]
+async fn canvas_display_p3_readback_matches_chrome_formats() {
+    assert_eq!(
+        check(
+            "(() => { \
+              const context = new OffscreenCanvas(2, 2).getContext('2d'); \
+              context.fillStyle = 'color(display-p3 1 0.25 0.5)'; \
+              context.fillRect(0, 0, 2, 2); \
+              const srgb = context.getImageData(0, 0, 1, 1, \
+                {colorSpace:'srgb',pixelFormat:'rgba-unorm8'}); \
+              const p3 = context.getImageData(0, 0, 1, 1, \
+                {colorSpace:'display-p3',pixelFormat:'rgba-unorm8'}); \
+              const wide = context.getImageData(0, 0, 1, 1, \
+                {colorSpace:'display-p3',pixelFormat:'rgba-float16'}); \
+              return JSON.stringify([Array.from(srgb.data), Array.from(p3.data), \
+                Array.from(wide.data), wide.data.constructor.name, wide.colorSpace, wide.pixelFormat]); \
+             })()"
+        )
+        .await,
+        "[[255,27,127,255],[255,64,127,255],[1,0.25,0.5,1],\"Float16Array\",\"display-p3\",\"rgba-float16\"]"
+    );
+}
+#[tokio::test]
 async fn canvas_to_data_url() {
     assert_eq!(
         check("document.createElement('canvas').toDataURL().startsWith('data:image/png')").await,

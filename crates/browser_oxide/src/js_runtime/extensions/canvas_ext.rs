@@ -59,6 +59,19 @@ pub fn op_canvas_create(
 }
 
 #[op2(fast)]
+pub fn op_canvas_resize(
+    state: &mut OpState,
+    #[smi] id: i32,
+    #[smi] width: i32,
+    #[smi] height: i32,
+) {
+    let state = state.borrow_mut::<CanvasState>();
+    if let Some(canvas) = state.canvases.get_mut(&id) {
+        canvas.resize(width.max(1) as u32, height.max(1) as u32);
+    }
+}
+
+#[op2(fast)]
 pub fn op_canvas_fill_rect(state: &mut OpState, #[smi] id: i32, x: f64, y: f64, w: f64, h: f64) {
     let state = state.borrow_mut::<CanvasState>();
     if let Some(c) = state.canvases.get_mut(&id) {
@@ -107,10 +120,10 @@ pub fn op_canvas_line_to(state: &mut OpState, #[smi] id: i32, x: f64, y: f64) {
 }
 
 #[op2(fast)]
-pub fn op_canvas_fill(state: &mut OpState, #[smi] id: i32) {
+pub fn op_canvas_fill(state: &mut OpState, #[smi] id: i32, even_odd: bool) {
     let state = state.borrow_mut::<CanvasState>();
     if let Some(c) = state.canvases.get_mut(&id) {
-        c.fill();
+        c.fill_with_rule(even_odd);
     }
 }
 
@@ -655,6 +668,7 @@ deno_core::extension!(
     canvas_extension,
     ops = [
         op_canvas_create,
+        op_canvas_resize,
         op_canvas_fill_rect,
         op_canvas_stroke_rect,
         op_canvas_clear_rect,

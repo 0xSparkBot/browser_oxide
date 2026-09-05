@@ -125,31 +125,70 @@ impl Path2D {
         }
 
         let mut builder = SkPathBuilder::new();
+        let mut has_current_point = false;
         for cmd in &self.commands {
             match cmd {
                 PathCommand::MoveTo(x, y) => {
                     builder.move_to((*x, *y));
+                    has_current_point = true;
                 }
                 PathCommand::LineTo(x, y) => {
-                    builder.line_to((*x, *y));
+                    if has_current_point {
+                        builder.line_to((*x, *y));
+                    } else {
+                        // Canvas lineTo() starts a new subpath when there is no
+                        // current point; Skia otherwise inserts a line from 0,0.
+                        builder.move_to((*x, *y));
+                    }
+                    has_current_point = true;
                 }
                 PathCommand::BezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) => {
                     builder.cubic_to((*cp1x, *cp1y), (*cp2x, *cp2y), (*x, *y));
+                    has_current_point = true;
                 }
                 PathCommand::QuadraticCurveTo(cpx, cpy, x, y) => {
                     builder.quad_to((*cpx, *cpy), (*x, *y));
+                    has_current_point = true;
                 }
                 PathCommand::Arc(cx, cy, r, start, end, ccw) => {
-                    append_arc(&mut builder, *cx, *cy, *r, *start, *end, *ccw);
+                    append_arc(
+                        &mut builder,
+                        *cx,
+                        *cy,
+                        *r,
+                        *start,
+                        *end,
+                        *ccw,
+                        !has_current_point,
+                    );
+                    has_current_point = true;
                 }
                 PathCommand::ArcTo(x1, y1, x2, y2, r) => {
-                    builder.arc_to_tangent((*x1, *y1), (*x2, *y2), *r);
+                    if has_current_point {
+                        builder.arc_to_tangent((*x1, *y1), (*x2, *y2), *r);
+                    } else {
+                        builder.move_to((*x1, *y1));
+                    }
+                    has_current_point = true;
                 }
                 PathCommand::Ellipse(cx, cy, rx, ry, rot, start, end, ccw) => {
-                    append_ellipse(&mut builder, *cx, *cy, *rx, *ry, *rot, *start, *end, *ccw);
+                    append_ellipse(
+                        &mut builder,
+                        *cx,
+                        *cy,
+                        *rx,
+                        *ry,
+                        *rot,
+                        *start,
+                        *end,
+                        *ccw,
+                        !has_current_point,
+                    );
+                    has_current_point = true;
                 }
                 PathCommand::Rect(x, y, w, h) => {
                     builder.add_rect(SkRect::from_xywh(*x, *y, *w, *h), None, None);
+                    has_current_point = true;
                 }
                 PathCommand::ClosePath => {
                     builder.close();
@@ -176,14 +215,21 @@ fn append_arc(
     start: f32,
     end: f32,
     ccw: bool,
+    force_move_to: bool,
 ) {
     let oval = SkRect::from_ltrb(cx - r, cy - r, cx + r, cy + r);
     let tau = std::f32::consts::TAU;
 
     // Normalise start/end into a canonical sweep per the HTML Canvas spec.
     let start_deg = start.to_degrees();
-    let mut sweep = end - start;
-    if !ccw {
+    let raw_sweep = end - start;
+    let mut sweep = raw_sweep;
+    if raw_sweep.abs() >= tau {
+        // Blink treats a span of at least one full turn as a complete circle
+        // in either direction. Normalising 0..2π counter-clockwise by repeated
+        // subtraction collapses it to zero and leaves the path empty.
+        sweep = if ccw { -tau } else { tau };
+    } else if !ccw {
         // Clockwise: sweep must be positive and at most 2π.
         while sweep < 0.0 {
             sweep += tau;
@@ -202,10 +248,19 @@ fn append_arc(
     }
     let sweep_deg = sweep.to_degrees();
 
-    // `false` force_move_to = continue the current contour from the implicit
-    // start of the arc, matching Canvas 2D's behavior of connecting the
-    // current path point to the arc start with a straight line.
-    builder.arc_to(oval, start_deg, sweep_deg, false);
+    // Skia's single arc verb normalises a ±360° sweep back to an empty arc.
+    // Split complete circles into two half turns so Canvas's full-circle
+    // semantics survive conversion in both winding directions.
+    if (sweep.abs() - tau).abs() <= f32::EPSILON * 8.0 {
+        let half = sweep_deg / 2.0;
+        builder.arc_to(oval, start_deg, half, force_move_to);
+        builder.arc_to(oval, start_deg + half, half, false);
+        return;
+    }
+
+    // Canvas starts a new subpath at the arc start when there is no current
+    // point, otherwise it connects the current point with a straight line.
+    builder.arc_to(oval, start_deg, sweep_deg, force_move_to);
 }
 
 /// Append a rotated ellipse arc using cubic-bezier approximation.
@@ -231,12 +286,16 @@ fn append_ellipse(
     start: f32,
     end: f32,
     ccw: bool,
+    force_move_to: bool,
 ) {
     let tau = std::f32::consts::TAU;
     let half_pi = std::f32::consts::FRAC_PI_2;
 
-    let mut sweep = end - start;
-    if !ccw {
+    let raw_sweep = end - start;
+    let mut sweep = raw_sweep;
+    if raw_sweep.abs() >= tau {
+        sweep = if ccw { -tau } else { tau };
+    } else if !ccw {
         while sweep < 0.0 {
             sweep += tau;
         }
@@ -263,15 +322,15 @@ fn append_ellipse(
         (cx + rxp, cy + ryp)
     };
 
-    // First point: ensure the contour starts at the arc start.
-    // Per Canvas spec, ellipse implicitly connects with a line from the
-    // current point if there is one — Skia's default line_to-on-implicit-
-    // start handles this when we line_to the first endpoint instead of
-    // move_to. But conservatively emit line_to so we match spec semantics
-    // even when this is the first command.
+    // First point: start a fresh contour when the path has no current point,
+    // otherwise connect the existing contour to the ellipse start.
     let (sx0, sy0) = (start.cos(), start.sin());
     let (px0, py0) = map(sx0, sy0);
-    builder.line_to((px0, py0));
+    if force_move_to {
+        builder.move_to((px0, py0));
+    } else {
+        builder.line_to((px0, py0));
+    }
 
     if sweep == 0.0 {
         return;
@@ -365,5 +424,17 @@ mod tests {
             false,
         );
         assert!(p.to_skia_path().is_some());
+    }
+
+    #[test]
+    fn partial_ellipse_does_not_connect_from_origin() {
+        let mut p = Path2D::new();
+        p.ellipse(50.0, 50.0, 10.0, 5.0, 0.0, 0.0, std::f32::consts::PI, false);
+        let path = p.to_skia_path().expect("ellipse path");
+        let bounds = path.bounds();
+        assert!(
+            bounds.left > 39.0,
+            "unexpected origin connection: {bounds:?}"
+        );
     }
 }

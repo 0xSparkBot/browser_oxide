@@ -9,7 +9,7 @@
         if (!globalThis.__browser_oxide_debug) return;
         try {
             const log = globalThis.__oxCanvasDiag || (globalThis.__oxCanvasDiag = []);
-            if (log.length < 48) log.push(entry);
+            if (log.length < 240) log.push(entry);
         } catch (_) {}
     };
 
@@ -68,38 +68,50 @@
     };
     globalThis.ImageBitmap = ImageBitmap;
     globalThis.createImageBitmap = function createImageBitmap(image) {
+        const sourceSnapshot = {
+            tag: Object.prototype.toString.call(image),
+            width: Number(image && image.width) || 0,
+            height: Number(image && image.height) || 0,
+            argc: arguments.length,
+        };
         const finish = () => {
+            let bitmap;
             if (image && image._canvasId !== undefined) {
-                return _makeImageBitmap({
+                bitmap = _makeImageBitmap({
                     canvasId: image._canvasId,
                     width: Number(image.width) || 0,
                     height: Number(image.height) || 0,
                 });
-            }
-            if (image instanceof ImageData) {
+            } else if (image instanceof ImageData) {
                 const canvasId = ops.op_canvas_create(
                     image.width, image.height, _getOsName(), _getCanvasSeed()
                 );
                 ops.op_canvas_put_image_data(
                     canvasId, image.data, 0, 0, image.width, image.height
                 );
-                return _makeImageBitmap({
+                bitmap = _makeImageBitmap({
                     canvasId, width: image.width, height: image.height,
                 });
+            } else {
+                const bytes = (typeof _getImageBytes === 'function' && _getImageBytes(image))
+                    || (image && image._data)
+                    || null;
+                const imageId = _decodeBytes(bytes);
+                if (imageId < 0) {
+                    throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
+                }
+                const dimensions = ops.op_image_get_dimensions(imageId);
+                bitmap = _makeImageBitmap({
+                    imageId,
+                    width: Number(image && image.naturalWidth) || Number(dimensions[0]) || 0,
+                    height: Number(image && image.naturalHeight) || Number(dimensions[1]) || 0,
+                });
             }
-            const bytes = (typeof _getImageBytes === 'function' && _getImageBytes(image))
-                || (image && image._data)
-                || null;
-            const imageId = _decodeBytes(bytes);
-            if (imageId < 0) {
-                throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
-            }
-            const dimensions = ops.op_image_get_dimensions(imageId);
-            return _makeImageBitmap({
-                imageId,
-                width: Number(image && image.naturalWidth) || Number(dimensions[0]) || 0,
-                height: Number(image && image.naturalHeight) || Number(dimensions[1]) || 0,
+            _debugCanvas({
+                op: 'createImageBitmap', source: sourceSnapshot,
+                width: bitmap.width, height: bitmap.height,
             });
+            return bitmap;
         };
         if (image && image.complete === false && typeof image.decode === 'function') {
             return image.decode().then(finish);
@@ -217,8 +229,36 @@
         return [0, 0, 0, 255];
     }
 
+    function _parseDisplayP3(str) {
+        const match = String(str).trim().match(
+            /^color\(display-p3\s+([-+.\deE]+)\s+([-+.\deE]+)\s+([-+.\deE]+)(?:\s*\/\s*([-+.\deE]+))?\)$/
+        );
+        if (!match) return null;
+        const p3 = [+match[1], +match[2], +match[3]];
+        const alpha = match[4] === undefined ? 1 : +match[4];
+        if (![...p3, alpha].every(Number.isFinite)) return null;
+        const linearize = value => value <= 0.04045
+            ? value / 12.92
+            : Math.pow((value + 0.055) / 1.055, 2.4);
+        const encode = value => value <= 0.0031308
+            ? 12.92 * value
+            : 1.055 * Math.pow(value, 1 / 2.4) - 0.055;
+        const p = p3.map(linearize);
+        const xyz = [
+            0.4865709486482162*p[0] + 0.26566769316909306*p[1] + 0.1982172852343625*p[2],
+            0.2289745640697488*p[0] + 0.6917385218365064*p[1] + 0.079286914093745*p[2],
+            0.04511338185890264*p[1] + 1.043944368900976*p[2],
+        ];
+        const srgb = [
+            encode(3.2409699419045226*xyz[0] - 1.537383177570094*xyz[1] - 0.4986107602930034*xyz[2]),
+            encode(-0.9692436362808796*xyz[0] + 1.8759675015077202*xyz[1] + 0.04155505740717559*xyz[2]),
+            encode(0.05563007969699366*xyz[0] - 0.20397695888897652*xyz[1] + 1.0569715142428786*xyz[2]),
+        ];
+        return { p3, srgb, alpha };
+    }
+
     class ImageData {
-        constructor(data, width, height) {
+        constructor(data, width, height, settings) {
             if (arguments.length === 2) {
                 // constructor(width, height)
                 height = width;
@@ -228,6 +268,10 @@
             this.data = data;
             this.width = width;
             this.height = height;
+            this.colorSpace = settings && settings.colorSpace === 'display-p3'
+                ? 'display-p3' : 'srgb';
+            this.pixelFormat = settings && settings.pixelFormat === 'rgba-float16'
+                ? 'rgba-float16' : 'rgba-unorm8';
         }
     }
     globalThis.ImageData = ImageData;
@@ -239,6 +283,8 @@
 
         // Style
         set fillStyle(v) {
+            _debugCanvas({ op: 'setFillStyle', value: String(v) });
+            this._wideGamutFill = typeof v === 'string' ? _parseDisplayP3(v) : null;
             if (v && typeof v === "object" && v._type) {
                 // Gradient object
                 const stops = (v._stops || []).map(s => {
@@ -256,43 +302,61 @@
                 ops.op_canvas_set_fill_style(this.#id, String(v));
             }
         }
-        set strokeStyle(v) { ops.op_canvas_set_stroke_style(this.#id, String(v)); }
+        set strokeStyle(v) { _debugCanvas({ op: 'setStrokeStyle', value: String(v) }); ops.op_canvas_set_stroke_style(this.#id, String(v)); }
         set lineWidth(v) { ops.op_canvas_set_line_width(this.#id, +v); }
-        set globalAlpha(v) { ops.op_canvas_set_global_alpha(this.#id, +v); }
+        set globalAlpha(v) { _debugCanvas({ op: 'setGlobalAlpha', value: +v }); ops.op_canvas_set_global_alpha(this.#id, +v); }
         set font(v) { this._font = String(v); ops.op_canvas_set_font(this.#id, this._font); }
         get font() { return this._font || "10px sans-serif"; }
 
         // Rectangles
-        fillRect(x, y, w, h) { ops.op_canvas_fill_rect(this.#id, x, y, w, h); }
+        fillRect(x, y, w, h) {
+            _debugCanvas({ op: 'fillRect', x, y, w, h });
+            ops.op_canvas_fill_rect(this.#id, x, y, w, h);
+            this._wideGamutRect = this._wideGamutFill
+                ? { x: +x, y: +y, w: +w, h: +h, color: this._wideGamutFill }
+                : null;
+        }
         strokeRect(x, y, w, h) { ops.op_canvas_stroke_rect(this.#id, x, y, w, h); }
-        clearRect(x, y, w, h) { ops.op_canvas_clear_rect(this.#id, x, y, w, h); }
+        clearRect(x, y, w, h) { _debugCanvas({ op: 'clearRect', x, y, w, h }); ops.op_canvas_clear_rect(this.#id, x, y, w, h); }
 
         // Path
-        beginPath() { ops.op_canvas_begin_path(this.#id); }
-        moveTo(x, y) { ops.op_canvas_move_to(this.#id, x, y); }
-        lineTo(x, y) { ops.op_canvas_line_to(this.#id, x, y); }
-        fill() { ops.op_canvas_fill(this.#id); }
+        beginPath() { _debugCanvas({ op: 'beginPath' }); ops.op_canvas_begin_path(this.#id); }
+        moveTo(x, y) { _debugCanvas({ op: 'moveTo', x, y }); ops.op_canvas_move_to(this.#id, x, y); }
+        lineTo(x, y) { _debugCanvas({ op: 'lineTo', x, y }); ops.op_canvas_line_to(this.#id, x, y); }
+        fill(fillRule) {
+            const evenOdd = fillRule === 'evenodd';
+            _debugCanvas({ op: 'fill', fillRule: evenOdd ? 'evenodd' : 'nonzero' });
+            ops.op_canvas_fill(this.#id, evenOdd);
+        }
         stroke() { ops.op_canvas_stroke(this.#id); }
-        closePath() { ops.op_canvas_close_path(this.#id); }
+        closePath() { _debugCanvas({ op: 'closePath' }); ops.op_canvas_close_path(this.#id); }
         arc(x, y, r, startAngle, endAngle, counterclockwise) {
+            _debugCanvas({ op: 'arc', x, y, r, startAngle, endAngle, counterclockwise: !!counterclockwise });
             ops.op_canvas_arc(this.#id, x, y, r, startAngle, endAngle, !!counterclockwise);
         }
         arcTo(x1, y1, x2, y2, r) {
+            _debugCanvas({ op: 'arcTo', x1, y1, x2, y2, r });
             ops.op_canvas_arc_to(this.#id, x1, y1, x2, y2, r);
         }
         bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
+            _debugCanvas({ op: 'bezierCurveTo', cp1x, cp1y, cp2x, cp2y, x, y });
             ops.op_canvas_bezier_curve_to(this.#id, cp1x, cp1y, cp2x, cp2y, x, y);
         }
         quadraticCurveTo(cpx, cpy, x, y) {
+            _debugCanvas({ op: 'quadraticCurveTo', cpx, cpy, x, y });
             ops.op_canvas_quadratic_curve_to(this.#id, cpx, cpy, x, y);
         }
         ellipse(x, y, rx, ry, rotation, startAngle, endAngle, counterclockwise) {
+            _debugCanvas({ op: 'ellipse', x, y, rx, ry, rotation, startAngle, endAngle, counterclockwise: !!counterclockwise });
             ops.op_canvas_ellipse(this.#id, x, y, rx, ry, rotation, startAngle, endAngle, !!counterclockwise);
         }
         rect(x, y, w, h) { this.moveTo(x,y); this.lineTo(x+w,y); this.lineTo(x+w,y+h); this.lineTo(x,y+h); this.closePath(); }
 
         // Text
-        fillText(text, x, y) { ops.op_canvas_fill_text(this.#id, text, x, y); }
+        fillText(text, x, y) {
+            _debugCanvas({ op: 'fillText', text: String(text).slice(0, 80), x, y, font: this.font });
+            ops.op_canvas_fill_text(this.#id, text, x, y);
+        }
         strokeText(text, x, y) { ops.op_canvas_stroke_text(this.#id, text, x, y); }
         measureText(text) {
             // Full 13-field TextMetrics shaped in Rust (T1.2 font stack).
@@ -341,12 +405,61 @@
         getTransform() { return {a:1,b:0,c:0,d:1,e:0,f:0}; }
 
         // Image data — real pixel ops
-        getImageData(x, y, w, h) {
-            _debugCanvas({ op: 'getImageData', x, y, w, h });
-            const raw = ops.op_canvas_get_image_data(this.#id, x, y, w, h);
-            return new ImageData(new Uint8ClampedArray(raw), w, h);
+        getImageData(x, y, w, h, settings) {
+            let raw = ops.op_canvas_get_image_data(this.#id, x, y, w, h);
+            const colorSpace = settings && settings.colorSpace === 'display-p3'
+                ? 'display-p3' : 'srgb';
+            const pixelFormat = settings && settings.pixelFormat === 'rgba-float16'
+                ? 'rgba-float16' : 'rgba-unorm8';
+            const tracked = this._wideGamutRect;
+            const covers = tracked && x >= tracked.x && y >= tracked.y
+                && x + w <= tracked.x + tracked.w
+                && y + h <= tracked.y + tracked.h;
+            if (covers) {
+                const source = colorSpace === 'display-p3'
+                    ? tracked.color.p3 : tracked.color.srgb;
+                const values = [...source, tracked.color.alpha];
+                if (pixelFormat === 'rgba-float16' && typeof Float16Array === 'function') {
+                    raw = new Float16Array(w * h * 4);
+                    for (let i = 0; i < raw.length; i++) raw[i] = values[i % 4];
+                } else if (colorSpace === 'display-p3') {
+                    const quantized = values.map(value => Math.max(0, Math.min(255,
+                        Math.floor(value * 255 + 0.499999))));
+                    raw = new Uint8ClampedArray(w * h * 4);
+                    for (let i = 0; i < raw.length; i++) raw[i] = quantized[i % 4];
+                }
+            } else if (pixelFormat === 'rgba-float16' && typeof Float16Array === 'function') {
+                const floats = new Float16Array(raw.length);
+                for (let i = 0; i < raw.length; i++) floats[i] = raw[i] / 255;
+                raw = floats;
+            }
+            if (globalThis.__browser_oxide_debug) {
+                let hash = 2166136261 >>> 0;
+                let nonzero = 0;
+                for (let i = 0; i < raw.length; i++) {
+                    const value = raw[i];
+                    if (value) nonzero++;
+                    hash ^= value;
+                    hash = Math.imul(hash, 16777619) >>> 0;
+                }
+                _debugCanvas({
+                    op: 'getImageData', x, y, w, h, hash, nonzero,
+                    head: Array.from(raw.slice(0, 16)),
+                });
+            }
+            const data = pixelFormat === 'rgba-float16' && raw instanceof Float16Array
+                ? raw : new Uint8ClampedArray(raw);
+            return new ImageData(data, w, h, { colorSpace, pixelFormat });
         }
         putImageData(imageData, dx, dy) {
+            _debugCanvas({
+                op: 'putImageData', dx, dy,
+                width: imageData && imageData.width,
+                height: imageData && imageData.height,
+                head: imageData && imageData.data
+                    ? Array.from(imageData.data.slice(0, 16))
+                    : [],
+            });
             ops.op_canvas_put_image_data(this.#id, imageData.data, dx, dy, imageData.width, imageData.height);
         }
         createImageData(w, h) { return new ImageData(w, h); }
@@ -369,6 +482,12 @@
             }
             // source can be another canvas element — get its internal ID
             if (source && source._canvasId !== undefined) {
+                _debugCanvas({
+                    op: 'drawCanvas', argc: arguments.length,
+                    dx: dx || 0, dy: dy || 0,
+                    width: Number(source.width) || 0,
+                    height: Number(source.height) || 0,
+                });
                 ops.op_canvas_draw_image(this.#id, source._canvasId, dx || 0, dy || 0);
                 return;
             }
@@ -484,6 +603,7 @@
         clear(mask) {
             if (mask & 0x4000 && this._canvasId !== undefined) { // COLOR_BUFFER_BIT
                 const [r, g, b, a] = this._clearColor;
+                _debugCanvas({ op: 'webglClear', width: this._width, height: this._height, rgba: [r, g, b, a] });
                 const color = `rgba(${r},${g},${b},${a})`;
                 ops.op_canvas_set_fill_style(this._canvasId, color);
                 ops.op_canvas_fill_rect(this._canvasId, 0, 0, this._width, this._height);
@@ -1470,13 +1590,34 @@
     //
     // Anti-fingerprint sites probe this path via
     // `const ctx = new OffscreenCanvas(w, h).getContext('2d'); ctx.fillText(...)`.
+    const _offscreenCanvasSize = new WeakMap();
     class RealOffscreenCanvas extends EventTarget {
         constructor(width, height) {
             super();
-            this.width = width | 0;
-            this.height = height | 0;
+            _offscreenCanvasSize.set(this, {
+                width: Math.max(0, width | 0),
+                height: Math.max(0, height | 0),
+            });
             this._canvasId = 0;
             this._context = null;
+        }
+        get width() { return _offscreenCanvasSize.get(this)?.width || 0; }
+        set width(value) {
+            const state = _offscreenCanvasSize.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            state.width = Math.max(0, Number(value) >>> 0);
+            if (this._canvasId) {
+                ops.op_canvas_resize(this._canvasId, state.width, state.height);
+            }
+        }
+        get height() { return _offscreenCanvasSize.get(this)?.height || 0; }
+        set height(value) {
+            const state = _offscreenCanvasSize.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            state.height = Math.max(0, Number(value) >>> 0);
+            if (this._canvasId) {
+                ops.op_canvas_resize(this._canvasId, state.width, state.height);
+            }
         }
         getContext(type, _opts) {
             if (type === "2d") {
