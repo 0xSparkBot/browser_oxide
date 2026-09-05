@@ -370,7 +370,13 @@ pub async fn op_fetch(
     } else {
         body.as_bytes().to_vec()
     };
-    let fetch_trace = std::env::var_os("BROWSER_OXIDE_FETCH_TRACE").is_some();
+    let fetch_trace = std::env::var("BROWSER_OXIDE_FETCH_TRACE")
+        .ok()
+        .is_some_and(|filter| match filter.trim() {
+            "" | "1" | "true" | "all" => true,
+            "0" | "false" => false,
+            substring => url.contains(substring),
+        });
     if fetch_trace {
         eprintln!(
             "[browser-oxide-fetch] request method={} url={} body_len={} header_names={:?} body={}",
