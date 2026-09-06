@@ -1826,11 +1826,19 @@ async fn perf_resource_entry_has_web_idl_prototype_chain() {
                 const script = document.createElement('script');
                 script.src = 'https://example.com/app.js';
                 document.head.appendChild(script);
-                const entry = performance.getEntriesByType('resource')[0];
-                return entry instanceof PerformanceResourceTiming
+                const entries = performance.getEntriesByType('resource');
+                const entry = entries[0];
+                const json = JSON.parse(JSON.stringify(entry));
+                return entries.length === 1
+                    && entry instanceof PerformanceResourceTiming
                     && entry instanceof PerformanceEntry
                     && Object.prototype.toString.call(entry)
-                        === '[object PerformanceResourceTiming]';
+                        === '[object PerformanceResourceTiming]'
+                    && typeof json.responseEnd === 'number'
+                    && json.responseStart === 0
+                    && json.requestStart === 0
+                    && json.transferSize === 0
+                    && json.encodedBodySize === 0;
             })()"#
         )
         .await,
@@ -1844,11 +1852,15 @@ async fn perf_navigation_entry_has_web_idl_prototype_chain() {
         check(
             r#"(() => {
                 const entry = performance.getEntriesByType('navigation')[0];
+                const json = JSON.parse(JSON.stringify(entry));
                 return entry instanceof PerformanceNavigationTiming
                     && entry instanceof PerformanceResourceTiming
                     && entry instanceof PerformanceEntry
                     && Object.prototype.toString.call(entry)
-                        === '[object PerformanceNavigationTiming]';
+                        === '[object PerformanceNavigationTiming]'
+                    && typeof json.responseEnd === 'number'
+                    && typeof json.domComplete === 'number'
+                    && json.entryType === 'navigation';
             })()"#
         )
         .await,

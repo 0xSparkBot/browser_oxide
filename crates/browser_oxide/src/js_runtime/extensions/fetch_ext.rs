@@ -558,7 +558,11 @@ pub fn op_cookie_set_sync(#[string] url: String, #[string] cookie: String) {
 /// is required.
 #[op2]
 #[string]
-pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> String {
+pub fn op_net_fetch_sync(
+    state: &mut OpState,
+    #[string] url: String,
+    #[string] referer: String,
+) -> String {
     // CSP `script-src-elem` enforcement. Sync-fetch is the path
     // `document.write('<script src=...>')` and dynamic
     // `appendChild(script)` use. CSP3 `strict-dynamic` propagates trust to
@@ -579,20 +583,38 @@ pub fn op_net_fetch_sync(#[string] url: String, #[string] referer: String) -> St
             return String::new();
         }
     }
-    fetch_sync_core(url, referer)
+    let result = fetch_sync_core(url, referer);
+    if let Some(timings) = result.timings {
+        record_resource_timing(state, timings);
+    }
+    result.body
 }
 
 /// Sync fetch for iframe documents and their same-origin resources. Skips the
 /// parent's `script-src` CSP: a child frame is a separate origin with its own CSP.
 #[op2]
 #[string]
-pub fn op_net_fetch_frame_sync(#[string] url: String, #[string] referer: String) -> String {
-    fetch_sync_core(url, referer)
+pub fn op_net_fetch_frame_sync(
+    state: &mut OpState,
+    #[string] url: String,
+    #[string] referer: String,
+) -> String {
+    let result = fetch_sync_core(url, referer);
+    if let Some(timings) = result.timings {
+        record_resource_timing(state, timings);
+    }
+    result.body
 }
 
 /// Shared body of the sync fetch ops. CSP, if any, is applied by the calling
 /// op before this runs, not here.
-fn fetch_sync_core(url: String, referer: String) -> String {
+#[derive(Default)]
+struct SyncFetchResult {
+    body: String,
+    timings: Option<crate::net::TimingStats>,
+}
+
+fn fetch_sync_core(url: String, referer: String) -> SyncFetchResult {
     // Resource blocker — return empty body for ad/tracker URLs without
     // doing any HTTP work. Tracker JS that loads via <script src=…>
     // (gtm.js, gpt.js, doubleclick) is the dominant time sink on
@@ -602,7 +624,7 @@ fn fetch_sync_core(url: String, referer: String) -> String {
         &referer,
         crate::net::blocker::classify_request_type(&url, Some("script")),
     ) {
-        return String::new();
+        return SyncFetchResult::default();
     }
 
     // Per-page chain ceiling — see MAX_SYNC_FETCH_PER_PAGE.
@@ -616,7 +638,7 @@ fn fetch_sync_core(url: String, referer: String) -> String {
             "[op_net_fetch_sync] CHAIN LIMIT ({}) exceeded — returning empty for {}",
             MAX_SYNC_FETCH_PER_PAGE, url
         );
-        return String::new();
+        return SyncFetchResult::default();
     }
 
     tracing::debug!("[op_net_fetch_sync] fetching {}", url);
@@ -652,7 +674,7 @@ fn fetch_sync_core(url: String, referer: String) -> String {
     };
     let client = match client_res {
         Ok(c) => c,
-        Err(_) => return String::new(),
+        Err(_) => return SyncFetchResult::default(),
     };
 
     // 2. Build browser-native headers for a script fetch
@@ -677,7 +699,7 @@ fn fetch_sync_core(url: String, referer: String) -> String {
             Ok(rt) => rt,
             Err(e) => {
                 eprintln!("[op_net_fetch_sync] runtime build error: {e}");
-                return String::new();
+                return SyncFetchResult::default();
             }
         };
         rt.block_on(async move {
@@ -687,15 +709,26 @@ fn fetch_sync_core(url: String, referer: String) -> String {
             )
             .await
             {
-                Ok(Ok(resp)) => resp.text(),
+                Ok(Ok(mut resp)) => {
+                    // Resource Timing names the URL requested by the element,
+                    // even when the network layer follows redirects to a
+                    // versioned asset. Keeping the final URL here prevented
+                    // document.scripts matching (and produced a duplicate
+                    // synthetic record for the original URL).
+                    resp.timings.name = url_clone.clone();
+                    SyncFetchResult {
+                        body: resp.text(),
+                        timings: Some(resp.timings),
+                    }
+                }
                 Ok(Err(e)) => {
                     eprintln!("[syncfetch] ERR {} {}", url_clone, e);
                     tracing::debug!(url = %url_clone, error = %e, "sync fetch failed");
-                    String::new()
+                    SyncFetchResult::default()
                 }
                 Err(_) => {
                     eprintln!("[op_net_fetch_sync] TIMEOUT fetching {}", url_clone);
-                    String::new()
+                    SyncFetchResult::default()
                 }
             }
         })

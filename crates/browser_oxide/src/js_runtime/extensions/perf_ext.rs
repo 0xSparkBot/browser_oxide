@@ -147,8 +147,12 @@ pub fn op_perf_get_resource_timings(state: &mut OpState) -> Vec<JsResourceTiming
             JsResourceTiming {
                 name: t.name.clone(),
                 entry_type: "resource".to_string(),
-                start_time: origin_offset + t.request_start_ms,
-                duration: t.response_end_ms - t.request_start_ms,
+                // Resource Timing starts when fetching begins, not when the
+                // request bytes finally reach the wire. The TimingStats wall
+                // clock is captured at fetch dispatch, so its offset from this
+                // realm's performance origin is the entry startTime.
+                start_time: origin_offset,
+                duration: t.response_end_ms,
                 fetch_start: origin_offset,
                 domain_lookup_start: origin_offset + t.dns_start_ms,
                 domain_lookup_end: origin_offset + t.dns_end_ms,

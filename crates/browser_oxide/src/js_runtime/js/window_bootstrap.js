@@ -3404,6 +3404,59 @@
             Object.setPrototypeOf(_PerfNavigationProto, _PerfResourceProto);
         }
 
+        const _resourceEntryJSON = (entry) => ({
+            name: entry.name,
+            entryType: entry.entryType,
+            startTime: entry.startTime,
+            duration: entry.duration,
+            initiatorType: entry.initiatorType,
+            nextHopProtocol: entry.nextHopProtocol,
+            workerStart: entry.workerStart,
+            redirectStart: entry.redirectStart,
+            redirectEnd: entry.redirectEnd,
+            fetchStart: entry.fetchStart,
+            domainLookupStart: entry.domainLookupStart,
+            domainLookupEnd: entry.domainLookupEnd,
+            connectStart: entry.connectStart,
+            secureConnectionStart: entry.secureConnectionStart,
+            connectEnd: entry.connectEnd,
+            requestStart: entry.requestStart,
+            responseStart: entry.responseStart,
+            responseEnd: entry.responseEnd,
+            transferSize: entry.transferSize,
+            encodedBodySize: entry.encodedBodySize,
+            decodedBodySize: entry.decodedBodySize,
+            serverTiming: entry.serverTiming,
+            renderBlockingStatus: entry.renderBlockingStatus,
+        });
+        _defProtoMethod(_PerfResourceProto, 'toJSON', function toJSON() {
+            return _resourceEntryJSON(this);
+        });
+        _defProtoMethod(_PerfNavigationProto, 'toJSON', function toJSON() {
+            return Object.assign(_resourceEntryJSON(this), {
+                unloadEventStart: this.unloadEventStart,
+                unloadEventEnd: this.unloadEventEnd,
+                domInteractive: this.domInteractive,
+                domContentLoadedEventStart: this.domContentLoadedEventStart,
+                domContentLoadedEventEnd: this.domContentLoadedEventEnd,
+                domComplete: this.domComplete,
+                loadEventStart: this.loadEventStart,
+                loadEventEnd: this.loadEventEnd,
+                type: this.type,
+                redirectCount: this.redirectCount,
+                activationStart: this.activationStart,
+            });
+        });
+
+        const _resourceTimingIsSameOrigin = (name) => {
+            try {
+                const documentUrl = globalThis.location?.href || "about:blank";
+                return new URL(name, documentUrl).origin === new URL(documentUrl).origin;
+            } catch (_) {
+                return false;
+            }
+        };
+
         const _buildResourceEntries = () => {
             const entries = [];
             const base = _perfNav.fetchStart;
@@ -3411,9 +3464,8 @@
             const _internalEntries = _browser_oxide.__perfResourceEntries || [];
             const _rustEntries = (ops.op_perf_get_resource_timings && ops.op_perf_get_resource_timings()) || [];
 
-            const mk = (name, startOffset, duration, type, size) => Object.assign(
-                Object.create(_PerfResourceProto),
-                {
+            const mk = (name, startOffset, duration, type, size) => {
+                const entry = Object.assign(Object.create(_PerfResourceProto), {
                     name,
                     entryType: "resource",
                     startTime: base + startOffset,
@@ -3437,13 +3489,34 @@
                     decodedBodySize: size * 3,
                     serverTiming: [],
                     renderBlockingStatus: "non-blocking",
-                },
-            );
+                });
+                // Cross-origin resources without Timing-Allow-Origin expose
+                // startTime/duration/responseEnd, but redact connection phases
+                // and transfer sizes. The sync script loader cannot currently
+                // receive TAO metadata, so apply the standards-safe redaction
+                // for every cross-origin entry rather than leaking impossible
+                // values.
+                if (!_resourceTimingIsSameOrigin(name)) {
+                    entry.domainLookupStart = 0;
+                    entry.domainLookupEnd = 0;
+                    entry.connectStart = 0;
+                    entry.connectEnd = 0;
+                    entry.secureConnectionStart = 0;
+                    entry.requestStart = 0;
+                    entry.responseStart = 0;
+                    entry.transferSize = 0;
+                    entry.encodedBodySize = 0;
+                    entry.decodedBodySize = 0;
+                }
+                return entry;
+            };
+
+            const _hasMeasuredEntry = (name) => _rustEntries.some((entry) => entry.name === name);
 
             if (globalThis.document) {
                 const scripts = globalThis.document.scripts || [];
                 for (let i = 0; i < scripts.length; i++) {
-                    if (scripts[i].src) {
+                    if (scripts[i].src && !_hasMeasuredEntry(scripts[i].src)) {
                         entries.push(mk(scripts[i].src, offset, 50, "script", 48600));
                         offset += 15;
                     }
@@ -3482,17 +3555,33 @@
             }
 
             for (const rt of _rustEntries) {
-                const e = mk(rt.name, 0, rt.duration, "other", 0);
+                let initiatorType = "other";
+                if (globalThis.document) {
+                    const scripts = globalThis.document.scripts || [];
+                    for (let i = 0; i < scripts.length; i++) {
+                        if (scripts[i].src === rt.name) {
+                            initiatorType = "script";
+                            break;
+                        }
+                    }
+                }
+                const e = mk(rt.name, 0, rt.duration, initiatorType, rt.encoded_body_size);
                 e.startTime = rt.start_time;
+                e.duration = rt.duration;
                 e.fetchStart = rt.fetch_start;
-                e.domainLookupStart = rt.domain_lookup_start;
-                e.domainLookupEnd = rt.domain_lookup_end;
-                e.connectStart = rt.connect_start;
-                e.connectEnd = rt.connect_end;
-                e.secureConnectionStart = rt.secure_connection_start;
-                e.requestStart = rt.request_start;
-                e.responseStart = rt.response_start;
                 e.responseEnd = rt.response_end;
+                if (_resourceTimingIsSameOrigin(rt.name)) {
+                    e.domainLookupStart = rt.domain_lookup_start;
+                    e.domainLookupEnd = rt.domain_lookup_end;
+                    e.connectStart = rt.connect_start;
+                    e.connectEnd = rt.connect_end;
+                    e.secureConnectionStart = rt.secure_connection_start;
+                    e.requestStart = rt.request_start;
+                    e.responseStart = rt.response_start;
+                    e.transferSize = rt.transfer_size;
+                    e.encodedBodySize = rt.encoded_body_size;
+                    e.decodedBodySize = rt.decoded_body_size;
+                }
                 entries.push(e);
             }
 
