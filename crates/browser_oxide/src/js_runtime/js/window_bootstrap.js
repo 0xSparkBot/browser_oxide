@@ -7665,11 +7665,129 @@
             try { Object.defineProperty(i, Symbol.toStringTag, { value: "GPUAdapterInfo", configurable: true }); } catch (_) {}
             return i;
         };
+        const _gpuTextureState = new WeakMap();
+        const _gpuTextureViewState = new WeakMap();
+        function GPUTexture() {
+            throw new TypeError("Illegal constructor");
+        }
+        function GPUTextureView() {
+            throw new TypeError("Illegal constructor");
+        }
+        const _textureGetter = (name, fallback) => function () {
+            const state = _gpuTextureState.get(this);
+            if (!state) throw new TypeError("Illegal invocation");
+            return state[name] === undefined ? fallback : state[name];
+        };
+        for (const [name, fallback] of Object.entries({
+            width: 1,
+            height: 1,
+            depthOrArrayLayers: 1,
+            mipLevelCount: 1,
+            sampleCount: 1,
+            dimension: "2d",
+            format: "rgba8unorm",
+            usage: 0,
+            textureBindingViewDimension: "2d",
+        })) {
+            Object.defineProperty(GPUTexture.prototype, name, {
+                get: _textureGetter(name, fallback),
+                enumerable: true,
+                configurable: true,
+            });
+        }
+        Object.defineProperty(GPUTexture.prototype, "label", {
+            get() {
+                const state = _gpuTextureState.get(this);
+                if (!state) throw new TypeError("Illegal invocation");
+                return state.label;
+            },
+            set(value) {
+                const state = _gpuTextureState.get(this);
+                if (!state) throw new TypeError("Illegal invocation");
+                state.label = String(value);
+            },
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(GPUTexture.prototype, "createView", {
+            value: function createView() {
+                if (!_gpuTextureState.has(this)) throw new TypeError("Illegal invocation");
+                const descriptor = arguments[0];
+                const view = Object.create(GPUTextureView.prototype);
+                _gpuTextureViewState.set(view, {
+                    label: String(descriptor && descriptor.label || ""),
+                });
+                return view;
+            },
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(GPUTexture.prototype, "destroy", {
+            value: function destroy() {
+                if (!_gpuTextureState.has(this)) throw new TypeError("Illegal invocation");
+                _gpuTextureState.get(this).destroyed = true;
+            },
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(GPUTexture.prototype, Symbol.toStringTag, {
+            value: "GPUTexture",
+            configurable: true,
+        });
+        Object.defineProperty(GPUTextureView.prototype, "label", {
+            get() {
+                const state = _gpuTextureViewState.get(this);
+                if (!state) throw new TypeError("Illegal invocation");
+                return state.label;
+            },
+            set(value) {
+                const state = _gpuTextureViewState.get(this);
+                if (!state) throw new TypeError("Illegal invocation");
+                state.label = String(value);
+            },
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(GPUTextureView.prototype, Symbol.toStringTag, {
+            value: "GPUTextureView",
+            configurable: true,
+        });
+        const _mkTexture = (descriptor) => {
+            descriptor = descriptor || {};
+            const size = descriptor.size === undefined ? [1, 1, 1] : descriptor.size;
+            const width = Number(Array.isArray(size) ? size[0] : size.width) || 1;
+            const height = Number(Array.isArray(size) ? size[1] : size.height) || 1;
+            const depth = Number(Array.isArray(size) ? size[2] : size.depthOrArrayLayers) || 1;
+            const texture = Object.create(GPUTexture.prototype);
+            _gpuTextureState.set(texture, {
+                width,
+                height,
+                depthOrArrayLayers: depth,
+                mipLevelCount: Number(descriptor.mipLevelCount) || 1,
+                sampleCount: Number(descriptor.sampleCount) || 1,
+                dimension: String(descriptor.dimension || "2d"),
+                format: String(descriptor.format || "rgba8unorm"),
+                usage: Number(descriptor.usage) || 0,
+                textureBindingViewDimension: String(descriptor.dimension || "2d"),
+                label: String(descriptor.label || ""),
+                destroyed: false,
+            });
+            return texture;
+        };
+        globalThis.GPUTexture = GPUTexture;
+        globalThis.GPUTextureView = GPUTextureView;
+        try {
+            _maskFunction(GPUTexture, "GPUTexture");
+            _maskFunction(GPUTextureView, "GPUTextureView");
+            _maskAsNative(GPUTexture.prototype, "createView", "destroy");
+        } catch (_) {}
         const _mkDevice = () => ({
             limits: _mkLimits(), features: _mkFeatures(),
             queue: { submit() {}, writeBuffer() {}, writeTexture() {}, onSubmittedWorkDone() { return Promise.resolve(); }, label: "" },
             label: "", lost: new Promise(() => {}),
-            destroy() {}, createBuffer() { return {}; }, createTexture() { return {}; },
+            destroy() {}, createBuffer() { return {}; }, createTexture(descriptor) { return _mkTexture(descriptor); },
             createShaderModule() { return {}; }, createCommandEncoder() { return {}; },
             createBindGroup() { return {}; }, createBindGroupLayout() { return {}; },
             createPipelineLayout() { return {}; }, createRenderPipeline() { return {}; },

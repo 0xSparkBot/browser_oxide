@@ -207,3 +207,25 @@ async fn webgl_debug_renderer_info_extension_present() {
     .await;
     assert_eq!(r, "true");
 }
+
+#[tokio::test]
+async fn webgl2_internalformat_and_lose_context_match_chrome() {
+    let r = evaluate(&format!(
+        "{GL_SETUP}
+        const samples = gl.getInternalformatParameter(0x8D41, 0x8D8E, 0x80A9);
+        const lose = gl.getExtension('WEBGL_lose_context');
+        JSON.stringify({{
+            sampleTag: Object.prototype.toString.call(samples),
+            samples: Array.from(samples),
+            loseTag: Object.prototype.toString.call(lose),
+            loseType: typeof lose.loseContext,
+            restoreType: typeof lose.restoreContext,
+            same: lose === gl.getExtension('WEBGL_lose_context')
+        }})"
+    ))
+    .await;
+    assert_eq!(
+        r,
+        r#"{"sampleTag":"[object Int32Array]","samples":[],"loseTag":"[object WebGLLoseContext]","loseType":"function","restoreType":"function","same":true}"#
+    );
+}

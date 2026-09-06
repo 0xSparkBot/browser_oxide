@@ -1542,6 +1542,43 @@ async fn webgpu_adapter_has_real_limits_and_info() {
     );
 }
 #[tokio::test]
+async fn webgpu_texture_create_view_has_webidl_shape() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    let setup = r#"
+        globalThis.__gpuTexture = "(pending)";
+        (async () => {
+            const adapter = await navigator.gpu.requestAdapter();
+            const device = await adapter.requestDevice();
+            const texture = device.createTexture({
+                size: [16, 8, 2], format: "rgba8unorm", usage: 16,
+            });
+            const view = texture.createView();
+            globalThis.__gpuTexture = JSON.stringify({
+                textureTag: Object.prototype.toString.call(texture),
+                viewTag: Object.prototype.toString.call(view),
+                dimensions: [texture.width, texture.height, texture.depthOrArrayLayers],
+                createViewType: typeof texture.createView,
+                createViewLength: texture.createView.length,
+                textureInstance: texture instanceof GPUTexture,
+                viewInstance: view instanceof GPUTextureView,
+            });
+        })();
+    "#;
+    let _ = page
+        .evaluate_async(setup, std::time::Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        page.evaluate("globalThis.__gpuTexture").unwrap_or_default(),
+        r#"{"textureTag":"[object GPUTexture]","viewTag":"[object GPUTextureView]","dimensions":[16,8,2],"createViewType":"function","createViewLength":0,"textureInstance":true,"viewInstance":true}"#
+    );
+}
+#[tokio::test]
 async fn offscreen_canvas_resize_resets_and_resizes_backing_store() {
     assert_eq!(
         check(

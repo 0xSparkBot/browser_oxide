@@ -529,6 +529,18 @@
         isPointInStroke() { return false; }
     }
 
+    const _webglLoseContextPrototype = {
+        loseContext() {},
+        restoreContext() {},
+    };
+    Object.defineProperty(_webglLoseContextPrototype, Symbol.toStringTag, {
+        value: "WebGLLoseContext",
+        configurable: true,
+    });
+    try {
+        _maskAsNative(_webglLoseContextPrototype, 'loseContext', 'restoreContext');
+    } catch (_) {}
+
     // WebGL — routes through Canvas2D backend for real pixel output.
     // Some scripts call readPixels() after clearColor()+clear() and expect real data.
     class WebGLRenderingContext {
@@ -841,6 +853,15 @@
         }
         getExtension(name) {
             if (name === "WEBGL_debug_renderer_info") return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+            if (name === "WEBGL_lose_context") {
+                if (!this._loseContextExtension) {
+                    Object.defineProperty(this, '_loseContextExtension', {
+                        value: Object.create(_webglLoseContextPrototype),
+                        configurable: true,
+                    });
+                }
+                return this._loseContextExtension;
+            }
             // Any supported extension gets a non-null stub. Fingerprinters
             // call getExtension(name) after getSupportedExtensions to verify.
             // Must agree with this context's getSupportedExtensions() surface —
@@ -947,7 +968,24 @@
     // carry `_isWebGL2 = true` (set in getContext) so the surface selector
     // returns the WebGL 2 surface. Static `_g/_g1/_surfaceFor/_gpuCache*` are
     // inherited and resolve to the same shared caches.
-    class WebGL2RenderingContext extends WebGLRenderingContext {}
+    class WebGL2RenderingContext extends WebGLRenderingContext {
+        getInternalformatParameter(target, internalformat, pname) {
+            // WebGL 2 exposes this method only for RENDERBUFFER/SAMPLES.
+            // Chrome returns an Int32Array, including an empty typed array for
+            // valid formats with no supported multisample counts.  The
+            // challenge queries RGB32I (0x8d8e), whose Chrome result is [].
+            if (target !== 0x8D41 || pname !== 0x80A9) return null;
+            const multisampled = new Set([
+                0x8051, // RGB8
+                0x8058, // RGBA8
+                0x8229, // R8
+                0x822B, // RG8
+                0x81A5, // DEPTH_COMPONENT16
+                0x88F0, // DEPTH24_STENCIL8
+            ]);
+            return new Int32Array(multisampled.has(internalformat) ? [4, 2] : []);
+        }
+    }
 
     // AudioContext + OfflineAudioContext
     // Simulates the pipeline commonly used for audio fingerprinting:
