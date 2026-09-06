@@ -2171,7 +2171,74 @@
     class SVGSwitchElement extends SVGGraphicsElement {}
     class SVGSymbolElement extends SVGGraphicsElement {}
     class SVGUseElement extends SVGGraphicsElement {}
-    class SVGTextContentElement extends SVGGraphicsElement {}
+    let _svgTextMeasureContext = null;
+    class SVGTextContentElement extends SVGGraphicsElement {
+        getComputedTextLength() {
+            if (!(this instanceof SVGTextContentElement)) {
+                throw new TypeError("Illegal invocation");
+            }
+            // Blink cannot lay out a detached SVG text node, and reports zero
+            // until it participates in the document's render tree.
+            if (!this.isConnected) return 0;
+
+            let text = String(this.textContent || "");
+            if (!text) return 0;
+            try {
+                const style = typeof globalThis.getComputedStyle === "function"
+                    ? globalThis.getComputedStyle(this)
+                    : null;
+                const whiteSpace = style && style.whiteSpace;
+                if (!whiteSpace || whiteSpace === "normal") {
+                    text = text.replace(/\s+/g, " ").trim();
+                }
+                if (!text) return 0;
+
+                if (!_svgTextMeasureContext) {
+                    const canvas = globalThis.document.createElement("canvas");
+                    _svgTextMeasureContext = canvas && canvas.getContext
+                        ? canvas.getContext("2d")
+                        : null;
+                }
+                if (_svgTextMeasureContext) {
+                    const attrSize = parseFloat(this.getAttribute("font-size"));
+                    const computedSize = style ? parseFloat(style.fontSize) : NaN;
+                    const fontSize = Number.isFinite(computedSize) && computedSize > 0
+                        ? computedSize
+                        : (Number.isFinite(attrSize) && attrSize > 0 ? attrSize : 16);
+                    const fontFamily = (style && style.fontFamily)
+                        || this.getAttribute("font-family")
+                        || '"PingFang SC"';
+                    const fontWeight = (style && style.fontWeight) || "400";
+                    const fontStyle = (style && style.fontStyle) || "normal";
+                    _svgTextMeasureContext.font = `${fontStyle} ${fontWeight} ${fontSize}px ${fontFamily}`;
+                    let width = _svgTextMeasureContext.measureText(text).width;
+                    const letterSpacing = style ? parseFloat(style.letterSpacing) : NaN;
+                    if (Number.isFinite(letterSpacing)) width += letterSpacing * text.length;
+                    const wordSpacing = style ? parseFloat(style.wordSpacing) : NaN;
+                    if (Number.isFinite(wordSpacing)) {
+                        width += wordSpacing * (text.match(/ /g) || []).length;
+                    }
+                    const textLength = parseFloat(this.getAttribute("textLength"));
+                    if (this.getAttribute("lengthAdjust") === "spacingAndGlyphs"
+                        && Number.isFinite(textLength) && textLength >= 0) {
+                        return textLength;
+                    }
+                    return width;
+                }
+            } catch (_) {}
+
+            // A rendering backend should normally be present. Keep the DOM
+            // method usable in reduced runtimes with a font-size-scaled width.
+            const fallbackSize = parseFloat(this.getAttribute("font-size")) || 16;
+            return text.length * fallbackSize * 0.5;
+        }
+    }
+    Object.defineProperty(SVGTextContentElement.prototype, "getComputedTextLength", {
+        value: SVGTextContentElement.prototype.getComputedTextLength,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    });
     class SVGTextPositioningElement extends SVGTextContentElement {}
     class SVGTextElement extends SVGTextPositioningElement {}
     class SVGTSpanElement extends SVGTextPositioningElement {}

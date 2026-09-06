@@ -1415,6 +1415,44 @@ async fn svg_namespace_uses_svg_web_idl_hierarchy() {
 }
 
 #[tokio::test]
+async fn svg_text_computed_length_matches_chrome_shape() {
+    assert_eq!(
+        check(
+            r#"(function(){
+                const ns='http://www.w3.org/2000/svg';
+                const svg=document.createElementNS(ns,'svg');
+                const text=document.createElementNS(ns,'text');
+                text.textContent='Turnstile';
+                svg.appendChild(text);
+                document.body.appendChild(svg);
+                const attached=text.getComputedTextLength();
+                text.remove();
+                let illegal=false;
+                try {
+                    SVGTextContentElement.prototype.getComputedTextLength.call({});
+                } catch (error) {
+                    illegal=error instanceof TypeError && error.message==='Illegal invocation';
+                }
+                const descriptor=Object.getOwnPropertyDescriptor(
+                    SVGTextContentElement.prototype,
+                    'getComputedTextLength'
+                );
+                return [
+                    typeof attached==='number' && Number.isFinite(attached) && attached>0,
+                    text.getComputedTextLength()===0,
+                    descriptor.enumerable && descriptor.writable && descriptor.configurable,
+                    descriptor.value.length===0,
+                    !Object.prototype.hasOwnProperty.call(SVGTextElement.prototype,'getComputedTextLength'),
+                    illegal
+                ].every(Boolean);
+            })()"#,
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn parsed_svg_elements_keep_svg_namespace_and_prototype() {
     assert_eq!(
         check(
