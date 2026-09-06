@@ -3788,6 +3788,7 @@
     // produces "function NAME() { [native code] }" cross-realm.
     const _MIRRORED_CONSTRUCTORS = [
         "Navigator", "Window", "Document", "HTMLDocument",
+        "MediaCapabilities",
         "EventTarget", "Node", "Element", "HTMLElement",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
         "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
@@ -3847,6 +3848,7 @@
     // throw where real Chrome succeeds, that differs from real Chrome.
     const _ILLEGAL_CONSTRUCTORS = new Set([
         "Navigator", "Window", "Document", "HTMLDocument",
+        "MediaCapabilities",
         "Node", "Element", "HTMLElement",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
         "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
@@ -4038,6 +4040,7 @@
     // shape.
     const _CHILD_REALM_INTERFACES = [
         "Navigator", "EventTarget", "Event", "CustomEvent", "MessageEvent",
+        "MediaCapabilities",
         "Node", "Element", "HTMLElement", "Document", "HTMLDocument",
         "DocumentFragment", "Text", "Comment", "ShadowRoot",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
@@ -4218,8 +4221,8 @@
                         const isErrEvent=event&&event.type==='error';
                         if(!isErrEvent&&typeof globalThis.ErrorEvent==='function'){
                             const msg=(error&&error.message)?String(error.message):String(error);
-                            const loc=(error&&error.stack)?String(error.stack).split('\n')[1]||'':'';
-                            const m=loc&&loc.match(/(\d+):(\d+)\)?\s*$/);
+                            const loc=(error&&error.stack)?String(error.stack).split('\\n')[1]||'':'';
+                            const m=loc&&loc.match(/(\\d+):(\\d+)\\)?\\s*$/);
                             const ev=new ErrorEvent('error',{
                                 message:'Uncaught '+msg,
                                 filename:target===globalThis?'':String((globalThis.location&&globalThis.location.href)||''),
@@ -5296,7 +5299,12 @@
                 // Some scripts check cw.navigator.webdriver; false is the
                 // Chrome-faithful value.
                 Object.defineProperty(_nav, 'webdriver', { value: false, writable: true, configurable: true, enumerable: true });
-                _sp("navigator", _nav);
+                // Materialize the object inside the child V8 context after
+                // its realm-local Navigator/MediaCapabilities prototypes have
+                // been installed. Passing this parent-realm object directly
+                // would leave Object.prototype as its prototype and would
+                // share the MediaCapabilities constructor/singleton.
+                _sp("__oxideNavigatorValues", _nav);
             } catch (_) {}
 
             // Own realm `fetch` — distinct reference (cw.fetch !== parent.fetch)
@@ -5408,6 +5416,40 @@
             // Replace copied DOM/Web-interface aliases with constructors and
             // prototypes created inside this child V8 context.
             _installChildRealmInterfaces(_realmId);
+            try {
+                ops.op_eval_in_child_realm(_realmId,
+                    `(function(){
+                        var values=globalThis.__oxideNavigatorValues||{};
+                        try{delete globalThis.__oxideNavigatorValues;}catch(_){}
+                        var nativeTag=Symbol.for('__browser_oxide_native__');
+                        function nativeGetter(key,value){
+                            var getter=function(){return value;};
+                            try{
+                                Object.defineProperty(getter,'name',{value:'get '+key,configurable:true});
+                                Object.defineProperty(getter,nativeTag,{value:'get '+key,configurable:true});
+                            }catch(_){}
+                            return getter;
+                        }
+                        var proto=(typeof Navigator==='function'&&Navigator.prototype)||Object.prototype;
+                        for(var key of Object.keys(values)){
+                            try{Object.defineProperty(proto,key,{get:nativeGetter(key,values[key]),enumerable:true,configurable:true});}catch(_){}
+                        }
+                        var mediaCapabilities;
+                        if(typeof MediaCapabilities==='function'){
+                            mediaCapabilities=Object.create(MediaCapabilities.prototype);
+                            try{Object.defineProperty(proto,'mediaCapabilities',{
+                                get:nativeGetter('mediaCapabilities',mediaCapabilities),
+                                enumerable:true,configurable:true
+                            });}catch(_){}
+                        }
+                        var nav=Object.create(proto);
+                        Object.defineProperty(globalThis,'navigator',{
+                            value:nav,writable:false,enumerable:true,configurable:true
+                        });
+                    })();`
+                );
+            } catch (_) {}
+            try { ops.op_delete_child_realm_prop(_realmId, "__oxideNavigatorValues"); } catch (_) {}
             try { ops.op_delete_child_realm_prop(_realmId, "__oxideFrameRegistryHook"); } catch (_) {}
             try {
                 const retarget = cw.__oxideDomRetargetValue;

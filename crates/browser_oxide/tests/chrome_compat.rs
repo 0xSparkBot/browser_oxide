@@ -1238,6 +1238,37 @@ async fn media_capabilities_match_chrome_148_macos() {
     );
 }
 
+#[tokio::test]
+async fn child_realm_media_capabilities_are_realm_local() {
+    let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
+        .await
+        .unwrap();
+    let result = page
+        .evaluate(
+            r#"(() => {
+                const iframe = document.createElement('iframe');
+                document.body.appendChild(iframe);
+                const child = iframe.contentWindow;
+                return JSON.stringify({
+                    constructorDistinct: child.MediaCapabilities !== MediaCapabilities,
+                    singletonDistinct: child.navigator.mediaCapabilities !== navigator.mediaCapabilities,
+                    prototypeLocal: child.Object.getPrototypeOf(child.navigator.mediaCapabilities)
+                        === child.MediaCapabilities.prototype,
+                    constructorLocal: child.navigator.mediaCapabilities.constructor
+                        === child.MediaCapabilities,
+                    navigatorOwn: child.Object.getOwnPropertyNames(child.navigator),
+                    singletonOwn: child.Object.getOwnPropertyNames(child.navigator.mediaCapabilities),
+                    tag: child.Object.prototype.toString.call(child.navigator.mediaCapabilities),
+                });
+            })()"#,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"constructorDistinct":true,"singletonDistinct":true,"prototypeLocal":true,"constructorLocal":true,"navigatorOwn":[],"singletonOwn":[],"tag":"[object MediaCapabilities]"}"#
+    );
+}
+
 // Speech synthesis voices
 #[tokio::test]
 async fn api_speech_synthesis_voices() {
