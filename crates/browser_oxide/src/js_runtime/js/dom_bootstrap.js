@@ -9,6 +9,7 @@
     const _nodeTypes = new WeakMap();
     const _tagNames = new WeakMap();
     const _localNames = new WeakMap();
+    const _SVG_NAMESPACE = "http://www.w3.org/2000/svg";
     const _shadowRoots = new WeakMap();
     const _shadowHosts = new WeakMap();
     const _shadowModes = new WeakMap();
@@ -1162,6 +1163,10 @@
             const t = _localNames.get(this);
             return t !== undefined ? t : ops.op_dom_get_tag_name(_getNodeId(this));
         }
+        get namespaceURI() {
+            return ops.op_dom_get_namespace(_getNodeId(this));
+        }
+        get prefix() { return null; }
         get id() { return ops.op_dom_get_attribute(_getNodeId(this), "id") || ""; }
         set id(val) { ops.op_dom_set_attribute(_getNodeId(this), "id", String(val)); }
         get className() { return ops.op_dom_get_attribute(_getNodeId(this), "class") || ""; }
@@ -2124,6 +2129,63 @@
     class HTMLDirectoryElement extends HTMLElement {}
     class HTMLSelectedContentElement extends HTMLElement {}
 
+    // SVG uses a separate WebIDL hierarchy from HTML. Treating namespaced
+    // elements as HTMLElement made valid SVG APIs such as getBBox disappear
+    // and leaked the wrong constructor/brand to feature-detection code.
+    const _svgRectToken = {};
+    const _svgRectValues = new WeakMap();
+    class SVGRect {
+        constructor(token, x = 0, y = 0, width = 0, height = 0) {
+            if (token !== _svgRectToken) throw new TypeError("Illegal constructor");
+            _svgRectValues.set(this, { x, y, width, height });
+        }
+        get x() { return _svgRectValues.get(this).x; }
+        set x(value) { _svgRectValues.get(this).x = Number(value) || 0; }
+        get y() { return _svgRectValues.get(this).y; }
+        set y(value) { _svgRectValues.get(this).y = Number(value) || 0; }
+        get width() { return _svgRectValues.get(this).width; }
+        set width(value) { _svgRectValues.get(this).width = Number(value) || 0; }
+        get height() { return _svgRectValues.get(this).height; }
+        set height(value) { _svgRectValues.get(this).height = Number(value) || 0; }
+    }
+    class SVGElement extends Element {}
+    class SVGGraphicsElement extends SVGElement {
+        getBBox(_options) {
+            const rect = this.getBoundingClientRect();
+            return new SVGRect(_svgRectToken, rect.x, rect.y, rect.width, rect.height);
+        }
+    }
+    class SVGGeometryElement extends SVGGraphicsElement {}
+    class SVGSVGElement extends SVGGraphicsElement {
+        createSVGRect() { return new SVGRect(_svgRectToken); }
+    }
+    class SVGGElement extends SVGGraphicsElement {}
+    class SVGAElement extends SVGGraphicsElement {}
+    class SVGDefsElement extends SVGGraphicsElement {}
+    class SVGClipPathElement extends SVGGraphicsElement {}
+    class SVGForeignObjectElement extends SVGGraphicsElement {}
+    class SVGImageElement extends SVGGraphicsElement {}
+    class SVGMarkerElement extends SVGGraphicsElement {}
+    class SVGMaskElement extends SVGGraphicsElement {}
+    class SVGPatternElement extends SVGGraphicsElement {}
+    class SVGSwitchElement extends SVGGraphicsElement {}
+    class SVGSymbolElement extends SVGGraphicsElement {}
+    class SVGUseElement extends SVGGraphicsElement {}
+    class SVGTextContentElement extends SVGGraphicsElement {}
+    class SVGTextPositioningElement extends SVGTextContentElement {}
+    class SVGTextElement extends SVGTextPositioningElement {}
+    class SVGTSpanElement extends SVGTextPositioningElement {}
+    class SVGRectElement extends SVGGeometryElement {}
+    class SVGCircleElement extends SVGGeometryElement {}
+    class SVGEllipseElement extends SVGGeometryElement {}
+    class SVGLineElement extends SVGGeometryElement {}
+    class SVGPathElement extends SVGGeometryElement {}
+    class SVGPolygonElement extends SVGGeometryElement {}
+    class SVGPolylineElement extends SVGGeometryElement {}
+    class SVGScriptElement extends SVGElement {}
+    class SVGStyleElement extends SVGElement {}
+    class SVGTitleElement extends SVGElement {}
+
     // Tag → specific HTML*Element prototype map. Anything not listed falls
     // back to HTMLElement.prototype.
     const _tagToProto = {
@@ -2182,14 +2244,48 @@
         selectedcontent: HTMLSelectedContentElement.prototype,
     };
 
+    const _svgTagToProto = {
+        svg: SVGSVGElement.prototype,
+        g: SVGGElement.prototype,
+        a: SVGAElement.prototype,
+        defs: SVGDefsElement.prototype,
+        clippath: SVGClipPathElement.prototype,
+        foreignobject: SVGForeignObjectElement.prototype,
+        image: SVGImageElement.prototype,
+        marker: SVGMarkerElement.prototype,
+        mask: SVGMaskElement.prototype,
+        pattern: SVGPatternElement.prototype,
+        switch: SVGSwitchElement.prototype,
+        symbol: SVGSymbolElement.prototype,
+        use: SVGUseElement.prototype,
+        text: SVGTextElement.prototype,
+        tspan: SVGTSpanElement.prototype,
+        rect: SVGRectElement.prototype,
+        circle: SVGCircleElement.prototype,
+        ellipse: SVGEllipseElement.prototype,
+        line: SVGLineElement.prototype,
+        path: SVGPathElement.prototype,
+        polygon: SVGPolygonElement.prototype,
+        polyline: SVGPolylineElement.prototype,
+        script: SVGScriptElement.prototype,
+        style: SVGStyleElement.prototype,
+        title: SVGTitleElement.prototype,
+    };
+
     // Adjust an Element instance's prototype to the tag-specific subclass
     // so `el instanceof HTMLDivElement` works as in real Chrome.
     function _retargetElementProto(el) {
         try {
-            const tag = ops.op_dom_get_tag_name(_getNodeId(el)).toLowerCase();
-            _localNames.set(el, tag);
-            _tagNames.set(el, tag.toUpperCase());
-            const proto = _tagToProto[tag] || HTMLElement.prototype;
+            const nodeId = _getNodeId(el);
+            const localName = ops.op_dom_get_tag_name(nodeId);
+            const tag = localName.toLowerCase();
+            const namespace = ops.op_dom_get_namespace(nodeId);
+            const isSvg = namespace === _SVG_NAMESPACE;
+            _localNames.set(el, localName);
+            _tagNames.set(el, isSvg ? localName : tag.toUpperCase());
+            const proto = isSvg
+                ? (_svgTagToProto[tag] || SVGElement.prototype)
+                : (_tagToProto[tag] || HTMLElement.prototype);
             Object.setPrototypeOf(el, proto);
         } catch {}
     }
@@ -2481,8 +2577,8 @@
             return el;
         }
         createElementNS(ns, tag) {
-            // For now, treat namespaced elements same as regular ones.
-            return this.createElement(tag);
+            const namespace = ns === null || ns === undefined ? "" : String(ns);
+            return _wrapNode(ops.op_dom_create_element_ns(namespace, String(tag)));
         }
         createTextNode(text) {
             return _wrapNode(ops.op_dom_create_text_node(text));
@@ -2981,6 +3077,37 @@
     _tag(HTMLDialogElement, "HTMLDialogElement");
     _tag(HTMLDirectoryElement, "HTMLDirectoryElement");
     _tag(HTMLSelectedContentElement, "HTMLSelectedContentElement");
+    _tag(SVGRect, "SVGRect");
+    _tag(SVGElement, "SVGElement");
+    _tag(SVGGraphicsElement, "SVGGraphicsElement");
+    _tag(SVGGeometryElement, "SVGGeometryElement");
+    _tag(SVGSVGElement, "SVGSVGElement");
+    _tag(SVGGElement, "SVGGElement");
+    _tag(SVGAElement, "SVGAElement");
+    _tag(SVGDefsElement, "SVGDefsElement");
+    _tag(SVGClipPathElement, "SVGClipPathElement");
+    _tag(SVGForeignObjectElement, "SVGForeignObjectElement");
+    _tag(SVGImageElement, "SVGImageElement");
+    _tag(SVGMarkerElement, "SVGMarkerElement");
+    _tag(SVGMaskElement, "SVGMaskElement");
+    _tag(SVGPatternElement, "SVGPatternElement");
+    _tag(SVGSwitchElement, "SVGSwitchElement");
+    _tag(SVGSymbolElement, "SVGSymbolElement");
+    _tag(SVGUseElement, "SVGUseElement");
+    _tag(SVGTextContentElement, "SVGTextContentElement");
+    _tag(SVGTextPositioningElement, "SVGTextPositioningElement");
+    _tag(SVGTextElement, "SVGTextElement");
+    _tag(SVGTSpanElement, "SVGTSpanElement");
+    _tag(SVGRectElement, "SVGRectElement");
+    _tag(SVGCircleElement, "SVGCircleElement");
+    _tag(SVGEllipseElement, "SVGEllipseElement");
+    _tag(SVGLineElement, "SVGLineElement");
+    _tag(SVGPathElement, "SVGPathElement");
+    _tag(SVGPolygonElement, "SVGPolygonElement");
+    _tag(SVGPolylineElement, "SVGPolylineElement");
+    _tag(SVGScriptElement, "SVGScriptElement");
+    _tag(SVGStyleElement, "SVGStyleElement");
+    _tag(SVGTitleElement, "SVGTitleElement");
     _tag(Text, "Text");
     _tag(Comment, "Comment");
     _tag(DocumentFragment, "DocumentFragment");
@@ -3037,7 +3164,7 @@
         "onvisibilitychange", "onwebkitfullscreenchange", "onwebkitfullscreenerror",
     ];
     const _eventHandlerValues = new WeakMap();
-    for (const _gehProto of [HTMLElement.prototype, Document.prototype]) {
+    for (const _gehProto of [HTMLElement.prototype, SVGElement.prototype, Document.prototype]) {
         for (const _geh of _globalEventHandlerNames) {
             if (!Object.getOwnPropertyDescriptor(_gehProto, _geh)) {
                 Object.defineProperty(_gehProto, _geh, {
@@ -3113,7 +3240,37 @@
     globalThis.HTMLDialogElement = HTMLDialogElement;
     globalThis.HTMLDirectoryElement = HTMLDirectoryElement;
     globalThis.HTMLSelectedContentElement = HTMLSelectedContentElement;
-    globalThis.SVGElement = Element;
+    globalThis.SVGRect = SVGRect;
+    globalThis.SVGElement = SVGElement;
+    globalThis.SVGGraphicsElement = SVGGraphicsElement;
+    globalThis.SVGGeometryElement = SVGGeometryElement;
+    globalThis.SVGSVGElement = SVGSVGElement;
+    globalThis.SVGGElement = SVGGElement;
+    globalThis.SVGAElement = SVGAElement;
+    globalThis.SVGDefsElement = SVGDefsElement;
+    globalThis.SVGClipPathElement = SVGClipPathElement;
+    globalThis.SVGForeignObjectElement = SVGForeignObjectElement;
+    globalThis.SVGImageElement = SVGImageElement;
+    globalThis.SVGMarkerElement = SVGMarkerElement;
+    globalThis.SVGMaskElement = SVGMaskElement;
+    globalThis.SVGPatternElement = SVGPatternElement;
+    globalThis.SVGSwitchElement = SVGSwitchElement;
+    globalThis.SVGSymbolElement = SVGSymbolElement;
+    globalThis.SVGUseElement = SVGUseElement;
+    globalThis.SVGTextContentElement = SVGTextContentElement;
+    globalThis.SVGTextPositioningElement = SVGTextPositioningElement;
+    globalThis.SVGTextElement = SVGTextElement;
+    globalThis.SVGTSpanElement = SVGTSpanElement;
+    globalThis.SVGRectElement = SVGRectElement;
+    globalThis.SVGCircleElement = SVGCircleElement;
+    globalThis.SVGEllipseElement = SVGEllipseElement;
+    globalThis.SVGLineElement = SVGLineElement;
+    globalThis.SVGPathElement = SVGPathElement;
+    globalThis.SVGPolygonElement = SVGPolygonElement;
+    globalThis.SVGPolylineElement = SVGPolylineElement;
+    globalThis.SVGScriptElement = SVGScriptElement;
+    globalThis.SVGStyleElement = SVGStyleElement;
+    globalThis.SVGTitleElement = SVGTitleElement;
     globalThis.Text = Text;
     globalThis.Comment = Comment;
     globalThis.DocumentFragment = DocumentFragment;
@@ -3565,6 +3722,16 @@
     const _MIRRORED_CONSTRUCTORS = [
         "Navigator", "Window", "Document", "HTMLDocument",
         "EventTarget", "Node", "Element", "HTMLElement",
+        "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
+        "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
+        "SVGClipPathElement", "SVGForeignObjectElement", "SVGImageElement",
+        "SVGMarkerElement", "SVGMaskElement", "SVGPatternElement",
+        "SVGSwitchElement", "SVGSymbolElement", "SVGUseElement",
+        "SVGTextContentElement", "SVGTextPositioningElement", "SVGTextElement",
+        "SVGTSpanElement", "SVGRectElement", "SVGCircleElement",
+        "SVGEllipseElement", "SVGLineElement", "SVGPathElement",
+        "SVGPolygonElement", "SVGPolylineElement", "SVGScriptElement",
+        "SVGStyleElement", "SVGTitleElement", "SVGRect",
         "HTMLDivElement", "HTMLSpanElement", "HTMLBodyElement",
         "HTMLAnchorElement", "HTMLImageElement", "HTMLInputElement",
         "HTMLFormElement", "HTMLButtonElement", "HTMLSelectElement",
@@ -3614,6 +3781,16 @@
     const _ILLEGAL_CONSTRUCTORS = new Set([
         "Navigator", "Window", "Document", "HTMLDocument",
         "Node", "Element", "HTMLElement",
+        "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
+        "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
+        "SVGClipPathElement", "SVGForeignObjectElement", "SVGImageElement",
+        "SVGMarkerElement", "SVGMaskElement", "SVGPatternElement",
+        "SVGSwitchElement", "SVGSymbolElement", "SVGUseElement",
+        "SVGTextContentElement", "SVGTextPositioningElement", "SVGTextElement",
+        "SVGTSpanElement", "SVGRectElement", "SVGCircleElement",
+        "SVGEllipseElement", "SVGLineElement", "SVGPathElement",
+        "SVGPolygonElement", "SVGPolylineElement", "SVGScriptElement",
+        "SVGStyleElement", "SVGTitleElement", "SVGRect",
         "HTMLDivElement", "HTMLSpanElement", "HTMLBodyElement",
         "HTMLAnchorElement", "HTMLImageElement", "HTMLInputElement",
         "HTMLFormElement", "HTMLButtonElement", "HTMLSelectElement",
@@ -3795,7 +3972,17 @@
     const _CHILD_REALM_INTERFACES = [
         "Navigator", "EventTarget", "Event", "CustomEvent", "MessageEvent",
         "Node", "Element", "HTMLElement", "Document", "HTMLDocument",
-        "DocumentFragment", "Text", "Comment", "ShadowRoot", "SVGElement",
+        "DocumentFragment", "Text", "Comment", "ShadowRoot",
+        "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
+        "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
+        "SVGClipPathElement", "SVGForeignObjectElement", "SVGImageElement",
+        "SVGMarkerElement", "SVGMaskElement", "SVGPatternElement",
+        "SVGSwitchElement", "SVGSymbolElement", "SVGUseElement",
+        "SVGTextContentElement", "SVGTextPositioningElement", "SVGTextElement",
+        "SVGTSpanElement", "SVGRectElement", "SVGCircleElement",
+        "SVGEllipseElement", "SVGLineElement", "SVGPathElement",
+        "SVGPolygonElement", "SVGPolylineElement", "SVGScriptElement",
+        "SVGStyleElement", "SVGTitleElement", "SVGRect",
         "NodeList", "HTMLCollection", "DOMTokenList",
         "HTMLHtmlElement", "HTMLHeadElement", "HTMLBodyElement",
         "HTMLDivElement", "HTMLSpanElement", "HTMLParagraphElement", "HTMLHeadingElement",
@@ -4439,8 +4626,12 @@
             // wrapper's current prototype chain.
             try {
                 if (value.nodeType === 1) {
-                    const tag = ops.op_dom_get_tag_name(_getNodeId(value)).toLowerCase();
-                    const proto = _tagToProto[tag] || HTMLElement.prototype;
+                    const nodeId = _getNodeId(value);
+                    const tag = ops.op_dom_get_tag_name(nodeId).toLowerCase();
+                    const namespace = ops.op_dom_get_namespace(nodeId);
+                    const proto = namespace === _SVG_NAMESPACE
+                        ? (_svgTagToProto[tag] || SVGElement.prototype)
+                        : (_tagToProto[tag] || HTMLElement.prototype);
                     const name = proto && proto.constructor && proto.constructor.name;
                     if (name) return String(name);
                 }
@@ -6262,6 +6453,16 @@
             'HTMLAreaElement', 'HTMLBRElement', 'HTMLBaseElement',
             'HTMLDListElement', 'HTMLDataElement', 'HTMLDataListElement',
             'HTMLDirectoryElement', 'HTMLSelectedContentElement',
+            'SVGRect', 'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement',
+            'SVGSVGElement', 'SVGGElement', 'SVGAElement', 'SVGDefsElement',
+            'SVGClipPathElement', 'SVGForeignObjectElement', 'SVGImageElement',
+            'SVGMarkerElement', 'SVGMaskElement', 'SVGPatternElement',
+            'SVGSwitchElement', 'SVGSymbolElement', 'SVGUseElement',
+            'SVGTextContentElement', 'SVGTextPositioningElement', 'SVGTextElement',
+            'SVGTSpanElement', 'SVGRectElement', 'SVGCircleElement',
+            'SVGEllipseElement', 'SVGLineElement', 'SVGPathElement',
+            'SVGPolygonElement', 'SVGPolylineElement', 'SVGScriptElement',
+            'SVGStyleElement', 'SVGTitleElement',
         ];
         for (const name of _toMask) {
             const ctor = globalThis[name];

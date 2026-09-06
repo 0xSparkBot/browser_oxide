@@ -1376,6 +1376,63 @@ async fn cls_svg_element() {
     assert_eq!(check("typeof SVGElement").await, "function");
 }
 
+#[tokio::test]
+async fn svg_namespace_uses_svg_web_idl_hierarchy() {
+    assert_eq!(
+        check(
+            r#"(function(){
+                const ns='http://www.w3.org/2000/svg';
+                const svg=document.createElementNS(ns,'svg');
+                const rect=document.createElementNS(ns,'rect');
+                const script=document.createElementNS(ns,'script');
+                const box=rect.getBBox();
+                let illegal=false;
+                try { new SVGRect(); } catch (error) { illegal=error instanceof TypeError; }
+                return [
+                    svg.namespaceURI===ns,
+                    svg.tagName==='svg',
+                    svg.constructor===SVGSVGElement,
+                    svg instanceof SVGGraphicsElement,
+                    rect.constructor===SVGRectElement,
+                    rect instanceof SVGGeometryElement,
+                    typeof rect.getBBox==='function',
+                    Object.prototype.toString.call(rect)==='[object SVGRectElement]',
+                    box.constructor===SVGRect,
+                    Object.prototype.toString.call(box)==='[object SVGRect]',
+                    box.x===0 && box.y===0 && box.width===0 && box.height===0,
+                    typeof script.getBBox==='undefined',
+                    typeof document.body.getBBox==='undefined',
+                    Object.getPrototypeOf(SVGGeometryElement.prototype)===SVGGraphicsElement.prototype,
+                    Object.getPrototypeOf(SVGGraphicsElement.prototype)===SVGElement.prototype,
+                    Object.getPrototypeOf(SVGElement.prototype)===Element.prototype,
+                    illegal
+                ].every(Boolean);
+            })()"#,
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn parsed_svg_elements_keep_svg_namespace_and_prototype() {
+    assert_eq!(
+        check(
+            r#"(function(){
+                document.body.innerHTML='<svg id="s"><rect id="r"></rect></svg>';
+                const svg=document.getElementById('s');
+                const rect=document.getElementById('r');
+                return svg instanceof SVGSVGElement
+                    && rect instanceof SVGRectElement
+                    && rect.namespaceURI==='http://www.w3.org/2000/svg'
+                    && typeof rect.getBBox==='function';
+            })()"#,
+        )
+        .await,
+        "true"
+    );
+}
+
 // ================================================================
 // Canvas
 // ================================================================

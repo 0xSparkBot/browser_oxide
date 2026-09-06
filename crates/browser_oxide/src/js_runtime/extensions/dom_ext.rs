@@ -65,6 +65,18 @@ pub fn op_dom_get_tag_name(state: &mut OpState, #[smi] node_id: i32) -> String {
         .unwrap_or_default()
 }
 
+#[op2]
+#[string]
+pub fn op_dom_get_namespace(state: &mut OpState, #[smi] node_id: i32) -> Option<String> {
+    let state = state.borrow::<DomState>();
+    let id = NodeId::from_raw(node_id as u32);
+    state
+        .dom
+        .get(id)
+        .and_then(|n| n.as_element())
+        .and_then(|e| e.name.ns.clone())
+}
+
 #[op2(fast)]
 #[smi]
 pub fn op_dom_get_node_type(state: &mut OpState, #[smi] node_id: i32) -> i32 {
@@ -564,8 +576,27 @@ pub fn op_dom_create_element(state: &mut OpState, #[string] tag: &str) -> i32 {
     let state = state.borrow_mut::<DomState>();
     state
         .dom
-        .create_element(crate::dom::node::QualName::new(tag), vec![])
+        .create_element(
+            crate::dom::node::QualName::with_ns("http://www.w3.org/1999/xhtml", tag),
+            vec![],
+        )
         .to_raw() as i32
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_dom_create_element_ns(
+    state: &mut OpState,
+    #[string] namespace: &str,
+    #[string] tag: &str,
+) -> i32 {
+    let state = state.borrow_mut::<DomState>();
+    let name = if namespace.is_empty() {
+        crate::dom::node::QualName::new(tag)
+    } else {
+        crate::dom::node::QualName::with_ns(namespace, tag)
+    };
+    state.dom.create_element(name, vec![]).to_raw() as i32
 }
 
 #[op2(fast)]
@@ -2266,6 +2297,7 @@ deno_core::extension!(
     ops = [
         op_dom_document_node,
         op_dom_get_tag_name,
+        op_dom_get_namespace,
         op_dom_get_node_type,
         op_dom_get_text_content,
         op_dom_get_inner_html,
@@ -2298,6 +2330,7 @@ deno_core::extension!(
         op_dom_get_prev_element_sibling,
         op_dom_get_child_element_count,
         op_dom_create_element,
+        op_dom_create_element_ns,
         op_dom_create_text_node,
         op_dom_create_document_fragment,
         op_dom_append_child,
