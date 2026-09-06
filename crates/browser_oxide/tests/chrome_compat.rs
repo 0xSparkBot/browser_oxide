@@ -1152,6 +1152,92 @@ async fn cls_media_source() {
     );
 }
 
+#[tokio::test]
+async fn media_codec_support_matches_chrome_148_macos() {
+    let result = check(
+        r#"JSON.stringify({
+            mse: [
+                'audio/mp4; codecs="mp4a.40.2"',
+                'audio/mp4; codecs="opus"',
+                'audio/webm; codecs="vorbis"',
+                'video/mp4; codecs="avc1.42E01E"',
+                'video/mp4; codecs="av01.0.01M.08"',
+                'video/mp4; codecs="vp09.00.10.08"',
+                'video/webm; codecs="vp8"',
+                'video/webm; codecs="vp09.00.10.08"',
+                'video/webm; codecs="av01.0.01M.08"',
+            ].map(type => MediaSource.isTypeSupported(type)),
+            unsupportedMse: [
+                'audio/mp4; codecs="ac-3"',
+                'audio/mp4; codecs="ec-3"',
+                'audio/ogg; codecs="vorbis"',
+                'audio/ogg; codecs="flac"',
+                'video/mp4; codecs="hev1.1.6.L93.B0"',
+                'video/ogg; codecs="theora"',
+            ].map(type => MediaSource.isTypeSupported(type)),
+            canPlay: [
+                'audio/ogg; codecs="vorbis"',
+                'audio/ogg; codecs="flac"',
+                'video/mp4; codecs="av01.0.01M.08"',
+            ].map(type => document.createElement('video').canPlayType(type)),
+            unsupportedCanPlay: [
+                'audio/mp4; codecs="ac-3"',
+                'video/mp4; codecs="hev1.1.6.L93.B0"',
+                'video/ogg; codecs="theora"',
+            ].map(type => document.createElement('video').canPlayType(type)),
+        })"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"mse":[true,true,true,true,true,true,true,true,true],"unsupportedMse":[false,false,false,false,false,false],"canPlay":["probably","probably","probably"],"unsupportedCanPlay":["","",""]}"#
+    );
+}
+
+#[tokio::test]
+async fn media_capabilities_match_chrome_148_macos() {
+    let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"globalThis.__mediaCapabilitiesResults = null;
+        Promise.all([
+            navigator.mediaCapabilities.decodingInfo({
+                type: 'file',
+                audio: {contentType:'audio/mp4; codecs="mp4a.40.2"', channels:'2', bitrate:128000, samplerate:48000}
+            }),
+            navigator.mediaCapabilities.decodingInfo({
+                type: 'file',
+                video: {contentType:'video/mp4; codecs="avc1.42E01E"', width:1920, height:1080, bitrate:2646242, framerate:'25'}
+            }),
+            navigator.mediaCapabilities.decodingInfo({
+                type: 'file',
+                video: {contentType:'video/mp4; codecs="hev1.1.6.L93.B0"', width:1920, height:1080, bitrate:2646242, framerate:'25'}
+            })
+        ]).then(results => { globalThis.__mediaCapabilitiesResults = results; });"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
+    let result = page
+        .evaluate(
+            r#"JSON.stringify({
+                results: globalThis.__mediaCapabilitiesResults,
+                resultNames: globalThis.__mediaCapabilitiesResults.map(Object.getOwnPropertyNames),
+                protoNames: Object.getOwnPropertyNames(MediaCapabilities.prototype),
+                methodLengths: [MediaCapabilities.prototype.decodingInfo.length, MediaCapabilities.prototype.encodingInfo.length],
+                construction: (() => { try { new MediaCapabilities(); return 'ok'; } catch (error) { return error.name + ':' + error.message; } })(),
+                tag: Object.prototype.toString.call(navigator.mediaCapabilities),
+            })"#,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"results":[{"powerEfficient":true,"smooth":true,"supported":true,"keySystemAccess":null},{"powerEfficient":false,"smooth":true,"supported":true,"keySystemAccess":null},{"powerEfficient":false,"smooth":false,"supported":false,"keySystemAccess":null}],"resultNames":[["powerEfficient","smooth","supported","keySystemAccess"],["powerEfficient","smooth","supported","keySystemAccess"],["powerEfficient","smooth","supported","keySystemAccess"]],"protoNames":["decodingInfo","encodingInfo","constructor"],"methodLengths":[1,1],"construction":"TypeError:Failed to construct 'MediaCapabilities': Illegal constructor","tag":"[object MediaCapabilities]"}"#
+    );
+}
+
 // Speech synthesis voices
 #[tokio::test]
 async fn api_speech_synthesis_voices() {

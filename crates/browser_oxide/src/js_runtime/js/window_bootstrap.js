@@ -6926,22 +6926,39 @@
     // Media codecs — Chrome-correct isTypeSupported / canPlayType
     // ================================================================
     {
-        const _supportedTypes = new Set([
-            "video/mp4", 'video/mp4; codecs="avc1.42E01E"', 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
-            'video/mp4; codecs="avc1.4D401E"', 'video/mp4; codecs="avc1.64001E"',
-            "video/webm", 'video/webm; codecs="vp8"', 'video/webm; codecs="vp8, vorbis"',
-            'video/webm; codecs="vp9"', 'video/webm; codecs="vp09.00.10.08"',
-            "audio/mp4", 'audio/mp4; codecs="mp4a.40.2"',
-            "audio/webm", 'audio/webm; codecs="opus"', 'audio/webm; codecs="vorbis"',
-            "audio/mpeg", "audio/ogg", 'audio/ogg; codecs="vorbis"', 'audio/ogg; codecs="opus"',
-            "audio/wav", 'audio/wav; codecs="1"', "audio/flac",
-            // Chrome accepts these codec MIME aliases too. Some scripts test
-            // audio/x-m4a and audio/aac (and the common misspelling "acc")
-            // and read the verdict from MediaSource.isTypeSupported. Without
-            // these entries we return false where Chrome returns true.
-            "audio/x-m4a", "audio/aac", "audio/acc",
-            "audio/mp3", "audio/x-wav",
+        const _codecFamilies = {
+            "video/mp4": ["avc1", "av01", "vp09", "mp4v"],
+            "video/webm": ["vp8", "vp9", "vp09", "av01"],
+            "audio/mp4": ["mp4a", "opus"],
+            "audio/webm": ["opus", "vorbis"],
+            "audio/ogg": ["opus", "vorbis", "flac"],
+            "audio/wav": ["1", "pcm"],
+        };
+        const _codecFreeTypes = new Set([
+            "video/mp4", "video/webm", "audio/mp4", "audio/webm",
+            "audio/mpeg", "audio/ogg", "audio/wav", "audio/flac",
+            "audio/x-m4a", "audio/aac", "audio/mp3", "audio/x-wav",
         ]);
+        function _parseMediaType(type) {
+            const text = String(type == null ? "" : type).trim().toLowerCase();
+            const semi = text.indexOf(';');
+            const mime = (semi < 0 ? text : text.slice(0, semi)).trim();
+            const match = text.match(/(?:^|;)\s*codecs\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;]*))/i);
+            const codecs = match
+                ? String(match[1] || match[2] || match[3] || "")
+                    .split(',').map(codec => codec.trim()).filter(Boolean)
+                : [];
+            return { mime, codecs };
+        }
+        function _canPlayMediaType(type) {
+            const parsed = _parseMediaType(type);
+            if (!_codecFreeTypes.has(parsed.mime)) return false;
+            if (parsed.codecs.length === 0) return true;
+            const families = _codecFamilies[parsed.mime];
+            return !!families && parsed.codecs.every(codec =>
+                families.some(family => codec === family || codec.indexOf(family + '.') === 0)
+            );
+        }
 
         // Removed redundant MediaSource definition here; it is defined further down.
 
@@ -6951,10 +6968,9 @@
         // cross-realm `iframe.contentWindow.Function.prototype.toString.call(el.canPlayType)`.
         if (globalThis.document) {
             const _canPlayTypeShim = function canPlayType(type) {
-                if (_supportedTypes.has(type)) return "probably";
-                const base = type.split(';')[0].trim();
-                if (_supportedTypes.has(base)) return "maybe";
-                return "";
+                const parsed = _parseMediaType(type);
+                if (!_canPlayMediaType(type)) return "";
+                return parsed.codecs.length > 0 ? "probably" : "maybe";
             };
             if (typeof _maskFunction === "function") {
                 _maskFunction(_canPlayTypeShim, "canPlayType");
@@ -7211,29 +7227,40 @@
     // MediaSource + MediaRecorder.isTypeSupported in window realm.
     // Some scripts read .isTypeSupported.
     (() => {
-        // Some scripts test audio/x-m4a + audio/aac + audio/acc and read
-        // the boolean verdict. Real Chrome returns true; without these
-        // entries we return false, a real engine gap. Brought in line with
-        // the first _supportedTypes Set above (the canPlayType one).
-        const _supportedTypes = new Set([
-            "video/mp4", 'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
-            'video/mp4;codecs="avc1.640028"', "video/webm",
-            'video/webm;codecs="vp8,vorbis"', 'video/webm;codecs="vp9"',
-            'video/webm;codecs="vp9,opus"', "audio/mp4",
-            'audio/mp4;codecs="mp4a.40.2"', "audio/webm",
-            'audio/webm;codecs=opus', 'audio/webm;codecs=vorbis',
-            // Codec MIME aliases some scripts test:
-            "audio/x-m4a", "audio/aac", "audio/acc",
-            "audio/mpeg", "audio/ogg", "audio/wav", "audio/flac",
-            "audio/mp3", "audio/x-wav",
+        // MSE support is container-and-codec specific. A recognized base MIME
+        // must not make an unknown codec (HEVC/Theora/AC-3, for example)
+        // appear supported.
+        const _mseCodecFamilies = {
+            "video/mp4": ["avc1", "av01", "vp09", "mp4v"],
+            "video/webm": ["vp8", "vp9", "vp09", "av01"],
+            "audio/mp4": ["mp4a", "opus"],
+            "audio/webm": ["opus", "vorbis"],
+        };
+        const _mseCodecFreeTypes = new Set([
+            "video/mp4", "video/webm", "audio/mp4", "audio/webm",
+            "audio/mpeg", "audio/aac", "audio/x-m4a", "audio/mp3",
         ]);
-        
+        const _parseMseType = type => {
+            const text = String(type == null ? "" : type).trim().toLowerCase();
+            const semi = text.indexOf(';');
+            const mime = (semi < 0 ? text : text.slice(0, semi)).trim();
+            const match = text.match(/(?:^|;)\s*codecs\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;]*))/i);
+            const codecs = match
+                ? String(match[1] || match[2] || match[3] || "")
+                    .split(',').map(codec => codec.trim()).filter(Boolean)
+                : [];
+            return { mime, codecs };
+        };
         const _isTypeSupported = ({
             isTypeSupported(type) {
                 if (typeof type !== 'string') return false;
-                if (_supportedTypes.has(type)) return true;
-                const base = type.split(';')[0].trim();
-                return _supportedTypes.has(base);
+                const parsed = _parseMseType(type);
+                if (!_mseCodecFreeTypes.has(parsed.mime)) return false;
+                if (parsed.codecs.length === 0) return true;
+                const families = _mseCodecFamilies[parsed.mime];
+                return !!families && parsed.codecs.every(codec =>
+                    families.some(family => codec === family || codec.indexOf(family + '.') === 0)
+                );
             }
         }).isTypeSupported;
         _maskFunction(_isTypeSupported, "isTypeSupported");
@@ -7460,24 +7487,32 @@
         const _supportedEncodingTypes = new Set([
             "record", "webrtc"
         ]);
-        const _normaliseMime = (s) => String(s || "").trim().toLowerCase();
-        // Codec families that real Chrome reports as supported on
-        // desktop. Conservative: only the common families commonly probed
-        // (mp4/h264/h265, vp8/vp9, av1, opus, mp4a).
-        const _supportedFamilies = [
-            "video/mp4", "video/webm", "video/h264", "video/h265", "video/hevc",
-            "video/avc", "video/vp8", "video/vp9", "video/av1", "video/avs3",
-            "audio/mp4", "audio/webm", "audio/aac", "audio/mpeg", "audio/opus",
-            "audio/vorbis", "audio/flac", "audio/wav", "audio/ogg",
-            "application/x-mpegurl"
-        ];
+        const _decodingCodecFamilies = {
+            "video/mp4": ["avc1", "av01", "vp09", "mp4v"],
+            "video/webm": ["vp8", "vp9", "vp09", "av01"],
+            "audio/mp4": ["mp4a", "opus"],
+            "audio/webm": ["opus", "vorbis"],
+            "audio/ogg": ["opus", "vorbis", "flac"],
+            "audio/wav": ["1", "pcm"],
+        };
+        const _decodingCodecFreeTypes = new Set([
+            "video/mp4", "video/webm", "audio/mp4", "audio/webm",
+            "audio/mpeg", "audio/ogg", "audio/wav", "audio/flac",
+            "audio/x-m4a", "audio/aac", "audio/mp3", "audio/x-wav",
+        ]);
         function _supportsContentType(ct) {
-            const t = _normaliseMime(ct);
-            if (!t) return false;
-            for (let i = 0; i < _supportedFamilies.length; i++) {
-                if (t.indexOf(_supportedFamilies[i]) === 0) return true;
-            }
-            return false;
+            const text = String(ct == null ? "" : ct).trim().toLowerCase();
+            const semi = text.indexOf(';');
+            const mime = (semi < 0 ? text : text.slice(0, semi)).trim();
+            if (!_decodingCodecFreeTypes.has(mime)) return false;
+            const match = text.match(/(?:^|;)\s*codecs\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;]*))/i);
+            if (!match) return true;
+            const codecs = String(match[1] || match[2] || match[3] || "")
+                .split(',').map(codec => codec.trim()).filter(Boolean);
+            const families = _decodingCodecFamilies[mime];
+            return codecs.length > 0 && !!families && codecs.every(codec =>
+                families.some(family => codec === family || codec.indexOf(family + '.') === 0)
+            );
         }
         function _buildInfo(config, supportedDecodingType) {
             const cfg = config && typeof config === "object" ? config : {};
@@ -7489,18 +7524,20 @@
                 : _supportedEncodingTypes.has(type);
             if (supported && audio) supported = _supportsContentType(audio.contentType);
             if (supported && video) supported = _supportsContentType(video.contentType);
+            const hasVideo = !!video;
+            // Chrome 148 headless on macOS reports software video decode as
+            // smooth but not power efficient. Audio decode is power efficient.
             return {
-                supported,
+                powerEfficient: supported && !hasVideo,
                 smooth: supported,
-                powerEfficient: supported,
-                configuration: cfg,
-                // keyStatuses appears in EME-bound decodingInfo; absent
-                // for plain configs — return undefined accessor to match
-                // Chrome.
+                supported,
+                keySystemAccess: null,
             };
         }
         class MediaCapabilities {
-            constructor() { /* spec: no constructor args */ }
+            constructor() {
+                throw new TypeError("Failed to construct 'MediaCapabilities': Illegal constructor");
+            }
             decodingInfo(configuration) {
                 if (configuration == null || typeof configuration !== "object") {
                     return Promise.reject(new TypeError(
@@ -7533,8 +7570,35 @@
         Object.defineProperty(MediaCapabilities.prototype, Symbol.toStringTag, {
             value: "MediaCapabilities", configurable: true,
         });
+        // Blink installs WebIDL operations before the constructor property;
+        // preserve that observable own-property order and descriptors.
+        const _decodingInfoDescriptor = Object.getOwnPropertyDescriptor(
+            MediaCapabilities.prototype, 'decodingInfo'
+        );
+        const _encodingInfoDescriptor = Object.getOwnPropertyDescriptor(
+            MediaCapabilities.prototype, 'encodingInfo'
+        );
+        delete MediaCapabilities.prototype.constructor;
+        delete MediaCapabilities.prototype.decodingInfo;
+        delete MediaCapabilities.prototype.encodingInfo;
+        Object.defineProperties(MediaCapabilities.prototype, {
+            decodingInfo: {
+                ..._decodingInfoDescriptor,
+                enumerable: true,
+            },
+            encodingInfo: {
+                ..._encodingInfoDescriptor,
+                enumerable: true,
+            },
+            constructor: {
+                value: MediaCapabilities,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        });
         globalThis.MediaCapabilities = MediaCapabilities;
-        const _mc = new MediaCapabilities();
+        const _mc = Object.create(MediaCapabilities.prototype);
         try {
             Object.defineProperty(_NavProto, 'mediaCapabilities', {
                 get() { return _mc; }, configurable: true, enumerable: true,
@@ -7543,6 +7607,7 @@
             navigator.mediaCapabilities = _mc;
         }
         // Mask methods as native so toString catalogue stays Chrome-shaped.
+        try { _maskFunction(MediaCapabilities, 'MediaCapabilities'); } catch (_) {}
         try { _maskAsNative(MediaCapabilities.prototype, 'decodingInfo', 'encodingInfo'); } catch (_) {}
     }
 
