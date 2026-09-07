@@ -404,9 +404,12 @@
             body = "s:" + String(rawBody);
         }
         headers = _flattenHeaders(init.headers);
-        const resourceInitiatorType = headers["x-browser-oxide-request-type"] === "image"
+        const internalRequestType = headers["x-browser-oxide-request-type"];
+        const resourceInitiatorType = internalRequestType === "image"
             ? "img"
-            : "fetch";
+            : internalRequestType === "link"
+                ? "link"
+                : "fetch";
 
         // FIX-FORMDATA: a FormData body's Content-Type is browser-controlled —
         // FORCE our generated boundary, overriding any (boundaryless)

@@ -157,3 +157,90 @@ async fn image_load_is_trusted_and_decode_waits_for_intrinsic_dimensions() {
     );
     assert!(request.contains("\r\nreferer: "), "{request}");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn image_preload_is_reused_and_keeps_link_initiator() {
+    let (origin, request_rx) = serve_png().await;
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let mut page = Page::from_html_with_url(
+        "<!doctype html><html><head></head><body></body></html>",
+        &format!("{origin}/page"),
+        Some(profile),
+    )
+    .await
+    .unwrap();
+
+    let image_url = format!("{origin}/preloaded.png");
+    page.evaluate(&format!(
+        r#"(() => {{
+            const result = {{ linkLoaded: false, imageLoaded: false }};
+            const link = document.createElement('link');
+            link.rel = 'preload';
+            link.as = 'image';
+            link.href = {image_url:?};
+            link.addEventListener('load', event => {{
+                result.linkLoaded = true;
+                result.linkLoadTrusted = event.isTrusted;
+            }});
+            document.head.appendChild(link);
+
+            const image = new Image();
+            image.addEventListener('load', event => {{
+                result.imageLoaded = true;
+                result.imageLoadTrusted = event.isTrusted;
+            }});
+            image.src = {image_url:?};
+            image.decode().then(() => {{
+                const entries = performance.getEntriesByName({image_url:?}, 'resource');
+                result.complete = image.complete;
+                result.naturalWidth = image.naturalWidth;
+                result.naturalHeight = image.naturalHeight;
+                result.entryCount = entries.length;
+                result.initiatorType = entries.length ? entries[0].initiatorType : null;
+                globalThis.__preloadResult = JSON.stringify(result);
+            }}, error => {{
+                globalThis.__preloadResult = 'ERROR:' + error;
+            }});
+            globalThis.__preloadResult = 'pending';
+        }})()"#,
+    ))
+    .unwrap();
+
+    for _ in 0..40 {
+        let _ = page
+            .event_loop()
+            .run_until_settled(Duration::from_millis(100))
+            .await;
+        if !matches!(
+            page.evaluate("globalThis.__preloadResult").as_deref(),
+            Ok("pending")
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let raw = page.evaluate("globalThis.__preloadResult").unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|error| panic!("{error}: {raw}"));
+    assert_eq!(value["linkLoaded"], true, "{raw}");
+    assert_eq!(value["linkLoadTrusted"], true, "{raw}");
+    assert_eq!(value["imageLoaded"], true, "{raw}");
+    assert_eq!(value["imageLoadTrusted"], true, "{raw}");
+    assert_eq!(value["complete"], true, "{raw}");
+    assert_eq!(value["naturalWidth"], 2, "{raw}");
+    assert_eq!(value["naturalHeight"], 1, "{raw}");
+    assert_eq!(value["entryCount"], 1, "{raw}");
+    assert_eq!(value["initiatorType"], "link", "{raw}");
+
+    let request = request_rx.await.unwrap().to_ascii_lowercase();
+    assert!(request.starts_with("get /preloaded.png http/1.1\r\n"));
+    assert!(
+        request.contains("\r\nsec-fetch-dest: image\r\n"),
+        "{request}"
+    );
+    assert!(
+        request.contains("\r\nsec-fetch-mode: no-cors\r\n"),
+        "{request}"
+    );
+}

@@ -24,6 +24,11 @@
     const _imageNaturalSize = new WeakMap();
     const _imageBytes = new WeakMap();
     const _imageDecodeWaiters = new WeakMap();
+    // Image preloads populate the same resource that a subsequent
+    // HTMLImageElement consumes. Keep the in-flight promise as well as the
+    // completed bytes so an immediately assigned Image.src joins the preload
+    // instead of issuing a second request.
+    const _imagePreloads = new Map();
     let _markFrameMessageTrusted = null;
     let _getFrameEventState = null;
     let _setFrameEventState = null;
@@ -34,6 +39,56 @@
             const log = globalThis.__oxImageDiag || (globalThis.__oxImageDiag = []);
             if (log.length < 24) log.push(entry);
         } catch (_) {}
+    }
+
+    function _absoluteResourceUrl(rawValue) {
+        const raw = String(rawValue || '');
+        let url = raw;
+        try {
+            url = new URL(
+                raw,
+                (globalThis.location && globalThis.location.href) || 'about:blank'
+            ).href;
+        } catch (_) {}
+        return url;
+    }
+
+    function _fetchImageResource(url, initiatorType) {
+        return Promise.resolve().then(() => _internalFetch(url, {
+            method: 'GET',
+            headers: {
+                'x-browser-oxide-request-type': initiatorType,
+                'accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                'sec-fetch-dest': 'image',
+                'sec-fetch-mode': 'no-cors',
+            },
+        })).then(async (response) => {
+            const loaded = !!response && response.status >= 200 && response.status < 400;
+            let bytes = null;
+            if (loaded) {
+                try { bytes = new Uint8Array(await response.arrayBuffer()); } catch (_) {}
+            }
+            return {
+                loaded: loaded && bytes !== null,
+                status: response && response.status,
+                bytes,
+            };
+        });
+    }
+
+    function _ensureImagePreload(url) {
+        let preload = _imagePreloads.get(url);
+        if (preload) return preload;
+        preload = _fetchImageResource(url, 'link');
+        _imagePreloads.set(url, preload);
+        preload.then(result => {
+            if (!result.loaded && _imagePreloads.get(url) === preload) {
+                _imagePreloads.delete(url);
+            }
+        }, () => {
+            if (_imagePreloads.get(url) === preload) _imagePreloads.delete(url);
+        });
+        return preload;
     }
 
     function _startImageLoad(image, rawValue) {
@@ -55,31 +110,19 @@
             return;
         }
         _imageComplete.set(image, false);
-        let url = raw;
-        try {
-            url = new URL(
-                raw,
-                (globalThis.location && globalThis.location.href) || 'about:blank'
-            ).href;
-        } catch (_) {}
+        const url = _absoluteResourceUrl(raw);
         _debugImageLoad({ phase: 'start', url: String(url).slice(-160), at: Math.round(performance.now()) });
-        Promise.resolve().then(() => _internalFetch(url, {
-            method: 'GET',
-            headers: {
-                'x-browser-oxide-request-type': 'image',
-                'accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                'sec-fetch-dest': 'image',
-                'sec-fetch-mode': 'no-cors',
-            },
-        })).then(async (response) => {
+        const resource = _imagePreloads.get(url)
+            || _fetchImageResource(url, 'image');
+        resource.then(result => {
             if (_imageLoadGeneration.get(image) !== generation) return;
             _imageComplete.set(image, true);
-            const loaded = !!response && response.status >= 200 && response.status < 400;
+            const loaded = result.loaded;
             _imageLoaded.set(image, loaded);
-            if (loaded) {
+            const bytes = result.bytes;
+            if (loaded && bytes) {
+                _imageBytes.set(image, bytes);
                 try {
-                    const bytes = new Uint8Array(await response.arrayBuffer());
-                    _imageBytes.set(image, bytes);
                     let width = 0;
                     let height = 0;
                     // PNG IHDR stores unsigned big-endian dimensions at
@@ -584,14 +627,31 @@
             }
         }
 
-        // Fire `load` on an injected stylesheet/preload <link>: CSS chunk loaders
-        // wait on it or hang. Deferred to a microtask to match async loading.
+        // An image preload performs the actual fetch. A later Image.src for
+        // the same absolute URL joins this promise, retaining the link
+        // PerformanceResourceTiming initiator and avoiding a duplicate GET.
+        // Other link types retain the lightweight load signal used by CSS
+        // chunk loaders until their dedicated loaders are implemented.
         if (childTag === 'link') {
             let _rel = '';
             try { _rel = String((child.getAttribute && child.getAttribute('rel')) || child.rel || '').toLowerCase(); } catch (_) {}
             let _lhref = '';
             try { _lhref = (child.getAttribute && child.getAttribute('href')) || child.href || ''; } catch (_) {}
-            if (_lhref && (_rel.indexOf('stylesheet') >= 0 || _rel.indexOf('preload') >= 0 || _rel.indexOf('prefetch') >= 0 || _rel.indexOf('modulepreload') >= 0)) {
+            let _as = '';
+            try { _as = String((child.getAttribute && child.getAttribute('as')) || child.as || '').toLowerCase(); } catch (_) {}
+            const _rels = _rel.split(/\s+/).filter(Boolean);
+            if (_lhref && _rels.includes('preload') && _as === 'image') {
+                const _lurl = _absoluteResourceUrl(_lhref);
+                _ensureImagePreload(_lurl).then(result => {
+                    const event = new Event(result.loaded ? 'load' : 'error');
+                    if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
+                    child.dispatchEvent && child.dispatchEvent(event);
+                }, () => {
+                    const event = new Event('error');
+                    if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
+                    child.dispatchEvent && child.dispatchEvent(event);
+                });
+            } else if (_lhref && (_rels.includes('stylesheet') || _rels.includes('preload') || _rels.includes('prefetch') || _rels.includes('modulepreload'))) {
                 queueMicrotask(() => {
                     try {
                         if (typeof child.onload === 'function') child.onload(new Event('load'));
@@ -6659,6 +6719,7 @@
             _nodeCache.clear();
             _scrollState.clear();
             _syncFetchInFlight.clear();
+            _imagePreloads.clear();
             // Observers registered by the previous page's scripts. Pages
             // routinely never call `disconnect()`, so this only shrinks on
             // reuse — each retained observer pins its callback closure and
