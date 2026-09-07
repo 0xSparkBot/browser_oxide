@@ -235,6 +235,15 @@
     let _syncEvalDepth = 0;
     const _MAX_SYNC_EVAL_DEPTH = 4;
 
+    // Dynamic classic scripts are fetched by an op and evaluated from this
+    // bootstrap, so plain eval() would label every frame `<anonymous>`. V8
+    // recognizes sourceURL for eval-originated scripts; use the element's
+    // request URL so Error.stack matches a browser-loaded external script.
+    function _externalScriptCode(code, url) {
+        const safeUrl = String(url || "").replace(/[\r\n\u2028\u2029]/g, "");
+        return String(code) + "\n//# sourceURL=" + safeUrl;
+    }
+
     // Guards against unbounded `document.write` chains. Two failure modes
     // we observed on bot.sannysoft.com:
     //   (a) A script does `document.write('<script>...</script>')` and the
@@ -430,7 +439,9 @@
                 try {
                     const _ccode = ops.op_net_fetch_frame_sync(_cUrl, _cbase);
                     if (_ccode) {
-                        try { ops.op_eval_in_child_realm(_rid, _ccode); } catch (_) {}
+                        try {
+                            ops.op_eval_in_child_realm(_rid, _externalScriptCode(_ccode, _cUrl));
+                        } catch (_) {}
                         if (scriptEl.onload) scriptEl.onload(new Event('load'));
                         scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
                     } else {
@@ -494,7 +505,7 @@
                             const resp = await globalThis.fetch(fullUrl);
                             if (resp.ok) {
                                 const code = await resp.text();
-                                try { (0, eval)(code); } catch(_) {}
+                                try { (0, eval)(_externalScriptCode(code, fullUrl)); } catch(_) {}
                                 if (scriptEl.onload) scriptEl.onload(new Event('load'));
                                 scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
                             }
@@ -519,7 +530,7 @@
                     if (code) {
                         console.log(`[DOM] sync executing script (${code.length} bytes): ${fullUrl}`);
                         try {
-                            (0, eval)(code);
+                            (0, eval)(_externalScriptCode(code, fullUrl));
                             console.log(`[DOM] sync execution SUCCESS: ${fullUrl}`);
                         } catch(e) {
                             console.log(`[DOM] sync eval ERROR for ${fullUrl}: ${e.message}\n${e.stack}`);
@@ -550,7 +561,7 @@
                             const code = await resp.text();
                             console.log(`[DOM] async executing script (${code.length} bytes): ${fullUrl}`);
                             try {
-                                (0, eval)(code);
+                                (0, eval)(_externalScriptCode(code, fullUrl));
                                 console.log(`[DOM] async execution SUCCESS: ${fullUrl}`);
                                 if (scriptEl.onload) scriptEl.onload(new Event('load'));
                                 scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));

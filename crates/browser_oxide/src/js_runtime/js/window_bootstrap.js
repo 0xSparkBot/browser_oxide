@@ -7207,8 +7207,13 @@
     // and any future bootstrap names without needing per-name additions.
     // ================================================================
     Error.prepareStackTrace = function(err, frames) {
+        const scriptName = f => f.getFileName()
+            || (typeof f.getScriptNameOrSourceURL === 'function'
+                ? f.getScriptNameOrSourceURL()
+                : '')
+            || '';
         const filtered = frames.filter(f => {
-            const file = f.getFileName() || '';
+            const file = scriptName(f);
             if (file.startsWith('ext:') || file.startsWith('deno:')) return false;
             if (file.includes('core/')) return false;
             // Internal bootstrap script names — all match `<...>` shape.
@@ -7224,7 +7229,7 @@
         }
         return err.toString() + '\n' + filtered.map(f => {
             const fn = f.getFunctionName() || f.getMethodName() || '<anonymous>';
-            const file = f.getFileName() || '<anonymous>';
+            const file = scriptName(f) || '<anonymous>';
             const line = f.getLineNumber() || 0;
             const col = f.getColumnNumber() || 0;
             // Format: "    at functionName (filename:line:col)"

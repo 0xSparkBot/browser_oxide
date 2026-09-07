@@ -907,7 +907,7 @@ impl Page {
                             event_loop.note_executed_script(&full_url, &code);
                             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
                             event_loop.set_current_script(Some(script.node_id));
-                            if let Err(e) = event_loop.execute_script(&code) {
+                            if let Err(e) = event_loop.execute_script_with_name(&code, &full_url) {
                                 tracing::warn!(script_src = %n, error = %e, "Script error in external script");
                             }
                             event_loop.set_current_script(None);
@@ -918,10 +918,10 @@ impl Page {
                     }
                 }
             } else if !script.code.is_empty() {
-                event_loop.note_executed_script(&format!("<inline>#{i}"), &script.code);
+                event_loop.note_executed_script(url, &script.code);
                 // document.currentScript parity (see build_page_with_scripts_init_and_storage).
                 event_loop.set_current_script(Some(script.node_id));
-                if let Err(e) = event_loop.execute_script(&script.code) {
+                if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
                     tracing::warn!(script_index = i, error = %e, "Script error in inline script");
                 }
                 event_loop.set_current_script(None);
