@@ -710,6 +710,32 @@ async fn target_capture_listeners_run_before_target_bubble_listeners() {
 }
 
 #[tokio::test]
+async fn event_listener_exception_is_reported_without_aborting_dispatch() {
+    let mut page = page_with("<div id='el'></div>").await;
+    page.evaluate(
+        r#"
+        globalThis._calls = [];
+        const element = document.getElementById('el');
+        element.addEventListener('ping', () => {
+            globalThis._calls.push('first');
+            throw new Error('expected-listener-fault');
+        });
+        element.addEventListener('ping', () => globalThis._calls.push('second'));
+        globalThis._dispatchReturned = element.dispatchEvent(new Event('ping'));
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        page.evaluate("JSON.stringify(globalThis._calls)").unwrap(),
+        r#"["first","second"]"#
+    );
+    assert_eq!(
+        page.evaluate("globalThis._dispatchReturned").unwrap(),
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn event_stop_propagation() {
     let mut page = page_with("<div id='parent'><span id='child'>x</span></div>").await;
     page.evaluate(r#"

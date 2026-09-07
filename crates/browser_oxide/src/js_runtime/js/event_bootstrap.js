@@ -671,10 +671,24 @@
                 const index = listeners.indexOf(l);
                 if (index !== -1) listeners.splice(index, 1);
             }
-            if (typeof l.callback === "function") {
-                l.callback.call(target, event);
-            } else if (l.callback && typeof l.callback.handleEvent === "function") {
-                l.callback.handleEvent(event);
+            // Web event-listener exceptions are reported, not rethrown from
+            // dispatchEvent.  Dispatch must continue with later listeners;
+            // otherwise one faulty observer can suppress the target's actual
+            // handler/state-machine callback.
+            try {
+                if (typeof l.callback === "function") {
+                    l.callback.call(target, event);
+                } else if (l.callback && typeof l.callback.handleEvent === "function") {
+                    l.callback.handleEvent(event);
+                }
+            } catch (e) {
+                try {
+                    _eventDiagNote && _eventDiagNote(
+                        "event-listener-error " + event.type + " "
+                        + String((e && e.stack) || e).slice(0, 1000)
+                    );
+                } catch (_) {}
+                console.error(e);
             }
         }
     }
