@@ -76,6 +76,7 @@ async fn image_load_is_trusted_and_decode_waits_for_intrinsic_dimensions() {
                 canvas.height = 1;
                 const context = canvas.getContext('2d');
                 context.drawImage(bitmap, 0, 0);
+                const resourceEntries = performance.getEntriesByName({image_url:?}, 'resource');
                 globalThis.__imageResult = JSON.stringify({{
                     completeWhilePending,
                     complete: image.complete,
@@ -90,6 +91,9 @@ async fn image_load_is_trusted_and_decode_waits_for_intrinsic_dimensions() {
                     bitmapPrototypeNames: Object.getOwnPropertyNames(ImageBitmap.prototype),
                     bitmapTag: Object.prototype.toString.call(bitmap),
                     pixels: Array.from(context.getImageData(0, 0, 2, 1).data),
+                    initiatorType: resourceEntries.length
+                        ? resourceEntries[resourceEntries.length - 1].initiatorType
+                        : null,
                 }});
                 }});
             }}, error => {{
@@ -139,6 +143,7 @@ async fn image_load_is_trusted_and_decode_waits_for_intrinsic_dimensions() {
     assert_eq!(value["loadEvent"]["trusted"], true, "{raw}");
     assert_eq!(value["loadEvent"]["isEvent"], true, "{raw}");
     assert_eq!(value["loadEvent"]["target"], true, "{raw}");
+    assert_eq!(value["initiatorType"], "img", "{raw}");
 
     let request = request_rx.await.unwrap().to_ascii_lowercase();
     assert!(request.starts_with("get /challenge.png http/1.1\r\n"));

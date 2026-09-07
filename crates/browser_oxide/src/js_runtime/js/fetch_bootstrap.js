@@ -353,6 +353,9 @@
             body = "s:" + String(rawBody);
         }
         headers = _flattenHeaders(init.headers);
+        const resourceInitiatorType = headers["x-browser-oxide-request-type"] === "image"
+            ? "img"
+            : "fetch";
 
         // FIX-FORMDATA: a FormData body's Content-Type is browser-controlled —
         // FORCE our generated boundary, overriding any (boundaryless)
@@ -476,7 +479,7 @@
 
             const entries = browser_oxide && browser_oxide.__perfResourceEntries;
             if (entries) {
-                const entry = { url, type: "fetch", startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 };
+                const entry = { url, type: resourceInitiatorType, startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 };
                 entries.push(entry);
                 try {
                     const notify = globalThis[Symbol.for('__browser_oxide_performance_resource__')];
