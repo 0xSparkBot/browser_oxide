@@ -164,3 +164,55 @@ async fn challenge_worker_observes_cors_network_error() {
         "TypeError:Failed to fetch"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetched_image_array_buffer_preserves_exact_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await;
+        let body = [0_u8, 0xff, 0x7f, 0x80];
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        let _ = socket.shutdown().await;
+    });
+
+    let target = format!("http://127.0.0.1:{port}/challenge-image");
+    let mut page = Page::from_html_with_url(
+        "<!doctype html><html><body></body></html>",
+        &format!("http://127.0.0.1:{port}/page"),
+        Some(browser_oxide::stealth::presets::chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+    page.evaluate(&format!(
+        r#"globalThis.__binaryFetchResult = 'pending';
+        fetch({target:?}).then(async response => {{
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            globalThis.__binaryFetchResult = bytes.length + ':' + Array.from(bytes).join(',');
+        }}, error => {{ globalThis.__binaryFetchResult = error.name + ':' + error.message; }});"#,
+    ))
+    .unwrap();
+    for _ in 0..30 {
+        let _ = page
+            .event_loop()
+            .run_until_settled(Duration::from_millis(100))
+            .await;
+        if !matches!(
+            page.evaluate("globalThis.__binaryFetchResult").as_deref(),
+            Ok("pending")
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        page.evaluate("globalThis.__binaryFetchResult").unwrap(),
+        "4:0,255,127,128"
+    );
+}
