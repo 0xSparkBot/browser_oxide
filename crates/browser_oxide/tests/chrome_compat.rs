@@ -2332,7 +2332,10 @@ async fn rtc_offer_and_state_machine_match_chrome_148() {
                 offerToReceiveVideo: true,
             });
             const offerChecks = {
-                instance: offer instanceof RTCSessionDescription,
+                plain: !(offer instanceof RTCSessionDescription)
+                    && Object.prototype.toString.call(offer) === '[object Object]'
+                    && Object.getPrototypeOf(offer) === Object.prototype
+                    && JSON.stringify(Object.getOwnPropertyNames(offer)) === JSON.stringify(['sdp', 'type']),
                 length: offer.sdp.length,
                 audio: offer.sdp.includes('m=audio 9 UDP/TLS/RTP/SAVPF'),
                 video: offer.sdp.includes('m=video 9 UDP/TLS/RTP/SAVPF'),
@@ -2342,13 +2345,25 @@ async fn rtc_offer_and_state_machine_match_chrome_148() {
                 fingerprint: /a=fingerprint:sha-256(?: [0-9A-F]{2}(?::[0-9A-F]{2}){31})\r\n/.test(offer.sdp),
             };
             await pc.setLocalDescription(offer);
+            const callee = new RTCPeerConnection();
+            await callee.setRemoteDescription(offer);
+            const answer = await callee.createAnswer();
+            const answerChecks = {
+                plain: !(answer instanceof RTCSessionDescription)
+                    && Object.prototype.toString.call(answer) === '[object Object]'
+                    && Object.getPrototypeOf(answer) === Object.prototype
+                    && JSON.stringify(Object.getOwnPropertyNames(answer)) === JSON.stringify(['sdp', 'type']),
+                type: answer.type,
+            };
             const afterSet = {
                 signaling: pc.signalingState,
                 current: pc.currentLocalDescription,
+                localTag: Object.prototype.toString.call(pc.localDescription),
                 pendingType: pc.pendingLocalDescription && pc.pendingLocalDescription.type,
             };
             await new Promise(resolve => setTimeout(resolve, 100));
-            globalThis.__rtcParity = { offerChecks, afterSet, events, localSdp: pc.localDescription.sdp };
+            globalThis.__rtcParity = { offerChecks, answerChecks, afterSet, events, localSdp: pc.localDescription.sdp };
+            callee.close();
         })();"#,
     )
     .unwrap();
@@ -2364,7 +2379,7 @@ async fn rtc_offer_and_state_machine_match_chrome_148() {
                 const gathering = result.events
                     .filter(event => event.type === 'icegatheringstatechange')
                     .map(event => event.gathering);
-                return result.offerChecks.instance
+                return result.offerChecks.plain
                     && result.offerChecks.length > 6000
                     && result.offerChecks.audio
                     && result.offerChecks.video
@@ -2372,8 +2387,11 @@ async fn rtc_offer_and_state_machine_match_chrome_148() {
                     && result.offerChecks.bundle
                     && result.offerChecks.ice
                     && result.offerChecks.fingerprint
+                    && result.answerChecks.plain
+                    && result.answerChecks.type === 'answer'
                     && result.afterSet.signaling === 'have-local-offer'
                     && result.afterSet.current === null
+                    && result.afterSet.localTag === '[object RTCSessionDescription]'
                     && result.afterSet.pendingType === 'offer'
                     && result.events.some(event => event.type === 'negotiationneeded')
                     && result.events.some(event => event.type === 'signalingstatechange')

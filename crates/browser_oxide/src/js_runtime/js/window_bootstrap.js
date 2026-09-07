@@ -6486,7 +6486,7 @@
     });
     _rtcMethod(_RTCPeerConnectionProto, 'createAnswer', function createAnswer() {
         _rtcState(_rtcPeerConnectionState, this);
-        return Promise.resolve({ type: 'answer', sdp: 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n' });
+        return Promise.resolve({ sdp: 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n', type: 'answer' });
     });
     _rtcMethod(_RTCPeerConnectionProto, 'createDTMFSender', function createDTMFSender(track) {
         _rtcState(_rtcPeerConnectionState, this);
@@ -6528,10 +6528,15 @@
         if (state.signalingState === 'closed') {
             return Promise.reject(new DOMException('The RTCPeerConnection is closed.', 'InvalidStateError'));
         }
-        const description = new globalThis.RTCSessionDescription({
-            type: 'offer',
+        // `createOffer()` resolves to the WebIDL dictionary
+        // RTCSessionDescriptionInit, not to a branded RTCSessionDescription.
+        // Blink materializes that dictionary as a plain object whose own
+        // property order is `sdp,type`; the branded object is only exposed by
+        // localDescription after setLocalDescription() consumes the dictionary.
+        const description = {
             sdp: _rtcBuildOffer(state, options || {}),
-        });
+            type: 'offer',
+        };
         return new Promise(resolve => setTimeout(() => resolve(description), 0));
     });
     _rtcMethod(_RTCPeerConnectionProto, 'getConfiguration', function getConfiguration() {
