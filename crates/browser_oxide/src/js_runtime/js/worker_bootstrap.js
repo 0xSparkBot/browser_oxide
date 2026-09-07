@@ -1111,8 +1111,13 @@
         for (const name of valueNames) {
             if (!Object.prototype.hasOwnProperty.call(globalThis, name)) {
                 globalThis[name] = name.startsWith('on') ? null
-                    : (name === 'origin' ? String(globalThis.location && globalThis.location.origin || '')
-                        : (name === 'self' ? globalThis : {}));
+                    : (name === 'crossOriginIsolated'
+                        ? !!(ops.op_cross_origin_isolated && ops.op_cross_origin_isolated())
+                        : (name === 'isSecureContext'
+                            ? !!(ops.op_is_secure_context && ops.op_is_secure_context())
+                            : (name === 'origin'
+                                ? String(globalThis.location && globalThis.location.origin || '')
+                                : (name === 'self' ? globalThis : {}))));
             }
             prototypeValues.set(name, globalThis[name]);
             const descriptor = {

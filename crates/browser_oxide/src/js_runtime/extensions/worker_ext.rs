@@ -463,6 +463,19 @@ pub fn op_worker_spawn(
                     worker_diag_note("eval-ok".to_string());
                 }
 
+                // Release the owner's initially-ref'ed receive after the
+                // worker body has run once. This preserves unsolicited
+                // startup messages while allowing a genuinely idle Worker to
+                // stop pinning page-idle detection for its whole lifetime.
+                WORKER_SELF.with(|worker| {
+                    if let Some(worker) = worker.borrow().as_ref() {
+                        let _ = worker
+                            .to_parent
+                            .send("__browser_oxide_worker_ready__".to_string());
+                        worker.notify_parent.notify_one();
+                    }
+                });
+
                 // When the event loop drains (worker idle), park on `notify_worker`
                 // instead of polling; a parent post or terminate wakes it.
                 while !terminate.load(Ordering::Acquire) {

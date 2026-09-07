@@ -2260,6 +2260,8 @@
     // a poll loop that delivers parent←worker messages to onmessage.
     if (!globalThis.Worker) {
         const _wops = Deno.core.ops;
+        const _refWorkerOp = Deno.core.refOpPromise;
+        const _unrefWorkerOp = Deno.core.unrefOpPromise;
         const _workerState = new WeakMap();
 
         function _getWorkerState(worker) {
@@ -2314,6 +2316,8 @@
                     url,
                     name,
                     type,
+                    initializing: true,
+                    pendingReceive: null,
                     handlers: { message: null, error: null },
                 };
                 _workerState.set(this, state);
@@ -2371,8 +2375,26 @@
                 const self = this;
                 const _drainOnce = () => {
                     if (!state.id) return;
-                    _wops.op_worker_await_message(state.id).then((raw) => {
+                    const pending = _wops.op_worker_await_message(state.id);
+                    state.pendingReceive = pending;
+                    // A Worker may remain idle for the whole lifetime of a
+                    // page.  Keep its receive operation alive, but do not let
+                    // that background wait pin deno_core's event loop until
+                    // every caller-side drain hits its timeout.  The op still
+                    // wakes normally and is observed by the next event-loop
+                    // turn, just like the unref'd long timers above.
+                    if (_unrefWorkerOp && !state.initializing) {
+                        _unrefWorkerOp(pending);
+                    }
+                    pending.then((raw) => {
+                        if (state.pendingReceive === pending) {
+                            state.pendingReceive = null;
+                        }
                         if (!raw || !state.id) return; // worker died
+                        if (raw === '__browser_oxide_worker_ready__') {
+                            state.initializing = false;
+                            return _drainOnce();
+                        }
                         const deserializer =
                             _browser_oxide && _browser_oxide.deserializeFromWire;
                         let payload = null;
@@ -2512,6 +2534,14 @@
                     payload = JSON.stringify({ data: null });
                 }
                 _wops.op_worker_post_to_worker(state.id, payload);
+                // A parent post normally expects a prompt worker reply. Ref
+                // the already-installed receive op for this exchange so the
+                // event loop waits for and dispatches that reply. Once it
+                // resolves, `_drainOnce` installs an unref'd idle receive
+                // again, avoiding the permanent navigation-idle pin.
+                if (_refWorkerOp && state.pendingReceive) {
+                    _refWorkerOp(state.pendingReceive);
+                }
             }
 
             terminate() {

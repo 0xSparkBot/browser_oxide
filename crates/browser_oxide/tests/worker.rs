@@ -74,6 +74,83 @@ fn worker_echo_round_trip() {
     assert_eq!(out, "echo:hello", "worker should echo 'echo:hello'");
 }
 
+/// An idle Worker must not keep the page event loop pending forever. Chrome
+/// treats the receive side as background work; keeping our async receive op
+/// ref'ed makes every bounded page drain consume its full timeout and inflates
+/// worker-message latency by hundreds of milliseconds.
+#[test]
+fn idle_worker_receive_does_not_pin_event_loop() {
+    let dom = browser_oxide::html_parser::parse_html(
+        "<html><head></head><body><div id=\"out\"></div></body></html>",
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        let mut runtime = BrowserJsRuntime::new(dom);
+        runtime
+            .execute_script(
+                r#"
+                    const url = URL.createObjectURL(new Blob([
+                        'self.onmessage = function() {}'
+                    ], { type: 'text/javascript' }));
+                    globalThis.__idleWorker = new Worker(url);
+                "#,
+                None,
+            )
+            .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), runtime.run_event_loop()).await;
+        assert!(
+            result.is_ok(),
+            "an idle worker receive must not pin the page event loop"
+        );
+        runtime
+            .execute_script("globalThis.__idleWorker.terminate()", None)
+            .unwrap();
+    });
+}
+
+/// Secure-context and cross-origin-isolation globals in a dedicated worker
+/// are booleans exposed through WorkerGlobalScope accessors. A generic `{}`
+/// fallback has the right property name but the wrong observable type/value.
+#[test]
+fn worker_security_context_globals_are_booleans() {
+    let code = r#"
+        const src = `
+            self.onmessage = function() {
+                self.postMessage(JSON.stringify({
+                    secureType: typeof isSecureContext,
+                    secureValue: isSecureContext,
+                    isolatedType: typeof crossOriginIsolated,
+                    isolatedValue: crossOriginIsolated,
+                    secureOwn: Object.hasOwn(globalThis, 'isSecureContext'),
+                    isolatedOwn: Object.hasOwn(globalThis, 'crossOriginIsolated'),
+                }));
+            };
+        `;
+        const worker = new Worker(URL.createObjectURL(
+            new Blob([src], { type: 'text/javascript' })
+        ));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+        setTimeout(() => worker.postMessage('probe'), 20);
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let value: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; raw={out}"));
+    assert_eq!(value["secureType"], "boolean", "{out}");
+    assert_eq!(value["secureValue"], true, "{out}");
+    assert_eq!(value["isolatedType"], "boolean", "{out}");
+    assert_eq!(value["isolatedValue"], false, "{out}");
+    assert_eq!(value["secureOwn"], false, "{out}");
+    assert_eq!(value["isolatedOwn"], false, "{out}");
+}
+
 #[test]
 fn worker_addeventlistener_roundtrip() {
     let code = r#"
