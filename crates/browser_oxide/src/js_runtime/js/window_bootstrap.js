@@ -3580,6 +3580,17 @@
                 e.requestStart = sTime + 5;
                 e.responseStart = sTime + (req.duration || 100) - 15;
                 e.responseEnd = sTime + (req.duration || 100);
+                if (_resourceTimingIsSameOrigin(req.url)) {
+                    if (typeof req.transferSize === "number") {
+                        e.transferSize = req.transferSize;
+                    }
+                    if (typeof req.encodedBodySize === "number") {
+                        e.encodedBodySize = req.encodedBodySize;
+                    }
+                    if (typeof req.decodedBodySize === "number") {
+                        e.decodedBodySize = req.decodedBodySize;
+                    }
+                }
                 entries.push(e);
                 offset += Math.max(10, (req.duration || 100) * 0.1);
             }

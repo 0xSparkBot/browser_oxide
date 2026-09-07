@@ -533,7 +533,16 @@
 
             const entries = browser_oxide && browser_oxide.__perfResourceEntries;
             if (entries) {
-                const entry = { url, type: resourceInitiatorType, startTime, duration: performance.now() - startTime, size: result.body ? result.body.length : 0 };
+                const entry = {
+                    url,
+                    type: resourceInitiatorType,
+                    startTime,
+                    duration: performance.now() - startTime,
+                    size: result.decoded_body_size || 0,
+                    transferSize: result.transfer_size || 0,
+                    encodedBodySize: result.encoded_body_size || 0,
+                    decodedBodySize: result.decoded_body_size || 0,
+                };
                 entries.push(entry);
                 try {
                     const notify = globalThis[Symbol.for('__browser_oxide_performance_resource__')];

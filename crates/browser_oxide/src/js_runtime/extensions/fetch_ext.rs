@@ -248,6 +248,12 @@ pub struct FetchResponse {
     /// avoid duplicating large text responses across the op boundary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_bytes: Option<Vec<u8>>,
+    /// Resource Timing byte counts from the network stack.  Keep these
+    /// separate from `body.len()`: the JS string is decoded text and cannot
+    /// represent either compressed transfer bytes or arbitrary binary data.
+    pub transfer_size: u64,
+    pub encoded_body_size: u64,
+    pub decoded_body_size: u64,
     pub url: String,
     pub ok: bool,
 }
@@ -321,6 +327,9 @@ pub async fn op_fetch(
                 headers: HashMap::new(),
                 body: String::new(),
                 body_bytes: None,
+                transfer_size: 0,
+                encoded_body_size: 0,
+                decoded_body_size: 0,
                 url: url.clone(),
                 ok: false,
             });
@@ -339,6 +348,9 @@ pub async fn op_fetch(
             headers: HashMap::new(),
             body: String::new(),
             body_bytes: None,
+            transfer_size: 0,
+            encoded_body_size: 0,
+            decoded_body_size: 0,
             url: url.clone(),
             ok: true,
         });
@@ -483,6 +495,9 @@ pub async fn op_fetch(
         headers: resp.headers.clone(),
         body: body_text,
         body_bytes: response_body_bytes,
+        transfer_size: resp.timings.transfer_size,
+        encoded_body_size: resp.timings.encoded_body_size,
+        decoded_body_size: resp.timings.decoded_body_size,
         url: resp.url.clone(),
         ok,
     };

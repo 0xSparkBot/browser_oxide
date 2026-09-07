@@ -197,6 +197,9 @@ async fn image_preload_is_reused_and_keeps_link_initiator() {
                 result.naturalHeight = image.naturalHeight;
                 result.entryCount = entries.length;
                 result.initiatorType = entries.length ? entries[0].initiatorType : null;
+                result.transferSize = entries.length ? entries[0].transferSize : null;
+                result.encodedBodySize = entries.length ? entries[0].encodedBodySize : null;
+                result.decodedBodySize = entries.length ? entries[0].decodedBodySize : null;
                 globalThis.__preloadResult = JSON.stringify(result);
             }}, error => {{
                 globalThis.__preloadResult = 'ERROR:' + error;
@@ -232,6 +235,13 @@ async fn image_preload_is_reused_and_keeps_link_initiator() {
     assert_eq!(value["naturalHeight"], 1, "{raw}");
     assert_eq!(value["entryCount"], 1, "{raw}");
     assert_eq!(value["initiatorType"], "link", "{raw}");
+    assert!(value["encodedBodySize"].as_u64().unwrap() > 0, "{raw}");
+    assert_eq!(value["decodedBodySize"], value["encodedBodySize"], "{raw}");
+    assert_eq!(
+        value["transferSize"].as_u64().unwrap(),
+        value["encodedBodySize"].as_u64().unwrap() + 300,
+        "{raw}"
+    );
 
     let request = request_rx.await.unwrap().to_ascii_lowercase();
     assert!(request.starts_with("get /preloaded.png http/1.1\r\n"));
