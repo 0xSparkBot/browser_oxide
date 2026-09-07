@@ -622,6 +622,94 @@ async fn event_once_listener() {
 }
 
 #[tokio::test]
+async fn event_listener_added_during_dispatch_waits_for_next_event() {
+    let mut page = page_with("<div id='el'></div>").await;
+    page.evaluate(
+        r#"
+        globalThis._calls = [];
+        const element = document.getElementById('el');
+        const late = () => globalThis._calls.push('late');
+        element.addEventListener('ping', () => {
+            globalThis._calls.push('first');
+            element.addEventListener('ping', late);
+        });
+        element.dispatchEvent(new Event('ping'));
+        globalThis._firstDispatch = JSON.stringify(globalThis._calls);
+        element.dispatchEvent(new Event('ping'));
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        page.evaluate("globalThis._firstDispatch").unwrap(),
+        r#"["first"]"#
+    );
+    assert_eq!(
+        page.evaluate("JSON.stringify(globalThis._calls)").unwrap(),
+        r#"["first","first","late"]"#
+    );
+}
+
+#[tokio::test]
+async fn event_listener_removed_during_dispatch_is_skipped() {
+    let mut page = page_with("<div id='el'></div>").await;
+    page.evaluate(
+        r#"
+        globalThis._calls = [];
+        const element = document.getElementById('el');
+        const removed = () => globalThis._calls.push('removed');
+        element.addEventListener('ping', () => {
+            globalThis._calls.push('first');
+            element.removeEventListener('ping', removed);
+        });
+        element.addEventListener('ping', removed);
+        element.dispatchEvent(new Event('ping'));
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        page.evaluate("JSON.stringify(globalThis._calls)").unwrap(),
+        r#"["first"]"#
+    );
+}
+
+#[tokio::test]
+async fn event_once_listener_is_removed_before_nested_dispatch() {
+    let mut page = page_with("<div id='el'></div>").await;
+    page.evaluate(
+        r#"
+        globalThis._count = 0;
+        const element = document.getElementById('el');
+        element.addEventListener('ping', () => {
+            globalThis._count++;
+            element.dispatchEvent(new Event('ping'));
+        }, { once: true });
+        element.dispatchEvent(new Event('ping'));
+    "#,
+    )
+    .unwrap();
+    assert_eq!(page.evaluate("globalThis._count").unwrap(), "1");
+}
+
+#[tokio::test]
+async fn target_capture_listeners_run_before_target_bubble_listeners() {
+    let mut page = page_with("<div id='el'></div>").await;
+    page.evaluate(
+        r#"
+        globalThis._calls = [];
+        const element = document.getElementById('el');
+        element.addEventListener('ping', () => globalThis._calls.push('bubble'));
+        element.addEventListener('ping', () => globalThis._calls.push('capture'), true);
+        element.dispatchEvent(new Event('ping'));
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        page.evaluate("JSON.stringify(globalThis._calls)").unwrap(),
+        r#"["capture","bubble"]"#
+    );
+}
+
+#[tokio::test]
 async fn event_stop_propagation() {
     let mut page = page_with("<div id='parent'><span id='child'>x</span></div>").await;
     page.evaluate(r#"

@@ -612,8 +612,8 @@
         if (!eventState.stopped) {
             eventState.currentTarget = this;
             eventState.eventPhase = 2;
-            _fireListeners(this, event, false);
             _fireListeners(this, event, true);
+            _fireListeners(this, event, false);
         }
 
         // Bubble phase (target → root)
@@ -656,20 +656,26 @@
 
         // --- 2. Fire registered listeners ---
         const listeners = _getListeners(target, event.type);
-        const toRemove = [];
-        for (let i = 0; i < listeners.length; i++) {
-            const l = listeners[i];
+        // The event listener list is snapshotted for each target/phase. A
+        // listener registered by a callback must not observe the dispatch
+        // already in progress. Removed listeners are skipped, however, so
+        // keep the live list as the membership source of truth.
+        const snapshot = listeners.slice();
+        for (const l of snapshot) {
+            if (!listeners.includes(l)) continue;
             if (l.capture !== capturePhase) continue;
             if (eventState.stoppedImmediate) break;
+            // Remove once-listeners before invoking them. Nested dispatches
+            // from the callback must not re-enter the same listener.
+            if (l.once) {
+                const index = listeners.indexOf(l);
+                if (index !== -1) listeners.splice(index, 1);
+            }
             if (typeof l.callback === "function") {
                 l.callback.call(target, event);
             } else if (l.callback && typeof l.callback.handleEvent === "function") {
                 l.callback.handleEvent(event);
             }
-            if (l.once) toRemove.push(i);
-        }
-        for (let i = toRemove.length - 1; i >= 0; i--) {
-            listeners.splice(toRemove[i], 1);
         }
     }
 
