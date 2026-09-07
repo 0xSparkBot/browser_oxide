@@ -1570,6 +1570,99 @@ async fn svg_text_computed_length_matches_chrome_shape() {
 }
 
 #[tokio::test]
+async fn svg_text_extent_matches_chrome_shape() {
+    assert_eq!(
+        check(
+            r#"(function(){
+                const ns='http://www.w3.org/2000/svg';
+                const svg=document.createElementNS(ns,'svg');
+                const text=document.createElementNS(ns,'text');
+                text.setAttribute('font-size','16');
+                text.textContent='😀A';
+                svg.appendChild(text);
+                document.body.appendChild(svg);
+                const emojiFromString=text.getExtentOfChar('😀');
+                const emojiFromLead=text.getExtentOfChar(0);
+                const emojiFromTrail=text.getExtentOfChar(1);
+                const ascii=text.getExtentOfChar(2);
+                const descriptor=Object.getOwnPropertyDescriptor(
+                    SVGTextContentElement.prototype,
+                    'getExtentOfChar'
+                );
+                text.remove();
+                let detached=false;
+                let missing=false;
+                let illegal=false;
+                try { text.getExtentOfChar(0); }
+                catch (error) { detached=error instanceof DOMException && error.name==='IndexSizeError'; }
+                try { text.getExtentOfChar(); }
+                catch (error) { missing=error instanceof TypeError; }
+                try { SVGTextContentElement.prototype.getExtentOfChar.call({},0); }
+                catch (error) { illegal=error instanceof TypeError && error.message==='Illegal invocation'; }
+                return [
+                    emojiFromString.constructor===SVGRect,
+                    Object.prototype.toString.call(emojiFromString)==='[object SVGRect]',
+                    [emojiFromString.x,emojiFromString.y,emojiFromString.width,emojiFromString.height]
+                        .every(Number.isFinite),
+                    emojiFromString.width>0 && emojiFromString.height>0,
+                    emojiFromString.x===emojiFromLead.x,
+                    emojiFromString.width===emojiFromLead.width,
+                    emojiFromLead.x===emojiFromTrail.x,
+                    emojiFromLead.width===emojiFromTrail.width,
+                    ascii.x>=emojiFromString.x+emojiFromString.width,
+                    text.getNumberOfChars()===0,
+                    descriptor.enumerable && descriptor.writable && descriptor.configurable,
+                    descriptor.value.length===1,
+                    !Object.prototype.hasOwnProperty.call(SVGTextElement.prototype,'getExtentOfChar'),
+                    detached,missing,illegal
+                ].every(Boolean);
+            })()"#,
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn character_data_mutation_methods_match_chrome_shape() {
+    assert_eq!(
+        check(
+            r#"(function(){
+                const text=document.createTextNode('ab');
+                text.appendData('<>');
+                text.insertData(2,'X');
+                text.deleteData(1,2);
+                text.replaceData(1,1,'YZ');
+                const descriptor=Object.getOwnPropertyDescriptor(
+                    CharacterData.prototype,
+                    'appendData'
+                );
+                let range=false;
+                let illegal=false;
+                try { text.substringData(99,1); }
+                catch (error) { range=error instanceof DOMException && error.name==='IndexSizeError'; }
+                try { CharacterData.prototype.appendData.call({},'x'); }
+                catch (error) { illegal=error instanceof TypeError && error.message==='Illegal invocation'; }
+                return [
+                    Object.getPrototypeOf(Text.prototype)===CharacterData.prototype,
+                    Object.getPrototypeOf(CharacterData.prototype)===Node.prototype,
+                    text instanceof CharacterData,
+                    text.data==='aYZ>',
+                    text.length===4,
+                    text.substringData(1,2)==='YZ',
+                    descriptor.enumerable && descriptor.writable && descriptor.configurable,
+                    descriptor.value.length===1,
+                    !Object.prototype.hasOwnProperty.call(Text.prototype,'appendData'),
+                    range,illegal
+                ].every(Boolean);
+            })()"#,
+        )
+        .await,
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn parsed_svg_elements_keep_svg_namespace_and_prototype() {
     assert_eq!(
         check(

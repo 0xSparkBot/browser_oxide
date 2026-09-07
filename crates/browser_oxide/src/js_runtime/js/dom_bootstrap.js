@@ -2303,13 +2303,98 @@
             const fallbackSize = parseFloat(this.getAttribute("font-size")) || 16;
             return text.length * fallbackSize * 0.5;
         }
+        getNumberOfChars() {
+            if (!(this instanceof SVGTextContentElement)) {
+                throw new TypeError("Illegal invocation");
+            }
+            return this.isConnected ? String(this.textContent || "").length : 0;
+        }
+        getExtentOfChar(charnum) {
+            if (!(this instanceof SVGTextContentElement)) {
+                throw new TypeError("Illegal invocation");
+            }
+            if (arguments.length === 0) {
+                throw new TypeError(
+                    "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': 1 argument required, but only 0 present.",
+                );
+            }
+            const text = this.isConnected ? String(this.textContent || "") : "";
+            const index = _toUnsignedLong(charnum);
+            if (index >= text.length) {
+                throw new DOMException(
+                    `Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The charnum provided (${index}) is greater than or equal to the maximum bound (${text.length}).`,
+                    "IndexSizeError",
+                );
+            }
+
+            let start = index;
+            let end = index + 1;
+            const unit = text.charCodeAt(index);
+            if (unit >= 0xDC00 && unit <= 0xDFFF && index > 0) {
+                const previous = text.charCodeAt(index - 1);
+                if (previous >= 0xD800 && previous <= 0xDBFF) start--;
+            } else if (unit >= 0xD800 && unit <= 0xDBFF && end < text.length) {
+                const next = text.charCodeAt(end);
+                if (next >= 0xDC00 && next <= 0xDFFF) end++;
+            }
+
+            let style = null;
+            try {
+                style = typeof globalThis.getComputedStyle === "function"
+                    ? globalThis.getComputedStyle(this)
+                    : null;
+            } catch (_) {}
+            const attrSize = parseFloat(this.getAttribute("font-size"));
+            const computedSize = style ? parseFloat(style.fontSize) : NaN;
+            const fontSize = Number.isFinite(computedSize) && computedSize > 0
+                ? computedSize
+                : (Number.isFinite(attrSize) && attrSize > 0 ? attrSize : 16);
+            if (!_svgTextMeasureContext) {
+                try {
+                    const canvas = globalThis.document.createElement("canvas");
+                    _svgTextMeasureContext = canvas && canvas.getContext
+                        ? canvas.getContext("2d")
+                        : null;
+                } catch (_) {}
+            }
+
+            let x = parseFloat(this.getAttribute("x")) || 0;
+            const baseline = parseFloat(this.getAttribute("y")) || 0;
+            let width = (end - start) * fontSize * 0.5;
+            let ascent = fontSize * 0.8;
+            let descent = fontSize * 0.2;
+            if (_svgTextMeasureContext) {
+                const fontFamily = (style && style.fontFamily)
+                    || this.getAttribute("font-family")
+                    || '"PingFang SC"';
+                const fontWeight = (style && style.fontWeight) || "400";
+                const fontStyle = (style && style.fontStyle) || "normal";
+                _svgTextMeasureContext.font = `${fontStyle} ${fontWeight} ${fontSize}px ${fontFamily}`;
+                if (start > 0) {
+                    x += _svgTextMeasureContext.measureText(text.slice(0, start)).width;
+                }
+                const metrics = _svgTextMeasureContext.measureText(text.slice(start, end));
+                width = metrics.width;
+                if (Number.isFinite(metrics.actualBoundingBoxAscent)) {
+                    ascent = metrics.actualBoundingBoxAscent;
+                }
+                if (Number.isFinite(metrics.actualBoundingBoxDescent)) {
+                    descent = metrics.actualBoundingBoxDescent;
+                }
+            } else {
+                x += start * fontSize * 0.5;
+            }
+            return new SVGRect(_svgRectToken, x, baseline - ascent, width, ascent + descent);
+        }
     }
-    Object.defineProperty(SVGTextContentElement.prototype, "getComputedTextLength", {
-        value: SVGTextContentElement.prototype.getComputedTextLength,
-        writable: true,
-        enumerable: true,
-        configurable: true,
-    });
+    for (const method of ["getComputedTextLength", "getNumberOfChars", "getExtentOfChar"]) {
+        Object.defineProperty(SVGTextContentElement.prototype, method, {
+            value: SVGTextContentElement.prototype[method],
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+    }
     class SVGTextPositioningElement extends SVGTextContentElement {}
     class SVGTextElement extends SVGTextPositioningElement {}
     class SVGTSpanElement extends SVGTextPositioningElement {}
@@ -2428,17 +2513,76 @@
         } catch {}
     }
 
-    class Text extends Node {
+    function _toUnsignedLong(value) {
+        const number = +value;
+        if (!Number.isFinite(number) || number === 0) return 0;
+        const integer = Math.trunc(number);
+        return ((integer % 4294967296) + 4294967296) % 4294967296;
+    }
+
+    function _characterDataOffset(method, value, length) {
+        const offset = _toUnsignedLong(value);
+        if (offset <= length) return offset;
+        throw new DOMException(
+            `Failed to execute '${method}' on 'CharacterData': The offset ${offset} is greater than the node's length (${length}).`,
+            "IndexSizeError",
+        );
+    }
+
+    class CharacterData extends Node {
         get data() { return ops.op_dom_get_text_content(_getNodeId(this)); }
         set data(val) { _setCharacterData(this, val); }
         get length() { return this.data.length; }
+        substringData(offset, count) {
+            if (!(this instanceof CharacterData)) throw new TypeError("Illegal invocation");
+            const data = this.data;
+            const start = _characterDataOffset("substringData", offset, data.length);
+            return data.slice(start, start + _toUnsignedLong(count));
+        }
+        appendData(data) {
+            if (!(this instanceof CharacterData)) throw new TypeError("Illegal invocation");
+            _setCharacterData(this, this.data + String(data));
+        }
+        insertData(offset, data) {
+            if (!(this instanceof CharacterData)) throw new TypeError("Illegal invocation");
+            const current = this.data;
+            const start = _characterDataOffset("insertData", offset, current.length);
+            _setCharacterData(this, current.slice(0, start) + String(data) + current.slice(start));
+        }
+        deleteData(offset, count) {
+            if (!(this instanceof CharacterData)) throw new TypeError("Illegal invocation");
+            const current = this.data;
+            const start = _characterDataOffset("deleteData", offset, current.length);
+            _setCharacterData(this, current.slice(0, start) + current.slice(start + _toUnsignedLong(count)));
+        }
+        replaceData(offset, count, data) {
+            if (!(this instanceof CharacterData)) throw new TypeError("Illegal invocation");
+            const current = this.data;
+            const start = _characterDataOffset("replaceData", offset, current.length);
+            _setCharacterData(
+                this,
+                current.slice(0, start) + String(data) + current.slice(start + _toUnsignedLong(count)),
+            );
+        }
+    }
+    for (const method of ["substringData", "appendData", "insertData", "deleteData", "replaceData"]) {
+        Object.defineProperty(CharacterData.prototype, method, {
+            value: CharacterData.prototype[method],
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+    }
+    for (const property of ["data", "length"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(CharacterData.prototype, property);
+        Object.defineProperty(CharacterData.prototype, property, { ...descriptor, enumerable: true });
+    }
+
+    class Text extends CharacterData {
         get wholeText() { return this.data; }
     }
 
-    class Comment extends Node {
-        get data() { return ops.op_dom_get_text_content(_getNodeId(this)); }
-        set data(val) { _setCharacterData(this, val); }
-    }
+    class Comment extends CharacterData {}
 
     class DocumentFragment extends Node {
         constructor(nodeId) {
@@ -3246,6 +3390,7 @@
     _tag(SVGScriptElement, "SVGScriptElement");
     _tag(SVGStyleElement, "SVGStyleElement");
     _tag(SVGTitleElement, "SVGTitleElement");
+    _tag(CharacterData, "CharacterData");
     _tag(Text, "Text");
     _tag(Comment, "Comment");
     _tag(DocumentFragment, "DocumentFragment");
@@ -3409,6 +3554,7 @@
     globalThis.SVGScriptElement = SVGScriptElement;
     globalThis.SVGStyleElement = SVGStyleElement;
     globalThis.SVGTitleElement = SVGTitleElement;
+    globalThis.CharacterData = CharacterData;
     globalThis.Text = Text;
     globalThis.Comment = Comment;
     globalThis.DocumentFragment = DocumentFragment;
@@ -3860,7 +4006,7 @@
     const _MIRRORED_CONSTRUCTORS = [
         "Navigator", "Window", "Document", "HTMLDocument",
         "MediaCapabilities",
-        "EventTarget", "Node", "Element", "HTMLElement",
+        "EventTarget", "Node", "CharacterData", "Text", "Comment", "Element", "HTMLElement",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
         "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
         "SVGClipPathElement", "SVGForeignObjectElement", "SVGImageElement",
@@ -4113,7 +4259,7 @@
         "Navigator", "EventTarget", "Event", "CustomEvent", "MessageEvent",
         "MediaCapabilities",
         "Node", "Element", "HTMLElement", "Document", "HTMLDocument",
-        "DocumentFragment", "Text", "Comment", "ShadowRoot",
+        "DocumentFragment", "CharacterData", "Text", "Comment", "ShadowRoot",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
         "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
         "SVGClipPathElement", "SVGForeignObjectElement", "SVGImageElement",
@@ -6596,7 +6742,7 @@
         const _toMask = [
             'EventTarget', 'Node', 'Element', 'HTMLElement',
             'Document', 'HTMLDocument', 'DocumentFragment',
-            'ShadowRoot', 'Text', 'Comment', 'Attr',
+            'ShadowRoot', 'CharacterData', 'Text', 'Comment', 'Attr',
             'NodeList', 'HTMLCollection', 'NamedNodeMap',
             'DOMTokenList', 'CSSStyleDeclaration',
             // Window-bootstrap-defined classes that previously leaked
