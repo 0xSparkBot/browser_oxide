@@ -157,7 +157,7 @@
             const event = new Event(loaded ? 'load' : 'error');
             if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
             _debugImageLoad({
-                phase: 'response', status: response && response.status,
+                phase: 'response', status: result.status,
                 loaded, trusted: event.isTrusted,
                 onload: typeof image.onload, onerror: typeof image.onerror,
                 width: image.width, height: image.height,
