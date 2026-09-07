@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 async fn cors_endpoint(extra_headers: &str) -> (String, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let headers = extra_headers.to_string();
+    let headers = extra_headers.replace("{PAGE_ORIGIN}", &format!("http://localhost:{port}"));
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0_u8; 4096];
@@ -40,6 +40,45 @@ async fn run_window_fetch(extra_headers: &str, init: &str) -> String {
         r#"globalThis.__corsResult = 'pending';
         fetch({target:?}, {init}).then(async response => {{
             globalThis.__corsResult = response.status + ':' + await response.text();
+        }}, error => {{
+            globalThis.__corsResult = error.name + ':' + error.message;
+        }});"#,
+    ))
+    .unwrap();
+    for _ in 0..30 {
+        let _ = page
+            .event_loop()
+            .run_until_settled(Duration::from_millis(100))
+            .await;
+        let result = page.evaluate("globalThis.__corsResult").unwrap();
+        if result != "pending" {
+            return result;
+        }
+    }
+    page.evaluate("globalThis.__corsResult").unwrap()
+}
+
+async fn run_window_fetch_headers(extra_headers: &str, init: &str) -> String {
+    let (target, page_url) = cors_endpoint(extra_headers).await;
+    let mut page = Page::from_html_with_url(
+        "<!doctype html><html><body></body></html>",
+        &page_url,
+        Some(browser_oxide::stealth::presets::chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+    page.evaluate(&format!(
+        r#"globalThis.__corsResult = 'pending';
+        fetch({target:?}, {init}).then(response => {{
+            globalThis.__corsResult = JSON.stringify({{
+                names: Array.from(response.headers.keys()),
+                cacheControl: response.headers.get('cache-control'),
+                contentType: response.headers.get('content-type'),
+                peek: response.headers.get('cf-chl-peek'),
+                hidden: response.headers.get('x-hidden'),
+                allowOrigin: response.headers.get('access-control-allow-origin'),
+                exposeHeaders: response.headers.get('access-control-expose-headers'),
+            }});
         }}, error => {{
             globalThis.__corsResult = error.name + ':' + error.message;
         }});"#,
@@ -125,6 +164,81 @@ async fn cors_wildcard_rejects_credentials_include() {
         )
         .await,
         "TypeError:Failed to fetch"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cors_response_exposes_only_safelisted_and_named_headers() {
+    let result = run_window_fetch_headers(
+        concat!(
+            "Access-Control-Allow-Origin: *\r\n",
+            "Access-Control-Expose-Headers: Cf-Chl-Peek\r\n",
+            "Cache-Control: private, no-store\r\n",
+            "Cf-Chl-Peek: challenge-state\r\n",
+            "X-Hidden: secret\r\n",
+        ),
+        r#"{ mode: "cors", credentials: "omit" }"#,
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        r#"{"names":["cache-control","cf-chl-peek","content-length","content-type"],"cacheControl":"private, no-store","contentType":"text/plain","peek":"challenge-state","hidden":null,"allowOrigin":null,"exposeHeaders":null}"#
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cors_expose_wildcard_without_credentials_exposes_non_forbidden_headers() {
+    let result = run_window_fetch_headers(
+        concat!(
+            "Access-Control-Allow-Origin: *\r\n",
+            "Access-Control-Expose-Headers: *\r\n",
+            "X-Hidden: visible-with-wildcard\r\n",
+        ),
+        r#"{ mode: "cors", credentials: "omit" }"#,
+    )
+    .await;
+
+    assert!(result.contains(r#""hidden":"visible-with-wildcard""#));
+    assert!(result.contains(r#""allowOrigin":"*""#));
+    assert!(result.contains(r#""exposeHeaders":"*""#));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cors_expose_wildcard_with_credentials_is_not_a_wildcard() {
+    let result = run_window_fetch_headers(
+        concat!(
+            "Access-Control-Allow-Origin: {PAGE_ORIGIN}\r\n",
+            "Access-Control-Allow-Credentials: true\r\n",
+            "Access-Control-Expose-Headers: *\r\n",
+            "X-Hidden: remains-hidden\r\n",
+        ),
+        r#"{ mode: "cors", credentials: "include" }"#,
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        r#"{"names":["content-length","content-type"],"cacheControl":null,"contentType":"text/plain","peek":null,"hidden":null,"allowOrigin":null,"exposeHeaders":null}"#
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn headers_iterate_in_lowercase_lexicographic_order() {
+    let mut page = Page::from_html(
+        "<!doctype html><html><body></body></html>",
+        Some(browser_oxide::stealth::presets::chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        page.evaluate(
+            r#"Array.from(new Headers({ Zeta: '3', alpha: '1', Middle: '2' }))
+                .map(([name, value]) => name + '=' + value).join('|')"#,
+        )
+        .unwrap(),
+        "alpha=1|middle=2|zeta=3"
     );
 }
 

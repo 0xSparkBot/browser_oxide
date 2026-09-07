@@ -27,10 +27,15 @@
         set(name, value) { this.#map[name.toLowerCase()] = String(value); }
         has(name) { return name.toLowerCase() in this.#map; }
         delete(name) { delete this.#map[name.toLowerCase()]; }
-        forEach(cb) { for (const [k, v] of Object.entries(this.#map)) cb(v, k, this); }
-        entries() { return Object.entries(this.#map)[Symbol.iterator](); }
-        keys() { return Object.keys(this.#map)[Symbol.iterator](); }
-        values() { return Object.values(this.#map)[Symbol.iterator](); }
+        #entriesSorted() {
+            return Object.entries(this.#map).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+        }
+        forEach(cb, thisArg) {
+            for (const [k, v] of this.#entriesSorted()) cb.call(thisArg, v, k, this);
+        }
+        entries() { return this.#entriesSorted()[Symbol.iterator](); }
+        keys() { return this.#entriesSorted().map(([k]) => k)[Symbol.iterator](); }
+        values() { return this.#entriesSorted().map(([, v]) => v)[Symbol.iterator](); }
         [Symbol.iterator]() { return this.entries(); }
     }
 
@@ -191,6 +196,52 @@
             if (String(key).toLowerCase() === lower) return String(value);
         }
         return null;
+    }
+
+    // A CORS response exposes only the safelisted response headers plus names
+    // authorized by Access-Control-Expose-Headers. The network layer retains
+    // the complete header block for protocol/cookie handling, so enforce the
+    // renderer-visible guard here before constructing the Response object.
+    const _corsSafelistedResponseHeaders = new Set([
+        "cache-control",
+        "content-language",
+        "content-length",
+        "content-type",
+        "expires",
+        "last-modified",
+        "pragma",
+    ]);
+    const _forbiddenResponseHeaders = new Set(["set-cookie", "set-cookie2"]);
+
+    function _stripForbiddenResponseHeaders(headers) {
+        const filtered = {};
+        for (const [name, value] of Object.entries(headers || {})) {
+            const lower = String(name).toLowerCase();
+            if (!_forbiddenResponseHeaders.has(lower)) filtered[lower] = String(value);
+        }
+        return filtered;
+    }
+
+    function _corsFilteredResponseHeaders(headers, credentialsMode) {
+        const exposed = new Set(_corsSafelistedResponseHeaders);
+        const exposeValue = _responseHeaderValue(headers, "access-control-expose-headers") || "";
+        let exposeAll = false;
+        for (const token of exposeValue.split(",")) {
+            const name = token.trim().toLowerCase();
+            if (!name) continue;
+            // `*` is a wildcard only for responses without credentials. For
+            // credentialed responses it denotes a header literally named `*`.
+            if (name === "*" && credentialsMode !== "include") exposeAll = true;
+            else exposed.add(name);
+        }
+
+        const filtered = {};
+        for (const [name, value] of Object.entries(headers || {})) {
+            const lower = String(name).toLowerCase();
+            if (_forbiddenResponseHeaders.has(lower)) continue;
+            if (exposeAll || exposed.has(lower)) filtered[lower] = String(value);
+        }
+        return filtered;
     }
 
     function _originForUrl(url) {
@@ -491,11 +542,14 @@
             // reads (including challenge polling loops) see Set-Cookie
             // values that arrived via this response.
             await _syncCookiesFromNet(url);
+            const responseHeaders = crossOrigin && requestMode === "cors"
+                ? _corsFilteredResponseHeaders(result.headers, credentialsMode)
+                : _stripForbiddenResponseHeaders(result.headers);
             return new Response(result.body, {
                 _rawBytes: result.body_bytes ? new Uint8Array(result.body_bytes) : null,
                 status: result.status,
                 statusText: result.status_text,
-                headers: result.headers,
+                headers: responseHeaders,
                 url: result.url,
             });
         } catch (e) {
