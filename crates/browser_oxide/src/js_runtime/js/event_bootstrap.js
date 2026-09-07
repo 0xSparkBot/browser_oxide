@@ -25,6 +25,7 @@
     const _customEventState = new WeakMap();
     const _uiEventState = new WeakMap();
     const _mouseEventState = new WeakMap();
+    const _keyboardEventState = new WeakMap();
     const _messageEventState = new WeakMap();
 
     const _stateFor = (map, value) => {
@@ -272,22 +273,69 @@
 
     class KeyboardEvent extends UIEvent {
         constructor(type, options = {}) {
-            super(type, { bubbles: true, cancelable: true, ...options });
-            this.key = options.key || "";
-            this.code = options.code || "";
-            this.keyCode = options.keyCode || 0;
-            this.charCode = options.charCode || 0;
-            this.which = options.which || options.keyCode || 0;
-            this.ctrlKey = !!options.ctrlKey;
-            this.shiftKey = !!options.shiftKey;
-            this.altKey = !!options.altKey;
-            this.metaKey = !!options.metaKey;
-            this.repeat = !!options.repeat;
-            this.isComposing = !!options.isComposing;
-            this.location = options.location || 0;
+            super(type, options);
+            const keyCode = (Number(options.keyCode) || 0) >>> 0;
+            _keyboardEventState.set(this, {
+                key: options.key === undefined ? "" : String(options.key),
+                code: options.code === undefined ? "" : String(options.code),
+                location: (Number(options.location) || 0) >>> 0,
+                ctrlKey: !!options.ctrlKey,
+                shiftKey: !!options.shiftKey,
+                altKey: !!options.altKey,
+                metaKey: !!options.metaKey,
+                repeat: !!options.repeat,
+                isComposing: !!options.isComposing,
+                charCode: (Number(options.charCode) || 0) >>> 0,
+                keyCode,
+            });
+            // UIEvent owns the legacy `which` getter in Blink. Constructor
+            // dictionaries ignore an explicit `which`; synthetic key events
+            // expose keyCode through it instead.
+            _stateFor(_uiEventState, this).which = keyCode;
         }
-        getModifierState(key) { return false; }
     }
+    for (const name of ['key', 'code', 'location', 'ctrlKey', 'shiftKey',
+        'altKey', 'metaKey', 'repeat', 'isComposing', 'charCode', 'keyCode']) {
+        _defineGetter(KeyboardEvent.prototype, name, _keyboardEventState);
+    }
+    for (const [name, value] of [
+        ['DOM_KEY_LOCATION_STANDARD', 0], ['DOM_KEY_LOCATION_LEFT', 1],
+        ['DOM_KEY_LOCATION_RIGHT', 2], ['DOM_KEY_LOCATION_NUMPAD', 3],
+    ]) {
+        for (const target of [KeyboardEvent, KeyboardEvent.prototype]) {
+            Object.defineProperty(target, name, {
+                value, writable: false, enumerable: true, configurable: false,
+            });
+        }
+    }
+    const _keyboardGetModifierState = { getModifierState(key) {
+        const state = _stateFor(_keyboardEventState, this);
+        switch (String(key)) {
+            case 'Control': return state.ctrlKey;
+            case 'Shift': return state.shiftKey;
+            case 'Alt': return state.altKey;
+            case 'Meta': return state.metaKey;
+            default: return false;
+        }
+    } }.getModifierState;
+    const _initKeyboardEvent = { initKeyboardEvent(type, bubbles, cancelable, view,
+        _char, location, ctrlKey, altKey, shiftKey, metaKey) {
+        _initUIEvent.call(this, type, bubbles, cancelable, view, 0);
+        Object.assign(_stateFor(_keyboardEventState, this), {
+            key: '', code: '', location: (Number(location) || 0) >>> 0,
+            ctrlKey: !!ctrlKey, altKey: !!altKey, shiftKey: !!shiftKey,
+            metaKey: !!metaKey, repeat: false, isComposing: false,
+            charCode: 0, keyCode: 0,
+        });
+        _stateFor(_uiEventState, this).which = 0;
+    } }.initKeyboardEvent;
+    for (const [name, fn] of [['getModifierState', _keyboardGetModifierState],
+        ['initKeyboardEvent', _initKeyboardEvent]]) {
+        Object.defineProperty(KeyboardEvent.prototype, name, {
+            value: _native(fn, name), writable: true, enumerable: true, configurable: true,
+        });
+    }
+    _moveConstructorLast(KeyboardEvent);
 
     class InputEvent extends UIEvent {
         constructor(type, options = {}) {

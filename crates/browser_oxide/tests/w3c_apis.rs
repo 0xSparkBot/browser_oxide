@@ -804,11 +804,44 @@ async fn keyboard_event_has_properties() {
         eval(
             r#"
         const e = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13 });
-        e.key + ',' + e.code + ',' + e.keyCode
+        e.key + ',' + e.code + ',' + e.keyCode + ',' + e.which
     "#
         )
         .await,
-        "Enter,Enter,13"
+        "Enter,Enter,13,13"
+    );
+}
+
+#[tokio::test]
+async fn keyboard_event_matches_chrome_148_webidl_surface() {
+    assert_eq!(
+        eval(
+            r#"
+        const e = new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', keyCode: 13,
+            ctrlKey: true, repeat: true, location: 2
+        });
+        JSON.stringify({
+            own: Object.getOwnPropertyNames(e),
+            proto: Object.getOwnPropertyNames(KeyboardEvent.prototype),
+            ctor: Object.getOwnPropertyNames(KeyboardEvent),
+            values: [e.key, e.code, e.keyCode, e.charCode, e.which,
+                e.ctrlKey, e.repeat, e.location],
+            modifiers: ['Control', 'Ctrl', 'Shift', 'Alt', 'Meta']
+                .map(name => e.getModifierState(name)),
+            constants: [e.DOM_KEY_LOCATION_STANDARD,
+                KeyboardEvent.DOM_KEY_LOCATION_LEFT,
+                KeyboardEvent.DOM_KEY_LOCATION_RIGHT,
+                KeyboardEvent.DOM_KEY_LOCATION_NUMPAD],
+            keyDescriptor: Object.getOwnPropertyDescriptor(
+                KeyboardEvent.prototype, 'key'),
+            constantDescriptor: Object.getOwnPropertyDescriptor(
+                KeyboardEvent.prototype, 'DOM_KEY_LOCATION_STANDARD'),
+        }, (_key, value) => typeof value === 'function' ? typeof value : value)
+    "#
+        )
+        .await,
+        r#"{"own":["isTrusted"],"proto":["key","code","location","ctrlKey","shiftKey","altKey","metaKey","repeat","isComposing","charCode","keyCode","DOM_KEY_LOCATION_STANDARD","DOM_KEY_LOCATION_LEFT","DOM_KEY_LOCATION_RIGHT","DOM_KEY_LOCATION_NUMPAD","getModifierState","initKeyboardEvent","constructor"],"ctor":["length","name","prototype","DOM_KEY_LOCATION_STANDARD","DOM_KEY_LOCATION_LEFT","DOM_KEY_LOCATION_RIGHT","DOM_KEY_LOCATION_NUMPAD"],"values":["Enter","Enter",13,0,13,true,true,2],"modifiers":[true,false,false,false,false],"constants":[0,1,2,3],"keyDescriptor":{"get":"function","enumerable":true,"configurable":true},"constantDescriptor":{"value":0,"writable":false,"enumerable":true,"configurable":false}}"#
     );
 }
 
