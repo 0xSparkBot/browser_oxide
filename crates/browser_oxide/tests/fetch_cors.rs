@@ -266,6 +266,7 @@ async fn challenge_worker_observes_cors_network_error() {
             .event_loop()
             .run_until_settled(Duration::from_millis(100))
             .await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
         if !matches!(
             page.evaluate("globalThis.__workerCorsResult").as_deref(),
             Ok("pending")
@@ -275,6 +276,55 @@ async fn challenge_worker_observes_cors_network_error() {
     }
     assert_eq!(
         page.evaluate("globalThis.__workerCorsResult").unwrap(),
+        "TypeError:Failed to fetch"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_transport_failure_does_not_expose_internal_error() {
+    // Accept a TCP connection and close it without an HTTP response. This
+    // deterministically exercises the transport-error catch path rather than
+    // the CORS response gate.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        drop(socket);
+    });
+
+    let target = format!("http://127.0.0.1:{port}/closed-connection");
+    let mut page = Page::from_html_with_url(
+        "<!doctype html><html><body></body></html>",
+        "https://accounts.x.ai/sign-up",
+        Some(browser_oxide::stealth::presets::chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+    page.evaluate(&format!(
+        r#"globalThis.__workerTransportResult = 'pending';
+        const source = `fetch({target:?})
+            .then(response => postMessage('ok:' + response.status))
+            .catch(error => postMessage(error.name + ':' + error.message));`;
+        const worker = new Worker(URL.createObjectURL(new Blob([source])));
+        worker.onmessage = event => {{ globalThis.__workerTransportResult = event.data; }};"#,
+    ))
+    .unwrap();
+    for _ in 0..40 {
+        let _ = page
+            .event_loop()
+            .run_until_settled(Duration::from_millis(100))
+            .await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if !matches!(
+            page.evaluate("globalThis.__workerTransportResult")
+                .as_deref(),
+            Ok("pending")
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        page.evaluate("globalThis.__workerTransportResult").unwrap(),
         "TypeError:Failed to fetch"
     );
 }

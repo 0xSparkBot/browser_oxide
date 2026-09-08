@@ -86,7 +86,8 @@ async fn fetch_unknown_blob_url_throws() {
                     await fetch('blob:null/fake-nonexistent-uuid-1234');
                     document.getElementById('out').textContent = 'unexpected-ok';
                 } catch (e) {
-                    document.getElementById('out').textContent = 'threw:' + e.name;
+                    document.getElementById('out').textContent =
+                        'threw:' + e.name + ':' + e.message;
                 }
             })();
         </script></body></html>"#,
@@ -94,11 +95,10 @@ async fn fetch_unknown_blob_url_throws() {
     )
     .await
     .unwrap();
-    // Network error → TypeError per Fetch spec.
-    let out = page.text_of("#out").unwrap_or_default();
-    assert!(
-        out.starts_with("threw:TypeError"),
-        "expected TypeError, got {out}"
+    // Network error → the generic TypeError exposed by Chromium fetch.
+    assert_eq!(
+        page.text_of("#out"),
+        Some("threw:TypeError:Failed to fetch".to_string())
     );
 }
 

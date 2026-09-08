@@ -303,11 +303,11 @@
             try {
                 resp = ops.op_blob_fetch_bytes(url);
             } catch (e) {
-                throw new TypeError("Failed to fetch: " + e.message);
+                throw new TypeError("Failed to fetch");
             }
             if (!resp || !resp.found) {
                 // Unknown blob URL — the spec says a network error.
-                throw new TypeError("Failed to fetch: unknown blob URL");
+                throw new TypeError("Failed to fetch");
             }
             // `resp.bytes` comes back from serde as an array of numbers;
             // coerce to Uint8Array so Response.arrayBuffer/blob hand
@@ -572,7 +572,11 @@
                 fetchLog.push({ method, url, status: 0, error: e.message });
             }
             if (e instanceof TypeError && e.message === "Failed to fetch") throw e;
-            throw new TypeError("Failed to fetch: " + e.message);
+            // Fetch deliberately hides transport details from page script.  In
+            // Chromium a DNS, TCP, TLS, or HTTP-stack failure is exposed only
+            // as the standard network-error TypeError; the underlying reason
+            // remains available in our internal fetch log above.
+            throw new TypeError("Failed to fetch");
         }
     };
 
