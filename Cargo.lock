@@ -329,6 +329,7 @@ dependencies = [
  "httparse",
  "image",
  "lazy_static",
+ "libc",
  "markup5ever",
  "percent-encoding",
  "png 0.17.16",
