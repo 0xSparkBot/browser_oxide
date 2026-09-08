@@ -528,6 +528,14 @@ pub fn configure_connection(
     let is_safari_ios = profile.device_class == DeviceClass::MobileIOS;
     let is_firefox = profile.browser_name == "Firefox";
 
+    // Chrome applies a new Fisher-Yates extension permutation for every TLS
+    // handshake. The connector carries one seed permutation only to describe
+    // the exact set of Chrome extensions; enable BoringSSL's per-connection
+    // shuffle here so retries and parallel origins do not reuse one order.
+    if !is_safari_ios && !is_firefox {
+        config.set_permute_extensions(true);
+    }
+
     if !is_safari_ios {
         // ECH GREASE — Chrome desktop+Android AND Firefox all send it.
         // Safari does not.
@@ -831,5 +839,87 @@ rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
 
         // Probabilistically should differ run-to-run.
         assert_ne!(p1, p2, "Shuffle should be non-deterministic");
+    }
+
+    /// Chrome randomizes extension order for each individual handshake, not
+    /// once when a reusable connector is constructed. Capture two hellos from
+    /// the same connector so a future refactor cannot accidentally restore the
+    /// stable-per-process ordering that real Chrome stopped using.
+    #[tokio::test]
+    async fn desktop_chrome_reshuffles_extensions_per_handshake() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn capture_client_hello(
+            connector: &SslConnector,
+            profile: &StealthProfile,
+        ) -> Vec<u8> {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = [0u8; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+                let mut record = vec![0u8; record_len];
+                stream.read_exact(&mut record).await.unwrap();
+                record
+            });
+
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                connect_tls(connector, profile, "localhost", tcp),
+            )
+            .await;
+            server.await.unwrap()
+        }
+
+        fn extension_order(record: &[u8]) -> Vec<u16> {
+            assert_eq!(record[0], 1, "expected a ClientHello handshake");
+            let mut cursor = 4 + 2 + 32;
+            cursor += 1 + record[cursor] as usize;
+            let cipher_len = u16::from_be_bytes([record[cursor], record[cursor + 1]]) as usize;
+            cursor += 2 + cipher_len;
+            cursor += 1 + record[cursor] as usize;
+            let extensions_len = u16::from_be_bytes([record[cursor], record[cursor + 1]]) as usize;
+            cursor += 2;
+            let end = cursor + extensions_len;
+            let mut extensions = Vec::new();
+            while cursor < end {
+                let extension = u16::from_be_bytes([record[cursor], record[cursor + 1]]);
+                let len = u16::from_be_bytes([record[cursor + 2], record[cursor + 3]]) as usize;
+                extensions.push(extension);
+                cursor += 4 + len;
+            }
+            assert_eq!(cursor, end, "malformed extension block");
+            extensions
+        }
+
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let connector = chrome_connector(&profile).expect("connector");
+        let first = extension_order(&capture_client_hello(&connector, &profile).await);
+        let second = extension_order(&capture_client_hello(&connector, &profile).await);
+
+        let without_grease = |extensions: &[u16]| {
+            extensions
+                .iter()
+                .copied()
+                .filter(|extension| {
+                    let [high, low] = extension.to_be_bytes();
+                    high != low || high & 0x0f != 0x0a
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            without_grease(&first),
+            without_grease(&second),
+            "each handshake must preserve the configured extension set"
+        );
+        assert_ne!(
+            first, second,
+            "Chrome extension order must be freshly shuffled per handshake"
+        );
     }
 }
