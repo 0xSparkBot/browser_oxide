@@ -253,6 +253,15 @@ async fn frame_tree_materializes_src_iframe() {
         title.contains("Example"),
         "materialized frame must run its own document (title={title:?})"
     );
+    let resources = page
+        .evaluate(
+            "JSON.stringify(performance.getEntriesByType('resource').map(e=>({name:e.name,startTime:e.startTime,duration:e.duration})))",
+        )
+        .unwrap_or_default();
+    assert!(
+        resources.contains("https://example.com/"),
+        "the embedding document must expose the iframe navigation as a resource: {resources}"
+    );
 }
 
 // F2 cross-frame postMessage: a materialized child frame (separate isolate)

@@ -1341,7 +1341,26 @@ impl Page {
         )
         .await
         {
-            Ok(child) => {
+            Ok((child, timings)) => {
+                // The iframe navigation is a resource of its embedding
+                // document as well as the navigation entry of the child
+                // document. Chromium exposes it on the parent's Performance
+                // Timeline using the parent's time origin. Keeping only the
+                // child's navigation entry made script-created frames vanish
+                // from `performance.getEntriesByType("resource")`.
+                if parent == top_id {
+                    self.event_loop
+                        .runtime_mut()
+                        .record_resource_timing(timings);
+                } else if let Some(parent_node) =
+                    self.frame_tree.iter_mut().find(|node| node.id == parent)
+                {
+                    parent_node
+                        .iframe
+                        .event_loop
+                        .runtime_mut()
+                        .record_resource_timing(timings);
+                }
                 self.register_child_frame(parent, host, child_id, src);
                 self.frame_tree.push(FrameNode {
                     id: child_id,

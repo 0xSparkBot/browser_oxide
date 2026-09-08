@@ -198,7 +198,7 @@ impl ChildIframe {
         name: &str,
         referrer: &str,
         ancestor_origins: &[String],
-    ) -> Result<Self, deno_core::error::AnyError> {
+    ) -> Result<(Self, crate::net::TimingStats), deno_core::error::AnyError> {
         // CSP `frame-src` enforcement (falls back to child-src then
         // default-src). Real Chrome refuses to navigate iframes whose
         // src violates the parent's CSP, surfacing the same network-
@@ -238,14 +238,16 @@ impl ChildIframe {
         }
 
         let html = resp.text();
+        let navigation_timing = resp.timings.clone();
         // Skip if response looks like non-HTML (binary, error page)
         if html.trim().is_empty() {
-            return Self::from_isolated_html(
+            let child = Self::from_isolated_html(
                 node_id,
                 "<html><body></body></html>",
                 stealth_profile.unwrap(),
             )
-            .await;
+            .await?;
+            return Ok((child, navigation_timing));
         }
 
         let dom = crate::html_parser::parse_html(&html);
@@ -410,10 +412,13 @@ impl ChildIframe {
             None => event_loop.run_until_settled_unbounded().await?,
         };
 
-        Ok(Self {
-            node_id,
-            event_loop,
-        })
+        Ok((
+            Self {
+                node_id,
+                event_loop,
+            },
+            navigation_timing,
+        ))
     }
 
     /// Evaluate JS in the child's V8 context.
