@@ -2282,6 +2282,34 @@
             return worker.dispatchEvent(_markTrustedEvent(event));
         }
 
+        // Chromium partitions storage by schemeful site and denies OPFS to a
+        // cross-site embedded frame. Dedicated workers inherit that owner's
+        // storage key, including when their script URL is blob:.
+        function _workerStorageDirectoryAllowed() {
+            try {
+                const site = (value) => {
+                    const parsed = new URL(String(value), location.href);
+                    const host = parsed.hostname.toLowerCase();
+                    if (!host || /^\d+(?:\.\d+){3}$/.test(host) || host.indexOf('.') < 0) {
+                        return parsed.protocol + '//' + host;
+                    }
+                    const labels = host.split('.');
+                    let take = 2;
+                    if (labels.at(-1).length === 2
+                        && /^(?:ac|co|com|edu|gov|net|org)$/.test(labels.at(-2))) {
+                        take = 3;
+                    }
+                    return parsed.protocol + '//' + labels.slice(-take).join('.');
+                };
+                const ownerSite = site(location.href);
+                const ancestors = location.ancestorOrigins;
+                for (let i = 0; ancestors && i < ancestors.length; i++) {
+                    if (site(ancestors[i]) !== ownerSite) return false;
+                }
+            } catch (_) {}
+            return true;
+        }
+
         function _resolveWorkerScript(url) {
             const s = String(url);
             if (s.startsWith('blob:')) {
@@ -2342,7 +2370,13 @@
                 // with real Chrome's WorkerLocation. Some workers
                 // read `self.location.origin` to
                 // gate execution; empty location silently bails.
-                state.id = _wops.op_worker_spawn(script, name, isModule, url);
+                state.id = _wops.op_worker_spawn(
+                    script,
+                    name,
+                    isModule,
+                    url,
+                    _workerStorageDirectoryAllowed(),
+                );
                 if (state.id <= 0) {
                     state.id = 0;
                     return;

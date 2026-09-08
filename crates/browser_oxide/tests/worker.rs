@@ -10,6 +10,21 @@ fn drive_runtime(code: &str, wait_ms: u64) -> String {
 }
 
 fn drive_runtime_with_secure_context(code: &str, wait_ms: u64, secure: bool) -> String {
+    drive_runtime_with_options(
+        code,
+        wait_ms,
+        browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
+            is_secure_context: secure,
+            ..Default::default()
+        },
+    )
+}
+
+fn drive_runtime_with_options(
+    code: &str,
+    wait_ms: u64,
+    options: browser_oxide::js_runtime::runtime::BrowserRuntimeOptions,
+) -> String {
     let dom = browser_oxide::html_parser::parse_html(
         "<html><head></head><body><div id=\"out\"></div></body></html>",
     );
@@ -19,13 +34,7 @@ fn drive_runtime_with_secure_context(code: &str, wait_ms: u64, secure: bool) -> 
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
-        let mut runtime = BrowserJsRuntime::with_options(
-            dom,
-            browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
-                is_secure_context: secure,
-                ..Default::default()
-            },
-        );
+        let mut runtime = BrowserJsRuntime::with_options(dom, options);
         runtime.execute_script(code, None).unwrap();
         // Drive the event loop with a bounded timeout, allowing setInterval
         // polling (Worker uses 5 ms poll) time to deliver the reply.
@@ -410,7 +419,7 @@ fn worker_origin_private_file_system_sync_access_round_trip() {
 }
 
 #[test]
-fn worker_origin_private_file_system_flush_has_storage_latency() {
+fn worker_origin_private_file_system_flush_has_no_synthetic_fixed_latency() {
     let code = r#"
         const src = `
             self.onmessage = async function() {
@@ -418,10 +427,10 @@ fn worker_origin_private_file_system_flush_has_storage_latency() {
                 const file = await root.getFileHandle('flush-latency', { create: true });
                 const handle = await file.createSyncAccessHandle();
                 const started = performance.now();
-                handle.flush();
+                const value = handle.flush();
                 const elapsed = performance.now() - started;
                 handle.close();
-                self.postMessage(String(elapsed));
+                self.postMessage(JSON.stringify({ elapsed, type: typeof value }));
             };
         `;
         const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
@@ -433,11 +442,46 @@ fn worker_origin_private_file_system_flush_has_storage_latency() {
         setTimeout(() => worker.postMessage('go'), 20);
     "#;
     let out = drive_runtime_with_secure_context(code, 2000, true);
-    let elapsed: f64 = out
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid latency: {e}; raw={out}"));
-    assert!(elapsed >= 4.4, "flush latency was {elapsed}ms");
-    assert!(elapsed < 20.0, "flush latency was {elapsed}ms");
+    let value: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; raw={out}"));
+    let elapsed = value["elapsed"].as_f64().unwrap();
+    assert_eq!(value["type"], "undefined", "{out}");
+    assert!(elapsed < 4.0, "flush had synthetic latency: {elapsed}ms");
+}
+
+#[test]
+fn worker_origin_private_file_system_is_denied_in_cross_site_frame() {
+    let code = r#"
+        globalThis.__frameAncestorOrigins = ['https://accounts.x.ai'];
+        const src = `
+            self.onmessage = async function() {
+                try {
+                    await navigator.storage.getDirectory();
+                    self.postMessage('unexpected-ok');
+                } catch (error) {
+                    self.postMessage(error.name + ':' + error.message);
+                }
+            };
+        `;
+        const worker = new Worker(URL.createObjectURL(
+            new Blob([src], { type: 'text/javascript' })
+        ));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+        setTimeout(() => worker.postMessage('go'), 20);
+    "#;
+    let out = drive_runtime_with_options(
+        code,
+        2000,
+        browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
+            base_url: Some(url::Url::parse("https://challenges.cloudflare.com/probe").unwrap()),
+            is_secure_context: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(out, "SecurityError:Storage directory access is denied.");
 }
 
 /// Chrome exposes a deliberately smaller namespace inside a dedicated worker

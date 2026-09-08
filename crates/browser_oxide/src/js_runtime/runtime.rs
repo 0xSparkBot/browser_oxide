@@ -536,6 +536,7 @@ pub fn create_runtime_with_signals(
 pub fn create_worker_runtime(
     profile: Option<StealthProfile>,
     is_secure_context: bool,
+    storage_directory_allowed: bool,
 ) -> JsRuntime {
     // Same requirement as the page runtime — worker realms are built on their
     // own threads, which may not have a runtime entered. See
@@ -564,6 +565,11 @@ pub fn create_worker_runtime(
     // worker code that calls `performance.now()` or similar panics
     // inside gotham_state with "required type ... is not present".
     runtime.op_state().borrow_mut().put(PerfState::default());
+    runtime.op_state().borrow_mut().put(
+        crate::js_runtime::extensions::worker_ext::WorkerContextState {
+            storage_directory_allowed,
+        },
+    );
     // Inject DomState even in workers (stubbed) to hold the stealth profile
     // so op_has_stealth_profile() works in the worker isolate.
     let mut dom_state = DomState::new(crate::dom::Dom::new());

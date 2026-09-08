@@ -880,11 +880,6 @@
         if (!state || state.closed) {
             throw new DOMException('The access handle is closed', 'InvalidStateError');
         }
-        // A real synchronous OPFS flush blocks on storage. Chrome 148 on the
-        // macOS profile reports roughly 4.6 ms for Turnstile's one-byte probe;
-        // an instantaneous no-op is a strong automation fingerprint.
-        const started = performance.now();
-        while (performance.now() - started < 4.5) {}
     });
     _opfsDefineMethod(FileSystemSyncAccessHandle.prototype, 'getSize', function getSize() {
         return _opfsAccessState.get(this)?.file?.bytes.length || 0;
@@ -936,7 +931,16 @@
         return Promise.resolve({ quota: 10 * 1024 * 1024 * 1024, usage: 0, usageDetails: {} });
     };
     StorageManager.prototype.persisted = function persisted() { return Promise.resolve(false); };
-    StorageManager.prototype.getDirectory = function getDirectory() { return Promise.resolve(_opfsRoot); };
+    StorageManager.prototype.getDirectory = function getDirectory() {
+        const allowed = !ops.op_worker_storage_directory_allowed
+            || ops.op_worker_storage_directory_allowed();
+        return allowed
+            ? Promise.resolve(_opfsRoot)
+            : Promise.reject(new DOMException(
+                'Storage directory access is denied.',
+                'SecurityError',
+            ));
+    };
     if (typeof _maskAsNative === 'function') {
         _maskAsNative(StorageManager.prototype, 'estimate', 'getDirectory', 'persisted');
     }

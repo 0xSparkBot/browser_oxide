@@ -21,6 +21,11 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerContextState {
+    pub storage_directory_allowed: bool,
+}
+
 // ============================================================================
 // Worker diagnostics — page-readable record of every worker spawn and
 // worker-realm notes. Challenge scripts crash inside their blob workers with
@@ -310,6 +315,7 @@ pub fn op_worker_spawn(
     #[string] _name: String,
     is_module: bool,
     #[string] url: String,
+    storage_directory_allowed: bool,
 ) -> i32 {
     record_worker_spawn(&url, &script);
     // 0.403: #[state] removed — borrow the three (immutable) states from OpState.
@@ -419,8 +425,11 @@ pub fn op_worker_spawn(
 
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let mut runtime =
-                    crate::js_runtime::runtime::create_worker_runtime(profile, is_secure_context);
+                let mut runtime = crate::js_runtime::runtime::create_worker_runtime(
+                    profile,
+                    is_secure_context,
+                    storage_directory_allowed,
+                );
 
                 // Execute the worker script inside the worker's isolate.
                 // Module workers go through `load_main_es_module_from_code`
@@ -728,6 +737,17 @@ pub fn op_worker_self_url() -> String {
     })
 }
 
+/// Whether the worker owner may use an origin-private filesystem. Chromium
+/// denies `navigator.storage.getDirectory()` in cross-site embedded frames
+/// even though the same origin can use it when loaded as the top-level page.
+#[op2(fast)]
+pub fn op_worker_storage_directory_allowed(op_state: &mut OpState) -> bool {
+    op_state
+        .try_borrow::<WorkerContextState>()
+        .map(|state| state.storage_directory_allowed)
+        .unwrap_or(true)
+}
+
 deno_core::extension!(
     worker_extension,
     ops = [
@@ -743,6 +763,7 @@ deno_core::extension!(
         op_worker_terminate,
         op_worker_self_post,
         op_worker_self_url,
+        op_worker_storage_directory_allowed,
         op_worker_self_recv,
         op_worker_self_await_message,
         op_worker_last_spawn,
