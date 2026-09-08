@@ -1826,6 +1826,120 @@ async fn webgpu_texture_create_view_has_webidl_shape() {
         r#"{"textureTag":"[object GPUTexture]","viewTag":"[object GPUTextureView]","dimensions":[16,8,2],"createViewType":"function","createViewLength":0,"textureInstance":true,"viewInstance":true}"#
     );
 }
+
+#[tokio::test]
+async fn webgpu_render_pass_command_flow_has_webidl_shape() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    let setup = r#"
+        globalThis.__gpuCommands = "(pending)";
+        (async () => {
+            const adapter = await navigator.gpu.requestAdapter();
+            const device = await adapter.requestDevice();
+            const texture = device.createTexture({
+                size: [1, 1], format: "rgba8unorm", usage: 16,
+            });
+            const encoder = device.createCommandEncoder({ label: "encoder" });
+            const pass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    view: texture.createView(), loadOp: "clear",
+                    clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store",
+                }],
+            });
+            pass.end();
+            const commandBuffer = encoder.finish({ label: "commands" });
+            device.queue.submit([commandBuffer]);
+            const buffer = device.createBuffer({
+                size: 64, usage: 9, label: "readback",
+            });
+            await buffer.mapAsync(1);
+            const mapped = buffer.getMappedRange();
+            const mappedState = buffer.mapState;
+            buffer.unmap();
+            const descriptor = Object.getOwnPropertyDescriptor(
+                GPUCommandEncoder.prototype, "beginRenderPass"
+            );
+            globalThis.__gpuCommands = JSON.stringify({
+                encoderTag: Object.prototype.toString.call(encoder),
+                passTag: Object.prototype.toString.call(pass),
+                commandBufferTag: Object.prototype.toString.call(commandBuffer),
+                encoderLabel: encoder.label,
+                commandBufferLabel: commandBuffer.label,
+                buffer: {
+                    tag: Object.prototype.toString.call(buffer),
+                    instance: buffer instanceof GPUBuffer,
+                    size: buffer.size,
+                    usage: buffer.usage,
+                    label: buffer.label,
+                    mappedBytes: mapped.byteLength,
+                    mappedState,
+                    unmappedState: buffer.mapState,
+                    mapAsyncLength: buffer.mapAsync.length,
+                    getMappedRangeLength: buffer.getMappedRange.length,
+                    protoNames: Object.getOwnPropertyNames(GPUBuffer.prototype),
+                },
+                instances: [
+                    encoder instanceof GPUCommandEncoder,
+                    pass instanceof GPURenderPassEncoder,
+                    commandBuffer instanceof GPUCommandBuffer,
+                ],
+                beginLength: encoder.beginRenderPass.length,
+                endLength: pass.end.length,
+                finishLength: encoder.finish.length,
+                enumerable: descriptor.enumerable,
+                writable: descriptor.writable,
+                configurable: descriptor.configurable,
+                protoNames: Object.getOwnPropertyNames(GPUCommandEncoder.prototype),
+            });
+        })();
+    "#;
+    let _ = page
+        .evaluate_async(setup, std::time::Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        page.evaluate("globalThis.__gpuCommands")
+            .unwrap_or_default(),
+        r#"{"encoderTag":"[object GPUCommandEncoder]","passTag":"[object GPURenderPassEncoder]","commandBufferTag":"[object GPUCommandBuffer]","encoderLabel":"encoder","commandBufferLabel":"commands","buffer":{"tag":"[object GPUBuffer]","instance":true,"size":64,"usage":9,"label":"readback","mappedBytes":64,"mappedState":"mapped","unmappedState":"unmapped","mapAsyncLength":1,"getMappedRangeLength":0,"protoNames":["size","usage","mapState","label","destroy","getMappedRange","mapAsync","unmap","constructor"]},"instances":[true,true,true],"beginLength":1,"endLength":0,"finishLength":0,"enumerable":true,"writable":true,"configurable":true,"protoNames":["label","beginComputePass","beginRenderPass","copyBufferToTexture","copyTextureToBuffer","copyTextureToTexture","finish","insertDebugMarker","pushDebugGroup","clearBuffer","copyBufferToBuffer","popDebugGroup","resolveQuerySet","constructor"]}"#
+    );
+}
+
+#[tokio::test]
+async fn connected_style_element_exposes_live_stylesheet() {
+    assert_eq!(
+        check(
+            r#"(() => {
+                const style = document.createElement('style');
+                style.appendChild(document.createTextNode('a { color: red; }'));
+                const detached = style.sheet;
+                document.head.appendChild(style);
+                const sheet = style.sheet;
+                const result = sheet.insertRule('b { color: blue; }', sheet.cssRules.length);
+                const descriptor = Object.getOwnPropertyDescriptor(
+                    HTMLStyleElement.prototype, 'sheet'
+                );
+                return JSON.stringify({
+                    detached: detached === null,
+                    tag: Object.prototype.toString.call(sheet),
+                    stable: sheet === style.sheet,
+                    owner: sheet.ownerNode === style,
+                    ruleCount: sheet.cssRules.length,
+                    insertResult: result,
+                    getterLength: descriptor.get.length,
+                    enumerable: descriptor.enumerable,
+                    configurable: descriptor.configurable,
+                });
+            })()"#
+        )
+        .await,
+        r#"{"detached":true,"tag":"[object CSSStyleSheet]","stable":true,"owner":true,"ruleCount":2,"insertResult":1,"getterLength":0,"enumerable":true,"configurable":true}"#
+    );
+}
+
 #[tokio::test]
 async fn offscreen_canvas_resize_resets_and_resizes_backing_store() {
     assert_eq!(

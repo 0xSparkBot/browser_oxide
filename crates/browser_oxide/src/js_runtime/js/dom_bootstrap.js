@@ -2014,7 +2014,34 @@
         return ops.op_canvas_to_data_url(this._canvasId);
     };
     class HTMLScriptElement extends HTMLElement {}
-    class HTMLStyleElement extends HTMLElement {}
+    const _styleElementSheets = new WeakMap();
+    class HTMLStyleElement extends HTMLElement {
+        get sheet() {
+            if (!this.isConnected) return null;
+            let sheet = _styleElementSheets.get(this);
+            if (sheet) return sheet;
+            if (typeof globalThis.CSSStyleSheet !== 'function') return null;
+            sheet = new globalThis.CSSStyleSheet();
+            try { sheet.ownerNode = this; } catch (_) {}
+            try {
+                if (Array.isArray(sheet._roots) && !sheet._roots.includes(this)) {
+                    sheet._roots.push(this);
+                }
+                const text = String(this.textContent || '');
+                if (text && typeof sheet._replaceSync === 'function') sheet._replaceSync(text);
+            } catch (_) {}
+            _styleElementSheets.set(this, sheet);
+            return sheet;
+        }
+    }
+    // WebIDL attributes are enumerable even though class accessors are not.
+    try {
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLStyleElement.prototype, 'sheet');
+        if (descriptor) {
+            descriptor.enumerable = true;
+            Object.defineProperty(HTMLStyleElement.prototype, 'sheet', descriptor);
+        }
+    } catch (_) {}
     class HTMLLinkElement extends HTMLElement {}
     class HTMLMetaElement extends HTMLElement {}
     _reflectStr(HTMLMetaElement.prototype, 'name');

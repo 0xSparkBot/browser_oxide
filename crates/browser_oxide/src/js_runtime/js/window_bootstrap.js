@@ -7783,12 +7783,72 @@
         };
         const _gpuTextureState = new WeakMap();
         const _gpuTextureViewState = new WeakMap();
+        const _gpuBufferState = new WeakMap();
+        const _gpuCommandEncoderState = new WeakMap();
+        const _gpuRenderPassEncoderState = new WeakMap();
+        const _gpuCommandBufferState = new WeakMap();
         function GPUTexture() {
             throw new TypeError("Illegal constructor");
         }
         function GPUTextureView() {
             throw new TypeError("Illegal constructor");
         }
+        function GPUBuffer() {
+            throw new TypeError("Failed to construct 'GPUBuffer': Illegal constructor");
+        }
+        function GPUCommandEncoder() {
+            throw new TypeError("Failed to construct 'GPUCommandEncoder': Illegal constructor");
+        }
+        function GPURenderPassEncoder() {
+            throw new TypeError("Failed to construct 'GPURenderPassEncoder': Illegal constructor");
+        }
+        function GPUCommandBuffer() {
+            throw new TypeError("Failed to construct 'GPUCommandBuffer': Illegal constructor");
+        }
+        // Blink installs WebIDL prototype members before the constructor
+        // back-reference, so own-property enumeration ends in "constructor".
+        try { delete GPUBuffer.prototype.constructor; } catch (_) {}
+        try { delete GPUCommandEncoder.prototype.constructor; } catch (_) {}
+        try { delete GPURenderPassEncoder.prototype.constructor; } catch (_) {}
+        try { delete GPUCommandBuffer.prototype.constructor; } catch (_) {}
+        const _defineGpuLabel = (proto, states) => {
+            Object.defineProperty(proto, "label", {
+                get() {
+                    const state = states.get(this);
+                    if (!state) throw new TypeError("Illegal invocation");
+                    return state.label;
+                },
+                set(value) {
+                    const state = states.get(this);
+                    if (!state) throw new TypeError("Illegal invocation");
+                    state.label = String(value);
+                },
+                enumerable: true,
+                configurable: true,
+            });
+        };
+        const _defineGpuReadonly = (proto, states, name) => {
+            Object.defineProperty(proto, name, {
+                get() { return _requireGpuState(states, this)[name]; },
+                enumerable: true,
+                configurable: true,
+            });
+        };
+        const _defineGpuMethod = (proto, name, length, implementation) => {
+            try { Object.defineProperty(implementation, "name", { value: name, configurable: true }); } catch (_) {}
+            try { Object.defineProperty(implementation, "length", { value: length, configurable: true }); } catch (_) {}
+            Object.defineProperty(proto, name, {
+                value: implementation,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            });
+        };
+        const _requireGpuState = (states, receiver) => {
+            const state = states.get(receiver);
+            if (!state) throw new TypeError("Illegal invocation");
+            return state;
+        };
         const _textureGetter = (name, fallback) => function () {
             const state = _gpuTextureState.get(this);
             if (!state) throw new TypeError("Illegal invocation");
@@ -7870,6 +7930,136 @@
             value: "GPUTextureView",
             configurable: true,
         });
+        _defineGpuReadonly(GPUBuffer.prototype, _gpuBufferState, "size");
+        _defineGpuReadonly(GPUBuffer.prototype, _gpuBufferState, "usage");
+        _defineGpuReadonly(GPUBuffer.prototype, _gpuBufferState, "mapState");
+        _defineGpuLabel(GPUBuffer.prototype, _gpuBufferState);
+        _defineGpuMethod(GPUBuffer.prototype, "destroy", 0, function() {
+            const state = _requireGpuState(_gpuBufferState, this);
+            state.destroyed = true;
+            state.mapState = "unmapped";
+        });
+        _defineGpuMethod(GPUBuffer.prototype, "getMappedRange", 0, function(offset, size) {
+            const state = _requireGpuState(_gpuBufferState, this);
+            if (state.mapState !== "mapped") {
+                throw new DOMException("Buffer is not mapped", "OperationError");
+            }
+            const start = Math.max(0, Number(offset) || 0);
+            const length = size === undefined ? state.size - start : Math.max(0, Number(size) || 0);
+            if (start === 0 && length === state.size) return state.data;
+            return state.data.slice(start, start + length);
+        });
+        _defineGpuMethod(GPUBuffer.prototype, "mapAsync", 1, function(_mode, _offset, _size) {
+            const state = _requireGpuState(_gpuBufferState, this);
+            if (state.destroyed) return Promise.reject(new DOMException("Buffer is destroyed", "OperationError"));
+            state.mapState = "pending";
+            return Promise.resolve().then(() => {
+                state.mapState = "mapped";
+            });
+        });
+        _defineGpuMethod(GPUBuffer.prototype, "unmap", 0, function() {
+            _requireGpuState(_gpuBufferState, this).mapState = "unmapped";
+        });
+        Object.defineProperty(GPUBuffer.prototype, Symbol.toStringTag, {
+            value: "GPUBuffer",
+            configurable: true,
+        });
+        Object.defineProperty(GPUBuffer.prototype, "constructor", {
+            value: GPUBuffer,
+            writable: true,
+            configurable: true,
+        });
+        _defineGpuLabel(GPUCommandEncoder.prototype, _gpuCommandEncoderState);
+        _defineGpuMethod(GPUCommandEncoder.prototype, "beginComputePass", 0, function() {
+            _requireGpuState(_gpuCommandEncoderState, this);
+            return { end() {}, label: "" };
+        });
+        _defineGpuMethod(GPUCommandEncoder.prototype, "beginRenderPass", 1, function(_descriptor) {
+            _requireGpuState(_gpuCommandEncoderState, this);
+            const pass = Object.create(GPURenderPassEncoder.prototype);
+            _gpuRenderPassEncoderState.set(pass, { label: "", ended: false });
+            return pass;
+        });
+        for (const [name, length] of [
+            ["copyBufferToTexture", 3], ["copyTextureToBuffer", 3],
+            ["copyTextureToTexture", 3],
+        ]) {
+            _defineGpuMethod(GPUCommandEncoder.prototype, name, length, function() {
+                _requireGpuState(_gpuCommandEncoderState, this);
+            });
+        }
+        _defineGpuMethod(GPUCommandEncoder.prototype, "finish", 0, function(descriptor) {
+            _requireGpuState(_gpuCommandEncoderState, this);
+            const buffer = Object.create(GPUCommandBuffer.prototype);
+            _gpuCommandBufferState.set(buffer, {
+                label: String(descriptor && descriptor.label || ""),
+            });
+            return buffer;
+        });
+        for (const [name, length] of [
+            ["insertDebugMarker", 1],
+            ["pushDebugGroup", 1], ["clearBuffer", 1],
+            ["copyBufferToBuffer", 2], ["popDebugGroup", 0],
+            ["resolveQuerySet", 5],
+        ]) {
+            _defineGpuMethod(GPUCommandEncoder.prototype, name, length, function() {
+                _requireGpuState(_gpuCommandEncoderState, this);
+            });
+        }
+        Object.defineProperty(GPUCommandEncoder.prototype, Symbol.toStringTag, {
+            value: "GPUCommandEncoder",
+            configurable: true,
+        });
+        Object.defineProperty(GPUCommandEncoder.prototype, "constructor", {
+            value: GPUCommandEncoder,
+            writable: true,
+            configurable: true,
+        });
+
+        _defineGpuLabel(GPURenderPassEncoder.prototype, _gpuRenderPassEncoderState);
+        for (const [name, length] of [
+            ["executeBundles", 1], ["insertDebugMarker", 1], ["pushDebugGroup", 1],
+            ["setBlendConstant", 1], ["setIndexBuffer", 2], ["beginOcclusionQuery", 1],
+            ["draw", 1], ["drawIndexed", 1], ["drawIndexedIndirect", 2],
+            ["drawIndirect", 2],
+        ]) {
+            _defineGpuMethod(GPURenderPassEncoder.prototype, name, length, function() {
+                _requireGpuState(_gpuRenderPassEncoderState, this);
+            });
+        }
+        _defineGpuMethod(GPURenderPassEncoder.prototype, "end", 0, function() {
+            _requireGpuState(_gpuRenderPassEncoderState, this).ended = true;
+        });
+        for (const [name, length] of [
+            ["endOcclusionQuery", 0], ["popDebugGroup", 0],
+            ["setBindGroup", 2], ["setPipeline", 1], ["setScissorRect", 4],
+            ["setStencilReference", 1], ["setVertexBuffer", 2], ["setViewport", 6],
+            ["writeTimestamp", 2], ["setImmediates", 2],
+        ]) {
+            _defineGpuMethod(GPURenderPassEncoder.prototype, name, length, function() {
+                _requireGpuState(_gpuRenderPassEncoderState, this);
+            });
+        }
+        Object.defineProperty(GPURenderPassEncoder.prototype, Symbol.toStringTag, {
+            value: "GPURenderPassEncoder",
+            configurable: true,
+        });
+        Object.defineProperty(GPURenderPassEncoder.prototype, "constructor", {
+            value: GPURenderPassEncoder,
+            writable: true,
+            configurable: true,
+        });
+
+        _defineGpuLabel(GPUCommandBuffer.prototype, _gpuCommandBufferState);
+        Object.defineProperty(GPUCommandBuffer.prototype, Symbol.toStringTag, {
+            value: "GPUCommandBuffer",
+            configurable: true,
+        });
+        Object.defineProperty(GPUCommandBuffer.prototype, "constructor", {
+            value: GPUCommandBuffer,
+            writable: true,
+            configurable: true,
+        });
         const _mkTexture = (descriptor) => {
             descriptor = descriptor || {};
             const size = descriptor.size === undefined ? [1, 1, 1] : descriptor.size;
@@ -7892,19 +8082,61 @@
             });
             return texture;
         };
+        const _mkBuffer = (descriptor) => {
+            descriptor = descriptor || {};
+            const size = Math.max(0, Number(descriptor.size) || 0);
+            const buffer = Object.create(GPUBuffer.prototype);
+            _gpuBufferState.set(buffer, {
+                size,
+                usage: Number(descriptor.usage) || 0,
+                mapState: descriptor.mappedAtCreation ? "mapped" : "unmapped",
+                label: String(descriptor.label || ""),
+                data: new ArrayBuffer(size),
+                destroyed: false,
+            });
+            return buffer;
+        };
         globalThis.GPUTexture = GPUTexture;
         globalThis.GPUTextureView = GPUTextureView;
+        globalThis.GPUBuffer = GPUBuffer;
+        globalThis.GPUCommandEncoder = GPUCommandEncoder;
+        globalThis.GPURenderPassEncoder = GPURenderPassEncoder;
+        globalThis.GPUCommandBuffer = GPUCommandBuffer;
         try {
             _maskFunction(GPUTexture, "GPUTexture");
             _maskFunction(GPUTextureView, "GPUTextureView");
+            _maskFunction(GPUBuffer, "GPUBuffer");
+            _maskFunction(GPUCommandEncoder, "GPUCommandEncoder");
+            _maskFunction(GPURenderPassEncoder, "GPURenderPassEncoder");
+            _maskFunction(GPUCommandBuffer, "GPUCommandBuffer");
             _maskAsNative(GPUTexture.prototype, "createView", "destroy");
+            _maskAsNative(GPUBuffer.prototype, "destroy", "getMappedRange", "mapAsync", "unmap");
+            _maskAsNative(GPUCommandEncoder.prototype,
+                "beginComputePass", "beginRenderPass", "copyBufferToTexture",
+                "copyTextureToBuffer", "copyTextureToTexture", "finish",
+                "insertDebugMarker", "pushDebugGroup", "clearBuffer",
+                "copyBufferToBuffer", "popDebugGroup", "resolveQuerySet");
+            _maskAsNative(GPURenderPassEncoder.prototype,
+                "executeBundles", "insertDebugMarker", "pushDebugGroup",
+                "setBlendConstant", "setIndexBuffer", "beginOcclusionQuery",
+                "draw", "drawIndexed", "drawIndexedIndirect", "drawIndirect",
+                "end", "endOcclusionQuery", "popDebugGroup", "setBindGroup",
+                "setPipeline", "setScissorRect", "setStencilReference",
+                "setVertexBuffer", "setViewport", "writeTimestamp", "setImmediates");
         } catch (_) {}
         const _mkDevice = () => ({
             limits: _mkLimits(), features: _mkFeatures(),
             queue: { submit() {}, writeBuffer() {}, writeTexture() {}, onSubmittedWorkDone() { return Promise.resolve(); }, label: "" },
             label: "", lost: new Promise(() => {}),
-            destroy() {}, createBuffer() { return {}; }, createTexture(descriptor) { return _mkTexture(descriptor); },
-            createShaderModule() { return {}; }, createCommandEncoder() { return {}; },
+            destroy() {}, createBuffer(descriptor) { return _mkBuffer(descriptor); }, createTexture(descriptor) { return _mkTexture(descriptor); },
+            createShaderModule() { return {}; },
+            createCommandEncoder(descriptor) {
+                const encoder = Object.create(GPUCommandEncoder.prototype);
+                _gpuCommandEncoderState.set(encoder, {
+                    label: String(descriptor && descriptor.label || ""),
+                });
+                return encoder;
+            },
             createBindGroup() { return {}; }, createBindGroupLayout() { return {}; },
             createPipelineLayout() { return {}; }, createRenderPipeline() { return {}; },
             createComputePipeline() { return {}; }, createSampler() { return {}; },
