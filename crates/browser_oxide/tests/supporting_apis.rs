@@ -10,6 +10,33 @@ use browser_oxide::Page;
 // ============================================================================
 
 #[tokio::test]
+async fn blob_and_file_expose_webidl_string_tags() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            const blob = new Blob(['hello']);
+            const file = new File(['hello'], 'hello.txt');
+            document.getElementById('out').textContent = JSON.stringify({
+                blob: Object.prototype.toString.call(blob),
+                file: Object.prototype.toString.call(file),
+                blobTag: Blob.prototype[Symbol.toStringTag],
+                fileTag: File.prototype[Symbol.toStringTag]
+            });
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .expect("page builds");
+
+    assert_eq!(
+        page.text_of("#out"),
+        Some(
+            r#"{"blob":"[object Blob]","file":"[object File]","blobTag":"Blob","fileTag":"File"}"#
+                .to_string()
+        )
+    );
+}
+
+#[tokio::test]
 async fn fetch_blob_url_returns_text() {
     let mut page = Page::from_html(
         r#"<html><body><div id="out"></div><script>

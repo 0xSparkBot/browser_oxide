@@ -390,12 +390,18 @@
                 return { getReader() { return { read() { if (done) return Promise.resolve({ done: true, value: undefined }); done = true; return Promise.resolve({ done: false, value: data }); }, releaseLock() {}, cancel() { return Promise.resolve(); } }; } };
             }
         };
+        Object.defineProperty(globalThis.Blob.prototype, Symbol.toStringTag, {
+            value: "Blob", configurable: true
+        });
         _maskAsNative(globalThis.Blob);
     }
     if (!globalThis.File) {
         globalThis.File = class File extends Blob {
             constructor(parts, name, options = {}) { super(parts, options); this.name = name; this.lastModified = options.lastModified || Date.now(); }
         };
+        Object.defineProperty(globalThis.File.prototype, Symbol.toStringTag, {
+            value: "File", configurable: true
+        });
         _maskAsNative(globalThis.File);
     }
 
