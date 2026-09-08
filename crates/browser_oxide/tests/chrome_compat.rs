@@ -2870,6 +2870,69 @@ async fn iframe_content_window() {
     );
 }
 #[tokio::test]
+async fn iframe_same_isolate_host_load_is_queued_once() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    let sync = page
+        .evaluate(
+            r#"(() => {
+                globalThis.__iframeLoadAudit = {listener: 0, handler: 0, trusted: false};
+                const frame = document.createElement('iframe');
+                frame.addEventListener('load', event => {
+                    __iframeLoadAudit.listener++;
+                    __iframeLoadAudit.trusted = event.isTrusted;
+                });
+                frame.onload = () => __iframeLoadAudit.handler++;
+                document.body.appendChild(frame);
+                void frame.contentWindow;
+                globalThis.__iframeLoadAudit.frame = frame;
+                return JSON.stringify({
+                    listener: __iframeLoadAudit.listener,
+                    handler: __iframeLoadAudit.handler,
+                });
+            })()"#,
+        )
+        .unwrap();
+    assert_eq!(sync, r#"{"listener":0,"handler":0}"#);
+
+    for _ in 0..10 {
+        let _ = page
+            .event_loop()
+            .run_until_idle(std::time::Duration::from_millis(25))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        page.evaluate(
+            "JSON.stringify({listener:__iframeLoadAudit.listener,handler:__iframeLoadAudit.handler,trusted:__iframeLoadAudit.trusted,readyState:__iframeLoadAudit.frame.contentDocument.readyState})"
+        )
+        .unwrap(),
+        r#"{"listener":1,"handler":1,"trusted":true,"readyState":"complete"}"#
+    );
+
+    page.evaluate("void __iframeLoadAudit.frame.contentWindow")
+        .unwrap();
+    for _ in 0..3 {
+        let _ = page
+            .event_loop()
+            .run_until_idle(std::time::Duration::from_millis(25))
+            .await;
+    }
+    assert_eq!(
+        page.evaluate(
+            "JSON.stringify({listener:__iframeLoadAudit.listener,handler:__iframeLoadAudit.handler})"
+        )
+        .unwrap(),
+        r#"{"listener":1,"handler":1}"#
+    );
+}
+#[tokio::test]
 async fn iframe_cross_realm_nav_stealth() {
     // Verify cross-realm property access works WITH a stealth profile.
     // The vendor's ifw probe reads cw.navigator.webdriver from the parent context.

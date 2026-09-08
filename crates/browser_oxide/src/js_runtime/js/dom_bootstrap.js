@@ -3998,6 +3998,18 @@
             delete _sameIsolateRealmForNode[nodeId];
         }
     }
+    function _queueSameIsolateIframeLoad(el, state) {
+        if (!state || state._hostLoadQueued || state._hostLoadFired) return;
+        state._hostLoadQueued = true;
+        setTimeout(() => {
+            state._hostLoadQueued = false;
+            if (_getIframeState(el) !== state || !el.isConnected) return;
+            state._hostLoadFired = true;
+            const event = new Event("load");
+            if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
+            el.dispatchEvent(event);
+        }, 0);
+    }
     const _realmPublicWindow = new Map();
     const _realmRawWindow = new Map();
     // Rebound once the stable public WindowProxy layer is installed below.
@@ -5861,6 +5873,7 @@
             });
             _setIframeState(el, state);
             _registerFrame(cw, el);
+            _queueSameIsolateIframeLoad(el, state);
             return cw;
         }
 
@@ -5941,6 +5954,7 @@
         state = { contentWindow: iframeWindow, contentDocument: iframeDoc, _src: ((el && el.getAttribute && el.getAttribute("src")) || (el && el.src) || "") };
         _setIframeState(el, state);
         _registerFrame(iframeWindow, el);
+        _queueSameIsolateIframeLoad(el, state);
         return iframeWindow;
     }
     function _getIframeDocument(el) {
