@@ -504,6 +504,38 @@ async fn domtokenlist_and_media_query_list_match_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn xml_serializer_matches_chrome_148() {
+    let result = check(
+        r#"(() => {
+            const serializer = new XMLSerializer();
+            const div = document.createElement('div');
+            div.setAttribute('data-x', '1');
+            div.appendChild(document.createTextNode('a&b'));
+            let noNew = '';
+            try { XMLSerializer(); noNew = 'ok'; }
+            catch (error) { noNew = error.name + ':' + error.message; }
+            return JSON.stringify({
+                ctorLength:XMLSerializer.length,
+                methodLength:XMLSerializer.prototype.serializeToString.length,
+                names:Object.getOwnPropertyNames(XMLSerializer.prototype).sort(),
+                tag:Object.prototype.toString.call(serializer),
+                keys:Reflect.ownKeys(serializer).map(String),
+                html:serializer.serializeToString(div),
+                text:serializer.serializeToString(document.createTextNode('a&b')),
+                noNew,
+                source:String(XMLSerializer),
+                methodSource:String(XMLSerializer.prototype.serializeToString)
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"ctorLength":0,"methodLength":1,"names":["constructor","serializeToString"],"tag":"[object XMLSerializer]","keys":[],"html":"<div xmlns=\"http://www.w3.org/1999/xhtml\" data-x=\"1\">a&amp;b</div>","text":"a&amp;b","noNew":"TypeError:Failed to construct 'XMLSerializer': Please use the 'new' operator, this DOM object constructor cannot be called as a function.","source":"function XMLSerializer() { [native code] }","methodSource":"function serializeToString() { [native code] }"}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================

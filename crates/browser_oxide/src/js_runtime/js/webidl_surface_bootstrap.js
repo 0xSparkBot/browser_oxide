@@ -18,6 +18,48 @@
         try { if (typeof _maskFunction === 'function' && typeof Ctor === 'function') _maskFunction(Ctor, name); } catch (_) {}
     };
 
+    if (globalThis.XMLSerializer) {
+        const escapeText = value => String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+        const serialize = node => {
+            if (node == null) throw new TypeError('XMLSerializer.serializeToString requires a Node');
+            const type = Number(node.nodeType || 0);
+            if (type === 3 || type === 4) return escapeText(node.data ?? node.nodeValue ?? node.textContent ?? '');
+            if (type === 8) return `<!--${String(node.data ?? node.nodeValue ?? '')}-->`;
+            if (type === 9) return node.documentElement ? serialize(node.documentElement) : '';
+            if (type === 11) {
+                let output = '';
+                const children = node.childNodes || [];
+                for (let i = 0; i < children.length; i++) output += serialize(children[i]);
+                return output;
+            }
+            let html = typeof node.outerHTML === 'string' ? node.outerHTML : '';
+            if (html && node.namespaceURI === 'http://www.w3.org/1999/xhtml' && !/\sxmlns=/.test(html)) {
+                html = html.replace(/^<([A-Za-z][^\s/>]*)/, '<$1 xmlns="http://www.w3.org/1999/xhtml"');
+            }
+            return html || escapeText(node.textContent || '');
+        };
+        function XMLSerializer() {
+            if (!new.target) {
+                throw new TypeError(
+                    "Failed to construct 'XMLSerializer': Please use the 'new' operator, this DOM object constructor cannot be called as a function."
+                );
+            }
+        }
+        Object.defineProperty(XMLSerializer.prototype, 'serializeToString', {
+            value: function serializeToString(root) { return serialize(root); },
+            writable: true, enumerable: true, configurable: true,
+        });
+        Object.defineProperty(XMLSerializer.prototype, Symbol.toStringTag, {
+            value: 'XMLSerializer', configurable: true,
+        });
+        maskCtor(XMLSerializer, 'XMLSerializer');
+        try { if (typeof _maskAsNative === 'function') _maskAsNative(XMLSerializer.prototype, 'serializeToString'); } catch (_) {}
+        globalThis.XMLSerializer = XMLSerializer;
+    }
+
     if (globalThis.DOMParser?.prototype) {
         maskCtor(globalThis.DOMParser, 'DOMParser');
         setEnumerable(globalThis.DOMParser.prototype, ['parseFromString']);
