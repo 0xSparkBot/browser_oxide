@@ -713,8 +713,14 @@ impl HttpClient {
     async fn get_sender(&self, host: &str, port: u16) -> Result<SendRequest<Bytes>, NetError> {
         // Check pool first
         if let Some(sender) = self.pool.get(host, port).await {
+            if std::env::var_os("BROWSER_OXIDE_POOL_TRACE").is_some() {
+                eprintln!("[pool-trace] HIT {host}:{port}");
+            }
             self.pool.touch(host, port).await;
             return Ok(sender);
+        }
+        if std::env::var_os("BROWSER_OXIDE_POOL_TRACE").is_some() {
+            eprintln!("[pool-trace] MISS {host}:{port}");
         }
         // Known h1-only host: skip the doomed h2 connect (which would do a full
         // TLS handshake only to fail the ALPN check). Fail fast so the caller
@@ -731,6 +737,22 @@ impl HttpClient {
         self.get_with_headers(url, &[]).await
     }
 
+    /// Fetch a child browsing-context document using iframe navigation
+    /// request headers rather than the fresh top-level navigation shape.
+    pub async fn get_frame_navigation(
+        &self,
+        url: &str,
+        referrer: &str,
+    ) -> Result<Response, NetError> {
+        let parsed = Url::parse(url)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
+        let accept_ch_upgraded = self.has_accept_ch(host).await;
+        let hdrs = headers::nav_headers_frame(&self.profile, url, referrer, accept_ch_upgraded);
+        self.get_with_exact_headers(url, &hdrs).await
+    }
+
     /// Fetch-API-style GET: uses `chrome_headers_fetch` (accept: */*, no
     /// upgrade-insecure-requests, sec-fetch-dest: empty, etc.) as the base
     /// header set, with caller's extras merged in. `origin` is the page's
@@ -742,8 +764,26 @@ impl HttpClient {
         extra_headers: &[(String, String)],
         origin: Option<&str>,
         request_type: Option<&str>,
+        storage_access: Option<&str>,
     ) -> Result<Response, NetError> {
         let mut hdrs = headers::nav_headers_fetch(&self.profile, url, origin);
+        if std::env::var_os("BROWSER_OXIDE_DISABLE_HTTP_CACHE").is_some() {
+            hdrs.push(("pragma".to_string(), "no-cache".to_string()));
+            hdrs.push(("cache-control".to_string(), "no-cache".to_string()));
+        }
+        if self.profile.browser_name != "Firefox" && self.profile.browser_name != "Safari" {
+            if let Some(value) = storage_access {
+                let at = hdrs
+                    .iter()
+                    .position(|(name, _)| name.eq_ignore_ascii_case("sec-fetch-dest"))
+                    .map(|index| index + 1)
+                    .unwrap_or(hdrs.len());
+                hdrs.insert(
+                    at,
+                    ("sec-fetch-storage-access".to_string(), value.to_string()),
+                );
+            }
+        }
         if request_type == Some("image") {
             // An HTMLImageElement request is no-cors and carries an image
             // destination/Accept shape. It also has no Origin header; Referer
@@ -764,6 +804,12 @@ impl HttpClient {
             hdrs.retain(|(name, _)| !name.eq_ignore_ascii_case("origin"));
         }
         merge_headers(&mut hdrs, extra_headers);
+        if request_type != Some("image")
+            && self.profile.browser_name != "Firefox"
+            && self.profile.browser_name != "Safari"
+        {
+            order_chrome_fetch_headers(&mut hdrs, extra_headers);
+        }
         self.get_with_exact_headers(url, &hdrs).await
     }
 
@@ -774,9 +820,30 @@ impl HttpClient {
         body: &[u8],
         extra_headers: &[(String, String)],
         origin: Option<&str>,
+        storage_access: Option<&str>,
     ) -> Result<Response, NetError> {
         let mut hdrs = headers::nav_headers_fetch(&self.profile, url, origin);
+        if std::env::var_os("BROWSER_OXIDE_DISABLE_HTTP_CACHE").is_some() {
+            hdrs.push(("pragma".to_string(), "no-cache".to_string()));
+            hdrs.push(("cache-control".to_string(), "no-cache".to_string()));
+        }
+        if self.profile.browser_name != "Firefox" && self.profile.browser_name != "Safari" {
+            if let Some(value) = storage_access {
+                let at = hdrs
+                    .iter()
+                    .position(|(name, _)| name.eq_ignore_ascii_case("sec-fetch-dest"))
+                    .map(|index| index + 1)
+                    .unwrap_or(hdrs.len());
+                hdrs.insert(
+                    at,
+                    ("sec-fetch-storage-access".to_string(), value.to_string()),
+                );
+            }
+        }
         merge_headers(&mut hdrs, extra_headers);
+        if self.profile.browser_name != "Firefox" && self.profile.browser_name != "Safari" {
+            order_chrome_fetch_headers(&mut hdrs, extra_headers);
+        }
         self.post_bytes_with_exact_headers(url, body, &hdrs).await
     }
 
@@ -792,6 +859,9 @@ impl HttpClient {
     ) -> Result<Response, NetError> {
         let timing_origin = RequestTimingOrigin::now();
         let parsed = Url::parse(url)?;
+        if std::env::var_os("BROWSER_OXIDE_TRACE_REQUEST_URLS").is_some() {
+            eprintln!("[net-trace] GET {url}");
+        }
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
@@ -875,6 +945,13 @@ impl HttpClient {
 
         let mut final_response = response;
         final_response.accept_ch_upgrade = upgrade;
+        if std::env::var_os("BROWSER_OXIDE_TRACE_REQUEST_URLS").is_some() {
+            eprintln!(
+                "[net-trace] GET-DONE status={} body_len={} {url}",
+                final_response.status,
+                final_response.body.len()
+            );
+        }
         Ok(final_response)
     }
 
@@ -908,12 +985,20 @@ impl HttpClient {
     ) -> Result<Response, NetError> {
         let timing_origin = RequestTimingOrigin::now();
         let parsed = Url::parse(url)?;
+        if std::env::var_os("BROWSER_OXIDE_TRACE_REQUEST_URLS").is_some() {
+            eprintln!("[net-trace] GET {url}");
+        }
         // HTTP/3 and HTTP/2 require TLS. Plain HTTP goes directly to the H1
         // path instead of attempting a TLS handshake against the cleartext
         // server.
         if parsed.scheme() == "https" {
-            if let Ok(resp) = self.try_h3_request(url, Method::Get, extra_headers).await {
-                return Ok(resp);
+            match self.try_h3_request(url, Method::Get, extra_headers).await {
+                Ok(resp) => return Ok(resp),
+                Err(error) => {
+                    if std::env::var_os("BROWSER_OXIDE_TRACE_H3").is_some() {
+                        eprintln!("[h3-trace] GET {url}: {error}");
+                    }
+                }
             }
         }
         let host = parsed
@@ -1022,6 +1107,13 @@ impl HttpClient {
 
         let mut final_response = response;
         final_response.accept_ch_upgrade = upgrade;
+        if std::env::var_os("BROWSER_OXIDE_TRACE_REQUEST_URLS").is_some() {
+            eprintln!(
+                "[net-trace] GET-DONE status={} body_len={} {url}",
+                final_response.status,
+                final_response.body.len()
+            );
+        }
         Ok(final_response)
     }
 
@@ -1185,6 +1277,9 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
+        if std::env::var_os("BROWSER_OXIDE_TRACE_REQUEST_URLS").is_some() {
+            eprintln!("[net-trace] POST body_len={} {url}", body.len());
+        }
         let port = Self::port_for_url(&parsed)?;
         let path = if let Some(q) = parsed.query() {
             format!("{}?{}", parsed.path(), q)
@@ -1228,6 +1323,9 @@ impl HttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
+        if std::env::var_os("BROWSER_OXIDE_TRACE_REQUEST_URLS").is_some() {
+            eprintln!("[net-trace] POST body_len={} {url}", body.len());
+        }
         let port = Self::port_for_url(&parsed)?;
 
         let mut hdrs: Vec<(String, String)> = headers
@@ -1358,6 +1456,23 @@ impl HttpClient {
 
         let mut final_response = response;
         final_response.accept_ch_upgrade = upgrade;
+        if let Ok(dir) = std::env::var("BROWSER_OXIDE_DUMP_POST_DIR") {
+            let counter_path = format!("{}/.counter", dir);
+            if let Some(current) = std::fs::read_to_string(counter_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+            {
+                let path = format!("{}/{:03}.response.body", dir, current);
+                let _ = std::fs::write(path, &final_response.body);
+            }
+        }
+        if std::env::var_os("BROWSER_OXIDE_TRACE_REQUEST_URLS").is_some() {
+            eprintln!(
+                "[net-trace] POST-DONE status={} body_len={} {url}",
+                final_response.status,
+                final_response.body.len()
+            );
+        }
 
         Ok(final_response)
     }
@@ -1375,11 +1490,16 @@ impl HttpClient {
         let parsed = Url::parse(url)?;
         // QUIC/H2 are HTTPS-only; cleartext HTTP goes straight to H1.
         if parsed.scheme() == "https" {
-            if let Ok(resp) = self
+            match self
                 .try_h3_request(url, Method::Post(body.to_vec()), extra_headers)
                 .await
             {
-                return Ok(resp);
+                Ok(resp) => return Ok(resp),
+                Err(error) => {
+                    if std::env::var_os("BROWSER_OXIDE_TRACE_H3").is_some() {
+                        eprintln!("[h3-trace] POST {url}: {error}");
+                    }
+                }
             }
         }
         let host = parsed
@@ -1683,6 +1803,94 @@ fn merge_headers(base: &mut Vec<(String, String)>, extra: &[(String, String)]) {
     }
 }
 
+/// Reorder a merged Fetch/XHR header block to the regular-header order
+/// Chromium emits on HTTP/2. Pseudo-headers and Content-Length are supplied by
+/// the H2 layer separately, so this function only handles browser/request
+/// headers below them.
+///
+/// Page-authored headers stay generic: Content-Type has Chromium's dedicated
+/// content-header slot, while all other caller headers retain their renderer
+/// iteration order. No site/vendor header names are encoded here.
+fn order_chrome_fetch_headers(
+    headers: &mut Vec<(String, String)>,
+    extra_headers: &[(String, String)],
+) {
+    let mut source = std::mem::take(headers);
+    let mut ordered = Vec::with_capacity(source.len());
+
+    fn take_named(
+        source: &mut Vec<(String, String)>,
+        ordered: &mut Vec<(String, String)>,
+        name: &str,
+    ) {
+        if let Some(index) = source
+            .iter()
+            .position(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            ordered.push(source.remove(index));
+        }
+    }
+
+    // Network/cache-control headers, when present, precede UA Client Hints.
+    take_named(&mut source, &mut ordered, "pragma");
+    take_named(&mut source, &mut ordered, "cache-control");
+    take_named(&mut source, &mut ordered, "sec-ch-ua-platform");
+    take_named(&mut source, &mut ordered, "user-agent");
+    take_named(&mut source, &mut ordered, "sec-ch-ua");
+
+    // Content-Type occupies a browser-controlled content-header slot before
+    // arbitrary page-authored request headers.
+    take_named(&mut source, &mut ordered, "content-type");
+
+    const CONTROLLED: &[&str] = &[
+        "pragma",
+        "cache-control",
+        "sec-ch-ua-platform",
+        "user-agent",
+        "sec-ch-ua",
+        "content-type",
+        "sec-ch-ua-mobile",
+        "accept",
+        "origin",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-dest",
+        "sec-fetch-storage-access",
+        "referer",
+        "accept-encoding",
+        "accept-language",
+        "priority",
+    ];
+    for (name, _) in extra_headers {
+        let lower = name.to_ascii_lowercase();
+        if CONTROLLED.iter().any(|known| *known == lower) || lower.starts_with("x-browser-oxide-") {
+            continue;
+        }
+        take_named(&mut source, &mut ordered, &lower);
+    }
+
+    for name in [
+        "sec-ch-ua-mobile",
+        "accept",
+        "origin",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-dest",
+        "sec-fetch-storage-access",
+        "referer",
+        "accept-encoding",
+        "accept-language",
+        "priority",
+    ] {
+        take_named(&mut source, &mut ordered, name);
+    }
+
+    // Future/Accept-CH headers that are not yet in the canonical list remain
+    // deterministic rather than being dropped.
+    ordered.append(&mut source);
+    *headers = ordered;
+}
+
 /// Resolve a redirect Location header to an absolute URL.
 fn resolve_redirect(current_url: &str, location: &str) -> Result<String, NetError> {
     // RFC 3986 §5.2 — resolve `location` against `current_url` as base.
@@ -1711,6 +1919,59 @@ mod tests {
         let profile = crate::stealth::chrome_148_linux();
         let client = HttpClient::new(&profile);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn chrome_fetch_header_order_matches_captured_h2_shape() {
+        let mut headers = vec![
+            ("user-agent".into(), "ua".into()),
+            ("accept".into(), "*/*".into()),
+            ("sec-ch-ua".into(), "brands".into()),
+            ("sec-ch-ua-mobile".into(), "?0".into()),
+            ("sec-ch-ua-platform".into(), "\"macOS\"".into()),
+            ("sec-fetch-site".into(), "same-origin".into()),
+            ("sec-fetch-mode".into(), "cors".into()),
+            ("sec-fetch-dest".into(), "empty".into()),
+            ("sec-fetch-storage-access".into(), "none".into()),
+            ("accept-encoding".into(), "gzip, deflate, br, zstd".into()),
+            ("accept-language".into(), "zh-CN,zh;q=0.9".into()),
+            ("priority".into(), "u=1, i".into()),
+            ("origin".into(), "https://example.test".into()),
+            ("referer".into(), "https://example.test/frame".into()),
+            ("x-proof-a".into(), "a".into()),
+            ("x-proof-b".into(), "b".into()),
+            ("content-type".into(), "text/plain;charset=UTF-8".into()),
+        ];
+        let extras = vec![
+            ("x-proof-a".into(), "a".into()),
+            ("x-proof-b".into(), "b".into()),
+            ("content-type".into(), "text/plain;charset=UTF-8".into()),
+            ("referer".into(), "https://example.test/frame".into()),
+        ];
+        order_chrome_fetch_headers(&mut headers, &extras);
+        let names: Vec<_> = headers.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "sec-ch-ua-platform",
+                "user-agent",
+                "sec-ch-ua",
+                "content-type",
+                "x-proof-a",
+                "x-proof-b",
+                "sec-ch-ua-mobile",
+                "accept",
+                "origin",
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-dest",
+                "sec-fetch-storage-access",
+                "referer",
+                "accept-encoding",
+                "accept-language",
+                "priority",
+            ]
+        );
     }
 
     #[test]

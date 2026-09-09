@@ -177,6 +177,7 @@ async fn cross_realm_post_message_to_parent() {
     page.evaluate(
         r#"(function(){
             globalThis.__msg = null;
+            globalThis.__msgCount = 0;
             const iframe = document.getElementById('f');
             const cw = iframe.contentWindow;
             globalThis.__cw = cw;
@@ -185,6 +186,7 @@ async fn cross_realm_post_message_to_parent() {
             globalThis.__parentIsWindow = (cw.parent === window);
             window.addEventListener('message', function(e){
                 if (e.data && e.data.hello) {
+                    globalThis.__msgCount++;
                     globalThis.__msg = { data: e.data, sameSource: e.source === globalThis.__cw };
                 }
             });
@@ -199,6 +201,7 @@ async fn cross_realm_post_message_to_parent() {
     let parent_is_window = page
         .evaluate("String(globalThis.__parentIsWindow)")
         .unwrap();
+    let message_count = page.evaluate("String(globalThis.__msgCount)").unwrap();
 
     assert_eq!(
         parent_is_window, "true",
@@ -211,6 +214,10 @@ async fn cross_realm_post_message_to_parent() {
     assert!(
         r.contains("\"sameSource\":true"),
         "event.source must be the iframe contentWindow: {r}"
+    );
+    assert_eq!(
+        message_count, "1",
+        "one child postMessage must dispatch exactly one parent MessageEvent"
     );
 }
 

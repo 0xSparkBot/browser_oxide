@@ -1,6 +1,27 @@
 ((globalThis) => {
     const core = Deno.core;
     const ops = core.ops;
+    const _domPrivateTraceEnabled = (() => {
+        try { return !!ops.op_dom_private_trace_enabled(); } catch (_) { return false; }
+    })();
+    const _domPrivateTrace = (row) => {
+        if (!_domPrivateTraceEnabled) return;
+        try {
+            row.at = Number(globalThis.performance && globalThis.performance.now() || 0);
+            row.origin = String(globalThis.location && globalThis.location.origin || "");
+            ops.op_dom_private_trace(JSON.stringify(row));
+        } catch (_) {}
+    };
+    const _domPrivateMeta = (node) => {
+        if (!node) return null;
+        const row = {};
+        try { row.nodeType = Number(node.nodeType) || 0; } catch (_) {}
+        try { row.tag = String(node.tagName || node.nodeName || ""); } catch (_) {}
+        try { row.id = String(node.id || "").slice(0, 80); } catch (_) {}
+        try { row.name = String(node.getAttribute && node.getAttribute("name") || "").slice(0, 80); } catch (_) {}
+        try { row.connected = !!node.isConnected; } catch (_) {}
+        return row;
+    };
     const _nodeIds = new WeakMap();
     const _nodeCache = new Map();
     const _scrollState = new Map(); // nodeId -> {top, left}
@@ -2861,6 +2882,7 @@
         }
         createElement(tag) {
             const el = _wrapNode(ops.op_dom_create_element(tag));
+            _domPrivateTrace({ phase: "createElement", tag: String(tag || ""), node: _domPrivateMeta(el) });
             if (tag.toLowerCase() === "script") {
                 let _src = "";
                 // Capture the real descriptor to avoid infinite recursion
@@ -3792,12 +3814,24 @@
     // window[0] is undefined → TypeError "Cannot read properties of undefined
     // (reading 'webdriver')".
     const _appendedIframes = [];
-    const _topFrameNamedSlots = new Set();
+    const _windowNamedSlots = new Set();
+    // deno_core's host global prototype is stable and must not be replaced or
+    // re-parented (doing so can break host-op lookup). Use that existing
+    // prototype as the safe named-property host for now. This preserves the
+    // important Window exotic invariant that named entries are inherited
+    // (`hasOwnProperty(window, name) === false`) while avoiding the old
+    // observable own-properties on globalThis. A future V8 interceptor can
+    // split this into Chrome's separate WindowProperties exotic layer without
+    // changing lookup semantics.
+    const _windowProperties = (() => {
+        try { return Object.getPrototypeOf(globalThis); } catch (_) { return null; }
+    })();
+    const _namedElementTags = new Set(["embed", "form", "img", "object"]);
     function _syncTopFrameRegistry() {
         let frames = [];
         try { frames = document.querySelectorAll("iframe") || []; } catch (_) { frames = []; }
         const previousCount = _appendedIframes.length;
-        const nextNamed = new Map();
+        const nextFrameNamed = new Map();
         _appendedIframes.length = 0;
         for (let i = 0; i < frames.length; i++) {
             const frame = frames[i];
@@ -3807,8 +3841,8 @@
             _appendedIframes.push(frame);
             try {
                 const name = String((frame.getAttribute && frame.getAttribute("name")) || frame.name || "");
-                if (name && !/^(0|[1-9]\d*)$/.test(name) && !nextNamed.has(name)) {
-                    nextNamed.set(name, frame);
+                if (name && !/^(0|[1-9]\d*)$/.test(name) && !nextFrameNamed.has(name)) {
+                    nextFrameNamed.set(name, frame);
                 }
             } catch (_) {}
             try {
@@ -3829,26 +3863,82 @@
                 writable: true,
             });
         } catch (_) {}
-        for (const name of Array.from(_topFrameNamedSlots)) {
-            if (nextNamed.has(name)) continue;
-            try { delete globalThis[name]; } catch (_) {}
-            _topFrameNamedSlots.delete(name);
-        }
-        for (const [name, frame] of nextNamed) {
-            const owned = _topFrameNamedSlots.has(name);
-            let available = owned;
-            if (!available) {
-                try { available = !(name in globalThis); } catch (_) { available = false; }
+        const nextElements = new Map();
+        try {
+            const elements = document.querySelectorAll("*") || [];
+            const addElement = function(name, element) {
+                name = String(name || "");
+                if (!name || /^(0|[1-9]\d*)$/.test(name) || nextFrameNamed.has(name)) return;
+                let list = nextElements.get(name);
+                if (!list) nextElements.set(name, list = []);
+                if (!list.includes(element)) list.push(element);
+            };
+            for (let i = 0; i < elements.length; i++) {
+                const element = elements[i];
+                try { addElement(element.getAttribute && element.getAttribute("id"), element); } catch (_) {}
+                try {
+                    const tag = String(element.localName || "").toLowerCase();
+                    if (_namedElementTags.has(tag)) {
+                        addElement(element.getAttribute && element.getAttribute("name"), element);
+                    }
+                } catch (_) {}
             }
-            if (!available) continue;
-            try {
-                Object.defineProperty(globalThis, name, {
-                    get: function() { return _frameWindowFor(frame); },
-                    configurable: true,
-                    enumerable: true,
-                });
-                _topFrameNamedSlots.add(name);
-            } catch (_) {}
+        } catch (_) {}
+
+        const nextNamedValues = new Map();
+        for (const [name, elements] of nextElements) {
+            if (nextFrameNamed.has(name) || elements.length === 0) continue;
+            if (elements.length === 1) {
+                nextNamedValues.set(name, elements[0]);
+            } else {
+                try {
+                    nextNamedValues.set(
+                        name,
+                        new HTMLCollection(elements.map(function(element) { return _getNodeId(element); }))
+                    );
+                } catch (_) {
+                    nextNamedValues.set(name, elements[0]);
+                }
+            }
+        }
+
+        if (_windowProperties) {
+            for (const name of Array.from(_windowNamedSlots)) {
+                if (nextFrameNamed.has(name) || nextNamedValues.has(name)) continue;
+                try { delete _windowProperties[name]; } catch (_) {}
+                _windowNamedSlots.delete(name);
+            }
+            for (const [name, frame] of nextFrameNamed) {
+                if (!_windowNamedSlots.has(name)) {
+                    try {
+                        if (Object.prototype.hasOwnProperty.call(_windowProperties, name)) continue;
+                    } catch (_) { continue; }
+                }
+                try {
+                    Object.defineProperty(_windowProperties, name, {
+                        get: function() { return _frameWindowFor(frame); },
+                        configurable: true,
+                        enumerable: false,
+                    });
+                    _windowNamedSlots.add(name);
+                } catch (_) {}
+            }
+            for (const [name, value] of nextNamedValues) {
+                if (!_windowNamedSlots.has(name)) {
+                    try {
+                        if (Object.prototype.hasOwnProperty.call(_windowProperties, name)) continue;
+                    } catch (_) { continue; }
+                }
+                try {
+                    Object.defineProperty(_windowProperties, name, {
+                        value,
+                        writable: true,
+                        configurable: true,
+                        enumerable: false,
+                    });
+                    _windowNamedSlots.add(name);
+                } catch (_) {}
+            }
         }
         try { globalThis.__ifAppendCount = frames.length; } catch (_) {}
     }
@@ -3856,7 +3946,14 @@
     // Wrap DOM mutation methods to fire MO notifications
     const _origAppendChild = Node.prototype.appendChild;
     Node.prototype.appendChild = function(child) {
+        const before = _domPrivateTraceEnabled ? _domPrivateMeta(child) : null;
         const result = _origAppendChild.call(this, child);
+        _domPrivateTrace({
+            phase: "appendChild",
+            parent: _domPrivateMeta(this),
+            childBefore: before,
+            childAfter: _domPrivateMeta(child),
+        });
         _syncTopFrameRegistry();
         if (_moObservers.length > 0) {
             _notifyMO("childList", _getNodeId(this), { target: this, addedNodes: [child] });
@@ -3866,7 +3963,14 @@
 
     const _origRemoveChild = Node.prototype.removeChild;
     Node.prototype.removeChild = function(child) {
+        const before = _domPrivateTraceEnabled ? _domPrivateMeta(child) : null;
         const result = _origRemoveChild.call(this, child);
+        _domPrivateTrace({
+            phase: "removeChild",
+            parent: _domPrivateMeta(this),
+            childBefore: before,
+            childAfter: _domPrivateMeta(child),
+        });
         _syncTopFrameRegistry();
         if (_moObservers.length > 0) {
             _notifyMO("childList", _getNodeId(this), { target: this, removedNodes: [child] });
@@ -3876,7 +3980,15 @@
 
     const _origInsertBefore = Node.prototype.insertBefore;
     Node.prototype.insertBefore = function(newChild, refChild) {
+        const before = _domPrivateTraceEnabled ? _domPrivateMeta(newChild) : null;
         const result = _origInsertBefore.call(this, newChild, refChild);
+        _domPrivateTrace({
+            phase: "insertBefore",
+            parent: _domPrivateMeta(this),
+            childBefore: before,
+            childAfter: _domPrivateMeta(newChild),
+            ref: _domPrivateMeta(refChild),
+        });
         _syncTopFrameRegistry();
         if (_moObservers.length > 0) {
             _notifyMO("childList", _getNodeId(this), { target: this, addedNodes: [newChild] });
@@ -3888,6 +4000,14 @@
     Element.prototype.setAttribute = function(name, value) {
         const oldVal = this.getAttribute(name);
         _origSetAttribute.call(this, name, value);
+        if (_domPrivateTraceEnabled && (String(name).toLowerCase() === "id" || String(name).toLowerCase() === "name" || String(name).toLowerCase() === "class" || String(name).toLowerCase() === "src" || String(name).toLowerCase() === "type")) {
+            _domPrivateTrace({
+                phase: "setAttribute",
+                node: _domPrivateMeta(this),
+                name: String(name),
+                value: String(value || "").slice(0, 120),
+            });
+        }
         if (_moObservers.length > 0) {
             _notifyMO("attributes", _getNodeId(this), { target: this, attributeName: name });
         }
@@ -3898,12 +4018,22 @@
                 try { this.attributeChangedCallback(name, oldVal, value); } catch (e) { console.error(e); }
             }
         }
+        if (String(name).toLowerCase() === "id" || String(name).toLowerCase() === "name") {
+            _syncTopFrameRegistry();
+        }
     };
 
     const _origRemoveAttribute = Element.prototype.removeAttribute;
     Element.prototype.removeAttribute = function(name) {
         const oldVal = this.getAttribute(name);
         _origRemoveAttribute.call(this, name);
+        if (_domPrivateTraceEnabled && (String(name).toLowerCase() === "id" || String(name).toLowerCase() === "name" || String(name).toLowerCase() === "class" || String(name).toLowerCase() === "src" || String(name).toLowerCase() === "type")) {
+            _domPrivateTrace({
+                phase: "removeAttribute",
+                node: _domPrivateMeta(this),
+                name: String(name),
+            });
+        }
         if (_moObservers.length > 0) {
             _notifyMO("attributes", _getNodeId(this), { target: this, attributeName: name });
         }
@@ -3913,6 +4043,9 @@
             if (Array.isArray(observed) && observed.includes(name)) {
                 try { this.attributeChangedCallback(name, oldVal, null); } catch (e) { console.error(e); }
             }
+        }
+        if (String(name).toLowerCase() === "id" || String(name).toLowerCase() === "name") {
+            _syncTopFrameRegistry();
         }
     };
 
@@ -5346,20 +5479,34 @@
                         _markFrameMessageTrusted,
                     );
                 }
+                let _childEventPrivateTrace = null;
+                try {
+                    if (ops.op_event_private_trace_enabled
+                        && ops.op_event_private_trace_enabled()) {
+                        _childEventPrivateTrace = function(row) {
+                            try { ops.op_event_private_trace(JSON.stringify(row)); } catch (_) {}
+                        };
+                        ops.op_set_child_realm_prop(
+                            _realmId,
+                            "__oxideEventPrivateTrace",
+                            _childEventPrivateTrace,
+                        );
+                    }
+                } catch (_) {}
                 if (_getFrameEventState && _setFrameEventState) {
                     ops.op_set_child_realm_prop(_realmId, "__oxideGetEventState", _getFrameEventState);
                     ops.op_set_child_realm_prop(_realmId, "__oxideSetEventState", _setFrameEventState);
                 }
                 ops.op_eval_in_child_realm(_realmId,
-                    "(function(){var _nt=Symbol.for('__browser_oxide_native__');var _L=Object.create(null);var _mt=globalThis.__oxideMarkTrusted;var _ges=globalThis.__oxideGetEventState;var _ses=globalThis.__oxideSetEventState;try{delete globalThis.__oxideMarkTrusted;delete globalThis.__oxideGetEventState;delete globalThis.__oxideSetEventState;}catch(_){};"
+                    "(function(){var _nt=Symbol.for('__browser_oxide_native__');var _L=Object.create(null);var _mt=globalThis.__oxideMarkTrusted;var _etr=globalThis.__oxideEventPrivateTrace;var _ges=globalThis.__oxideGetEventState;var _ses=globalThis.__oxideSetEventState;try{delete globalThis.__oxideMarkTrusted;delete globalThis.__oxideEventPrivateTrace;delete globalThis.__oxideGetEventState;delete globalThis.__oxideSetEventState;}catch(_){};"
                     + "function _n(fn,nm){try{Object.defineProperty(fn,'name',{value:nm,configurable:true});"
                     + "Object.defineProperty(fn,_nt,{value:nm,configurable:true});var ts=function toString(){return 'function '+nm+'() { [native code] }'};"
                     + "Object.defineProperty(ts,_nt,{value:'toString',configurable:true});Object.defineProperty(ts,'name',{value:'toString',configurable:true});"
                     + "Object.defineProperty(fn,'toString',{value:ts,configurable:true});}catch(_){}return fn;}"
                     + "function ael(type,fn){if(!(typeof fn==='function'||(fn&&typeof fn.handleEvent==='function')))return;var t=String(type);(_L[t]||(_L[t]=[])).push(fn);}"
                     + "function rel(type,fn){var a=_L[String(type)];if(a){var i=a.indexOf(fn);if(i>=0)a.splice(i,1);}}"
-                    + "function de(ev){try{if(typeof _ses==='function')_ses(ev,{target:globalThis,currentTarget:globalThis,eventPhase:2,path:[globalThis],dispatching:true});var t=ev&&ev.type;var a=_L[t];if(a)a.slice().forEach(function(h){try{(typeof h==='function'?h:h.handleEvent).call(globalThis,ev);}catch(_){}});"
-                    + "var on=globalThis['on'+t];if(typeof on==='function'){try{on.call(globalThis,ev);}catch(_){}}}catch(_){}finally{try{if(typeof _ses==='function')_ses(ev,{currentTarget:null,eventPhase:0,path:[],dispatching:false});}catch(_){}}return !(typeof _ges==='function'&&_ges(ev).defaultPrevented);}"
+                    + "function de(ev){var _trace=typeof _etr==='function'&&ev&&ev.type==='message',_ds=_trace?performance.now():0;try{if(typeof _ses==='function')_ses(ev,{target:globalThis,currentTarget:globalThis,eventPhase:2,path:[globalThis],dispatching:true});var t=ev&&ev.type;var a=_L[t];if(a)a.slice().forEach(function(h){var _s=_trace?performance.now():0;try{(typeof h==='function'?h:h.handleEvent).call(globalThis,ev);}catch(_){}finally{if(_trace){var _cb=typeof h==='function'?h:h&&h.handleEvent;_etr({phase:'child-listener',type:'message',duration:performance.now()-_s,name:String(_cb&&_cb.name||''),sourceLength:_cb?String(_cb).length:0});}}});"
+                    + "var on=globalThis['on'+t];if(typeof on==='function'){var _s=_trace?performance.now():0;try{on.call(globalThis,ev);}catch(_){}finally{if(_trace)_etr({phase:'child-handler',type:'message',duration:performance.now()-_s,name:String(on.name||''),sourceLength:String(on).length});}}}catch(_){}finally{try{if(typeof _ses==='function')_ses(ev,{currentTarget:null,eventPhase:0,path:[],dispatching:false});}catch(_){}if(_trace)_etr({phase:'child-dispatch',type:'message',duration:performance.now()-_ds,listenerCount:(a&&a.length)||0,hasHandler:typeof on==='function',trusted:!!ev.isTrusted});}return !(typeof _ges==='function'&&_ges(ev).defaultPrevented);}"
                     + "Object.defineProperty(globalThis,'addEventListener',{value:_n(ael,'addEventListener'),writable:true,configurable:true});"
                     + "Object.defineProperty(globalThis,'removeEventListener',{value:_n(rel,'removeEventListener'),writable:true,configurable:true});"
                     + "Object.defineProperty(globalThis,'dispatchEvent',{value:_n(de,'dispatchEvent'),writable:true,configurable:true});"
@@ -5859,7 +6006,7 @@
             try {
                 ops.op_eval_in_child_realm(
                     _realmId,
-                    "try{globalThis.__completeDocumentLifecycle&&globalThis.__completeDocumentLifecycle();}finally{try{delete globalThis.__completeDocumentLifecycle;}catch(_){}}",
+                    "try{globalThis.__completeDocumentLifecycle&&globalThis.__completeDocumentLifecycle();Object.defineProperty(globalThis,'__oxFrameReady',{value:1,writable:true,configurable:true,enumerable:false});}finally{try{delete globalThis.__completeDocumentLifecycle;}catch(_){}}",
                 );
             } catch (_) {}
 
@@ -6297,64 +6444,9 @@
             return _frameHandle(fid);
         }
         globalThis.__frameHandleFor = _frameHandle;
-        let _frameReadyGatePasses = 0;
-        let _frameAgeGatePasses = 0;
-        let _framePumpStart = null;
-        let _frameRedeliveryCount = 0;
         globalThis.__pumpFrameMessages = function() {
             if (globalThis.__oxOps) {
                 try { globalThis.__oxPumpC = (globalThis.__oxPumpC || 0) + 1; } catch (_) {}
-            }
-            // Deferred-delivery gate: hold queued cross-frame messages until
-            // this realm's initial load has settled. The driver calls this
-            // pump as soon as the mailbox is non-empty, which during page load
-            // lands between this realm's per-script event-loop turns — the
-            // gap that wedges Turnstile-style challenge state machines
-            // (first handler dispatch throws -> crashed_retry loop).
-            // `__oxFrameReady` is set by the driver / ChildIframe right
-            // after the document lifecycle completes. Bounded: after 400
-            // gate passes (~sweeps, not ms) deliver anyway so a realm that
-            // never settles still receives its mail (browsers never drop).
-            if (!globalThis.__oxFrameReady) {
-                _frameReadyGatePasses++;
-                if (globalThis.__oxOps) {
-                    try {
-                        globalThis.__oxGateN = _frameReadyGatePasses;
-                        const gp = globalThis.__oxGP || (globalThis.__oxGP = []);
-                        if (gp.length < 8) gp.push("g" + _frameReadyGatePasses + "@" + Math.round(performance.now()));
-                    } catch (_) {}
-                }
-                if (_frameReadyGatePasses < 400) return;
-            } else {
-                _frameReadyGatePasses = 0;
-                if (globalThis.__oxOps) globalThis.__oxGateN = 0;
-            }
-            // Time floor: the challenge's first message handler reads lazy
-            // lookup tables that later timers / phases finish building; a
-            // dispatch before ~1.5s realm-age throws inside the CF VM
-            // ("reading 'call' of undefined"), the widget's own wrapper then
-            // declares the realm crashed and renavigates — a loop. c22
-            // proved a +1.2s replay of the same message runs clean, so the
-            // tables exist by then: simply hold the FIRST delivery window
-            // until the realm has had 1.5s of Timer-eligible life. Leaves
-            // messages queued (driver re-pumps); bounded like the gate.
-            {
-                const now = performance.now();
-                if (_framePumpStart === null) _framePumpStart = now;
-                const age = now - _framePumpStart;
-                if (age < 1500) {
-                    _frameAgeGatePasses++;
-                    if (_frameAgeGatePasses < 400) {
-                        if (globalThis.__oxOps) {
-                            try {
-                                globalThis.__oxGateT = _frameAgeGatePasses;
-                                const gt = globalThis.__oxGT || (globalThis.__oxGT = []);
-                                if (gt.length < 6) gt.push("t" + _frameAgeGatePasses + "@" + Math.round(now));
-                            } catch (_) {}
-                        }
-                        return;
-                    }
-                }
             }
             let arr;
             try { arr = JSON.parse(ops.op_frame_take_messages(globalThis.__frameId || 0)); }
@@ -6408,40 +6500,6 @@
                         ring.push("DISPATCH_FAIL:" + (e && e.message) + "|DATA:" + full
                             + "|STACK:" + (e && e.stack ? String(e.stack).replace(/\n/g, " ~ ").slice(0, 900) : ""));
                     }
-                    // Redelivery: Turnstile-style challenge bundles register
-                    // their message handler before the VM string tables are
-                    // finished; the first dispatch in the load window throws, and a plain drop wedges the state machine until
-                    // its own crashed_retry renavigates. A single late
-                    // redelivery (the handler is idempotent from a second
-                    // dispatch, verified empirically) lets the same realm
-                    // recover without a renavigation. Bounded and once-only
-                    // per failure so a deterministically-broken handler can't
-                    // spin the loop.
-                    try {
-                        if (_frameRedeliveryCount < 24) {
-                            _frameRedeliveryCount++;
-                            if (globalThis.__oxOps) {
-                                globalThis.__oxMsgRD = { n: _frameRedeliveryCount };
-                            }
-                            setTimeout(function () {
-                                try {
-                                    const ev2 = new MessageEvent("message", {
-                                        data: data,
-                                        origin: m.o || "",
-                                        source: _frameSourceHandle(m.s),
-                                    });
-                                    if (_markFrameMessageTrusted) _markFrameMessageTrusted(ev2);
-                                    globalThis.dispatchEvent(ev2);
-                                    if (ring) {
-                                        if (ring.length >= 24) ring.shift();
-                                        ring.push("RD_OK@" + Math.round(performance.now()));
-                                    }
-                                } catch (e2) {
-                                    if (ring) ring.push("RD_FAIL:" + (e2 && e2.message));
-                                }
-                            }, 1200);
-                        }
-                    } catch (_) {}
                 }
             }
         };
@@ -6954,19 +7012,30 @@
         };
         try {
             const NativeFunction = globalThis.Function;
-            globalThis.Function = new Proxy(NativeFunction, {
+            const FunctionProxy = new Proxy(NativeFunction, {
                 apply(target, thisArg, args) {
-                    record(typeof args[0] === "string"
-                        ? args[0]
-                        : (args[0] != null ? String(args[0]) : ""));
+                    const body = args.length ? args[args.length - 1] : "";
+                    record(typeof body === "string"
+                        ? body
+                        : (body != null ? String(body) : ""));
                     return Reflect.apply(target, thisArg, args);
                 },
                 construct(target, args, newTarget) {
-                    record(typeof args[0] === "string"
-                        ? args[0]
-                        : (args[0] != null ? String(args[0]) : ""));
+                    const body = args.length ? args[args.length - 1] : "";
+                    record(typeof body === "string"
+                        ? body
+                        : (body != null ? String(body) : ""));
                     return Reflect.construct(target, args, newTarget);
                 },
+            });
+            globalThis.Function = FunctionProxy;
+            // Obfuscated loaders normally obtain the constructor through
+            // `(function() {}).constructor` instead of `window.Function`.
+            // Cover that intrinsic path as well while diagnostics are on.
+            Object.defineProperty(NativeFunction.prototype, "constructor", {
+                value: FunctionProxy,
+                writable: true,
+                configurable: true,
             });
         } catch (_) {}
     };

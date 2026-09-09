@@ -709,6 +709,19 @@
             // preserve direct-eval lexical semantics while tracking trust.
             const source = String(value);
             trustedScriptSources.add(source);
+            if (globalThis.__browser_oxide_debug === true
+                || globalThis.__oxideDiagnostics === true) {
+                try {
+                    if (source.length >= 512) {
+                        const log = globalThis.__oxTrustedScriptSources
+                            || (globalThis.__oxTrustedScriptSources = []);
+                        if (log.length < 8
+                            && !log.some((entry) => entry.length === source.length)) {
+                            log.push(source);
+                        }
+                    }
+                } catch (_) {}
+            }
             return source;
         };
         globalThis.trustedTypes = {

@@ -14,16 +14,89 @@ use crate::js_runtime::extensions::stealth_ext::StealthState;
 use crate::js_runtime::state::DomState;
 use deno_core::op2;
 use deno_core::OpState;
+use futures_util::task::AtomicWaker;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Waker;
 use tokio::sync::Notify;
+
+fn trace_worker_wire(direction: &str, worker_id: u32, data: &str) {
+    if std::env::var_os("BROWSER_OXIDE_WORKER_WIRE_TRACE").is_none() {
+        return;
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(data).ok();
+    let keys = parsed
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .map(|map| map.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let (inner_len, inner_keys) = parsed
+        .as_ref()
+        .and_then(|value| value.get("data"))
+        .map(|inner| {
+            let len = serde_json::to_string(inner)
+                .map(|text| text.len())
+                .unwrap_or(0);
+            let keys = inner
+                .as_object()
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            (len, keys)
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "[worker-wire] dir={direction} id={worker_id} len={} keys={} inner_len={inner_len} inner_keys={}",
+        data.len(),
+        keys.join(","),
+        inner_keys.join(",")
+    );
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerContextState {
     pub storage_directory_allowed: bool,
+}
+
+/// Per-owner-runtime wake channel for worker -> owner messages.
+///
+/// The JS-side receive promise is deliberately unref'ed after worker startup
+/// so an idle Worker does not pin navigation forever. Chromium still queues a
+/// MessageEvent immediately when that worker posts, so an actual message needs
+/// a wake path that is independent of the ref-state of the receive op.
+#[derive(Clone)]
+pub struct WorkerOwnerWake {
+    notify: Arc<Notify>,
+    task_waker: Arc<AtomicWaker>,
+}
+
+impl Default for WorkerOwnerWake {
+    fn default() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            task_waker: Arc::new(AtomicWaker::new()),
+        }
+    }
+}
+
+impl WorkerOwnerWake {
+    pub fn register(&self, waker: &Waker) {
+        self.task_waker.register(waker);
+    }
+
+    pub fn notify_handle(&self) -> Arc<Notify> {
+        self.notify.clone()
+    }
+
+    fn wake(&self) {
+        // `Notify` stores a permit for BrowserEventLoop even when it is between
+        // waits. AtomicWaker targets the persistent FrameWaker registered by
+        // the frame-tree driver's BrowserJsRuntime::poll_once.
+        self.notify.notify_one();
+        self.task_waker.wake();
+    }
 }
 
 // ============================================================================
@@ -124,6 +197,13 @@ pub fn op_blob_register(
     #[buffer] data: &[u8],
     #[string] content_type: String,
 ) {
+    // URL.createObjectURL is a synchronous renderer -> browser-service
+    // operation in Chromium. If an earlier browser-main service task (for
+    // example cold SpeechSynthesis voice discovery) is still occupying the
+    // browser process, BlobURLStore::Register waits in that queue before the
+    // tiny registration itself runs. Model the shared service lane rather
+    // than baking a vendor/site-specific delay into ObjectURL.
+    crate::js_runtime::extensions::timer_ext::wait_for_browser_main_service_lane();
     // Trace blob registration so the blob-worker path
     // (URL.createObjectURL(blob) -> new Worker(blobUrl)) is observable
     // just before the spawn.
@@ -288,6 +368,8 @@ struct WorkerSelf {
     /// Same Arc as the parent's `WorkerSlot.notify_worker`; the worker's
     /// `op_worker_self_await_message` parks on it, the parent signals on post/terminate.
     notify_worker: Arc<Notify>,
+    /// Out-of-band wake for the browser runtime that owns this worker.
+    owner_wake: WorkerOwnerWake,
     /// Same Arc as the parent's `WorkerSlot.terminate`. Lets the worker's
     /// `op_worker_self_await_message` return "" (stop) once terminated.
     terminate: Arc<AtomicBool>,
@@ -322,6 +404,10 @@ pub fn op_worker_spawn(
     let state = op_state.borrow::<DomState>();
     let stealth = op_state.borrow::<StealthState>();
     let owned = op_state.borrow::<WorkerOwnership>();
+    let owner_wake = op_state
+        .try_borrow::<WorkerOwnerWake>()
+        .cloned()
+        .unwrap_or_default();
     // Prefer StealthState.profile (always set from BrowserRuntimeOptions) over
     // DomState.stealth_profile (historically always None in the main runtime).
     let profile = stealth
@@ -395,6 +481,7 @@ pub fn op_worker_spawn(
                     from_parent: to_worker_rx,
                     notify_parent: notify_parent.clone(),
                     notify_worker: notify_worker.clone(),
+                    owner_wake: owner_wake.clone(),
                     terminate: terminate.clone(),
                     url,
                 });
@@ -524,6 +611,7 @@ pub fn op_worker_spawn(
 
 #[op2(fast)]
 pub fn op_worker_post_to_worker(#[smi] worker_id: i32, #[string] data: String) {
+    trace_worker_wire("parent->worker", worker_id as u32, &data);
     let reg = worker_registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = reg.get(&(worker_id as u32)) {
         let _ = slot.to_worker.send(data);
@@ -541,7 +629,10 @@ pub fn op_worker_poll_from_worker(#[smi] worker_id: i32) -> String {
     let reg = worker_registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = reg.get(&(worker_id as u32)) {
         match slot.from_worker.try_recv() {
-            Ok(msg) => return msg,
+            Ok(msg) => {
+                trace_worker_wire("worker->parent", worker_id as u32, &msg);
+                return msg;
+            }
             Err(_) => return String::new(),
         }
     }
@@ -628,6 +719,7 @@ pub async fn op_worker_await_message(#[smi] worker_id: i32) -> String {
         }
     };
     if let Some(msg) = fast_msg {
+        trace_worker_wire("worker->parent", id, &msg);
         return msg;
     }
     // Loop on notify until we get a message OR the worker terminates.
@@ -643,6 +735,7 @@ pub async fn op_worker_await_message(#[smi] worker_id: i32) -> String {
         match reg.get(&id) {
             Some(slot) => {
                 if let Ok(msg) = slot.from_worker.try_recv() {
+                    trace_worker_wire("worker->parent", id, &msg);
                     return msg;
                 }
                 // Spurious wake — re-loop.
@@ -660,11 +753,12 @@ pub async fn op_worker_await_message(#[smi] worker_id: i32) -> String {
 pub fn op_worker_self_post(#[string] data: String) {
     WORKER_SELF.with(|w| {
         if let Some(s) = w.borrow().as_ref() {
-            let _ = s.to_parent.send(data);
-            // Wake the parent's awaiting `op_worker_await_message` so
-            // it can drain this message immediately. Without the
-            // notify, the await would block until the worker terminates.
-            s.notify_parent.notify_one();
+            if s.to_parent.send(data).is_ok() {
+                // Settle a referenced receive if one exists and independently
+                // wake the owner runtime when that receive has been unref'ed.
+                s.notify_parent.notify_one();
+                s.owner_wake.wake();
+            }
         }
     });
 }

@@ -13,6 +13,18 @@ use deno_core::JsRuntime;
 use deno_core::OpState;
 use std::collections::HashMap;
 
+#[op2(fast)]
+pub fn op_dom_private_trace_enabled() -> bool {
+    std::env::var_os("BROWSER_OXIDE_DOM_PRIVATE_TRACE").is_some()
+}
+
+#[op2(fast)]
+pub fn op_dom_private_trace(#[string] summary: String) {
+    if std::env::var_os("BROWSER_OXIDE_DOM_PRIVATE_TRACE").is_some() {
+        eprintln!("[dom-private] {summary}");
+    }
+}
+
 fn compile_realm_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     source: &str,
@@ -2295,6 +2307,8 @@ pub fn op_eval_in_child_realm<'s>(
 deno_core::extension!(
     dom_extension,
     ops = [
+        op_dom_private_trace_enabled,
+        op_dom_private_trace,
         op_dom_document_node,
         op_dom_get_tag_name,
         op_dom_get_namespace,

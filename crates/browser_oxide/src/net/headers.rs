@@ -41,6 +41,57 @@ pub fn nav_headers_for_url(
     hdrs
 }
 
+/// Browser-aware headers for an `<iframe src=...>` document navigation.
+///
+/// An iframe navigation keeps document Accept/navigate/priority semantics but
+/// differs from a fresh top-level navigation in its Fetch Metadata destination
+/// and site classification, and it carries the embedding document's referrer
+/// after referrer-policy processing by the caller.
+pub fn nav_headers_frame(
+    profile: &StealthProfile,
+    target_url: &str,
+    referrer: &str,
+    accept_ch_upgraded: bool,
+) -> Vec<(String, String)> {
+    let mut hdrs = nav_headers_for_url(profile, target_url, accept_ch_upgraded);
+
+    let site = if referrer.is_empty() {
+        "none"
+    } else {
+        let target = url::Url::parse(target_url).ok();
+        let source = url::Url::parse(referrer).ok();
+        match (target, source) {
+            (Some(target), Some(source)) => {
+                if target.origin() == source.origin() {
+                    "same-origin"
+                } else if same_site(&target, &source) {
+                    "same-site"
+                } else {
+                    "cross-site"
+                }
+            }
+            _ => "cross-site",
+        }
+    };
+
+    for (name, value) in &mut hdrs {
+        match name.as_str() {
+            "sec-fetch-site" => *value = site.to_string(),
+            "sec-fetch-dest" => *value = "iframe".to_string(),
+            _ => {}
+        }
+    }
+
+    if !referrer.is_empty() {
+        let index = hdrs
+            .iter()
+            .position(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+            .unwrap_or(hdrs.len());
+        hdrs.insert(index, ("referer".to_string(), referrer.to_string()));
+    }
+    hdrs
+}
+
 /// Replace `accept-language` in `hdrs` with the region-appropriate value
 /// for `url`, using the browser family's q-step convention. No-op if the
 /// URL's TLD has no regional override registered.
@@ -543,7 +594,25 @@ fn chrome_platform_version(os_name: &str, os_version: &str) -> String {
 /// Brand strings here MUST match `build_sec_ch_ua` exactly.
 fn build_sec_ch_ua_full_version_list(profile: &StealthProfile) -> String {
     let v = &profile.browser_version;
-    format!("\"Google Chrome\";v=\"{v}\", \"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"{v}\"")
+    match profile.browser_version.split('.').next().unwrap_or("147") {
+        // Verified from Cloak Chromium 145.0.7632.109 on macOS. Chromium's
+        // GREASE brand spelling/order is version-specific; emitting the 147+
+        // tuple while advertising Chrome/145 is internally inconsistent.
+        "145" => format!(
+            "\"Not:A-Brand\";v=\"99.0.0.0\", \"Google Chrome\";v=\"{v}\", \"Chromium\";v=\"{v}\""
+        ),
+        // Verified from Chrome 148 NetLog.
+        "148" => format!(
+            "\"Chromium\";v=\"{v}\", \"Not(A:Brand\";v=\"24.0.0.0\", \"Google Chrome\";v=\"{v}\""
+        ),
+        // Verified from Chrome 152 NetLog.
+        "152" => format!(
+            "\"Chromium\";v=\"{v}\", \"Not?A_Brand\";v=\"24.0.0.0\", \"Google Chrome\";v=\"{v}\""
+        ),
+        _ => format!(
+            "\"Google Chrome\";v=\"{v}\", \"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"{v}\""
+        ),
+    }
 }
 
 /// Build the sec-ch-ua header value from the browser version.
@@ -557,19 +626,20 @@ fn build_sec_ch_ua_full_version_list(profile: &StealthProfile) -> String {
 /// middle, not the end.
 fn build_sec_ch_ua(profile: &StealthProfile) -> String {
     let major_version = profile.browser_version.split('.').next().unwrap_or("147");
-
-    // Real Chrome 147 sec-ch-ua:
-    //   "Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
-    // Brand order is [Google Chrome, Not.A/Brand, Chromium] (NOT
-    // alphabetical and NOT what the W3C spec implies). The "Not."-style
-    // dummy brand changes per Chrome version — we hardcode the v=8 / dot-slash
-    // form that matches Chrome 147+. Earlier Chrome (130 era) used
-    // "Not-A.Brand";v="24" with brands ordered [Chromium, Not-A.Brand, Google Chrome]
-    // — that's what we used to emit, but it diverges from modern Chrome.
-    format!(
-        "\"Google Chrome\";v=\"{v}\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"{v}\"",
-        v = major_version
-    )
+    match major_version {
+        "145" => format!(
+            "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"{major_version}\", \"Chromium\";v=\"{major_version}\""
+        ),
+        "148" => format!(
+            "\"Chromium\";v=\"{major_version}\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"{major_version}\""
+        ),
+        "152" => format!(
+            "\"Chromium\";v=\"{major_version}\", \"Not?A_Brand\";v=\"24\", \"Google Chrome\";v=\"{major_version}\""
+        ),
+        _ => format!(
+            "\"Google Chrome\";v=\"{major_version}\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"{major_version}\""
+        ),
+    }
 }
 
 // ============================================================================
@@ -848,8 +918,21 @@ fn build_accept_language(languages: &[String]) -> String {
         return "en-US,en;q=0.9".to_string();
     }
 
-    let mut parts = Vec::with_capacity(languages.len());
-    for (i, lang) in languages.iter().enumerate() {
+    // Chromium implicitly adds the base language when a single regional
+    // locale is configured: zh-CN -> `zh-CN,zh;q=0.9`, en-US ->
+    // `en-US,en;q=0.9`. `navigator.languages` still contains only the
+    // configured locale; this expansion is an HTTP Accept-Language detail.
+    let mut expanded = languages.to_vec();
+    if languages.len() == 1 {
+        if let Some((base, _)) = languages[0].split_once('-') {
+            if !base.is_empty() && !expanded.iter().any(|lang| lang == base) {
+                expanded.push(base.to_string());
+            }
+        }
+    }
+
+    let mut parts = Vec::with_capacity(expanded.len());
+    for (i, lang) in expanded.iter().enumerate() {
         if i == 0 {
             parts.push(lang.clone());
         } else {
@@ -977,7 +1060,7 @@ mod tests {
     #[test]
     fn accept_language_single() {
         let result = build_accept_language(&["en-US".to_string()]);
-        assert_eq!(result, "en-US");
+        assert_eq!(result, "en-US,en;q=0.9");
     }
 
     #[test]
@@ -1214,21 +1297,46 @@ mod tests {
 
     #[test]
     fn sec_ch_ua_full_version_list_has_chrome_version() {
-        // Chrome 147+ live capture format:
-        //   "Google Chrome";v="<ver>", "Not.A/Brand";v="8.0.0.0", "Chromium";v="<ver>"
-        // The "Not" brand name rotates across major releases (was `Not-A.Brand`
-        // v="24" in Chrome 130-146; changed to `Not.A/Brand` v="8" in Chrome 147+).
+        // Chrome 148 live NetLog captured this version-specific GREASE tuple.
         let profile = crate::stealth::chrome_148_linux();
         let value = build_sec_ch_ua_full_version_list(&profile);
-        assert!(value.contains("Google Chrome"));
-        assert!(value.contains(&profile.browser_version));
-        assert!(value.contains("Not.A/Brand"));
-        // Brand order: Google Chrome first, Not.A/Brand middle, Chromium last.
-        let google_idx = value.find("Google Chrome").unwrap();
-        let not_idx = value.find("Not.A/Brand").unwrap();
+        assert!(value.contains("Not(A:Brand"));
+        assert!(value.contains("24.0.0.0"));
         let chromium_idx = value.find("Chromium").unwrap();
-        assert!(google_idx < not_idx);
-        assert!(not_idx < chromium_idx);
+        let not_idx = value.find("Not(A:Brand").unwrap();
+        let google_idx = value.find("Google Chrome").unwrap();
+        assert!(chromium_idx < not_idx);
+        assert!(not_idx < google_idx);
+    }
+
+    #[test]
+    fn chrome_145_client_hints_match_captured_cloak() {
+        let mut profile = crate::stealth::chrome_148_macos();
+        profile.browser_version = "145.0.7632.109".to_string();
+        assert_eq!(
+            build_sec_ch_ua(&profile),
+            r#""Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145""#
+        );
+        assert_eq!(
+            build_sec_ch_ua_full_version_list(&profile),
+            r#""Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.7632.109", "Chromium";v="145.0.7632.109""#
+        );
+    }
+
+    #[test]
+    fn chrome_accept_language_expands_single_regional_locale() {
+        assert_eq!(
+            build_accept_language(&["zh-CN".to_string()]),
+            "zh-CN,zh;q=0.9"
+        );
+        assert_eq!(
+            build_accept_language(&["en-US".to_string()]),
+            "en-US,en;q=0.9"
+        );
+        assert_eq!(
+            build_accept_language(&["en-US".to_string(), "en".to_string()]),
+            "en-US,en;q=0.9"
+        );
     }
 
     #[test]
@@ -1467,6 +1575,78 @@ mod tests {
             .find(|(k, _)| k.eq_ignore_ascii_case("accept-language"))
             .expect("accept-language present");
         assert_eq!(al.1, "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7");
+    }
+
+    #[test]
+    fn chrome_frame_navigation_headers_match_cross_site_iframe_shape() {
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let headers = nav_headers_frame(
+            &profile,
+            "https://challenges.example.test/frame",
+            "https://accounts.example.org/",
+            false,
+        );
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+
+        assert_eq!(value("sec-fetch-dest"), Some("iframe"));
+        assert_eq!(value("sec-fetch-mode"), Some("navigate"));
+        assert_eq!(value("sec-fetch-site"), Some("cross-site"));
+        assert_eq!(value("sec-fetch-user"), Some("?1"));
+        assert_eq!(value("referer"), Some("https://accounts.example.org/"));
+        assert_eq!(value("priority"), Some("u=0, i"));
+        assert!(value("origin").is_none());
+
+        let referer_index = headers
+            .iter()
+            .position(|(name, _)| name == "referer")
+            .unwrap();
+        let encoding_index = headers
+            .iter()
+            .position(|(name, _)| name == "accept-encoding")
+            .unwrap();
+        assert!(referer_index < encoding_index);
+    }
+
+    #[test]
+    fn chrome_frame_navigation_site_classification_tracks_embedding_url() {
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let header = |target: &str, referrer: &str, name: &str| {
+            nav_headers_frame(&profile, target, referrer, false)
+                .into_iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value)
+                .unwrap()
+        };
+
+        assert_eq!(
+            header(
+                "https://shop.example.com/frame",
+                "https://shop.example.com/page",
+                "sec-fetch-site"
+            ),
+            "same-origin"
+        );
+        assert_eq!(
+            header(
+                "https://cdn.example.com/frame",
+                "https://shop.example.com/page",
+                "sec-fetch-site"
+            ),
+            "same-site"
+        );
+        assert_eq!(
+            header(
+                "https://other.example.net/frame",
+                "https://shop.example.com/page",
+                "sec-fetch-site"
+            ),
+            "cross-site"
+        );
     }
 
     #[test]

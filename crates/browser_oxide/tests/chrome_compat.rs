@@ -6,6 +6,54 @@
 
 use browser_oxide::Page;
 
+#[tokio::test]
+async fn window_named_properties_match_chrome_element_and_frame_lookup() {
+    let mut page = Page::from_html_with_url(
+        "<!doctype html><html><body><div id='namedProbe'></div><input name='namedInput'><iframe name='namedFrame'></iframe></body></html>",
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    let result = page
+        .evaluate(
+            r#"JSON.stringify({
+                idType: typeof window.namedProbe,
+                idSame: window.namedProbe === document.getElementById('namedProbe'),
+                idOwn: Object.prototype.hasOwnProperty.call(window, 'namedProbe'),
+                idEnumerable: Object.keys(window).includes('namedProbe'),
+                inputType: typeof window.namedInput,
+                frameType: typeof window.namedFrame,
+                frameTag: Object.prototype.toString.call(window.namedFrame),
+                frameOwn: Object.prototype.hasOwnProperty.call(window, 'namedFrame')
+            })"#,
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["idType"], "object");
+    assert_eq!(value["idSame"], true);
+    assert_eq!(value["idOwn"], false);
+    assert_eq!(value["idEnumerable"], false);
+    assert_eq!(value["inputType"], "undefined");
+    assert_eq!(value["frameType"], "object");
+    assert_eq!(value["frameTag"], "[object Window]");
+    assert_eq!(value["frameOwn"], false);
+
+    let dynamic = page
+        .evaluate(
+            r#"(() => {
+                const element = document.getElementById('namedProbe');
+                element.setAttribute('id', 'renamedProbe');
+                const renamed = typeof window.namedProbe === 'undefined'
+                    && window.renamedProbe === element;
+                element.removeAttribute('id');
+                return renamed && typeof window.renamedProbe === 'undefined';
+            })()"#,
+        )
+        .unwrap();
+    assert_eq!(dynamic, "true");
+}
+
 fn html(body: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head></head><body>{}</body></html>",
@@ -1269,12 +1317,32 @@ async fn child_realm_media_capabilities_are_realm_local() {
     );
 }
 
-// Speech synthesis voices
+// Speech synthesis voices are populated asynchronously in Chromium. A new
+// document can legitimately observe [] on the first getVoices() call.
 #[tokio::test]
 async fn api_speech_synthesis_voices() {
     assert_eq!(
-        check("speechSynthesis.getVoices().length > 0").await,
+        check("Array.isArray(speechSynthesis.getVoices())").await,
         "true"
+    );
+}
+
+#[tokio::test]
+async fn api_speech_synthesis_eventtarget_and_illegal_constructor() {
+    assert_eq!(
+        check(
+            r#"JSON.stringify({
+                eventTarget: speechSynthesis instanceof EventTarget,
+                instance: speechSynthesis instanceof SpeechSynthesis,
+                tag: Object.prototype.toString.call(speechSynthesis),
+                illegal: (() => { try { new SpeechSynthesis(); return false; }
+                    catch (error) { return error instanceof TypeError && /Illegal constructor/.test(error.message); } })(),
+                onAccessor: (() => { const d=Object.getOwnPropertyDescriptor(SpeechSynthesis.prototype,'onvoiceschanged');
+                    return !!d && typeof d.get==='function' && typeof d.set==='function' && d.enumerable===true; })()
+            })"#,
+        )
+        .await,
+        r#"{"eventTarget":true,"instance":true,"tag":"[object SpeechSynthesis]","illegal":true,"onAccessor":true}"#
     );
 }
 
@@ -2389,6 +2457,84 @@ async fn perf_navigation_uses_network_measurements_when_available() {
 }
 
 #[tokio::test]
+async fn perf_network_navigation_lifecycle_uses_measured_dispatch_times() {
+    // Make the network navigation 600ms old at runtime creation. PerfState
+    // anchors performance.now() to this HTTP origin, so the lifecycle emitted
+    // below must land around the live elapsed time rather than the historical
+    // fixed 320.5/328.7/515.9ms constants.
+    let time_origin_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        * 1000.0
+        - 600.0;
+    let dom = browser_oxide::html_parser::parse_html("<html><body></body></html>");
+    let mut runtime = browser_oxide::js_runtime::BrowserJsRuntime::with_options(
+        dom,
+        browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
+            navigation_timing: Some(browser_oxide::net::TimingStats {
+                name: "https://example.test/measured-lifecycle".into(),
+                time_origin_unix_ms,
+                request_start_ms: 20.0,
+                response_start_ms: 180.0,
+                response_end_ms: 260.0,
+                transfer_size: 10_300,
+                encoded_body_size: 10_000,
+                decoded_body_size: 30_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    runtime.complete_document_lifecycle();
+    let result = runtime
+        .execute_script(
+            r#"(() => {
+                const e = performance.getEntriesByType('navigation')[0];
+                const t = performance.timing;
+                return JSON.stringify({
+                    responseEnd: e.responseEnd,
+                    domInteractive: e.domInteractive,
+                    dclStart: e.domContentLoadedEventStart,
+                    dclEnd: e.domContentLoadedEventEnd,
+                    domComplete: e.domComplete,
+                    loadStart: e.loadEventStart,
+                    loadEnd: e.loadEventEnd,
+                    legacyDclEnd: t.domContentLoadedEventEnd - t.navigationStart,
+                    legacyLoadEnd: t.loadEventEnd - t.navigationStart,
+                });
+            })()"#,
+            None,
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let number = |key: &str| value[key].as_f64().unwrap();
+    let response_end = number("responseEnd");
+    let dom_interactive = number("domInteractive");
+    let dcl_start = number("dclStart");
+    let dcl_end = number("dclEnd");
+    let dom_complete = number("domComplete");
+    let load_start = number("loadStart");
+    let load_end = number("loadEnd");
+
+    assert!(dom_interactive >= response_end, "{result}");
+    assert!(
+        dom_interactive >= 500.0,
+        "lifecycle remained synthetic: {result}"
+    );
+    assert!(dom_interactive <= dcl_start, "{result}");
+    assert!(dcl_start <= dcl_end, "{result}");
+    assert!(dcl_end <= dom_complete, "{result}");
+    assert!(dom_complete <= load_start, "{result}");
+    assert!(load_start <= load_end, "{result}");
+    assert!((number("legacyDclEnd") - dcl_end).abs() <= 1.0, "{result}");
+    assert!(
+        (number("legacyLoadEnd") - load_end).abs() <= 1.0,
+        "{result}"
+    );
+}
+
+#[tokio::test]
 async fn perf_entries_do_not_invent_vendor_resources() {
     assert_eq!(
         check("performance.getEntries().some(e => /qauth|wbaas/.test(e.name))").await,
@@ -2853,7 +2999,7 @@ async fn performance_memory() {
 #[tokio::test]
 async fn speech_synthesis() {
     assert_eq!(
-        check("speechSynthesis.getVoices().length > 0").await,
+        check("Array.isArray(speechSynthesis.getVoices())").await,
         "true"
     );
 }
@@ -5077,6 +5223,33 @@ async fn shim_recursion_diag_callsite() {
     assert!(
         !result.starts_with("error:"),
         "callsite diag failed: {result}"
+    );
+}
+
+#[tokio::test]
+async fn error_stack_preserves_v8_method_alias_formatting() {
+    let result = check(
+        r#"(() => {
+            function target() { return new Error('boom').stack; }
+            const receiver = { alias: target };
+            return receiver.alias();
+        })()"#,
+    )
+    .await;
+    assert!(
+        result.contains("Object.target [as alias]"),
+        "V8 method alias formatting was lost: {result}"
+    );
+}
+
+#[tokio::test]
+async fn error_stack_preserves_v8_eval_origin_formatting() {
+    let result =
+        check(r#"(() => eval("function inner(){return new Error('boom').stack}; inner()"))()"#)
+            .await;
+    assert!(
+        result.contains("at inner (eval at"),
+        "V8 eval origin formatting was lost: {result}"
     );
 }
 

@@ -279,7 +279,7 @@ pub struct FetchResponse {
 pub async fn op_fetch(
     #[string] url: String,
     #[string] method: String,
-    #[serde] headers: HashMap<String, String>,
+    #[serde] headers: Vec<(String, String)>,
     #[string] body: String,
 ) -> Result<FetchResponse, deno_error::JsErrorBox> {
     // Pull JS-provided headers first. The pseudo origin both drives Fetch
@@ -288,6 +288,7 @@ pub async fn op_fetch(
     let mut extra_headers: Vec<(String, String)> = Vec::with_capacity(headers.len());
     let mut origin: Option<String> = None;
     let mut request_type_hint: Option<String> = None;
+    let mut storage_access: Option<String> = None;
     for (k, v) in headers.into_iter() {
         let lk = k.to_ascii_lowercase();
         if lk == "x-browser-oxide-origin" {
@@ -296,6 +297,13 @@ pub async fn op_fetch(
         }
         if lk == "x-browser-oxide-request-type" {
             request_type_hint = Some(v.to_ascii_lowercase());
+            continue;
+        }
+        if lk == "x-browser-oxide-storage-access" {
+            storage_access = match v.as_str() {
+                "active" | "inactive" | "none" => Some(v),
+                _ => None,
+            };
             continue;
         }
         extra_headers.push((lk, v));
@@ -389,6 +397,30 @@ pub async fn op_fetch(
             "0" | "false" => false,
             substring => url.contains(substring),
         });
+    // Metadata-only network tracing for parity work. Unlike
+    // BROWSER_OXIDE_FETCH_TRACE this never prints request/response bodies, so
+    // opaque proof payloads, credentials, and form values stay out of logs.
+    // It also lives entirely on the Rust side and therefore does not change
+    // the page-observable JS surface the way diagnostics bootstraps can.
+    let fetch_meta_trace = std::env::var("BROWSER_OXIDE_FETCH_META_TRACE")
+        .ok()
+        .is_some_and(|filter| match filter.trim() {
+            "" | "1" | "true" | "all" => true,
+            "0" | "false" => false,
+            substring => url.contains(substring),
+        });
+    if fetch_meta_trace {
+        eprintln!(
+            "[browser-oxide-fetch-meta] request method={} url={} body_len={} header_names={:?}",
+            method,
+            url,
+            body_bytes.len(),
+            extra_headers
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
     if fetch_trace {
         eprintln!(
             "[browser-oxide-fetch] request method={} url={} body_len={} header_names={:?} body={}",
@@ -424,7 +456,13 @@ pub async fn op_fetch(
         match method_upper.as_str() {
             "POST" | "PUT" | "PATCH" => {
                 client
-                    .fetch_post_bytes(&url, &body_bytes, &extra_headers, origin.as_deref())
+                    .fetch_post_bytes(
+                        &url,
+                        &body_bytes,
+                        &extra_headers,
+                        origin.as_deref(),
+                        storage_access.as_deref(),
+                    )
                     .await
             }
             _ => {
@@ -434,6 +472,7 @@ pub async fn op_fetch(
                         &extra_headers,
                         origin.as_deref(),
                         request_type_hint.as_deref(),
+                        storage_access.as_deref(),
                     )
                     .await
             }
@@ -472,6 +511,17 @@ pub async fn op_fetch(
     let response_body_bytes = (request_type_hint.as_deref() == Some("image") || response_is_image)
         .then(|| resp.body.clone());
     let body_text = resp.text();
+    if fetch_meta_trace {
+        eprintln!(
+            "[browser-oxide-fetch-meta] response status={} url={} body_len={} transfer_size={} encoded_body_size={} decoded_body_size={}",
+            resp.status,
+            resp.url,
+            body_text.len(),
+            resp.timings.transfer_size,
+            resp.timings.encoded_body_size,
+            resp.timings.decoded_body_size,
+        );
+    }
     if fetch_trace {
         let mut response_headers = resp
             .headers

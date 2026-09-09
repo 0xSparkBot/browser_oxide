@@ -97,6 +97,91 @@ static NEXT_FRAME_ID: AtomicU32 = AtomicU32::new(1);
 /// and the driver delivers it at once — a multi-step frame RPC times out otherwise.
 static FRAME_MSG_PENDING: AtomicBool = AtomicBool::new(false);
 
+fn collect_numeric_frame_fields(
+    value: &serde_json::Value,
+    path: &str,
+    out: &mut Vec<(String, f64)>,
+) {
+    if out.len() >= 96 {
+        return;
+    }
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_f64() {
+                out.push((path.to_string(), value));
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.iter().take(24).enumerate() {
+                let child = if path.is_empty() {
+                    format!("[{index}]")
+                } else {
+                    format!("{path}[{index}]")
+                };
+                collect_numeric_frame_fields(value, &child, out);
+                if out.len() >= 96 {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values.iter().take(96) {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                collect_numeric_frame_fields(value, &child, out);
+                if out.len() >= 96 {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn trace_frame_message_meta(target_id: u32, source_id: u32, data: &str) {
+    if std::env::var_os("BROWSER_OXIDE_FRAME_META_TRACE").is_none() {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        eprintln!(
+            "[frame-meta] {source_id}->{target_id} wire_len={} json=false",
+            data.len()
+        );
+        return;
+    };
+    let keys = value
+        .as_object()
+        .map(|object| object.keys().take(64).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Keep the trace useful without accidentally dumping opaque response
+    // values.  `event` and `source` are protocol-shape metadata (short,
+    // non-secret strings) and are enough to distinguish lifecycle messages;
+    // all other string-valued fields remain redacted.
+    let strings = value
+        .as_object()
+        .map(|object| {
+            ["source", "event"]
+                .into_iter()
+                .filter_map(|key| {
+                    object
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(|text| (key.to_string(), text.chars().take(96).collect::<String>()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut numeric = Vec::new();
+    collect_numeric_frame_fields(&value, "", &mut numeric);
+    eprintln!(
+        "[frame-meta] {source_id}->{target_id} wire_len={} keys={keys:?} strings={strings:?} numeric={numeric:?}",
+        data.len()
+    );
+}
+
 pub fn frame_msg_pending() -> bool {
     FRAME_MSG_PENDING.load(Ordering::Relaxed)
 }
@@ -169,6 +254,7 @@ pub fn op_frame_post_message(
             &data[..data.len().min(2000)]
         );
     }
+    trace_frame_message_meta(target_id, source_id, data);
     if let Ok(mut m) = frame_mailboxes().lock() {
         m.entry(target_id).or_default().push_back(FrameMessage {
             source_id,

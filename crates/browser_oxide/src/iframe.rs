@@ -11,6 +11,404 @@ use crate::js_runtime::BrowserJsRuntime;
 use std::time::Duration;
 use tracing;
 
+const VM_CALL_TRACE_BOOTSTRAP: &str = r#"
+globalThis.__oxVmInstrumentation = 'iframe-handler-call-v2';
+globalThis.__oxVmEventN = 0;
+globalThis.__oxVmEventCounts = Object.create(null);
+globalThis.__oxVmEvents = [];
+globalThis.__oxVmRuns = [];
+globalThis.__oxVmStateMeta = [];
+globalThis.__oxVmStates = [];
+globalThis.__oxVmRunSnapshots = [];
+globalThis.__oxVmCaughtErrors = [];
+globalThis.__oxVmThrownCallErrors = [];
+globalThis.__oxVmPromiseTrace = [];
+globalThis.__oxVmPromiseAllTrace = [];
+globalThis.__oxVmScheduleTrace = [];
+const __oxVmIds = new WeakMap();
+const __oxVmProgress = new WeakMap();
+const __oxVmSeenErrors = new WeakSet();
+const __oxVmSeenErrorSignatures = new Set();
+let __oxVmNextId = 1;
+let __oxVmPromiseNextId = 1;
+const __oxVmNativePromiseThen = Promise.prototype.then;
+const __oxVmTraceScheduler = function(name) {
+    const nativeScheduler = globalThis[name];
+    if (typeof nativeScheduler !== 'function') return;
+    globalThis[name] = new Proxy(nativeScheduler, {
+        apply(target, thisArg, args) {
+            const callback = args[0];
+            const record = {
+                id: globalThis.__oxVmScheduleTrace.length + 1,
+                phase: 'schedule', kind: name, at: performance.now(),
+                delay: args.length > 1 ? Number(args[1]) : null,
+                callback: typeof callback === 'function'
+                    ? { name: String(callback.name || ''), source: String(callback).slice(0, 240) }
+                    : { type: typeof callback, value: String(callback).slice(0, 240) },
+                stack: String(new Error().stack || '').slice(0, 900)
+            };
+            const trace = globalThis.__oxVmScheduleTrace;
+            trace.push(record);
+            if (trace.length > 8192) trace.splice(0, trace.length - 8192);
+            if (typeof callback === 'function') {
+                const wrapped = function() {
+                    trace.push({
+                        id: record.id, phase: 'fire', kind: name,
+                        at: performance.now(), argc: arguments.length
+                    });
+                    if (trace.length > 8192) trace.splice(0, trace.length - 8192);
+                    try {
+                        const result = Reflect.apply(callback, this, arguments);
+                        trace.push({
+                            id: record.id, phase: 'return', kind: name,
+                            at: performance.now(), result: __oxVmDescribe(result)
+                        });
+                        return result;
+                    } catch (error) {
+                        trace.push({
+                            id: record.id, phase: 'throw', kind: name,
+                            at: performance.now(), error: __oxVmDescribe(error)
+                        });
+                        throw error;
+                    }
+                };
+                args = Array.prototype.slice.call(args);
+                args[0] = wrapped;
+            }
+            const result = Reflect.apply(target, thisArg, args);
+            record.result = typeof result === 'number' ? result : __oxVmDescribe(result);
+            return result;
+        }
+    });
+};
+for (const __oxVmSchedulerName of [
+    'setTimeout', 'setInterval', 'requestAnimationFrame',
+    'requestIdleCallback', 'queueMicrotask'
+]) {
+    try { __oxVmTraceScheduler(__oxVmSchedulerName); } catch (_) {}
+}
+const __oxVmPromiseCallback = function(callback) {
+    if (typeof callback !== 'function') return typeof callback;
+    return { name: String(callback.name || ''), source: String(callback).slice(0, 240) };
+};
+Promise.prototype.then = new Proxy(__oxVmNativePromiseThen, {
+    apply(target, thisArg, args) {
+        const record = {
+            id: __oxVmPromiseNextId++, at: performance.now(),
+            fulfilled: __oxVmPromiseCallback(args[0]),
+            rejected: __oxVmPromiseCallback(args[1]),
+            stack: String(new Error().stack || '').slice(0, 900)
+        };
+        const trace = globalThis.__oxVmPromiseTrace;
+        trace.push(record);
+        if (trace.length > 4096) trace.splice(0, trace.length - 4096);
+        const wrap = function(callback, kind) {
+            if (typeof callback !== 'function') return callback;
+            return function(value) {
+                record.settledAt = performance.now();
+                record.settledKind = kind;
+                record.value = __oxVmDescribe(value);
+                try {
+                    const result = Reflect.apply(callback, this, arguments);
+                    record.result = __oxVmDescribe(result);
+                    return result;
+                } catch (error) {
+                    record.callbackError = __oxVmDescribe(error);
+                    throw error;
+                }
+            };
+        };
+        return Reflect.apply(target, thisArg, [
+            wrap(args[0], 'fulfilled'), wrap(args[1], 'rejected')
+        ]);
+    }
+});
+const __oxVmShouldCaptureError = function(error) {
+    const message = String(error && error.message || error || '');
+    if (!message) return false;
+    return !message.includes('Cyclic __proto__ value') &&
+        !message.includes("'caller', 'callee', and 'arguments' properties") &&
+        !message.includes("Function.prototype.toString requires that 'this' be a Function") &&
+        !message.includes('Invalid code point -1');
+};
+const __oxVmErrorSignature = function(kind, error) {
+    const stack = String(error && error.stack || '');
+    return kind + '|' + String(error && error.name || '') + '|' +
+        String(error && error.message || error || '') + '|' +
+        stack.split('\n').slice(0, 3).join('\n');
+};
+const __oxVmDescribe = function(value, depth) {
+    depth = Number(depth) || 0;
+    const type = typeof value;
+    if (value === undefined || value === null || type === 'boolean' || type === 'number') {
+        return value;
+    }
+    if (type === 'string') return value.slice(0, 1200);
+    if (type === 'function') return { type: 'function', name: String(value.name || '') };
+    const tag = Object.prototype.toString.call(value);
+    if (tag === '[object Window]') return { type: tag };
+    if (depth >= 3) return { type: tag };
+    if (tag === '[object MessageEvent]') {
+        let data;
+        try { data = __oxVmDescribe(value.data, depth + 1); } catch (error) { data = String(error); }
+        return { type: tag, data: data };
+    }
+    if (value instanceof Error) {
+        return { type: tag, name: value.name, message: value.message,
+            stack: String(value.stack || '').slice(0, 1200) };
+    }
+    if (Array.isArray(value)) {
+        return { type: tag, length: value.length,
+            values: value.slice(0, 24).map(value => __oxVmDescribe(value, depth + 1)) };
+    }
+    const own = {};
+    try {
+        for (const key of Object.getOwnPropertyNames(value).slice(0, 40)) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+            if (descriptor && 'value' in descriptor) {
+                own[key] = __oxVmDescribe(descriptor.value, depth + 1);
+            }
+        }
+    } catch (_) {}
+    return { type: tag, own: own };
+};
+const __oxVmCounterStores = function(heap) {
+    const found = [];
+    const seen = new WeakSet();
+    const walk = function(value, path, depth) {
+        if (!value || typeof value !== 'object' || depth > 6 || seen.has(value)) return;
+        seen.add(value);
+        try {
+            if (Object.prototype.hasOwnProperty.call(value, 'tQdUc5')) {
+                const numbered = {};
+                Object.getOwnPropertyNames(value)
+                    .filter(key => /^\d+$/.test(key))
+                    .forEach(key => { numbered[key] = __oxVmDescribe(value[key]); });
+                found.push({
+                    path, tQdUc5: value.tQdUc5, ZMSOw0: value.ZMSOw0,
+                    twvE0: value.twvE0, TzZRB1: value.TzZRB1,
+                    keys: Object.getOwnPropertyNames(value), numbered
+                });
+            }
+            if (Array.isArray(value)) {
+                for (let index = 0; index < value.length && index < 320; index++) {
+                    walk(value[index], path + '[' + index + ']', depth + 1);
+                }
+            } else {
+                for (const key of Object.getOwnPropertyNames(value).slice(0, 320)) {
+                    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+                    if (descriptor && 'value' in descriptor) {
+                        walk(descriptor.value, path + '.' + key, depth + 1);
+                    }
+                }
+            }
+        } catch (_) {}
+    };
+    for (let index = 0; index < heap.length; index++) {
+        walk(heap[index], 'h[' + index + ']', 0);
+    }
+    return found;
+};
+const __oxVmNativePromiseAll = Promise.all;
+Promise.all = new Proxy(__oxVmNativePromiseAll, {
+    apply(target, thisArg, args) {
+        const input = args[0];
+        const record = {
+            id: globalThis.__oxVmPromiseAllTrace.length + 1,
+            at: performance.now(),
+            length: Array.isArray(input) ? input.length : null,
+            inputs: Array.isArray(input)
+                ? input.slice(0, 48).map(value => __oxVmDescribe(value)) : [],
+            stack: String(new Error().stack || '').slice(0, 900)
+        };
+        globalThis.__oxVmPromiseAllTrace.push(record);
+        const promise = Reflect.apply(target, thisArg, args);
+        Reflect.apply(__oxVmNativePromiseThen, promise, [
+            function(value) {
+                record.settledAt = performance.now();
+                record.settledKind = 'fulfilled';
+                record.value = __oxVmDescribe(value);
+            },
+            function(error) {
+                record.settledAt = performance.now();
+                record.settledKind = 'rejected';
+                record.value = __oxVmDescribe(error);
+            }
+        ]);
+        return promise;
+    }
+});
+globalThis.__oxWrapVm = function(fn, name) {
+    try {
+        if (!fn || Object.prototype.hasOwnProperty.call(fn, 'call')) return;
+        Object.defineProperty(fn, 'call', {
+            configurable: true,
+            writable: true,
+            value: function(vm) {
+                const args = Array.prototype.slice.call(arguments, 1);
+                const heap = vm && vm.h;
+                const before = heap && Number(heap[vm.l]);
+                let vmId = __oxVmIds.get(vm);
+                if (!vmId) {
+                    vmId = __oxVmNextId++;
+                    __oxVmIds.set(vm, vmId);
+                    globalThis.__oxVmStateMeta.push([
+                        vmId, vm && vm.i, vm && vm.j, vm && vm.m, vm && vm.l, vm && vm.o,
+                        heap && heap.length
+                    ]);
+                    globalThis.__oxVmStates[vmId] = vm;
+                }
+                globalThis.__oxVmLast = vm;
+                const at = performance.now();
+                const previous = __oxVmProgress.get(vm);
+                if (!previous || at - previous.at > 0.5) {
+                    const runs = globalThis.__oxVmRuns;
+                    runs.push([at, vmId, name, before, previous ? previous.after : null]);
+                    if (runs.length > 2048) runs.splice(0, runs.length - 2048);
+                    try {
+                        const bytecode = heap && heap[vm.m];
+                        if (bytecode && bytecode.length > 100000) {
+                            const values = [];
+                            for (let index = 0; index < heap.length; index++) {
+                                const value = heap[index];
+                                if (value !== undefined && value !== 0) {
+                                    values.push([index, __oxVmDescribe(value)]);
+                                }
+                            }
+                            const snapshots = globalThis.__oxVmRunSnapshots;
+                            snapshots.push({ at: at, vmId: vmId, name: name, pc: before,
+                                values: values, stores: __oxVmCounterStores(heap) });
+                            if (snapshots.length > 128) snapshots.shift();
+                        }
+                    } catch (_) {}
+                }
+                const count = (globalThis.__oxVmEventCounts[name] || 0) + 1;
+                globalThis.__oxVmEventCounts[name] = count;
+                globalThis.__oxVmEventN++;
+                let result;
+                let error = null;
+                try {
+                    result = Reflect.apply(fn, vm, args);
+                    return result;
+                } catch (caught) {
+                    error = caught;
+                    try {
+                        const bytecode = heap && heap[vm.m];
+                        const signature = __oxVmErrorSignature('thrown', caught);
+                        if (bytecode && bytecode.length > 100000 &&
+                            __oxVmShouldCaptureError(caught) &&
+                            !__oxVmSeenErrorSignatures.has(signature) &&
+                            globalThis.__oxVmThrownCallErrors.length < 128) {
+                            __oxVmSeenErrorSignatures.add(signature);
+                            const values = [];
+                            for (let index = 0; index < heap.length; index++) {
+                                const value = heap[index];
+                                if (value !== undefined && value !== 0) {
+                                    values.push([index, __oxVmDescribe(value)]);
+                                }
+                            }
+                            globalThis.__oxVmThrownCallErrors.push({
+                                at: performance.now(), vmId: vmId, handler: name,
+                                before: before, after: heap && Number(heap[vm.l]),
+                                error: __oxVmDescribe(caught),
+                                bytecode: Array.prototype.slice.call(
+                                    bytecode, Math.max(0, Number(before) - 32), Number(before) + 64
+                                ),
+                                values: values
+                            });
+                        }
+                    } catch (_) {}
+                    throw caught;
+                } finally {
+                    try {
+                        const after = heap && Number(heap[vm.l]);
+                        const bytecode = heap && heap[vm.m];
+                        if (bytecode && bytecode.length > 100000) {
+                            for (let index = 0; index < heap.length; index++) {
+                                const value = heap[index];
+                                if (!(value instanceof Error) || __oxVmSeenErrors.has(value) ||
+                                    !__oxVmShouldCaptureError(value)) continue;
+                                __oxVmSeenErrors.add(value);
+                                const signature = __oxVmErrorSignature('heap', value);
+                                if (__oxVmSeenErrorSignatures.has(signature) ||
+                                    globalThis.__oxVmCaughtErrors.length >= 128) continue;
+                                __oxVmSeenErrorSignatures.add(signature);
+                                const values = [];
+                                for (let heapIndex = 0; heapIndex < heap.length; heapIndex++) {
+                                    const heapValue = heap[heapIndex];
+                                    if (heapValue !== undefined && heapValue !== 0) {
+                                        values.push([heapIndex, __oxVmDescribe(heapValue)]);
+                                    }
+                                }
+                                globalThis.__oxVmCaughtErrors.push({
+                                    at: performance.now(), vmId: vmId, handler: name,
+                                    before: before, after: after, heapIndex: index,
+                                    error: __oxVmDescribe(value),
+                                    bytecode: Array.prototype.slice.call(
+                                        bytecode, Math.max(0, Number(before) - 32), Number(before) + 64
+                                    ),
+                                    values: values
+                                });
+                            }
+                        }
+                        __oxVmProgress.set(vm, { at: performance.now(), after });
+                        const events = globalThis.__oxVmEvents;
+                        events.push([
+                            performance.now(), name, count, before, after,
+                            error ? String(error && (error.stack || error)).slice(0, 600) : '',
+                            vmId, vm && vm.i, vm && vm.j, vm && vm.m, vm && vm.l, vm && vm.o
+                        ]);
+                        if (events.length > 1024) events.splice(0, events.length - 1024);
+                    } catch (_) {}
+                }
+            }
+        });
+    } catch (_) {}
+};
+"#;
+
+fn instrument_vm_handler_calls(code: &str) -> String {
+    let marker = "function ";
+    let positions: Vec<usize> = code.match_indices(marker).map(|(at, _)| at).collect();
+    let mut insertions = Vec::new();
+    for (index, &at) in positions.iter().enumerate() {
+        let name_start = at + marker.len();
+        let Some(name_end_rel) = code[name_start..].find('(') else {
+            continue;
+        };
+        let name_end = name_start + name_end_rel;
+        let name = code[name_start..name_end].trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$')
+        {
+            continue;
+        }
+        let next = positions.get(index + 1).copied().unwrap_or(code.len());
+        let function_region = &code[at..next];
+        if function_region.contains("this.h") && function_region.contains("this.l") {
+            insertions.push((at, name.to_string()));
+        }
+    }
+
+    let mut traced =
+        String::with_capacity(code.len() + insertions.len() * 40 + VM_CALL_TRACE_BOOTSTRAP.len());
+    traced.push_str(VM_CALL_TRACE_BOOTSTRAP);
+    let mut cursor = 0;
+    for (at, name) in insertions {
+        traced.push_str(&code[cursor..at]);
+        traced.push_str("globalThis.__oxWrapVm(");
+        traced.push_str(&name);
+        traced.push_str(",'");
+        traced.push_str(&name);
+        traced.push_str("');");
+        cursor = at;
+    }
+    traced.push_str(&code[cursor..]);
+    traced
+}
+
 /// Info about an iframe found in the DOM.
 pub struct IframeInfo {
     pub node_id: NodeId,
@@ -226,7 +624,7 @@ impl ChildIframe {
         }
 
         let resp = client
-            .get(url)
+            .get_frame_navigation(url, referrer)
             .await
             .map_err(|e| deno_core::error::AnyError::msg(format!("iframe fetch error: {}", e)))?;
 
@@ -303,6 +701,201 @@ impl ChildIframe {
         let runtime = BrowserJsRuntime::with_options(dom, options);
         let mut event_loop = BrowserEventLoop::new(runtime);
 
+        if std::env::var_os("BROWSER_OXIDE_CHL_TIMING_TRACE").is_some() {
+            let object_url_delay_ms = std::env::var("BROWSER_OXIDE_OBJECT_URL_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(0.0)
+                .clamp(0.0, 5_000.0);
+            let timing_trace_script = r#"
+globalThis.__oxChlTimingTrace = [];
+Object.defineProperty(globalThis, '_cf_chl_opt', {
+    configurable: true,
+    set: function(value) {
+        const trace = globalThis.__oxChlTimingTrace;
+        const proxy = new Proxy(value, {
+            set: function(target, key, next) {
+                if (key === 'HPTB8' || key === 'USPmo4' || key === 'QWkZ6' ||
+                    key === 'OuRz1' || key === 'GrXx7' || key === 'tLOO8' ||
+                    key === 'AOzXq2' || key === 'lSKCv5' || key === 'xZLH1' ||
+                    key === 'DausG2' || key === 'CXYBD4' || key === 'BHwY7') {
+                    const record = {
+                        key: String(key), value: next, date: Date.now(),
+                        now: performance.now(),
+                        stack: String(new Error().stack || '').slice(0, 1200)
+                    };
+                    if (key === 'HPTB8') {
+                        record.vmEventN = globalThis.__oxVmEventN || 0;
+                        record.vmEventCounts = Object.assign(
+                            {}, globalThis.__oxVmEventCounts || {}
+                        );
+                        record.vmEvents = (globalThis.__oxVmEvents || []).slice(-1024);
+                        record.opCallCount = globalThis.__oxOpCallCount || 0;
+                    }
+                    trace.push(record);
+                }
+                return Reflect.set(target, key, next);
+            }
+        });
+        Object.defineProperty(globalThis, '_cf_chl_opt', {
+            value: proxy,
+            writable: true,
+            configurable: true,
+            enumerable: true
+        });
+    }
+});
+globalThis.__oxObjectUrlDiag = [];
+if (globalThis.URL && typeof globalThis.URL.createObjectURL === 'function') {
+    const nativeCreateObjectURL = globalThis.URL.createObjectURL;
+    globalThis.URL.createObjectURL = new Proxy(nativeCreateObjectURL, {
+        apply: function(target, thisArg, args) {
+            const started = performance.now();
+            const value = args[0];
+            const record = {
+                phase: 'call', at: started,
+                size: Number(value && value.size) || 0,
+                type: String(value && value.type || ''),
+                tag: Object.prototype.toString.call(value),
+                stack: String(new Error().stack || '').slice(0, 1600)
+            };
+            // Diagnostics-only: small JavaScript worker blobs are normally
+            // loader shims. Capture their source so a stalled worker can be
+            // distinguished from a parent that simply never posted work.
+            // Keep the cap low so opaque proof programs are never dumped.
+            try {
+                if (record.size <= 1024
+                    && record.type === 'text/javascript'
+                    && value && value._data instanceof Uint8Array) {
+                    record.smallJsSource = new TextDecoder('utf-8', {fatal:false})
+                        .decode(value._data).slice(0, 1024);
+                }
+            } catch (_) {}
+            globalThis.__oxObjectUrlDiag.push(record);
+            try {
+                const result = Reflect.apply(target, thisArg, args);
+                const matchingDelay = globalThis.__oxObjectUrlDiag.length === 1
+                    ? {object_url_delay_ms} : 0;
+                const delayUntil = performance.now() + matchingDelay;
+                while (performance.now() < delayUntil) {}
+                record.phase = 'return';
+                record.end = performance.now();
+                record.duration = record.end - started;
+                record.result = String(result).slice(0, 200);
+                return result;
+            } catch (error) {
+                record.phase = 'throw';
+                record.end = performance.now();
+                record.duration = record.end - started;
+                record.error = String(error && error.stack || error).slice(0, 1200);
+                throw error;
+            }
+        }
+    });
+}
+globalThis.__oxRunProgramDiag = [];
+let __oxRunProgramValue;
+const __oxShortHash = function(value) {
+    if (typeof value !== 'string') return null;
+    let hash = 2166136261 >>> 0;
+    for (let i = 0; i < value.length; i++) {
+        hash ^= value.charCodeAt(i);
+        hash = Math.imul(hash, 16777619) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+};
+Object.defineProperty(globalThis, 'runProgram', {
+    configurable: true,
+    enumerable: false,
+    get: function() { return __oxRunProgramValue; },
+    set: function(value) {
+        const assigned = {
+            phase: 'assign', at: performance.now(), type: typeof value,
+            name: String(value && value.name || ''),
+            length: Number(value && value.length) || 0,
+            stack: String(new Error().stack || '').slice(0, 1600)
+        };
+        globalThis.__oxRunProgramDiag.push(assigned);
+        if (typeof value !== 'function') {
+            __oxRunProgramValue = value;
+            return;
+        }
+        __oxRunProgramValue = new Proxy(value, {
+            apply: function(target, thisArg, args) {
+                const started = performance.now();
+                const record = {
+                    phase: 'factory-call', at: started, argc: args.length,
+                    argTypes: args.map(function(arg) { return Object.prototype.toString.call(arg); }),
+                    argLengths: args.map(function(arg) { return Number(arg && (arg.length === undefined ? arg.byteLength : arg.length)) || 0; }),
+                    argHashes: args.map(__oxShortHash),
+                    stack: String(new Error().stack || '').slice(0, 1600)
+                };
+                globalThis.__oxRunProgramDiag.push(record);
+                const result = Reflect.apply(target, thisArg, args);
+                record.end = performance.now();
+                record.duration = record.end - started;
+                record.resultType = typeof result;
+                if (typeof result !== 'function') return result;
+                return new Proxy(result, {
+                    apply: function(innerTarget, innerThis, innerArgs) {
+                        const innerStarted = performance.now();
+                        const innerRecord = {
+                            phase: 'program-call', at: innerStarted, argc: innerArgs.length,
+                            argTypes: innerArgs.map(function(arg) { return Object.prototype.toString.call(arg); }),
+                            stack: String(new Error().stack || '').slice(0, 1600)
+                        };
+                        globalThis.__oxRunProgramDiag.push(innerRecord);
+                        try {
+                            const innerResult = Reflect.apply(innerTarget, innerThis, innerArgs);
+                            innerRecord.end = performance.now();
+                            innerRecord.duration = innerRecord.end - innerStarted;
+                            innerRecord.resultType = typeof innerResult;
+                            return innerResult;
+                        } catch (error) {
+                            innerRecord.end = performance.now();
+                            innerRecord.duration = innerRecord.end - innerStarted;
+                            innerRecord.error = String(error && error.stack || error).slice(0, 1200);
+                            throw error;
+                        }
+                    }
+                });
+            }
+        });
+    }
+});
+globalThis.__oxWorkerCtorEarlyDiag = [];
+if (typeof globalThis.Worker === 'function') {
+    const nativeWorker = globalThis.Worker;
+    globalThis.Worker = new Proxy(nativeWorker, {
+        construct: function(target, args, newTarget) {
+            const record = {
+                phase: 'call', at: performance.now(),
+                url: String(args[0] || '').slice(0, 300),
+                options: args.length > 1 ? String(args[1]) : '',
+                stack: String(new Error().stack || '').slice(0, 1600)
+            };
+            globalThis.__oxWorkerCtorEarlyDiag.push(record);
+            try {
+                const result = Reflect.construct(target, args, newTarget);
+                record.phase = 'return';
+                record.end = performance.now();
+                record.duration = record.end - record.at;
+                return result;
+            } catch (error) {
+                record.phase = 'throw';
+                record.end = performance.now();
+                record.duration = record.end - record.at;
+                record.error = String(error && error.stack || error).slice(0,1600);
+                throw error;
+            }
+        }
+    });
+}
+"#
+            .replace("{object_url_delay_ms}", &object_url_delay_ms.to_string());
+            event_loop.execute_script(&timing_trace_script)?;
+        }
+
         // Set location
         let url_js = url.replace('\\', "\\\\").replace('\'', "\\'");
         event_loop
@@ -348,7 +941,7 @@ impl ChildIframe {
 
         // Execute scripts, fetching external ones
         for (i, script) in scripts.iter().enumerate() {
-            let code = if let Some(src) = &script.src {
+            let mut code = if let Some(src) = &script.src {
                 let full_url = if src.starts_with("http") {
                     src.clone()
                 } else if src.starts_with('/') {
@@ -381,6 +974,9 @@ impl ChildIframe {
 
             if code.trim().is_empty() {
                 continue;
+            }
+            if std::env::var_os("BROWSER_OXIDE_VM_CALL_TRACE").is_some() {
+                code = instrument_vm_handler_calls(&code);
             }
             // W2.7 — name scripts by their actual URL (external src or
             // the iframe document URL for inline). Chrome stack frames

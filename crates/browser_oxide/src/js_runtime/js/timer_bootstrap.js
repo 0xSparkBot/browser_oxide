@@ -1,6 +1,103 @@
 ((globalThis) => {
     const ops = Deno.core.ops;
     const _cancelledTimers = new Set();
+    const _timerDiagnosticsEnabled =
+        globalThis.__browser_oxide_debug === true ||
+        globalThis.__oxideDiagnostics === true;
+    const _timerPrivateTraceEnabled = !!(
+        ops.op_timer_private_trace_enabled && ops.op_timer_private_trace_enabled()
+    );
+    const _timerWireTraceEnabled = !!(
+        ops.op_timer_wire_trace_enabled && ops.op_timer_wire_trace_enabled()
+    );
+    const _timerWireTrace = (row) => {
+        if (!_timerWireTraceEnabled) return;
+        try {
+            row.realmOrigin = String(globalThis.location && globalThis.location.origin || "");
+            row.timeOrigin = Number(globalThis.performance && globalThis.performance.timeOrigin || 0);
+            ops.op_timer_wire_trace(JSON.stringify(row));
+        } catch (_) {}
+    };
+    const _timerArgDiag = [];
+    if (_timerDiagnosticsEnabled) {
+        Object.defineProperty(globalThis, "__oxTimerArgDiag", {
+            value: _timerArgDiag,
+            configurable: true,
+        });
+    }
+
+    // Diagnostics-only capture for timer calls carrying extra arguments.
+    // Challenge runtimes and large applications commonly shuttle an opaque
+    // state object through setTimeout(fn, delay, ...args); keeping a bounded
+    // record makes cross-engine behavioral diffs possible without wrapping
+    // the page API from the outside (which itself changes Function#toString).
+    function _recordTimerArgs(kind, callback, ms, args) {
+        if (_timerPrivateTraceEnabled && args.length > 0) {
+            try {
+                const describe = (value, depth = 0) => {
+                    if (value === null) return { type: "null" };
+                    const type = typeof value;
+                    if (type === "number" || type === "boolean") {
+                        return { type, value };
+                    }
+                    if (type === "string") return { type, length: value.length };
+                    if (type === "undefined") return { type };
+                    if (Array.isArray(value)) {
+                        return { type: "array", length: value.length };
+                    }
+                    if (type === "object") {
+                        const keys = Object.keys(value);
+                        const fields = {};
+                        if (depth < 1 && keys.length >= 16) {
+                            for (const key of keys) {
+                                try { fields[key] = describe(value[key], depth + 1); } catch (_) {}
+                            }
+                        }
+                        return { type: "object", keys, fields };
+                    }
+                    return { type };
+                };
+                const described = args.map((value) => describe(value));
+                // Only emit state-bearing timers; this avoids noise from the
+                // ordinary one/two-value timer traffic of application code.
+                if (described.some((entry) => entry.type === "object" && entry.keys.length >= 16)) {
+                    ops.op_timer_private_trace(JSON.stringify({
+                        kind,
+                        delay: ms,
+                        argc: args.length,
+                        callback: String((callback && callback.name) || ""),
+                        args: described,
+                    }));
+                }
+            } catch (_) {}
+        }
+        if (!_timerDiagnosticsEnabled || args.length === 0) return;
+        try {
+            const text = JSON.stringify(args);
+            _timerArgDiag.push({
+                kind,
+                delay: ms,
+                argc: args.length,
+                callback: String((callback && callback.name) || ""),
+                keys: args.map((value) => {
+                    try {
+                        return value && typeof value === "object"
+                            ? Object.keys(value)
+                            : [];
+                    } catch (_) {
+                        return [];
+                    }
+                }),
+                length: text.length,
+                text: text.slice(0, 50000),
+                at: globalThis.performance &&
+                    typeof globalThis.performance.now === "function"
+                    ? globalThis.performance.now()
+                    : 0,
+            });
+            if (_timerArgDiag.length > 64) _timerArgDiag.shift();
+        } catch (_) {}
+    }
     // Timer generation — bumped by `globalThis.__cancelAllTimers()` so that
     // the warm-reuse path in `Page::navigate_warm` can mass-cancel every
     // in-flight `setTimeout`/`setInterval` callback from the previous page
@@ -99,7 +196,19 @@
             callback = new Function(String(callback));
         }
         const ms = Math.max(0, delay | 0);
+        _recordTimerArgs("timeout", callback, ms, args);
         const id = ops.op_set_timeout(ms);
+        if (_timerWireTraceEnabled) {
+            _timerWireTrace({
+                phase: "schedule",
+                kind: "timeout",
+                id,
+                delay: ms,
+                at: performance.now(),
+                callback: String((callback && callback.name) || ""),
+                sourceLength: String(callback).length,
+            });
+        }
         // Async ops in deno_core 0.311 are called directly and return Promise.
         const p = ops.op_timer_sleep(ms);
         _maybeUnref(p, ms);
@@ -107,10 +216,24 @@
         p.then(() => {
             if (myGen !== _timerGen) return; // post `__cancelAllTimers`, drop
             if (!_cancelledTimers.has(id)) {
+                const started = _timerWireTraceEnabled ? performance.now() : 0;
                 try {
                     callback(...args);
                 } catch (e) {
                     _reportTimerError(e);
+                } finally {
+                    if (_timerWireTraceEnabled) {
+                        _timerWireTrace({
+                            phase: "fire",
+                            kind: "timeout",
+                            id,
+                            delay: ms,
+                            at: started,
+                            duration: performance.now() - started,
+                            callback: String((callback && callback.name) || ""),
+                            sourceLength: String(callback).length,
+                        });
+                    }
                 }
             }
         });
@@ -154,7 +277,19 @@
             callback = new Function(String(callback));
         }
         const ms = Math.max(4, delay | 0);
+        _recordTimerArgs("interval", callback, ms, args);
         const id = ops.op_set_interval(ms);
+        if (_timerWireTraceEnabled) {
+            _timerWireTrace({
+                phase: "schedule",
+                kind: "interval",
+                id,
+                delay: ms,
+                at: performance.now(),
+                callback: String((callback && callback.name) || ""),
+                sourceLength: String(callback).length,
+            });
+        }
 
         const myGen = _timerGen;
         function tick() {
@@ -166,10 +301,24 @@
             p.then(() => {
                 if (myGen !== _timerGen) return;
                 if (!_cancelledTimers.has(id)) {
+                    const started = _timerWireTraceEnabled ? performance.now() : 0;
                     try {
                         callback(...args);
                     } catch (e) {
                         _reportTimerError(e);
+                    } finally {
+                        if (_timerWireTraceEnabled) {
+                            _timerWireTrace({
+                                phase: "fire",
+                                kind: "interval",
+                                id,
+                                delay: ms,
+                                at: started,
+                                duration: performance.now() - started,
+                                callback: String((callback && callback.name) || ""),
+                                sourceLength: String(callback).length,
+                            });
+                        }
                     }
                     tick();
                 }
@@ -190,6 +339,14 @@
     // clearInterval as separate natives; aliasing them causes masking one name
     // to overwrite the other's Function#toString identity.
     globalThis.clearInterval = function clearInterval(id) {
+        if (_timerWireTraceEnabled) {
+            _timerWireTrace({
+                phase: "clear",
+                kind: "interval",
+                id,
+                at: performance.now(),
+            });
+        }
         return globalThis.clearTimeout(id);
     };
 

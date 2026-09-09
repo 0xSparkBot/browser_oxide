@@ -296,6 +296,7 @@ impl BrowserEventLoop {
         // Wakes only on real events (idle, frame message, navigation, readiness);
         // no poll cadence or timer.
         let nav_notify = self.runtime.nav_notify();
+        let worker_notify = self.runtime.worker_message_notify();
 
         // With `honor_settle`, its Notify wakes the select on each mutation/load
         // transition so a page parked on background work re-checks promptly.
@@ -330,6 +331,7 @@ impl BrowserEventLoop {
                 r = self.runtime.run_event_loop() => Ok(r),
                 _ = frame_notify.notified() => Err(()),
                 _ = nav_notify.notified() => Err(()),
+                _ = worker_notify.notified() => Err(()),
                 _ = &mut ready_fut, if honor_settle => Err(()),
             };
 

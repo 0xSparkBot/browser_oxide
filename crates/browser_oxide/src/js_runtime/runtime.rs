@@ -170,6 +170,7 @@ pub fn create_runtime(dom: Dom, options: BrowserRuntimeOptions) -> JsRuntime {
 pub struct RuntimeInternalFns {
     pub set_current_script: Option<v8::Global<v8::Function>>,
     pub complete_document_lifecycle: Option<v8::Global<v8::Function>>,
+    pub pump_worker_messages: Option<v8::Global<v8::Function>>,
 }
 
 /// Create a runtime AND return its NavSignal so the event-loop driver
@@ -307,6 +308,10 @@ pub fn create_runtime_with_signals(
         .op_state()
         .borrow_mut()
         .put(crate::js_runtime::extensions::worker_ext::WorkerOwnership::default());
+    runtime
+        .op_state()
+        .borrow_mut()
+        .put(crate::js_runtime::extensions::worker_ext::WorkerOwnerWake::default());
 
     // Capture the GENUINE `Function.prototype.toString` before any
     // bootstrap replaces it. Untagged functions delegate to
@@ -404,6 +409,7 @@ pub fn create_runtime_with_signals(
                     "_completeDocumentLifecycle",
                     &mut captured.complete_document_lifecycle,
                 ),
+                ("_pumpWorkerMessages", &mut captured.pump_worker_messages),
             ] {
                 let Some(key) = v8::String::new(scope, name) else {
                     continue;
@@ -565,6 +571,14 @@ pub fn create_worker_runtime(
     // worker code that calls `performance.now()` or similar panics
     // inside gotham_state with "required type ... is not present".
     runtime.op_state().borrow_mut().put(PerfState::default());
+    runtime
+        .op_state()
+        .borrow_mut()
+        .put(crate::js_runtime::extensions::worker_ext::WorkerOwnerWake::default());
+    runtime
+        .op_state()
+        .borrow_mut()
+        .put(crate::js_runtime::extensions::worker_ext::WorkerOwnership::default());
     runtime.op_state().borrow_mut().put(
         crate::js_runtime::extensions::worker_ext::WorkerContextState {
             storage_directory_allowed,
@@ -621,6 +635,23 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/shared_apis_bootstrap.js"))
         .expect("worker: shared_apis bootstrap failed");
+
+    // Page runtimes may unref long setTimeout/setInterval sleeps so analytics
+    // and retry timers do not pin render-settle detection. A DedicatedWorker
+    // has a different lifetime: once its own deno event loop reports idle, the
+    // worker thread parks on the parent-message Notify. If a worker-local long
+    // timer were unref'ed, nothing would poll that isolate when the timer
+    // became due, so the callback could be stranded until an unrelated parent
+    // post woke the worker. Browsers keep a live worker's timers runnable
+    // independently of parent traffic. Reuse timer_bootstrap's existing
+    // keep-refed gate for every worker realm; cleanup_bootstrap hides this
+    // engine-owned name from observable global-key enumeration.
+    runtime
+        .execute_script(
+            "<anonymous>",
+            "Object.defineProperty(globalThis, '__keepLongTimersRefed', { value: true, writable: false, configurable: false, enumerable: false });",
+        )
+        .expect("worker: timer keepalive flag failed");
 
     runtime
         .execute_script("<anonymous>", include_str!("js/timer_bootstrap.js"))

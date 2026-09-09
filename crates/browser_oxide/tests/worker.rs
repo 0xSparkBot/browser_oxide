@@ -122,6 +122,110 @@ fn idle_worker_receive_does_not_pin_event_loop() {
     });
 }
 
+/// A DedicatedWorker stays alive until it is terminated/closed (or its owner
+/// goes away), so a long worker-local timer must fire even when the parent
+/// sends no further messages.  Page-level render settling may unref long
+/// timers, but applying that policy inside a worker strands the worker thread:
+/// its event loop reports idle and parks waiting for a parent message before
+/// the timer can wake and run.
+#[test]
+fn worker_long_timer_fires_without_parent_wakeup() {
+    let code = r#"
+        const worker = new Worker(URL.createObjectURL(new Blob([`
+            setTimeout(() => self.postMessage('long-timer-fired'), 2100);
+        `], { type: 'text/javascript' })));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime(code, 3200);
+    assert_eq!(
+        out, "long-timer-fired",
+        "a live DedicatedWorker must continue driving its own long timers"
+    );
+}
+
+/// Once the worker bootstrap has emitted its internal ready marker, later
+/// unsolicited worker messages still have to wake and enter the owning page's
+/// task queue. No parent `postMessage()` should be required to make the receive
+/// side observable again.
+#[test]
+fn worker_unsolicited_message_after_ready_is_delivered() {
+    let code = r#"
+        const worker = new Worker(URL.createObjectURL(new Blob([`
+            setTimeout(() => self.postMessage('unsolicited'), 100);
+        `], { type: 'text/javascript' })));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime(code, 1000);
+    assert_eq!(
+        out, "unsolicited",
+        "worker-to-parent delivery must wake after the internal ready marker"
+    );
+}
+
+/// A real worker message must wake an owner that is currently parked on a
+/// later unrelated timer. This deliberately avoids the test helper's 50ms
+/// manual `run_event_loop()` re-entry cadence: the worker's 120ms post is the
+/// only thing that should make the owner process `onmessage` before 300ms.
+#[test]
+fn worker_unsolicited_message_wakes_owner_before_later_timer() {
+    let dom = browser_oxide::html_parser::parse_html(
+        "<html><head></head><body><div id=\"out\"></div></body></html>",
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        let runtime = BrowserJsRuntime::new(dom);
+        let mut event_loop = browser_oxide::event_loop::BrowserEventLoop::new(runtime);
+        event_loop
+            .execute_script(
+                r#"
+                globalThis.__workerWakeStarted = performance.now();
+                const worker = new Worker(URL.createObjectURL(new Blob([`
+                    setTimeout(function(){ self.postMessage('wake'); }, 120);
+                `], { type: 'text/javascript' })));
+                worker.onmessage = function() {
+                    document.querySelector('#out').textContent = String(
+                        Math.round(performance.now() - globalThis.__workerWakeStarted)
+                    );
+                    worker.terminate();
+                };
+                setTimeout(function() {
+                    if (!document.querySelector('#out').textContent) {
+                        document.querySelector('#out').textContent = 'late';
+                    }
+                }, 450);
+                "#,
+            )
+            .unwrap();
+
+        let reason = event_loop
+            .run_until_idle(Duration::from_millis(800))
+            .await
+            .unwrap();
+        assert_ne!(reason, browser_oxide::event_loop::IdleReason::Timeout);
+        let out = event_loop
+            .execute_script("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_ne!(out, "late", "worker message waited for owner timer");
+        let elapsed: u64 = out
+            .parse()
+            .unwrap_or_else(|_| panic!("unexpected worker wake output: {out}"));
+        assert!(
+            elapsed < 300,
+            "worker message was not scheduled promptly: {elapsed}ms"
+        );
+    });
+}
+
 /// Secure-context and cross-origin-isolation globals in a dedicated worker
 /// are booleans exposed through WorkerGlobalScope accessors. A generic `{}`
 /// fallback has the right property name but the wrong observable type/value.
@@ -452,7 +556,7 @@ fn worker_origin_private_file_system_flush_has_no_synthetic_fixed_latency() {
 #[test]
 fn worker_origin_private_file_system_is_denied_in_cross_site_frame() {
     let code = r#"
-        globalThis.__frameAncestorOrigins = ['https://accounts.x.ai'];
+        globalThis.__frameAncestorOrigins = ['https://parent.example'];
         const src = `
             self.onmessage = async function() {
                 try {
@@ -476,12 +580,62 @@ fn worker_origin_private_file_system_is_denied_in_cross_site_frame() {
         code,
         2000,
         browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
-            base_url: Some(url::Url::parse("https://challenges.cloudflare.com/probe").unwrap()),
+            base_url: Some(url::Url::parse("https://child.example/probe").unwrap()),
             is_secure_context: true,
             ..Default::default()
         },
     );
     assert_eq!(out, "SecurityError:Storage directory access is denied.");
+}
+
+/// Chromium 145 grants a cross-site embedded frame OPFS after real user
+/// activation, and that grant remains after transient activation expires.
+/// Keep the permission-driving bit separate from the JS-visible
+/// `navigator.userActivation` fingerprint: only the engine's privileged input
+/// bridge may unlock it.
+#[test]
+fn worker_origin_private_file_system_is_allowed_after_trusted_cross_site_activation() {
+    let code = r#"
+        globalThis.__frameAncestorOrigins = ['https://parent.example'];
+
+        // Browser-driver input, not page-authored dispatchEvent(). This is the
+        // same privileged path used by a CDP/Computer-Use mouse operation.
+        globalThis._browser_oxide.__dispatchTrustedMouseEvent(
+            'mousedown', 10, 10, { button: 0, buttons: 1, detail: 1 }
+        );
+
+        const src = `
+            self.onmessage = async function() {
+                try {
+                    const root = await navigator.storage.getDirectory();
+                    const file = await root.getFileHandle('activation-probe', { create: true });
+                    const access = await file.createSyncAccessHandle();
+                    access.close();
+                    self.postMessage('ok');
+                } catch (error) {
+                    self.postMessage(error.name + ':' + error.message);
+                }
+            };
+        `;
+        const worker = new Worker(URL.createObjectURL(
+            new Blob([src], { type: 'text/javascript' })
+        ));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+        setTimeout(() => worker.postMessage('go'), 20);
+    "#;
+    let out = drive_runtime_with_options(
+        code,
+        2000,
+        browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
+            base_url: Some(url::Url::parse("https://child.example/probe").unwrap()),
+            is_secure_context: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(out, "ok");
 }
 
 /// Chrome exposes a deliberately smaller namespace inside a dedicated worker

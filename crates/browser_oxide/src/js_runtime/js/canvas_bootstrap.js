@@ -1173,39 +1173,11 @@
         } catch (_) {}
         return 44100;
     })();
-    const _audioBaseLatency = (() => {
-        // Real Chrome reports baseLatency in [0.005, 0.030] sec range
-        // depending on output device. Derive deterministically from
-        // bits 0-9 of audio_seed so it's stable per profile.
-        let bits = 512; // mid-range fallback
-        try {
-            const has = ops.op_has_stealth_profile && ops.op_has_stealth_profile();
-            if (has) {
-                const raw = ops.op_get_profile_value("audio_seed");
-                if (raw) {
-                    bits = Number(BigInt(raw) & 0x3ffn); // 0..1023
-                }
-            }
-        } catch (_) {}
-        const v = 0.005 + (bits / 1023) * 0.025;
-        return Math.round(v * 1000) / 1000;
-    })();
-    const _audioOutputLatency = (() => {
-        // outputLatency > baseLatency typically. Add 5-30ms on top,
-        // derived from bits 10-19 of audio_seed.
-        let bits = 512;
-        try {
-            const has = ops.op_has_stealth_profile && ops.op_has_stealth_profile();
-            if (has) {
-                const raw = ops.op_get_profile_value("audio_seed");
-                if (raw) {
-                    bits = Number((BigInt(raw) >> 10n) & 0x3ffn);
-                }
-            }
-        } catch (_) {}
-        const v = _audioBaseLatency + 0.005 + (bits / 1023) * 0.025;
-        return Math.round(v * 1000) / 1000;
-    })();
+    // Chromium's headless audio output uses a 256-frame render quantum:
+    // 256 / 48kHz = 0.005333… and 256 / 44.1kHz = 0.005804988….
+    // There is no physical output device, so outputLatency is exactly zero.
+    const _audioBaseLatency = 256 / _audioSampleRate;
+    const _audioOutputLatency = 0;
 
     class BaseAudioContext extends EventTarget {
         constructor() {
@@ -1213,7 +1185,7 @@
             this.sampleRate = _audioSampleRate;
             this.baseLatency = _audioBaseLatency;
             this.outputLatency = _audioOutputLatency;
-            this.state = "running";
+            this.state = "suspended";
             this.currentTime = 0;
             this.destination = new AudioDestinationNode();
             this.listener = {}; // AudioListener stub
@@ -1236,7 +1208,7 @@
             };
         }
         decodeAudioData() { return Promise.resolve(); }
-        resume() { return Promise.resolve(); }
+        resume() { this.state = "running"; return Promise.resolve(); }
     }
     globalThis.BaseAudioContext = BaseAudioContext;
 
@@ -1244,8 +1216,8 @@
         constructor() {
             super();
         }
-        close() { return Promise.resolve(); }
-        suspend() { return Promise.resolve(); }
+        close() { this.state = "closed"; return Promise.resolve(); }
+        suspend() { this.state = "suspended"; return Promise.resolve(); }
     }
 
     class OfflineAudioContext extends BaseAudioContext {
@@ -1273,6 +1245,13 @@
         startRendering() {
             const self = this;
             return new Promise((resolve) => {
+                if (globalThis.__browser_oxide_debug) {
+                    try {
+                        const log = globalThis.__oxAsyncApiDiag
+                            || (globalThis.__oxAsyncApiDiag = []);
+                        log.push({ api: 'OfflineAudioContext.startRendering', phase: 'call', at: performance.now() });
+                    } catch (_) {}
+                }
                 const sr = self.sampleRate;
                 const len = self._length;
                 const freq = self._oscFreq;
@@ -1324,6 +1303,14 @@
                     duration: len / sr,
                     getChannelData() { return data; },
                 };
+                if (globalThis.__browser_oxide_debug) {
+                    try {
+                        globalThis.__oxAsyncApiDiag.push({
+                            api: 'OfflineAudioContext.startRendering', phase: 'resolve',
+                            length: len, at: performance.now(),
+                        });
+                    } catch (_) {}
+                }
                 resolve(buf);
             });
         }
@@ -1334,10 +1321,10 @@
         #canvasId;
         #attrs;
         constructor(width = 300, height = 150) {
+            width = Math.max(0, Number(width) >>> 0);
+            height = Math.max(0, Number(height) >>> 0);
             this.#canvasId = ops.op_canvas_create(width, height, _getOsName(), _getCanvasSeed());
             this.#attrs = { width: String(width), height: String(height) };
-            Object.defineProperty(this, 'width', { value: width, writable: true, enumerable: true, configurable: true });
-            Object.defineProperty(this, 'height', { value: height, writable: true, enumerable: true, configurable: true });
             // Element base properties — fpCollect and bot.sannysoft expect these.
             // Use defineProperty because Element.prototype (which we chain into
             // at the bottom of this file) has tagName/nodeName/etc. as getters
@@ -1357,12 +1344,14 @@
         // Attribute API — required by canvas fingerprinters that do
         // `canvas.setAttribute('width', 200)` before drawing.
         setAttribute(name, value) {
-            this.#attrs[name] = String(value);
-            if (name === "width") {
-                Object.defineProperty(this, 'width', { value: parseInt(value, 10) || this.width, writable: true, enumerable: true, configurable: true });
-            }
-            if (name === "height") {
-                Object.defineProperty(this, 'height', { value: parseInt(value, 10) || this.height, writable: true, enumerable: true, configurable: true });
+            name = String(name);
+            if (name === "width" || name === "height") {
+                const parsed = Number.parseInt(value, 10);
+                const fallback = name === "width" ? 300 : 150;
+                this.#attrs[name] = String(Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback);
+                ops.op_canvas_resize(this.#canvasId, this.width, this.height);
+            } else {
+                this.#attrs[name] = String(value);
             }
         }
         getAttribute(name) { return this.#attrs[name] !== undefined ? this.#attrs[name] : null; }

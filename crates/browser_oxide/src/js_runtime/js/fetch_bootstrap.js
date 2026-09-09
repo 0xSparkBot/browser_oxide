@@ -433,6 +433,37 @@
             const loc = globalThis.location;
             if (loc && loc.origin && loc.origin !== "null") {
                 headers["x-browser-oxide-origin"] = loc.origin;
+                // Fetch Metadata: Chromium includes
+                // `Sec-Fetch-Storage-Access` on modern fetch/XHR requests.
+                // Keep this as an engine-private pseudo header; the Rust op
+                // strips it before the request reaches the wire and inserts
+                // the real browser-controlled header in Chromium order.
+                let storageAccess = "active";
+                try {
+                    const site = (value) => {
+                        const parsed = new URL(String(value), loc.href);
+                        const host = parsed.hostname.toLowerCase();
+                        if (!host || /^\d+(?:\.\d+){3}$/.test(host) || host.indexOf('.') < 0) {
+                            return parsed.protocol + "//" + host;
+                        }
+                        const labels = host.split('.');
+                        let take = 2;
+                        if (labels.at(-1).length === 2
+                            && /^(?:ac|co|com|edu|gov|net|org)$/.test(labels.at(-2))) {
+                            take = 3;
+                        }
+                        return parsed.protocol + "//" + labels.slice(-take).join('.');
+                    };
+                    const ownerSite = site(loc.href);
+                    const ancestors = loc.ancestorOrigins;
+                    for (let i = 0; ancestors && i < ancestors.length; i++) {
+                        if (site(ancestors[i]) !== ownerSite) {
+                            storageAccess = "none";
+                            break;
+                        }
+                    }
+                } catch (_) {}
+                headers["x-browser-oxide-storage-access"] = storageAccess;
                 if (!headers["referer"]) {
                     let targetOrigin = "";
                     try { targetOrigin = new URL(url).origin; } catch (_) {}
@@ -446,6 +477,7 @@
             } else if (loc && loc.href && loc.href !== "about:blank") {
                 const u = new URL(loc.href);
                 headers["x-browser-oxide-origin"] = u.origin;
+                headers["x-browser-oxide-storage-access"] = "active";
                 if (!headers["referer"]) {
                     headers["referer"] = u.href.replace(/#.*$/, "");
                 }
@@ -479,7 +511,13 @@
                 encodedBodyLength: body.length,
                 headerNames: Object.keys(headers).sort(),
             });
-            const result = await ops.op_fetch(url, method, headers, body);
+            // Preserve renderer request-header order across the JS -> Rust
+            // boundary. Serializing a plain object into a Rust HashMap made
+            // page-authored headers nondeterministic on the wire, while real
+            // browsers keep a stable network-stack header order. The op takes
+            // an ordered list of [name, value] pairs so the net layer can
+            // merge replacements in-place without losing that order.
+            const result = await ops.op_fetch(url, method, Object.entries(headers), body);
             _pushFetchDiag({
                 phase: "response",
                 method,
@@ -526,6 +564,10 @@
             }
             
             const browser_oxide = globalThis._browser_oxide;
+            if (_diagnosticsEnabled && result.body && result.body.length > 10000) {
+                globalThis.__oxLastLargeFetchBody = result.body;
+                globalThis.__oxLastLargeFetchUrl = url;
+            }
             const fetchLog = browser_oxide && browser_oxide.__fetchLog;
             if (fetchLog) {
                 fetchLog.push({ method, url, status: result.status });

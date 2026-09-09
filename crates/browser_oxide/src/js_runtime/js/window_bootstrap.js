@@ -5,6 +5,13 @@
         (globalThis.__browser_oxide && globalThis.__browser_oxide._markTrustedEvent)
         || globalThis.__bo_mark_trusted
         || ((event) => event);
+    // Keep the browser's permission-driving activation state separate from
+    // navigator.userActivation.  Stealth/browser profiles may intentionally
+    // expose a fixed JS-visible UserActivation fingerprint, while Chromium's
+    // storage/security gates are driven by real trusted input.  This bit is
+    // sticky (the internal equivalent of hasBeenActive) and can only be set
+    // through the privileged browser-driver input bridge below.
+    let _hasTrustedUserActivation = false;
     const _browser_oxide = {
         __documentReadyState: "loading",
         __pendingNavigation: null,
@@ -19,6 +26,95 @@
     };
     if (_diagnosticsEnabled) _browser_oxide.__perfObserverDiag = [];
     Object.defineProperty(globalThis, '_browser_oxide', { value: _browser_oxide, configurable: true, enumerable: false, writable: true });
+
+    // Browser-driver input must be distinguishable from page-authored
+    // `dispatchEvent()` calls.  Keep the privileged trusted-event minter in
+    // this engine-owned (and global-ownKeys-hidden) bridge rather than
+    // exposing it as a Web Platform global.
+    Object.defineProperty(_browser_oxide, '__dispatchTrustedMouseEvent', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value(type, x, y, init = {}) {
+            // HTML user-activation notification treats a trusted mouse down as
+            // activation-triggering input.  Do this before event dispatch so a
+            // synchronous handler that creates a Worker observes the activated
+            // storage permission state.  Page-authored dispatchEvent() cannot
+            // reach this state because it does not go through this bridge.
+            if (type === 'mousedown') {
+                _hasTrustedUserActivation = true;
+            }
+            const target = (document.elementFromPoint
+                && document.elementFromPoint(Number(x) || 0, Number(y) || 0))
+                || document.body
+                || document.documentElement
+                || document;
+            const button = Number(init.button) || 0;
+            const buttons = Number(init.buttons) || 0;
+            const detail = Number(init.detail) || 0;
+            const common = {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: globalThis,
+                clientX: Number(x) || 0,
+                clientY: Number(y) || 0,
+                screenX: Number(init.screenX ?? x) || 0,
+                screenY: Number(init.screenY ?? y) || 0,
+                movementX: Number(init.movementX) || 0,
+                movementY: Number(init.movementY) || 0,
+                button,
+                buttons,
+                detail,
+                ctrlKey: !!init.ctrlKey,
+                shiftKey: !!init.shiftKey,
+                altKey: !!init.altKey,
+                metaKey: !!init.metaKey,
+            };
+            const pointerType = type === 'mousemove'
+                ? 'pointermove'
+                : type === 'mousedown'
+                    ? 'pointerdown'
+                    : type === 'mouseup'
+                        ? 'pointerup'
+                        : '';
+            if (pointerType && typeof globalThis.PointerEvent === 'function') {
+                const pointer = _markTrustedEvent(new globalThis.PointerEvent(pointerType, {
+                    ...common,
+                    button: pointerType === 'pointermove' ? -1 : button,
+                    pointerId: Number(init.pointerId) || 1,
+                    pointerType: String(init.pointerType || 'mouse'),
+                    isPrimary: init.isPrimary !== false,
+                    width: Number(init.width) || 1,
+                    height: Number(init.height) || 1,
+                    pressure: Number(init.pressure) || 0,
+                }));
+                target.dispatchEvent(pointer);
+            }
+            const mouse = _markTrustedEvent(new globalThis.MouseEvent(type, common));
+            target.dispatchEvent(mouse);
+            if (type === 'mouseup' && button === 0) {
+                const ClickEvent = typeof globalThis.PointerEvent === 'function'
+                    ? globalThis.PointerEvent
+                    : globalThis.MouseEvent;
+                target.dispatchEvent(_markTrustedEvent(new ClickEvent('click', {
+                    ...common,
+                    buttons: 0,
+                    detail: detail || 1,
+                    pointerId: Number(init.pointerId) || 1,
+                    pointerType: String(init.pointerType || 'mouse'),
+                    isPrimary: init.isPrimary !== false,
+                    width: Number(init.width) || 1,
+                    height: Number(init.height) || 1,
+                    pressure: 0,
+                })));
+            }
+            return {
+                target: String(target.tagName || target.nodeName || ''),
+                id: String(target.id || ''),
+            };
+        },
+    });
 
     // Exposed via a Symbol slot so it survives `cleanup_bootstrap` deleting the
     // `Deno`/`ops` globals; the closure keeps `ops` reachable.
@@ -782,33 +878,26 @@
     Object.defineProperty(_navHid, Symbol.toStringTag, { value: "HID", configurable: true });
     Object.defineProperty(_navLocks, Symbol.toStringTag, { value: "LockManager", configurable: true });
 
-    // navigator.keyboard — Keyboard API (commonly probed by fingerprint scripts).
-    // Real Chrome exposes a Keyboard instance with getLayoutMap() returning a
-    // KeyboardLayoutMap: a Map<string, string> of physical key code → character.
-    // An empty {} or missing getLayoutMap is an immediate lie signal.
+    // navigator.keyboard — Keyboard API. Chromium/macOS exposes the printable,
+    // layout-dependent subset only; iteration order is observable. Captured
+    // Chromium 145/152 both expose exactly these 50 entries.
     const _qwertyLayout = new Map([
-        ['Backquote', '`'], ['Digit1', '1'], ['Digit2', '2'], ['Digit3', '3'],
+        ['Backquote', '`'],
+        ['Backslash', '\\'],
+        ['BracketLeft', '['], ['BracketRight', ']'],
+        ['Comma', ','],
+        ['Digit0', '0'], ['Digit1', '1'], ['Digit2', '2'], ['Digit3', '3'],
         ['Digit4', '4'], ['Digit5', '5'], ['Digit6', '6'], ['Digit7', '7'],
-        ['Digit8', '8'], ['Digit9', '9'], ['Digit0', '0'], ['Minus', '-'],
+        ['Digit8', '8'], ['Digit9', '9'],
         ['Equal', '='],
-        ['KeyQ', 'q'], ['KeyW', 'w'], ['KeyE', 'e'], ['KeyR', 'r'], ['KeyT', 't'],
-        ['KeyY', 'y'], ['KeyU', 'u'], ['KeyI', 'i'], ['KeyO', 'o'], ['KeyP', 'p'],
-        ['BracketLeft', '['], ['BracketRight', ']'], ['Backslash', '\\'],
-        ['KeyA', 'a'], ['KeyS', 's'], ['KeyD', 'd'], ['KeyF', 'f'], ['KeyG', 'g'],
-        ['KeyH', 'h'], ['KeyJ', 'j'], ['KeyK', 'k'], ['KeyL', 'l'],
-        ['Semicolon', ';'], ['Quote', "'"],
-        ['KeyZ', 'z'], ['KeyX', 'x'], ['KeyC', 'c'], ['KeyV', 'v'], ['KeyB', 'b'],
-        ['KeyN', 'n'], ['KeyM', 'm'],
-        ['Comma', ','], ['Period', '.'], ['Slash', '/'],
-        ['Space', ' '],
-        ['F1', 'F1'], ['F2', 'F2'], ['F3', 'F3'], ['F4', 'F4'],
-        ['F5', 'F5'], ['F6', 'F6'], ['F7', 'F7'], ['F8', 'F8'],
-        ['F9', 'F9'], ['F10', 'F10'], ['F11', 'F11'], ['F12', 'F12'],
-        ['Numpad0', '0'], ['Numpad1', '1'], ['Numpad2', '2'], ['Numpad3', '3'],
-        ['Numpad4', '4'], ['Numpad5', '5'], ['Numpad6', '6'], ['Numpad7', '7'],
-        ['Numpad8', '8'], ['Numpad9', '9'],
-        ['NumpadAdd', '+'], ['NumpadSubtract', '-'], ['NumpadMultiply', '*'],
-        ['NumpadDivide', '/'], ['NumpadDecimal', '.'],
+        ['IntlBackslash', '<'], ['IntlRo', '\\'], ['IntlYen', '¥'],
+        ['KeyA', 'a'], ['KeyB', 'b'], ['KeyC', 'c'], ['KeyD', 'd'], ['KeyE', 'e'],
+        ['KeyF', 'f'], ['KeyG', 'g'], ['KeyH', 'h'], ['KeyI', 'i'], ['KeyJ', 'j'],
+        ['KeyK', 'k'], ['KeyL', 'l'], ['KeyM', 'm'], ['KeyN', 'n'], ['KeyO', 'o'],
+        ['KeyP', 'p'], ['KeyQ', 'q'], ['KeyR', 'r'], ['KeyS', 's'], ['KeyT', 't'],
+        ['KeyU', 'u'], ['KeyV', 'v'], ['KeyW', 'w'], ['KeyX', 'x'], ['KeyY', 'y'],
+        ['KeyZ', 'z'],
+        ['Minus', '-'], ['Period', '.'], ['Quote', "'"], ['Semicolon', ';'], ['Slash', '/'],
     ]);
 
     class KeyboardLayoutMap {
@@ -833,9 +922,82 @@
     });
     globalThis.KeyboardLayoutMap = KeyboardLayoutMap;
 
+    const _keyboardNativeSetTimeout = globalThis.setTimeout;
+    const _keyboardPrivateTraceEnabled = (() => {
+        try { return !!ops.op_keyboard_private_trace_enabled(); } catch (_) { return false; }
+    })();
+    const _keyboardPrivateTrace = (row) => {
+        if (!_keyboardPrivateTraceEnabled) return;
+        try {
+            row.origin = String(globalThis.location && globalThis.location.origin || '');
+            row.at = Number(globalThis.performance && globalThis.performance.now() || 0);
+            ops.op_keyboard_private_trace(JSON.stringify(row));
+        } catch (_) {}
+    };
+
     class Keyboard extends EventTarget {
         getLayoutMap() {
-            return Promise.resolve(new KeyboardLayoutMap(_qwertyLayout));
+            const map = new KeyboardLayoutMap(_qwertyLayout);
+            const embedding = (() => {
+                const row = {
+                    ancestorCount: 0,
+                    parentEqSelf: true,
+                    topEqSelf: true,
+                    hasFrameElement: false,
+                    hasReferrer: false,
+                };
+                try {
+                    const ancestors = globalThis.location && globalThis.location.ancestorOrigins;
+                    row.ancestorCount = ancestors ? ancestors.length : 0;
+                } catch (_) {}
+                try { row.parentEqSelf = globalThis.parent === globalThis; } catch (_) {}
+                try { row.topEqSelf = globalThis.top === globalThis; } catch (_) {}
+                try { row.hasFrameElement = !!globalThis.frameElement; } catch (_) {}
+                try { row.hasReferrer = !!(globalThis.document && globalThis.document.referrer); } catch (_) {}
+                return row;
+            })();
+            const embedded = embedding.ancestorCount > 0
+                || !embedding.parentEqSelf
+                || !embedding.topEqSelf
+                || embedding.hasFrameElement;
+            _keyboardPrivateTrace({ phase: 'call', embedded, ...embedding });
+            if (_diagnosticsEnabled) {
+                try {
+                    const log = globalThis.__oxAsyncApiDiag
+                        || (globalThis.__oxAsyncApiDiag = []);
+                    log.push({
+                        api: 'Keyboard.getLayoutMap', phase: 'call',
+                        embedded, at: performance.now(),
+                    });
+                } catch (_) {}
+            }
+            if (!embedded) {
+                if (_diagnosticsEnabled) {
+                    queueMicrotask(() => {
+                        try {
+                            globalThis.__oxAsyncApiDiag.push({
+                                api: 'Keyboard.getLayoutMap', phase: 'resolve',
+                                embedded: false, size: map.size, at: performance.now(),
+                            });
+                        } catch (_) {}
+                    });
+                }
+                return Promise.resolve(map);
+            }
+            return new Promise((resolve) => {
+                _keyboardNativeSetTimeout(() => {
+                    _keyboardPrivateTrace({ phase: 'resolve', embedded: true, size: map.size });
+                    if (_diagnosticsEnabled) {
+                        try {
+                            globalThis.__oxAsyncApiDiag.push({
+                                api: 'Keyboard.getLayoutMap', phase: 'resolve',
+                                embedded: true, size: map.size, at: performance.now(),
+                            });
+                        } catch (_) {}
+                    }
+                    resolve(map);
+                }, 1000);
+            });
         }
         lock(keyCodes) { return Promise.resolve(); }
         unlock() {}
@@ -1090,8 +1252,11 @@
         const _UAProto = globalThis.UserActivation && globalThis.UserActivation.prototype;
         const u = _UAProto ? Object.create(_UAProto) : {};
         Object.defineProperties(u, {
-            isActive: { get: () => false, enumerable: true },
-            hasBeenActive: { get: () => false, enumerable: true },
+            // A newly-created, foreground CDP target reports activated in
+            // Chromium headless.  BrowserOxide exposes the same automation
+            // target semantics rather than the cold, never-focused tab state.
+            isActive: { get: () => true, enumerable: true },
+            hasBeenActive: { get: () => true, enumerable: true },
         });
         return u;
     })();
@@ -2160,19 +2325,38 @@
             return copy;
         };
 
-        // Phase 7 — real Chrome 147 GREASE entry is
-        // `{brand: "Not.A/Brand", version: "8"}`, not "24".
-        // Chrome rotates the GREASE version periodically.
-        const _makeLowBrands = () => Object.freeze(_shuffled([
-            Object.freeze({ brand: "Chromium", version: _uaBrowserMajor() }),
-            Object.freeze({ brand: "Google Chrome", version: _uaBrowserMajor() }),
-            Object.freeze({ brand: "Not.A/Brand", version: "8" }),
-        ]).map(Object.freeze));
-        const _makeFullBrands = () => Object.freeze(_shuffled([
-            Object.freeze({ brand: "Chromium", version: _uaBrowserFull() }),
-            Object.freeze({ brand: "Google Chrome", version: _uaBrowserFull() }),
-            Object.freeze({ brand: "Not.A/Brand", version: "8.0.0.0" }),
-        ]).map(Object.freeze));
+        // UA-CH GREASE spelling/order changes across Chrome releases. Keep
+        // the JS low/high entropy values coherent with the HTTP sec-ch-ua
+        // builder for versions we have captured from real Chromium.
+        const _brandSpec = (() => {
+            const major = _uaBrowserMajor();
+            if (major === "145") return [
+                ["Not:A-Brand", "99", "99.0.0.0"],
+                ["Google Chrome", major, _uaBrowserFull()],
+                ["Chromium", major, _uaBrowserFull()],
+            ];
+            if (major === "148") return [
+                ["Chromium", major, _uaBrowserFull()],
+                ["Not(A:Brand", "24", "24.0.0.0"],
+                ["Google Chrome", major, _uaBrowserFull()],
+            ];
+            if (major === "152") return [
+                ["Chromium", major, _uaBrowserFull()],
+                ["Not?A_Brand", "24", "24.0.0.0"],
+                ["Google Chrome", major, _uaBrowserFull()],
+            ];
+            return _shuffled([
+                ["Chromium", major, _uaBrowserFull()],
+                ["Google Chrome", major, _uaBrowserFull()],
+                ["Not.A/Brand", "8", "8.0.0.0"],
+            ]);
+        })();
+        const _makeLowBrands = () => Object.freeze(_brandSpec.map((entry) =>
+            Object.freeze({ brand: entry[0], version: entry[1] })
+        ));
+        const _makeFullBrands = () => Object.freeze(_brandSpec.map((entry) =>
+            Object.freeze({ brand: entry[0], version: entry[2] })
+        ));
         // Chrome re-uses the same GREASE ordering across a userAgentData
         // object's lifetime; only randomized once per construction.
         let _lowBrands = null, _fullBrands = null;
@@ -2263,6 +2447,7 @@
         const _refWorkerOp = Deno.core.refOpPromise;
         const _unrefWorkerOp = Deno.core.unrefOpPromise;
         const _workerState = new WeakMap();
+        const _activeWorkers = new Map();
 
         function _getWorkerState(worker) {
             const state = _workerState.get(worker);
@@ -2282,9 +2467,143 @@
             return worker.dispatchEvent(_markTrustedEvent(event));
         }
 
-        // Chromium partitions storage by schemeful site and denies OPFS to a
-        // cross-site embedded frame. Dedicated workers inherit that owner's
-        // storage key, including when their script URL is blob:.
+        function _deliverWorkerRaw(worker, state, raw) {
+            if (!raw || !state.id) return false;
+            if (raw === '__browser_oxide_worker_ready__') {
+                state.initializing = false;
+                // The ready marker can be drained synchronously by the Rust
+                // event-loop entry pump before the async receive promise gets
+                // a chance to settle. In that case its original ref would
+                // otherwise pin the page forever; convert it to the normal
+                // idle/background receive now.
+                if (_unrefWorkerOp && state.pendingReceive) {
+                    try { _unrefWorkerOp(state.pendingReceive); } catch (_) {}
+                }
+                return true;
+            }
+            const deserializer =
+                _browser_oxide && _browser_oxide.deserializeFromWire;
+            let payload = null;
+            try { payload = JSON.parse(raw); }
+            catch (_) { return false; }
+            const data = deserializer
+                ? deserializer(payload && payload.data)
+                : payload && payload.data;
+            // Mirror dedicated-worker eval-source captures into the
+            // top-window sink (worker isolates die with the page's
+            // interest in them; this survives for end-of-run dumps).
+            try {
+                if (data && typeof data === "object" && data.__oxEvalSrc) {
+                    const sink = globalThis.__oxParentEvalSrc
+                        || (globalThis.__oxParentEvalSrc = []);
+                    if (sink.length < 8) {
+                        const code = data.__oxEvalSrc.code;
+                        let dup = false;
+                        for (let i = 0; i < sink.length; i++) {
+                            if (sink[i] && sink[i].code
+                                && sink[i].code.length === code.length) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (!dup) sink.push(data.__oxEvalSrc);
+                    }
+                }
+            } catch (_) {}
+            const event = _markTrustedEvent(new MessageEvent('message', {
+                data,
+                origin: '',
+                lastEventId: '',
+                source: null,
+                ports: [],
+            }));
+            if (_diagnosticsEnabled) {
+                try {
+                    const log = globalThis.__oxWorkerRxDiag
+                        || (globalThis.__oxWorkerRxDiag = []);
+                    if (log.length < 48) {
+                        log.push({
+                            id: state.id,
+                            keys: data && typeof data === 'object'
+                                ? Object.keys(data).slice(0, 8).join(',')
+                                : typeof data,
+                            value: (() => {
+                                try { return JSON.stringify(data).slice(0, 1200); }
+                                catch (_) { return ''; }
+                            })(),
+                            trusted: event.isTrusted,
+                            at: Math.round(performance.now()),
+                        });
+                    }
+                } catch (_) {}
+            }
+            try { _fireWorkerEvent(worker, 'message', event); }
+            catch (_) {}
+            try {
+                globalThis.__oxWRX = (globalThis.__oxWRX || 0) + 1;
+            } catch (_) {}
+
+            // A synchronous fallback drain may satisfy the reply that caused
+            // postMessage() to ref the outstanding async receive. The promise
+            // itself is still waiting, so return it to background/unref state
+            // after dispatching the queued message.
+            if (_unrefWorkerOp && state.pendingReceive) {
+                try { _unrefWorkerOp(state.pendingReceive); } catch (_) {}
+            }
+            return true;
+        }
+
+        // Unref'ed deno op promises intentionally do not keep a page event
+        // loop alive, but that also means an unsolicited worker->parent
+        // message can remain queued after the page has become idle. Rust calls
+        // this bridge whenever it re-enters/polls the owning runtime. Drain
+        // the already-buffered MPSC messages synchronously so they become
+        // ordinary MessageEvent tasks without restoring the old 5ms polling
+        // interval or permanently ref'ing an idle Worker receive.
+        Object.defineProperty(_browser_oxide, '__pumpWorkerMessages', {
+            configurable: false,
+            enumerable: false,
+            writable: false,
+            value() {
+                let delivered = 0;
+                for (const [id, worker] of Array.from(_activeWorkers.entries())) {
+                    const state = _workerState.get(worker);
+                    if (!state || !state.id || state.id !== id) {
+                        _activeWorkers.delete(id);
+                        continue;
+                    }
+                    for (let i = 0; i < 64; i++) {
+                        let raw = '';
+                        try { raw = _wops.op_worker_poll_from_worker(id); }
+                        catch (_) { break; }
+                        if (!raw) break;
+                        if (_deliverWorkerRaw(worker, state, raw)) delivered++;
+                    }
+                }
+                return delivered;
+            },
+        });
+        // Rust captures privileged bootstrap closures from __browser_oxide
+        // before cleanup removes that temporary bridge. Mirror only the
+        // callable (not the active-worker registry) there so event-loop entry
+        // can synchronously flush messages that arrived while the receive op
+        // was unref'ed.
+        try {
+            Object.defineProperty(globalThis.__browser_oxide, '_pumpWorkerMessages', {
+                configurable: true,
+                enumerable: false,
+                writable: false,
+                value: _browser_oxide.__pumpWorkerMessages,
+            });
+        } catch (_) {}
+
+        // Chromium 145 denies OPFS to a cross-site embedded frame until that
+        // frame has received real user activation.  The grant is sticky after
+        // transient `navigator.userActivation.isActive` expires. Dedicated
+        // workers inherit the owner's storage permission, including blob:
+        // workers.  Newer Chromium versions additionally support partitioned
+        // third-party OPFS; the no-activation branch remains conservative here
+        // until that capability is represented explicitly by the profile.
         function _workerStorageDirectoryAllowed() {
             try {
                 const site = (value) => {
@@ -2304,7 +2623,9 @@
                 const ownerSite = site(location.href);
                 const ancestors = location.ancestorOrigins;
                 for (let i = 0; ancestors && i < ancestors.length; i++) {
-                    if (site(ancestors[i]) !== ownerSite) return false;
+                    if (site(ancestors[i]) !== ownerSite) {
+                        return _hasTrustedUserActivation;
+                    }
                 }
             } catch (_) {}
             return true;
@@ -2381,6 +2702,7 @@
                     state.id = 0;
                     return;
                 }
+                _activeWorkers.set(state.id, this);
                 if (_diagnosticsEnabled) {
                     try {
                         const log = globalThis.__oxWorkerCtorDiag
@@ -2425,71 +2747,7 @@
                             state.pendingReceive = null;
                         }
                         if (!raw || !state.id) return; // worker died
-                        if (raw === '__browser_oxide_worker_ready__') {
-                            state.initializing = false;
-                            return _drainOnce();
-                        }
-                        const deserializer =
-                            _browser_oxide && _browser_oxide.deserializeFromWire;
-                        let payload = null;
-                        try { payload = JSON.parse(raw); }
-                        catch (e) { return _drainOnce(); }
-                        const data = deserializer
-                            ? deserializer(payload && payload.data)
-                            : payload && payload.data;
-                        // Mirror dedicated-worker eval-source captures into the
-                        // top-window sink (worker isolates die with the page's
-                        // interest in them; this survives for end-of-run dumps).
-                        try {
-                            if (data && typeof data === "object" && data.__oxEvalSrc) {
-                                const sink = globalThis.__oxParentEvalSrc
-                                    || (globalThis.__oxParentEvalSrc = []);
-                                if (sink.length < 8) {
-                                    const code = data.__oxEvalSrc.code;
-                                    let dup = false;
-                                    for (let i = 0; i < sink.length; i++) {
-                                        if (sink[i] && sink[i].code
-                                            && sink[i].code.length === code.length) {
-                                            dup = true;
-                                            break;
-                                        }
-                                    }
-                                    if (!dup) sink.push(data.__oxEvalSrc);
-                                }
-                            }
-                        } catch (_) {}
-                        const event = _markTrustedEvent(new MessageEvent('message', {
-                            data,
-                            origin: '',
-                            lastEventId: '',
-                            source: null,
-                            ports: [],
-                        }));
-                        if (_diagnosticsEnabled) {
-                            try {
-                                const log = globalThis.__oxWorkerRxDiag
-                                    || (globalThis.__oxWorkerRxDiag = []);
-                                if (log.length < 48) {
-                                    log.push({
-                                        id: state.id,
-                                        keys: data && typeof data === 'object'
-                                            ? Object.keys(data).slice(0, 8).join(',')
-                                            : typeof data,
-                                        value: (() => {
-                                            try { return JSON.stringify(data).slice(0, 1200); }
-                                            catch (_) { return ''; }
-                                        })(),
-                                        trusted: event.isTrusted,
-                                        at: Math.round(performance.now()),
-                                    });
-                                }
-                            } catch (_) {}
-                        }
-                        try { _fireWorkerEvent(self, 'message', event); }
-                        catch (_) {}
-                        try {
-                            globalThis.__oxWRX = (globalThis.__oxWRX || 0) + 1;
-                        } catch (_) {}
+                        _deliverWorkerRaw(self, state, raw);
                         _drainOnce(); // chain next await
                     }).catch(() => {});
                 };
@@ -2525,6 +2783,17 @@
                         if (posts.length < 8
                             && !posts.some((source) => source.length === message.length)) {
                             posts.push(message);
+                        }
+                        const txDiag = globalThis.__oxWorkerTxDiag
+                            || (globalThis.__oxWorkerTxDiag = []);
+                        if (txDiag.length < 32) {
+                            txDiag.push({
+                                id: state.id,
+                                at: performance.now(),
+                                length: message.length,
+                                head: message.slice(0, 180),
+                                tail: message.slice(-120),
+                            });
                         }
                     }
                 } catch (_) {}
@@ -2581,7 +2850,9 @@
             terminate() {
                 const state = _getWorkerState(this);
                 if (state.id) {
-                    try { _wops.op_worker_terminate(state.id); } catch (e) {}
+                    const id = state.id;
+                    try { _wops.op_worker_terminate(id); } catch (e) {}
+                    _activeWorkers.delete(id);
                     state.id = 0;
                 }
             }
@@ -3044,20 +3315,124 @@
     }
     // end batch 2
 
-    // speechSynthesis — prototype-backed; bot tests check getVoices().length > 0
-    class SpeechSynthesis {}
+    // speechSynthesis — Chromium exposes an EventTarget-backed singleton with
+    // an illegal constructor. Voice enumeration is asynchronous: a new page's
+    // first getVoices() commonly returns [], then the browser voice backend
+    // populates the list and fires a trusted `voiceschanged` event.
+    class SpeechSynthesis extends EventTarget {
+        constructor() {
+            super();
+            throw new TypeError("Failed to construct 'SpeechSynthesis': Illegal constructor");
+        }
+    }
     globalThis.SpeechSynthesis = SpeechSynthesis;
     const _SSProto = SpeechSynthesis.prototype;
-    const _ssVoices = [
+    let _ssVoices = [
         {name:"Google US English",lang:"en-US",localService:false,default:true,voiceURI:"Google US English"},
         {name:"Google UK English Female",lang:"en-GB",localService:false,default:false,voiceURI:"Google UK English Female"},
         {name:"Google UK English Male",lang:"en-GB",localService:false,default:false,voiceURI:"Google UK English Male"},
     ];
+    const _ssOnVoicesChanged = new WeakMap();
+    const _ssMarkTrusted = (() => {
+        try {
+            const bo = globalThis.__browser_oxide;
+            return bo && typeof bo._markTrustedEvent === 'function'
+                ? bo._markTrustedEvent : null;
+        } catch (_) { return null; }
+    })();
+    const _ssNativeSetTimeout = globalThis.setTimeout;
+    let _ssVoicesReady = false;
+    let _ssVoiceLoadStarted = false;
+    const _ssPrivateTraceEnabled = (() => {
+        try { return !!ops.op_speech_private_trace_enabled(); } catch (_) { return false; }
+    })();
+    const _ssPrivateTrace = (row) => {
+        if (!_ssPrivateTraceEnabled) return;
+        try {
+            row.origin = String(globalThis.location && globalThis.location.origin || "");
+            row.at = Number(globalThis.performance && globalThis.performance.now() || 0);
+            ops.op_speech_private_trace(JSON.stringify(row));
+        } catch (_) {}
+    };
+    const _ssVoiceBackendWarm = (() => {
+        try { return !!ops.op_speech_voice_backend_is_warm(); } catch (_) { return false; }
+    })();
+    const _ssVoiceDelayMs = (() => {
+        if (_ssVoiceBackendWarm) return 0;
+        const major = String(_p("browser_version", "148.0.0.0")).split('.')[0];
+        const os = _p("os_name", "Linux");
+        // Browser-main SpeechSynthesis cold-service measurements: Chromium
+        // 145/macOS ~0.93s, Chrome 152/macOS ~0.09-0.10s. This duration is
+        // also used by the Rust browser-service lane model so synchronous
+        // browser-main requests issued while voice discovery is in flight
+        // serialize behind it, matching Chromium's Mojo scheduling.
+        if (os === "macOS" && major === "145") return 930;
+        if (os === "macOS" && major === "152") return 95;
+        return 100;
+    })();
+    const _ssBeginVoiceLoad = () => {
+        if (_ssVoiceLoadStarted) return;
+        _ssVoiceLoadStarted = true;
+        try {
+            ops.op_speech_voice_backend_begin_init(Math.round(_ssVoiceDelayMs));
+        } catch (_) {}
+        _ssPrivateTrace({
+            phase: 'schedule-ready',
+            delay: _ssVoiceDelayMs,
+            backendWarmAtBootstrap: _ssVoiceBackendWarm,
+        });
+        _ssNativeSetTimeout(() => {
+            _ssVoicesReady = true;
+            try { ops.op_speech_voice_backend_mark_warm(); } catch (_) {}
+            _ssPrivateTrace({
+                phase: 'ready',
+                voiceCount: _ssVoices.length,
+                backendWarmAtBootstrap: _ssVoiceBackendWarm,
+            });
+            try {
+                const event = new Event('voiceschanged');
+                if (_ssMarkTrusted) _ssMarkTrusted(event);
+                globalThis.speechSynthesis.dispatchEvent(event);
+            } catch (_) {}
+        }, _ssVoiceDelayMs);
+    };
     _defProtoGetter(_SSProto, 'pending', () => false);
     _defProtoGetter(_SSProto, 'speaking', () => false);
     _defProtoGetter(_SSProto, 'paused', () => false);
-    _defProtoGetter(_SSProto, 'onvoiceschanged', () => null);
-    _defProtoMethod(_SSProto, 'getVoices', function getVoices() { return _ssVoices.slice(); });
+    _defProtoGetter(
+        _SSProto,
+        'onvoiceschanged',
+        function getOnVoicesChanged() { return _ssOnVoicesChanged.get(this) || null; },
+        function setOnVoicesChanged(value) {
+            _ssOnVoicesChanged.set(this, typeof value === 'function' ? value : null);
+            _ssPrivateTrace({
+                phase: 'set-onvoiceschanged',
+                isFunction: typeof value === 'function',
+                sourceLength: typeof value === 'function' ? String(value).length : 0,
+            });
+        },
+    );
+    _defProtoMethod(_SSProto, 'getVoices', function getVoices() {
+        if (!_ssVoicesReady) {
+            _ssBeginVoiceLoad();
+            _ssPrivateTrace({
+                phase: 'getVoices',
+                ready: false,
+                loadStarted: _ssVoiceLoadStarted,
+                returnCount: 0,
+                backendWarmAtBootstrap: _ssVoiceBackendWarm,
+            });
+            return [];
+        }
+        _ssPrivateTrace({
+            phase: 'getVoices',
+            ready: true,
+            loadStarted: _ssVoiceLoadStarted,
+            returnCount: _ssVoices.length,
+            backendWarmAtBootstrap: _ssVoiceBackendWarm,
+        });
+        return _ssVoices.slice();
+    });
     _defProtoMethod(_SSProto, 'speak', function speak() {});
     _defProtoMethod(_SSProto, 'cancel', function cancel() {});
     _defProtoMethod(_SSProto, 'pause', function pause() {});
@@ -3665,7 +4040,25 @@
         const _navEntry = () => {
             const entry = Object.assign(Object.create(_PerfNavigationProto), _perfNav);
             const measured = _readNavigationTiming();
-            if (measured) Object.assign(entry, measured);
+            if (measured) {
+                Object.assign(entry, measured);
+                const lifecycle = _browser_oxide.__navigationLifecycleTiming;
+                if (lifecycle) {
+                    for (const key of [
+                        'domInteractive',
+                        'domContentLoadedEventStart',
+                        'domContentLoadedEventEnd',
+                        'domComplete',
+                        'loadEventStart',
+                        'loadEventEnd',
+                    ]) {
+                        const value = lifecycle[key];
+                        if (typeof value === 'number' && isFinite(value) && value >= 0) {
+                            entry[key] = value;
+                        }
+                    }
+                }
+            }
             // Runtime bootstrap precedes Page's location install. Capturing
             // the name once above would freeze it as about:blank even for a
             // subsequently navigated document. Chromium reports the current
@@ -3750,6 +4143,22 @@
                     timing[key] = navigationStart + Math.round(measured[key]);
                 }
                 timing.domLoading = timing.responseStart;
+                const lifecycle = _browser_oxide.__navigationLifecycleTiming;
+                if (lifecycle) {
+                    for (const key of [
+                        'domInteractive',
+                        'domContentLoadedEventStart',
+                        'domContentLoadedEventEnd',
+                        'domComplete',
+                        'loadEventStart',
+                        'loadEventEnd',
+                    ]) {
+                        const value = lifecycle[key];
+                        if (typeof value === 'number' && isFinite(value) && value >= 0) {
+                            timing[key] = navigationStart + Math.round(value);
+                        }
+                    }
+                }
             }
             if (globalThis.document && globalThis.document.readyState !== 'complete') {
                 timing.domComplete = 0;
@@ -6998,8 +7407,7 @@
             ],
         };
         const _voices = _voicesByOS[_osName] || _voicesByOS["Linux"];
-        // Override the existing speechSynthesis with OS-aware voices
-        globalThis.speechSynthesis.getVoices = function() { return _voices; };
+        _ssVoices = _voices;
     }
 
     // ================================================================
@@ -7273,17 +7681,23 @@
             return err.toString() + '\n    at <anonymous>:1:1';
         }
         return err.toString() + '\n' + filtered.map(f => {
-            const fn = f.getFunctionName() || f.getMethodName() || '<anonymous>';
-            const file = scriptName(f) || '<anonymous>';
-            const line = f.getLineNumber() || 0;
-            const col = f.getColumnNumber() || 0;
-            // Format: "    at functionName (filename:line:col)"
-            // or if no filename: "    at functionName (line:col)"
-            // or if no function name: "    at filename:line:col"
-            if (fn === '<anonymous>') {
-                return `    at ${file}:${line}:${col}`;
+            // Delegate formatting to V8's native CallSite formatter. It
+            // preserves details that cannot be reconstructed from the public
+            // getters alone: receiver/method aliases (`Object.f [as alias]`),
+            // eval provenance (`eval at ...`), constructor/native markers,
+            // and V8's exact parenthesization rules. We only own filtering of
+            // BrowserOxide-internal frames above; surviving page frames should
+            // be rendered exactly as V8 would render them in Chromium.
+            try {
+                return '    at ' + String(f);
+            } catch (_) {
+                const fn = f.getFunctionName() || f.getMethodName() || '<anonymous>';
+                const file = scriptName(f) || '<anonymous>';
+                const line = f.getLineNumber() || 0;
+                const col = f.getColumnNumber() || 0;
+                if (fn === '<anonymous>') return `    at ${file}:${line}:${col}`;
+                return `    at ${fn} (${file}:${line}:${col})`;
             }
-            return `    at ${fn} (${file}:${line}:${col})`;
         }).join('\n');
     };
 
@@ -8193,10 +8607,43 @@
         _defNav('gpu', () => _secure() ? _navGpu : undefined);
     }
 
+    // Storage Access API. A first-party/top-level document has storage access
+    // by default; a cross-site embedded document does not until an explicit
+    // Storage Access API grant exists. BrowserOxide does not model grants yet,
+    // so keep the embedded branch false while matching Chromium's default
+    // first-party result.
+    function _documentStorageAccessActive() {
+        try {
+            const site = (value) => {
+                const parsed = new URL(String(value), location.href);
+                const host = parsed.hostname.toLowerCase();
+                if (!host || /^\d+(?:\.\d+){3}$/.test(host) || host.indexOf('.') < 0) {
+                    return parsed.protocol + '//' + host;
+                }
+                const labels = host.split('.');
+                let take = 2;
+                if (labels.at(-1).length === 2
+                    && /^(?:ac|co|com|edu|gov|net|org)$/.test(labels.at(-2))) {
+                    take = 3;
+                }
+                return parsed.protocol + '//' + labels.slice(-take).join('.');
+            };
+            const ownerSite = site(location.href);
+            const ancestors = location.ancestorOrigins;
+            for (let i = 0; ancestors && i < ancestors.length; i++) {
+                if (site(ancestors[i]) !== ownerSite) return false;
+            }
+        } catch (_) {}
+        return true;
+    }
+    function _hasStorageAccess() {
+        return Promise.resolve(_documentStorageAccessActive());
+    }
+
     // Storage Access API
     if (globalThis.document) {
         if (!globalThis.document.hasStorageAccess) {
-            globalThis.document.hasStorageAccess = function() { return Promise.resolve(false); };
+            globalThis.document.hasStorageAccess = _hasStorageAccess;
         }
         if (!globalThis.document.requestStorageAccess) {
             globalThis.document.requestStorageAccess = function() { return Promise.reject(new DOMException("Not allowed", "NotAllowedError")); };
@@ -8785,7 +9232,6 @@
     // (11) Document.prototype.hasStorageAccess / requestStorageAccess (Storage Access API)
     // Chrome 130+. Cross-site trackers probe these heavily.
     if (globalThis.Document && typeof globalThis.Document.prototype.hasStorageAccess === "undefined") {
-        const _hasStorageAccess = function hasStorageAccess() { return Promise.resolve(false); };
         const _requestStorageAccess = function requestStorageAccess() { 
             return Promise.reject(new DOMException("The request was denied.", "NotAllowedError")); 
         };

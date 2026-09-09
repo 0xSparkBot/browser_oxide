@@ -174,16 +174,25 @@
         const _osName = _p("os_name", "Windows");
         const _browserMajor = _p("browser_version", "148.0.0.0").split(".")[0];
         const _browserFull = _p("browser_version", "148.0.0.0");
-        const _brands = [
-            { brand: "Google Chrome", version: _browserMajor },
-            { brand: "Not.A/Brand", version: "8" },
-            { brand: "Chromium", version: _browserMajor },
+        const _brandSpec = _browserMajor === "145" ? [
+            ["Not:A-Brand", "99", "99.0.0.0"],
+            ["Google Chrome", _browserMajor, _browserFull],
+            ["Chromium", _browserMajor, _browserFull],
+        ] : _browserMajor === "148" ? [
+            ["Chromium", _browserMajor, _browserFull],
+            ["Not(A:Brand", "24", "24.0.0.0"],
+            ["Google Chrome", _browserMajor, _browserFull],
+        ] : _browserMajor === "152" ? [
+            ["Chromium", _browserMajor, _browserFull],
+            ["Not?A_Brand", "24", "24.0.0.0"],
+            ["Google Chrome", _browserMajor, _browserFull],
+        ] : [
+            ["Google Chrome", _browserMajor, _browserFull],
+            ["Not.A/Brand", "8", "8.0.0.0"],
+            ["Chromium", _browserMajor, _browserFull],
         ];
-        const _fullVersionList = [
-            { brand: "Google Chrome", version: _browserFull },
-            { brand: "Not.A/Brand", version: "8.0.0.0" },
-            { brand: "Chromium", version: _browserFull },
-        ];
+        const _brands = _brandSpec.map((entry) => ({ brand: entry[0], version: entry[1] }));
+        const _fullVersionList = _brandSpec.map((entry) => ({ brand: entry[0], version: entry[2] }));
         class WorkerNavigatorUAData {
             get brands() { return _brands.slice(); }
             get mobile() { return false; }
@@ -1190,19 +1199,27 @@
                 } catch (_) {}
             };
             const NativeFunction = globalThis.Function;
-            globalThis.Function = new Proxy(NativeFunction, {
+            const FunctionProxy = new Proxy(NativeFunction, {
                 apply(target, thisArg, args) {
-                    record(typeof args[0] === "string"
-                        ? args[0]
-                        : (args[0] != null ? String(args[0]) : ""));
+                    const body = args.length ? args[args.length - 1] : "";
+                    record(typeof body === "string"
+                        ? body
+                        : (body != null ? String(body) : ""));
                     return Reflect.apply(target, thisArg, args);
                 },
                 construct(target, args, newTarget) {
-                    record(typeof args[0] === "string"
-                        ? args[0]
-                        : (args[0] != null ? String(args[0]) : ""));
+                    const body = args.length ? args[args.length - 1] : "";
+                    record(typeof body === "string"
+                        ? body
+                        : (body != null ? String(body) : ""));
                     return Reflect.construct(target, args, newTarget);
                 },
+            });
+            globalThis.Function = FunctionProxy;
+            Object.defineProperty(NativeFunction.prototype, "constructor", {
+                value: FunctionProxy,
+                writable: true,
+                configurable: true,
             });
         }
     } catch (_) {}

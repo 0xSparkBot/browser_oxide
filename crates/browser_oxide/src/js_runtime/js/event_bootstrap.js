@@ -1,4 +1,16 @@
 ((globalThis) => {
+    const _eventPrivateTraceEnabled = (() => {
+        try {
+            return !!(Deno.core.ops.op_event_private_trace_enabled
+                && Deno.core.ops.op_event_private_trace_enabled());
+        } catch (_) {
+            return false;
+        }
+    })();
+    const _eventPrivateTrace = (row) => {
+        if (!_eventPrivateTraceEnabled) return;
+        try { Deno.core.ops.op_event_private_trace(JSON.stringify(row)); } catch (_) {}
+    };
     const _eventDiagNote = (() => {
         if (globalThis.__browser_oxide_debug !== true
             && globalThis.__oxideDiagnostics !== true) return null;
@@ -27,6 +39,10 @@
     const _mouseEventState = new WeakMap();
     const _keyboardEventState = new WeakMap();
     const _messageEventState = new WeakMap();
+    const _inputEventState = new WeakMap();
+    const _focusEventState = new WeakMap();
+    const _pointerEventState = new WeakMap();
+    const _wheelEventState = new WeakMap();
 
     const _stateFor = (map, value) => {
         const state = map.get(value);
@@ -340,47 +356,100 @@
     class InputEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, { bubbles: true, cancelable: false, ...options });
-            this.data = options.data || null;
-            this.inputType = options.inputType || "";
-            this.isComposing = !!options.isComposing;
+            _inputEventState.set(this, {
+                data: options.data === undefined ? null : options.data,
+                isComposing: !!options.isComposing,
+                inputType: String(options.inputType || ""),
+                dataTransfer: options.dataTransfer || null,
+                targetRanges: options.targetRanges ? Array.from(options.targetRanges) : [],
+            });
         }
     }
+    for (const name of ['data', 'isComposing', 'inputType', 'dataTransfer']) {
+        _defineGetter(InputEvent.prototype, name, _inputEventState);
+    }
+    const _inputGetTargetRanges = { getTargetRanges() {
+        return _stateFor(_inputEventState, this).targetRanges.slice();
+    } }.getTargetRanges;
+    Object.defineProperty(InputEvent.prototype, 'getTargetRanges', {
+        value: _native(_inputGetTargetRanges, 'getTargetRanges'),
+        writable: true, enumerable: true, configurable: true,
+    });
+    _moveConstructorLast(InputEvent);
 
     class FocusEvent extends UIEvent {
         constructor(type, options = {}) {
             super(type, options);
-            this.relatedTarget = options.relatedTarget || null;
+            _focusEventState.set(this, { relatedTarget: options.relatedTarget || null });
         }
     }
+    _defineGetter(FocusEvent.prototype, 'relatedTarget', _focusEventState);
+    _moveConstructorLast(FocusEvent);
 
     class PointerEvent extends MouseEvent {
         constructor(type, options = {}) {
             super(type, options);
-            this.pointerId = options.pointerId || 0;
-            this.width = options.width || 1;
-            this.height = options.height || 1;
-            this.pressure = options.pressure || 0;
-            this.tangentialPressure = options.tangentialPressure || 0;
-            this.tiltX = options.tiltX || 0;
-            this.tiltY = options.tiltY || 0;
-            this.twist = options.twist || 0;
-            this.pointerType = options.pointerType || "mouse";
-            this.isPrimary = options.isPrimary !== undefined ? options.isPrimary : true;
+            _pointerEventState.set(this, {
+                pointerId: Number(options.pointerId) || 0,
+                width: options.width === undefined ? 1 : Number(options.width) || 0,
+                height: options.height === undefined ? 1 : Number(options.height) || 0,
+                pressure: Number(options.pressure) || 0,
+                tiltX: Number(options.tiltX) || 0,
+                tiltY: Number(options.tiltY) || 0,
+                azimuthAngle: Number(options.azimuthAngle) || 0,
+                altitudeAngle: options.altitudeAngle === undefined
+                    ? Math.PI / 2
+                    : Number(options.altitudeAngle) || 0,
+                tangentialPressure: Number(options.tangentialPressure) || 0,
+                twist: Number(options.twist) || 0,
+                pointerType: String(options.pointerType || ""),
+                isPrimary: !!options.isPrimary,
+                persistentDeviceId: Number(options.persistentDeviceId) || 0,
+            });
         }
     }
+    for (const name of ['pointerId', 'width', 'height', 'pressure', 'tiltX',
+        'tiltY', 'azimuthAngle', 'altitudeAngle', 'tangentialPressure', 'twist',
+        'pointerType', 'isPrimary', 'persistentDeviceId']) {
+        _defineGetter(PointerEvent.prototype, name, _pointerEventState);
+    }
+    const _pointerGetPredictedEvents = { getPredictedEvents() { return []; } }.getPredictedEvents;
+    Object.defineProperty(PointerEvent.prototype, 'getPredictedEvents', {
+        value: _native(_pointerGetPredictedEvents, 'getPredictedEvents'),
+        writable: true, enumerable: true, configurable: true,
+    });
+    _moveConstructorLast(PointerEvent);
 
     class WheelEvent extends MouseEvent {
         constructor(type, options = {}) {
             super(type, options);
-            this.deltaX = options.deltaX || 0;
-            this.deltaY = options.deltaY || 0;
-            this.deltaZ = options.deltaZ || 0;
-            this.deltaMode = options.deltaMode || 0;
+            const deltaX = Number(options.deltaX) || 0;
+            const deltaY = Number(options.deltaY) || 0;
+            _wheelEventState.set(this, {
+                deltaX,
+                deltaY,
+                deltaZ: Number(options.deltaZ) || 0,
+                deltaMode: (Number(options.deltaMode) || 0) >>> 0,
+                wheelDeltaX: deltaX ? -Math.sign(deltaX) * 120 : 0,
+                wheelDeltaY: deltaY ? -Math.sign(deltaY) * 120 : 0,
+                wheelDelta: deltaY ? -Math.sign(deltaY) * 120 : 0,
+            });
         }
-        static DOM_DELTA_PIXEL = 0;
-        static DOM_DELTA_LINE = 1;
-        static DOM_DELTA_PAGE = 2;
     }
+    for (const name of ['deltaX', 'deltaY', 'deltaZ', 'deltaMode',
+        'wheelDeltaX', 'wheelDeltaY', 'wheelDelta']) {
+        _defineGetter(WheelEvent.prototype, name, _wheelEventState);
+    }
+    for (const [name, value] of [
+        ['DOM_DELTA_PIXEL', 0], ['DOM_DELTA_LINE', 1], ['DOM_DELTA_PAGE', 2],
+    ]) {
+        for (const target of [WheelEvent, WheelEvent.prototype]) {
+            Object.defineProperty(target, name, {
+                value, writable: false, enumerable: true, configurable: false,
+            });
+        }
+    }
+    _moveConstructorLast(WheelEvent);
 
     class TouchEvent extends UIEvent {
         constructor(type, options = {}) {
@@ -602,6 +671,22 @@
 
     const _addEventListener = function addEventListener(type, callback, options) {
         if (typeof callback !== "function" && typeof callback !== "object") return;
+        if (type === "voiceschanged") {
+            try {
+                if (Deno.core.ops.op_speech_private_trace_enabled
+                    && Deno.core.ops.op_speech_private_trace_enabled()) {
+                    const handler = typeof callback === "function"
+                        ? callback : callback && callback.handleEvent;
+                    Deno.core.ops.op_speech_private_trace(JSON.stringify({
+                        phase: "add-listener",
+                        origin: String(globalThis.location && globalThis.location.origin || ""),
+                        at: Number(globalThis.performance && globalThis.performance.now() || 0),
+                        targetCtor: String(this && this.constructor && this.constructor.name || ""),
+                        sourceLength: handler ? String(handler).length : 0,
+                    }));
+                }
+            } catch (_) {}
+        }
         const capture = typeof options === "boolean" ? options : !!(options && options.capture);
         const once = typeof options === "object" && options ? !!options.once : false;
         const passive = typeof options === "object" && options ? !!options.passive : false;
@@ -626,6 +711,8 @@
         if (eventState.dispatching) {
             throw new DOMException('The event is already being dispatched.', 'InvalidStateError');
         }
+        const privateMessageTrace = _eventPrivateTraceEnabled && event.type === "message";
+        const privateDispatchStart = privateMessageTrace ? performance.now() : 0;
         eventState.dispatching = true;
         eventState.target = this;
         const nodeId = _getNodeIdOrMinusOne(this);
@@ -678,6 +765,22 @@
         eventState.currentTarget = null;
         eventState.path = [];
         eventState.dispatching = false;
+        if (privateMessageTrace) {
+            let listenerCount = 0;
+            let hasHandler = false;
+            try {
+                listenerCount = _getListeners(this, event.type).length;
+                hasHandler = typeof this.onmessage === "function";
+            } catch (_) {}
+            _eventPrivateTrace({
+                phase: "dispatch",
+                type: "message",
+                duration: performance.now() - privateDispatchStart,
+                listenerCount,
+                hasHandler,
+                trusted: !!event.isTrusted,
+            });
+        }
         return !eventState.defaultPrevented;
     };
 
@@ -688,6 +791,8 @@
             const handlerName = `on${event.type}`;
             const handler = target[handlerName];
             if (typeof handler === "function") {
+                const privateStart = _eventPrivateTraceEnabled && event.type === "message"
+                    ? performance.now() : 0;
                 try {
                     handler.call(target, event);
                 } catch (e) {
@@ -698,6 +803,16 @@
                         );
                     } catch (_) {}
                     console.error(e);
+                } finally {
+                    if (privateStart) {
+                        _eventPrivateTrace({
+                            phase: "handler",
+                            type: "message",
+                            duration: performance.now() - privateStart,
+                            name: String(handler.name || ""),
+                            sourceLength: String(handler).length,
+                        });
+                    }
                 }
             }
         }
@@ -724,10 +839,23 @@
             // otherwise one faulty observer can suppress the target's actual
             // handler/state-machine callback.
             try {
+                const privateStart = _eventPrivateTraceEnabled && event.type === "message"
+                    ? performance.now() : 0;
                 if (typeof l.callback === "function") {
                     l.callback.call(target, event);
                 } else if (l.callback && typeof l.callback.handleEvent === "function") {
                     l.callback.handleEvent(event);
+                }
+                if (privateStart) {
+                    const callback = typeof l.callback === "function"
+                        ? l.callback : l.callback && l.callback.handleEvent;
+                    _eventPrivateTrace({
+                        phase: "listener",
+                        type: "message",
+                        duration: performance.now() - privateStart,
+                        name: String((callback && callback.name) || ""),
+                        sourceLength: callback ? String(callback).length : 0,
+                    });
                 }
             } catch (e) {
                 try {
@@ -933,16 +1061,40 @@
             bo._completeDocumentLifecycle = function() {
                 const state = globalThis._browser_oxide;
                 const trusted = (type, options) => _markTrusted(new Event(type, options));
+                // Navigation lifecycle timestamps must be measured at the
+                // actual browser-generated transitions.  The old
+                // PerformanceNavigationTiming implementation kept fixed
+                // 320.5/328.7/515.9ms constants even for network-backed
+                // documents, which made every real navigation expose the same
+                // DOMContentLoaded/load fingerprint.  PerfState's clock is
+                // already anchored to the HTTP navigation time origin, so
+                // performance.now() here is the correct navigation-relative
+                // coordinate (including response download, parsing and script
+                // execution that happened before this lifecycle dispatch).
+                const lifecycle = state
+                    ? (state.__navigationLifecycleTiming ||
+                        (state.__navigationLifecycleTiming = {}))
+                    : null;
+                const stamp = (name) => {
+                    if (!lifecycle) return;
+                    try { lifecycle[name] = performance.now(); } catch (_) {}
+                };
 
+                stamp('domInteractive');
                 if (state) state.__documentReadyState = 'interactive';
                 document.dispatchEvent(trusted('readystatechange'));
                 // DOM standard: bubbles:true so the event propagates to the
                 // window (window-level DOMContentLoaded listeners).
+                stamp('domContentLoadedEventStart');
                 document.dispatchEvent(trusted('DOMContentLoaded', { bubbles: true }));
+                stamp('domContentLoadedEventEnd');
 
+                stamp('domComplete');
                 if (state) state.__documentReadyState = 'complete';
                 document.dispatchEvent(trusted('readystatechange'));
+                stamp('loadEventStart');
                 window.dispatchEvent(trusted('load'));
+                stamp('loadEventEnd');
                 try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}
             };
         }

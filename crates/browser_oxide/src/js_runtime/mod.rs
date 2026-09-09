@@ -19,6 +19,7 @@ use crate::stealth::StealthProfile;
 use deno_core::v8;
 use deno_core::JsRuntime;
 use extensions::nav_ext::NavSignal;
+use extensions::worker_ext::WorkerOwnerWake;
 use runtime::{create_runtime_with_signals, BrowserRuntimeOptions, RuntimeInternalFns};
 use state::{ConsoleMessage, DomState};
 
@@ -49,12 +50,15 @@ pub struct BrowserJsRuntime {
     /// temporary page-visible bridge.
     set_current_script_fn: Option<v8::Global<v8::Function>>,
     complete_lifecycle_fn: Option<v8::Global<v8::Function>>,
+    worker_messages_pump_fn: Option<v8::Global<v8::Function>>,
     /// Per-runtime navigation-pending signal. JS sets it via
     /// `op_set_pending_nav` (called from window_bootstrap.js whenever
     /// `__pendingNavigation` is assigned). The event loop polls it to
     /// short-circuit `run_until_idle` for fast nav handoff (some sites
     /// expect a navigation to begin within a few seconds).
     nav_signal: NavSignal,
+    /// Wake channel for messages posted by workers owned by this runtime.
+    worker_owner_wake: WorkerOwnerWake,
 }
 
 /// RAII guard that enters a V8 isolate on creation and exits it on drop,
@@ -131,12 +135,20 @@ impl BrowserJsRuntime {
         nav_signal: NavSignal,
         internal_fns: RuntimeInternalFns,
     ) -> Self {
+        let worker_owner_wake = inner
+            .op_state()
+            .borrow()
+            .try_borrow::<WorkerOwnerWake>()
+            .cloned()
+            .unwrap_or_default();
         Self {
             inner,
             nav_signal,
+            worker_owner_wake,
             frame_deliver_fn: None,
             set_current_script_fn: internal_fns.set_current_script,
             complete_lifecycle_fn: internal_fns.complete_document_lifecycle,
+            worker_messages_pump_fn: internal_fns.pump_worker_messages,
         }
     }
 
@@ -156,6 +168,12 @@ impl BrowserJsRuntime {
     /// event-loop driver immediately.
     pub fn nav_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.nav_signal.notify()
+    }
+
+    /// Fires only when an owned worker has actually queued a message. This is
+    /// separate from the worker receive op so an idle worker stays unref'ed.
+    pub fn worker_message_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.worker_owner_wake.notify_handle()
     }
 
     /// Set `document.currentScript` through a private bootstrap closure that is
@@ -180,6 +198,24 @@ impl BrowserJsRuntime {
     /// Advance the document through the trusted browser lifecycle sequence.
     pub fn complete_document_lifecycle(&mut self) {
         let Some(function) = self.complete_lifecycle_fn.clone() else {
+            return;
+        };
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let function = v8::Local::new(scope, &function);
+        let receiver = v8::undefined(scope).into();
+        let _ = function.call(scope, receiver, &[]);
+    }
+
+    /// Flush worker->parent messages that accumulated while the worker's
+    /// receive op was intentionally unref'ed. This is a synchronous task-queue
+    /// handoff: it never waits for an idle worker, so calling it on every event
+    /// loop entry preserves fast page-idle detection while ensuring a later
+    /// unsolicited worker message is not stranded behind an unpolled op.
+    fn pump_worker_messages(&mut self) {
+        let Some(function) = self.worker_messages_pump_fn.clone() else {
             return;
         };
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
@@ -468,6 +504,7 @@ impl BrowserJsRuntime {
     /// Run the V8 event loop until all pending work is done.
     pub async fn run_event_loop(&mut self) -> Result<(), deno_core::error::AnyError> {
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        self.pump_worker_messages();
         // v8-149: re-enter this runtime's own isolate so driving the event
         // loop (which runs JS, microtasks, and ops that build scopes) targets
         // the correct thread-current isolate even when a child-iframe runtime
@@ -475,10 +512,13 @@ impl BrowserJsRuntime {
         // the long note in `execute_script`. Without this, sites that spawn
         // iframes/workers crash with the scope.rs "not the same Isolate" panic.
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
-        self.inner
+        let result = self
+            .inner
             .run_event_loop(deno_core::PollEventLoopOptions::default())
             .await
-            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))
+            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()));
+        self.pump_worker_messages();
+        result
     }
 
     /// Poll this runtime's event loop once with the driver's context, so the
@@ -488,6 +528,8 @@ impl BrowserJsRuntime {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), deno_core::error::AnyError>> {
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        self.worker_owner_wake.register(cx.waker());
+        self.pump_worker_messages();
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
         self.inner
             .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())

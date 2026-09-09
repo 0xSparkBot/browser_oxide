@@ -1669,6 +1669,61 @@ impl Page {
         self.event_loop.execute_script(js)
     }
 
+    /// Return the current values of form controls whose `name` exactly
+    /// matches `name`.
+    ///
+    /// This is intentionally a generic DOM helper rather than a
+    /// vendor-specific challenge solver.  It is useful for controls that are
+    /// populated asynchronously by page JavaScript (for example hidden
+    /// verification-response inputs) once the page has completed whatever
+    /// normal browser interaction it requires.
+    ///
+    /// The lookup avoids interpolating `name` into a CSS selector, so callers
+    /// do not need to CSS-escape arbitrary control names.
+    pub fn named_form_control_values(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<String>, deno_core::error::AnyError> {
+        let encoded_name = serde_json::to_string(name)?;
+        let script = format!(
+            r#"(function(expectedName) {{
+                const values = [];
+                const controls = document.querySelectorAll('input,textarea,select');
+                for (const control of controls) {{
+                    let controlName = '';
+                    try {{
+                        controlName = String(
+                            control.name ||
+                            (control.getAttribute && control.getAttribute('name')) ||
+                            ''
+                        );
+                    }} catch (_) {{}}
+                    if (controlName !== expectedName) continue;
+                    let value = '';
+                    try {{ value = String(control.value ?? ''); }} catch (_) {{}}
+                    values.push(value);
+                }}
+                return JSON.stringify(values);
+            }})({encoded_name})"#
+        );
+        let raw = self.evaluate(&script)?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
+    /// Return the first non-empty value from [`Page::named_form_control_values`].
+    ///
+    /// No challenge is solved by this method; it only reads state that page
+    /// JavaScript has already written into a standard form control.
+    pub fn first_nonempty_named_form_control_value(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<String>, deno_core::error::AnyError> {
+        Ok(self
+            .named_form_control_values(name)?
+            .into_iter()
+            .find(|value| !value.is_empty()))
+    }
+
     /// V8's `used_heap_size` for this page's isolate, in bytes.
     ///
     /// Useful for monitoring a [`crate::pool::PagePool`]: sample after each
@@ -4947,6 +5002,52 @@ impl Page {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn named_form_control_values_reads_async_populated_controls() {
+        let html = r#"
+            <html><body>
+                <input type="hidden" name="dynamic-response" value="">
+                <textarea name="dynamic-response"></textarea>
+                <input name="other" value="ignore-me">
+                <script>
+                    document.querySelector('input[name="dynamic-response"]').value = 'value-a';
+                    document.querySelector('textarea[name="dynamic-response"]').value = 'value-b';
+                </script>
+            </body></html>
+        "#;
+        let mut page = Page::from_html(html, None).await.expect("page");
+
+        assert_eq!(
+            page.named_form_control_values("dynamic-response")
+                .expect("named control values"),
+            vec!["value-a".to_string(), "value-b".to_string()]
+        );
+        assert_eq!(
+            page.first_nonempty_named_form_control_value("dynamic-response")
+                .expect("first nonempty value")
+                .as_deref(),
+            Some("value-a")
+        );
+        assert!(page
+            .named_form_control_values("missing")
+            .expect("missing values")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn named_form_control_values_handles_selector_metacharacters() {
+        let html = r#"<html><body><input id="target" value="safe"></body></html>"#;
+        let mut page = Page::from_html(html, None).await.expect("page");
+        page.evaluate(r#"document.getElementById('target').setAttribute('name', 'a"] [name="b')"#)
+            .expect("set unusual name");
+
+        assert_eq!(
+            page.named_form_control_values("a\"] [name=\"b")
+                .expect("unusual named control"),
+            vec!["safe".to_string()]
+        );
+    }
+
     /// `is_interstitial_challenge` must catch a typical
     /// `rt:'i'` interstitial (small body + a captcha-delivery.com script).
     #[test]
@@ -5322,13 +5423,11 @@ mod tests {
         );
     }
 
-    /// Real Chrome on macOS exposes the `window.ApplePaySession`
-    /// constructor; we match that on the macOS UA for fidelity.
-    /// Regression-locks the macOS-conditional shim in window_bootstrap.
+    /// Current Chrome/Chromium on macOS does not expose the Safari-only
+    /// `window.ApplePaySession` constructor. Keep the Chrome profile free of
+    /// that surface even on a secure context.
     #[tokio::test]
-    async fn apple_pay_session_present_on_macos_profile() {
-        // ApplePaySession is gated on isSecureContext so the
-        // page must be loaded over https:// for the macOS shim to install.
+    async fn apple_pay_session_absent_on_macos_chrome_profile() {
         let profile = crate::stealth::presets::chrome_148_macos();
         let mut page = Page::from_html_with_url(
             "<html><head></head><body></body></html>",
@@ -5339,13 +5438,9 @@ mod tests {
         .unwrap();
         let t = page.evaluate("typeof ApplePaySession").unwrap();
         assert_eq!(
-            t, "function",
-            "macOS profile must expose ApplePaySession constructor"
+            t, "undefined",
+            "macOS Chrome profile must not expose Safari-only ApplePaySession"
         );
-        let cmp = page.evaluate("ApplePaySession.canMakePayments()").unwrap();
-        assert_eq!(cmp, "true");
-        let v = page.evaluate("ApplePaySession.supportsVersion(3)").unwrap();
-        assert_eq!(v, "true");
     }
 
     #[tokio::test]
