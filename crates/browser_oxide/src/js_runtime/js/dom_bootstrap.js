@@ -4552,6 +4552,23 @@
         "HTMLDataElement", "HTMLDataListElement", "HTMLDetailsElement",
         "HTMLDialogElement", "HTMLDirectoryElement", "HTMLSelectedContentElement",
     ];
+    // Keep the child realm constructor surface aligned with the parent WebIDL
+    // graph without maintaining a second hand-written list.  The names are
+    // captured now; their actual source constructors/prototype parents are read
+    // later when the child realm is materialized, after all normalization
+    // bootstraps have run.
+    for (const name of Object.getOwnPropertyNames(globalThis)) {
+        if (/^(HTML.*Element|SVG.*Element)$/.test(name)
+            && typeof globalThis[name] === "function"
+            && !_CHILD_REALM_INTERFACES.includes(name)) {
+            _CHILD_REALM_INTERFACES.push(name);
+        }
+    }
+    for (const name of ["Attr", "AbstractRange", "Range", "Selection", "NamedNodeMap"]) {
+        if (typeof globalThis[name] === "function" && !_CHILD_REALM_INTERFACES.includes(name)) {
+            _CHILD_REALM_INTERFACES.push(name);
+        }
+    }
 
     function _installChildRealmInterfaces(realmId) {
         const sources = Object.create(null);
@@ -4659,6 +4676,9 @@
                     }catch(_){}
                     try{Object.defineProperty(proto,'constructor',{value:fresh,writable:true,configurable:true});}catch(_){}
                     try{fresh.prototype=proto;}catch(_){}
+                    try{
+                        if(parentName&&built[parentName])Object.setPrototypeOf(fresh,built[parentName]);
+                    }catch(_){}
                     try{
                         for(const key of Reflect.ownKeys(source)){
                             if(key==='prototype'||key==='name'||key==='length'||key==='caller'||key==='arguments')continue;

@@ -400,6 +400,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/dom_element_webidl_bootstrap.js"),
             "\n",
+            include_str!("js/constructor_webidl_bootstrap.js"),
+            "\n",
             include_str!("js/performance_webidl_bootstrap.js"),
             "\n",
             include_str!("js/network_webidl_bootstrap.js"),

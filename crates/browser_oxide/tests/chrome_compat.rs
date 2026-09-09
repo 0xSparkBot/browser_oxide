@@ -10494,7 +10494,10 @@ async fn dom_core_extended_webidl_matches_chrome_shape_and_behavior() {
     .await;
     let v: serde_json::Value =
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("json: {e}; raw={raw}"));
-    assert_eq!(v["nodeCtor"], "TypeError:Illegal constructor");
+    assert_eq!(
+        v["nodeCtor"],
+        "TypeError:Failed to construct 'Node': Illegal constructor"
+    );
     assert_eq!(
         v["constants"],
         serde_json::json!([1, 2, 3, 8, 9, 11, 4, 8, 16])
@@ -10661,7 +10664,8 @@ async fn element_html_webidl_layers_preserve_behavior_and_ownership() {
         "HTMLIFrameElement",
     ] {
         assert_eq!(
-            v["ctorResults"][name], "TypeError:Illegal constructor",
+            v["ctorResults"][name],
+            format!("TypeError:Failed to construct '{name}': Illegal constructor"),
             "{name}: {raw}"
         );
     }
@@ -10798,4 +10802,143 @@ async fn native_mask_metadata_is_hidden_from_parent_and_child_reflection() {
         );
     }
     assert_eq!(value["cross"], "function DOMRect() { [native code] }");
+}
+
+#[tokio::test]
+async fn dom_html_svg_constructor_chains_match_chrome() {
+    let raw = check(
+        r#"(() => {
+            const names = Object.getOwnPropertyNames(globalThis).filter(name =>
+                /^(HTML.*Element|SVG.*Element)$/.test(name) ||
+                ['EventTarget','Node','CharacterData','Text','Comment','Element','HTMLElement','Document',
+                 'HTMLDocument','DocumentFragment','ShadowRoot','Attr','NamedNodeMap','Range','Selection'].includes(name)
+            ).sort();
+            const constructible = new Set(['Comment','Document','DocumentFragment','EventTarget','Range','Text']);
+            const failures = [];
+            for (const name of names) {
+                const C = globalThis[name];
+                if (typeof C !== 'function') continue;
+                let ok = false;
+                try { new C(); ok = true; } catch (_) {}
+                if (ok !== constructible.has(name)) failures.push('construct:' + name + ':' + ok);
+                if (C.prototype && C.prototype.constructor !== C) failures.push('ctor:' + name);
+                const source = Function.prototype.toString.call(C);
+                if (source !== `function ${name}() { [native code] }`) failures.push('source:' + name + ':' + source);
+                if (Object.getOwnPropertySymbols(C).length !== 0) failures.push('symbol:' + name);
+            }
+
+            const parentChecks = {
+                Node: Object.getPrototypeOf(Node) === EventTarget && Object.getPrototypeOf(Node.prototype) === EventTarget.prototype,
+                Attr: Object.getPrototypeOf(Attr) === Node && Object.getPrototypeOf(Attr.prototype) === Node.prototype,
+                HTMLElement: Object.getPrototypeOf(HTMLElement) === Element && Object.getPrototypeOf(HTMLElement.prototype) === Element.prototype,
+                HTMLMediaElement: Object.getPrototypeOf(HTMLMediaElement) === HTMLElement && Object.getPrototypeOf(HTMLMediaElement.prototype) === HTMLElement.prototype,
+                HTMLVideoElement: Object.getPrototypeOf(HTMLVideoElement) === HTMLMediaElement && Object.getPrototypeOf(HTMLVideoElement.prototype) === HTMLMediaElement.prototype,
+                HTMLEmbedElement: Object.getPrototypeOf(HTMLEmbedElement) === HTMLElement && Object.getPrototypeOf(HTMLEmbedElement.prototype) === HTMLElement.prototype,
+                Range: Object.getPrototypeOf(Range) === AbstractRange && Object.getPrototypeOf(Range.prototype) === AbstractRange.prototype,
+                SVGElement: Object.getPrototypeOf(SVGElement) === Element && Object.getPrototypeOf(SVGElement.prototype) === Element.prototype,
+                SVGGraphicsElement: Object.getPrototypeOf(SVGGraphicsElement) === SVGElement && Object.getPrototypeOf(SVGGraphicsElement.prototype) === SVGElement.prototype,
+                SVGGeometryElement: Object.getPrototypeOf(SVGGeometryElement) === SVGGraphicsElement && Object.getPrototypeOf(SVGGeometryElement.prototype) === SVGGraphicsElement.prototype,
+                SVGCircleElement: Object.getPrototypeOf(SVGCircleElement) === SVGGeometryElement && Object.getPrototypeOf(SVGCircleElement.prototype) === SVGGeometryElement.prototype,
+                SVGAnimationElement: Object.getPrototypeOf(SVGAnimationElement) === SVGElement && Object.getPrototypeOf(SVGAnimationElement.prototype) === SVGElement.prototype,
+                SVGSetElement: Object.getPrototypeOf(SVGSetElement) === SVGAnimationElement && Object.getPrototypeOf(SVGSetElement.prototype) === SVGAnimationElement.prototype,
+            };
+
+            const div = document.createElement('div');
+            const video = document.createElement('video');
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            const created = {
+                div: div instanceof HTMLDivElement && div instanceof HTMLElement && div instanceof Element && div instanceof Node,
+                video: video instanceof HTMLVideoElement && video instanceof HTMLMediaElement && video instanceof HTMLElement,
+                svg: svg instanceof SVGSVGElement && svg instanceof SVGGraphicsElement && svg instanceof SVGElement,
+                circle: circle instanceof SVGCircleElement && circle instanceof SVGGeometryElement && circle instanceof SVGGraphicsElement,
+            };
+
+            const staticChecks = {
+                media: [HTMLMediaElement.NETWORK_EMPTY, HTMLMediaElement.NETWORK_LOADING, HTMLMediaElement.HAVE_ENOUGH_DATA],
+                track: [HTMLTrackElement.NONE, HTMLTrackElement.LOADING, HTMLTrackElement.LOADED, HTMLTrackElement.ERROR],
+                script: ['classic','module','importmap','speculationrules','webbundle'].every(x => HTMLScriptElement.supports(x))
+                    && !HTMLScriptElement.supports('text/javascript'),
+                fenced: HTMLFencedFrameElement.canLoadOpaqueURL(),
+                svgBlend: [SVGFEBlendElement.SVG_FEBLEND_MODE_UNKNOWN, SVGFEBlendElement.SVG_FEBLEND_MODE_LUMINOSITY],
+                svgMarker: [SVGMarkerElement.SVG_MARKERUNITS_STROKEWIDTH, SVGMarkerElement.SVG_MARKER_ORIENT_ANGLE],
+            };
+            const parsed = Document.parseHTMLUnsafe('<title>x</title><p id="p">ok</p><script>never()</script>');
+            staticChecks.parse = [
+                Object.prototype.toString.call(parsed), parsed.title,
+                parsed.getElementById('p')?.textContent || '',
+                parsed.querySelectorAll('script').length,
+                Reflect.ownKeys(parsed).map(String),
+                parsed.defaultView,
+            ];
+            const safeParsed = Document.parseHTML('<title>s</title><p id="safe-id" data-x="1">safe</p><script>never()</script>');
+            staticChecks.parseSafe = [
+                Object.prototype.toString.call(safeParsed), safeParsed.title,
+                safeParsed.getElementById('safe-id'),
+                safeParsed.querySelector('p')?.textContent || '',
+                safeParsed.querySelector('p')?.attributes.length || 0,
+                safeParsed.querySelectorAll('script').length,
+                Reflect.ownKeys(safeParsed).map(String),
+                safeParsed.defaultView,
+            ];
+
+            const iframe = document.createElement('iframe');
+            iframe.srcdoc = '<!doctype html><html><body></body></html>';
+            document.body.appendChild(iframe);
+            const child = iframe.contentWindow;
+            let childIllegal = false;
+            try { new child.HTMLAnchorElement(); } catch (e) { childIllegal = e instanceof child.TypeError; }
+            const childChecks = child && {
+                illegal: childIllegal,
+                videoParent: child.Object.getPrototypeOf(child.HTMLVideoElement) === child.HTMLMediaElement,
+                videoProtoParent: child.Object.getPrototypeOf(child.HTMLVideoElement.prototype) === child.HTMLMediaElement.prototype,
+                svgCircleParent: child.Object.getPrototypeOf(child.SVGCircleElement) === child.SVGGeometryElement,
+                native: child.Function.prototype.toString.call(child.HTMLQuoteElement),
+            };
+
+            return JSON.stringify({ count: names.length, failures, parentChecks, created, staticChecks, childChecks });
+        })()"#,
+    )
+    .await;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("json: {e}; raw={raw}"));
+    assert_eq!(v["count"], 159);
+    assert_eq!(v["failures"], serde_json::json!([]));
+    for value in v["parentChecks"].as_object().unwrap().values() {
+        assert_eq!(value, true, "parent chain: {raw}");
+    }
+    for value in v["created"].as_object().unwrap().values() {
+        assert_eq!(value, true, "created instance chain: {raw}");
+    }
+    assert_eq!(v["staticChecks"]["media"], serde_json::json!([0, 2, 4]));
+    assert_eq!(v["staticChecks"]["track"], serde_json::json!([0, 1, 2, 3]));
+    assert_eq!(v["staticChecks"]["script"], true);
+    assert_eq!(v["staticChecks"]["fenced"], true);
+    assert_eq!(v["staticChecks"]["svgBlend"], serde_json::json!([0, 16]));
+    assert_eq!(v["staticChecks"]["svgMarker"], serde_json::json!([2, 2]));
+    assert_eq!(
+        v["staticChecks"]["parse"],
+        serde_json::json!(["[object HTMLDocument]", "x", "ok", 1, ["location"], null])
+    );
+    assert_eq!(
+        v["staticChecks"]["parseSafe"],
+        serde_json::json!([
+            "[object HTMLDocument]",
+            "s",
+            null,
+            "safe",
+            0,
+            0,
+            ["location"],
+            null
+        ])
+    );
+    assert_eq!(v["childChecks"]["illegal"], true);
+    assert_eq!(v["childChecks"]["videoParent"], true);
+    assert_eq!(v["childChecks"]["videoProtoParent"], true);
+    assert_eq!(v["childChecks"]["svgCircleParent"], true);
+    assert_eq!(
+        v["childChecks"]["native"],
+        "function HTMLQuoteElement() { [native code] }"
+    );
 }
