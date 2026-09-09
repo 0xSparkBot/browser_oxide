@@ -10291,3 +10291,121 @@ async fn file_reader_read_as_text_decodes_utf8() {
     "#;
     assert_eq!(check(js).await, "héllo");
 }
+
+#[tokio::test]
+async fn binary_file_and_fetch_objects_match_chrome_webidl_shape() {
+    let raw = check(
+        r#"(() => {
+            const descriptorShape = (ctor, required) => {
+                const proto = ctor.prototype;
+                return required.every((name) => {
+                    const d = Object.getOwnPropertyDescriptor(proto, name);
+                    return !!d && d.enumerable === true && d.configurable === true;
+                });
+            };
+            const blob = new Blob(['abc'], { type: 'TEXT/PLAIN' });
+            const file = new File(['xy'], 'a/b.txt', { type: 'text/plain', lastModified: 1234 });
+            const reader = new FileReader();
+            const headers = new Headers();
+            headers.append('x-test', 'a');
+            headers.append('x-test', 'b');
+            headers.append('set-cookie', 'a=1');
+            headers.append('set-cookie', 'b=2');
+            const request = new Request('https://example.com/path', {
+                method: 'POST', body: 'hello', headers: { 'x-test': '1' },
+            });
+            const requestClone = request.clone();
+            const response = new Response('hello', {
+                status: 201, headers: { 'content-type': 'text/plain' },
+            });
+            return JSON.stringify({
+                descriptorOk:
+                    descriptorShape(Blob, ['size','type','slice','text','arrayBuffer','bytes','stream']) &&
+                    descriptorShape(File, ['name','lastModified','lastModifiedDate','webkitRelativePath']) &&
+                    descriptorShape(FileReader, ['readyState','result','error','readAsText','readAsArrayBuffer','readAsBinaryString','readAsDataURL','abort']) &&
+                    descriptorShape(Headers, ['append','delete','entries','forEach','get','getSetCookie','has','keys','set','values']) &&
+                    descriptorShape(Request, ['url','method','headers','body','bodyUsed','signal','text','json','arrayBuffer','blob','bytes','formData','clone']) &&
+                    descriptorShape(Response, ['type','redirected','status','statusText','ok','headers','url','body','bodyUsed','text','json','arrayBuffer','blob','bytes','formData','clone']),
+                ownKeys: {
+                    blob: Reflect.ownKeys(blob).map(String),
+                    file: Reflect.ownKeys(file).map(String),
+                    reader: Reflect.ownKeys(reader).map(String),
+                    headers: Reflect.ownKeys(headers).map(String),
+                    request: Reflect.ownKeys(request).map(String),
+                    response: Reflect.ownKeys(response).map(String),
+                },
+                blob: { size: blob.size, type: blob.type },
+                file: {
+                    name: file.name, size: file.size, type: file.type,
+                    lastModified: file.lastModified,
+                    lastModifiedDate: file.lastModifiedDate.getTime(),
+                    relative: file.webkitRelativePath,
+                    isBlob: file instanceof Blob,
+                },
+                headers: {
+                    combined: headers.get('x-test'),
+                    cookies: headers.getSetCookie(),
+                    iteratorSame: Headers.prototype[Symbol.iterator] === Headers.prototype.entries,
+                },
+                request: {
+                    tag: Object.prototype.toString.call(request),
+                    method: request.method,
+                    url: request.url,
+                    header: request.headers.get('x-test'),
+                    cloneOwnKeys: Reflect.ownKeys(requestClone).map(String),
+                    cloneMethod: requestClone.method,
+                    cloneUrl: requestClone.url,
+                },
+                response: {
+                    tag: Object.prototype.toString.call(response),
+                    status: response.status,
+                    ok: response.ok,
+                    type: response.type,
+                    redirected: response.redirected,
+                    contentType: response.headers.get('content-type'),
+                },
+                readerConstants: [FileReader.EMPTY, FileReader.LOADING, FileReader.DONE],
+            });
+        })()"#,
+    )
+    .await;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("json: {e}; raw={raw}"));
+    assert_eq!(value["descriptorOk"], true);
+    for name in ["blob", "file", "reader", "headers", "request", "response"] {
+        assert_eq!(
+            value["ownKeys"][name],
+            serde_json::json!([]),
+            "{name}: {raw}"
+        );
+    }
+    assert_eq!(value["blob"]["size"], 3);
+    assert_eq!(value["blob"]["type"], "text/plain");
+    assert_eq!(value["file"]["name"], "a:b.txt");
+    assert_eq!(value["file"]["size"], 2);
+    assert_eq!(value["file"]["type"], "text/plain");
+    assert_eq!(value["file"]["lastModified"], 1234);
+    assert_eq!(value["file"]["lastModifiedDate"], 1234);
+    assert_eq!(value["file"]["relative"], "");
+    assert_eq!(value["file"]["isBlob"], true);
+    assert_eq!(value["headers"]["combined"], "a, b");
+    assert_eq!(
+        value["headers"]["cookies"],
+        serde_json::json!(["a=1", "b=2"])
+    );
+    assert_eq!(value["headers"]["iteratorSame"], true);
+    assert_eq!(value["request"]["tag"], "[object Request]");
+    assert_eq!(value["request"]["method"], "POST");
+    assert_eq!(value["request"]["url"], "https://example.com/path");
+    assert_eq!(value["request"]["header"], "1");
+    assert_eq!(value["request"]["cloneOwnKeys"], serde_json::json!([]));
+    assert_eq!(value["request"]["cloneMethod"], "POST");
+    assert_eq!(value["request"]["cloneUrl"], "https://example.com/path");
+    assert_eq!(value["response"]["tag"], "[object Response]");
+    assert_eq!(value["response"]["status"], 201);
+    assert_eq!(value["response"]["ok"], true);
+    assert_eq!(value["response"]["type"], "default");
+    assert_eq!(value["response"]["redirected"], false);
+    assert_eq!(value["response"]["contentType"], "text/plain");
+    assert_eq!(value["readerConstants"], serde_json::json!([0, 1, 2]));
+}

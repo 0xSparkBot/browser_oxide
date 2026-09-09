@@ -400,6 +400,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/network_webidl_bootstrap.js"),
             "\n",
+            include_str!("js/binary_fetch_webidl_bootstrap.js"),
+            "\n",
             include_str!("js/structured_clone.js"),
         );
 
@@ -708,6 +710,13 @@ pub fn create_worker_runtime(
         .execute_script("<anonymous>", include_str!("js/event_details_bootstrap.js"))
         .expect("worker: event details bootstrap failed");
 
+    runtime
+        .execute_script(
+            "<anonymous>",
+            include_str!("js/binary_fetch_webidl_bootstrap.js"),
+        )
+        .expect("worker: binary/fetch WebIDL bootstrap failed");
+
     // structuredClone is useful inside workers too — worker code that
     // uses `postMessage` with complex values relies on it, and the
     // impl is self-contained (it gracefully handles the absence of
@@ -733,7 +742,10 @@ pub fn create_worker_runtime(
         .expect("worker: WebIDL arity bootstrap failed");
 
     runtime
-        .execute_script("<anonymous>", include_str!("js/webidl_surface_bootstrap.js"))
+        .execute_script(
+            "<anonymous>",
+            include_str!("js/webidl_surface_bootstrap.js"),
+        )
         .expect("worker: WebIDL surface bootstrap failed");
 
     runtime

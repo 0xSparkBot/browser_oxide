@@ -179,6 +179,8 @@ pub fn get_snapshot() -> &'static [u8] {
             "\n",
             include_str!("js/network_webidl_bootstrap.js"),
             "\n",
+            include_str!("js/binary_fetch_webidl_bootstrap.js"),
+            "\n",
             include_str!("js/structured_clone.js"),
         );
 
