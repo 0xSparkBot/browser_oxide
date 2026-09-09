@@ -4582,6 +4582,28 @@
                 try{Object.defineProperty(fn,nativeTag,{value:name,configurable:true});}catch(_){}
                 return fn;
             }
+            // Keep the cross-realm native-name marker for Function#toString,
+            // but hide that engine-private configurable Symbol from normal
+            // browser reflection just like the parent cleanup layer does.
+            const rawOwnKeys=Reflect.ownKeys;
+            const rawGetOwnPropertySymbols=Object.getOwnPropertySymbols;
+            const rawGetOwnPropertyDescriptors=Object.getOwnPropertyDescriptors;
+            const ownKeys=nativeShape(function ownKeys(target){
+                return rawOwnKeys(target).filter(key=>key!==nativeTag);
+            },'ownKeys');
+            const getOwnPropertySymbols=nativeShape(function getOwnPropertySymbols(target){
+                return rawGetOwnPropertySymbols(target).filter(key=>key!==nativeTag);
+            },'getOwnPropertySymbols');
+            const getOwnPropertyDescriptors=nativeShape(function getOwnPropertyDescriptors(target){
+                const descriptors=rawGetOwnPropertyDescriptors(target);
+                for(const key of rawOwnKeys(descriptors)){
+                    if(key===nativeTag){try{delete descriptors[key];}catch(_){}}
+                }
+                return descriptors;
+            },'getOwnPropertyDescriptors');
+            Reflect.ownKeys=ownKeys;
+            Object.getOwnPropertySymbols=getOwnPropertySymbols;
+            Object.getOwnPropertyDescriptors=getOwnPropertyDescriptors;
             function syncFrames(){
                 try{if(typeof frameRegistryHook==='function')frameRegistryHook();}catch(_){}
             }

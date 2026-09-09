@@ -10721,3 +10721,81 @@ async fn element_html_webidl_layers_preserve_behavior_and_ownership() {
     assert_eq!(v["specific"]["scriptAsync"], true);
     assert_eq!(v["specific"]["anchorHref"], "/x");
 }
+
+#[tokio::test]
+async fn native_mask_metadata_is_hidden_from_parent_and_child_reflection() {
+    let raw = check(
+        r#"(() => {
+            const snap = root => {
+                const rows = {};
+                for (const [name, fn] of Object.entries({
+                    DOMRect: root.DOMRect,
+                    Path2D: root.Path2D,
+                    Request: root.Request,
+                    fnToString: root.Function.prototype.toString,
+                })) {
+                    rows[name] = {
+                        own: root.Reflect.ownKeys(fn).map(String),
+                        symbols: root.Object.getOwnPropertySymbols(fn).map(String),
+                        descriptorSymbols: root.Object.getOwnPropertySymbols(
+                            root.Object.getOwnPropertyDescriptors(fn)
+                        ).map(String),
+                        source: root.Function.prototype.toString.call(fn),
+                    };
+                }
+                rows.reflection = {
+                    ownKeys: String(root.Reflect.ownKeys),
+                    symbols: String(root.Object.getOwnPropertySymbols),
+                    descriptors: String(root.Object.getOwnPropertyDescriptors),
+                };
+                return rows;
+            };
+            const iframe = document.createElement('iframe');
+            iframe.srcdoc = '<!doctype html><html><body></body></html>';
+            document.body.appendChild(iframe);
+            const child = iframe.contentWindow;
+            return JSON.stringify({
+                parent: snap(window),
+                child: snap(child),
+                cross: child.Function.prototype.toString.call(DOMRect),
+            });
+        })()"#,
+    )
+    .await;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("json: {e}; raw={raw}"));
+    for realm in ["parent", "child"] {
+        for name in ["DOMRect", "Path2D", "Request", "fnToString"] {
+            for field in ["own", "symbols", "descriptorSymbols"] {
+                let entries = value[realm][name][field].as_array().unwrap();
+                assert!(
+                    entries.iter().all(|entry| !entry
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("__browser_oxide_native__")),
+                    "{realm}/{name}/{field}: {raw}"
+                );
+            }
+            assert!(
+                value[realm][name]["source"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("[native code]"),
+                "{realm}/{name}: {raw}"
+            );
+        }
+        assert_eq!(
+            value[realm]["reflection"]["ownKeys"],
+            "function ownKeys() { [native code] }"
+        );
+        assert_eq!(
+            value[realm]["reflection"]["symbols"],
+            "function getOwnPropertySymbols() { [native code] }"
+        );
+        assert_eq!(
+            value[realm]["reflection"]["descriptors"],
+            "function getOwnPropertyDescriptors() { [native code] }"
+        );
+    }
+    assert_eq!(value["cross"], "function DOMRect() { [native code] }");
+}

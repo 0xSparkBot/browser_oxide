@@ -1062,10 +1062,13 @@
             } catch (_e) {}
         }
 
+        const _nativeMaskTag = globalThis._nativeTag;
         const _objectGetOwnPropertyNames = Object.getOwnPropertyNames;
+        const _objectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
         const _objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
         const _objectKeys = Object.keys;
         const _reflectOwnKeys = Reflect.ownKeys;
+        const _isHiddenOwnKey = (key) => _nativeMaskTag && key === _nativeMaskTag;
 
         const getOwnPropertyNames = function getOwnPropertyNames(target) {
             const names = _objectGetOwnPropertyNames(target);
@@ -1073,11 +1076,15 @@
                 ? names.filter((name) => !_isHiddenGlobalName(name))
                 : names;
         };
+        const getOwnPropertySymbols = function getOwnPropertySymbols(target) {
+            return _objectGetOwnPropertySymbols(target).filter((key) => !_isHiddenOwnKey(key));
+        };
         const getOwnPropertyDescriptors = function getOwnPropertyDescriptors(target) {
             const descriptors = _objectGetOwnPropertyDescriptors(target);
-            if (_isGlobalTarget(target)) {
-                for (const name of Object.keys(descriptors)) {
-                    if (_isHiddenGlobalName(name)) delete descriptors[name];
+            for (const key of _reflectOwnKeys(descriptors)) {
+                if (_isHiddenOwnKey(key)
+                    || (_isGlobalTarget(target) && typeof key === 'string' && _isHiddenGlobalName(key))) {
+                    try { delete descriptors[key]; } catch (_e) {}
                 }
             }
             return descriptors;
@@ -1090,17 +1097,20 @@
         };
         const ownKeys = function ownKeys(target) {
             const names = _reflectOwnKeys(target);
-            return _isGlobalTarget(target)
-                ? names.filter((name) => !_isHiddenGlobalName(name))
-                : names;
+            return names.filter((name) =>
+                !_isHiddenOwnKey(name)
+                && (!_isGlobalTarget(target) || typeof name !== 'string' || !_isHiddenGlobalName(name))
+            );
         };
 
         Object.getOwnPropertyNames = getOwnPropertyNames;
+        Object.getOwnPropertySymbols = getOwnPropertySymbols;
         Object.getOwnPropertyDescriptors = getOwnPropertyDescriptors;
         Object.keys = keys;
         Reflect.ownKeys = ownKeys;
         if (typeof globalThis._maskFunction === 'function') {
             globalThis._maskFunction(getOwnPropertyNames, 'getOwnPropertyNames');
+            globalThis._maskFunction(getOwnPropertySymbols, 'getOwnPropertySymbols');
             globalThis._maskFunction(getOwnPropertyDescriptors, 'getOwnPropertyDescriptors');
             globalThis._maskFunction(keys, 'keys');
             globalThis._maskFunction(ownKeys, 'ownKeys');
