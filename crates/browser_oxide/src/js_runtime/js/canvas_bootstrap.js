@@ -1744,45 +1744,65 @@
     //
     // Anti-fingerprint sites probe this path via
     // `const ctx = new OffscreenCanvas(w, h).getContext('2d'); ctx.fillText(...)`.
-    const _offscreenCanvasSize = new WeakMap();
+    const _offscreenCanvasState = new WeakMap();
+    const _requireOffscreenCanvasState = (canvas) => {
+        const state = _offscreenCanvasState.get(canvas);
+        if (!state) throw new TypeError('Illegal invocation');
+        return state;
+    };
     class RealOffscreenCanvas extends EventTarget {
         constructor(width, height) {
             super();
-            _offscreenCanvasSize.set(this, {
+            _offscreenCanvasState.set(this, {
                 width: Math.max(0, width | 0),
                 height: Math.max(0, height | 0),
+                canvasId: 0,
+                context2d: null,
+                glctx1: null,
+                glctx2: null,
+                oncontextlost: null,
+                oncontextrestored: null,
             });
-            this._canvasId = 0;
-            this._context = null;
         }
-        get width() { return _offscreenCanvasSize.get(this)?.width || 0; }
+        get width() { return _requireOffscreenCanvasState(this).width; }
         set width(value) {
-            const state = _offscreenCanvasSize.get(this);
-            if (!state) throw new TypeError('Illegal invocation');
+            const state = _requireOffscreenCanvasState(this);
             state.width = Math.max(0, Number(value) >>> 0);
-            if (this._canvasId) {
-                ops.op_canvas_resize(this._canvasId, state.width, state.height);
+            if (state.canvasId) {
+                ops.op_canvas_resize(state.canvasId, state.width, state.height);
             }
         }
-        get height() { return _offscreenCanvasSize.get(this)?.height || 0; }
+        get height() { return _requireOffscreenCanvasState(this).height; }
         set height(value) {
-            const state = _offscreenCanvasSize.get(this);
-            if (!state) throw new TypeError('Illegal invocation');
+            const state = _requireOffscreenCanvasState(this);
             state.height = Math.max(0, Number(value) >>> 0);
-            if (this._canvasId) {
-                ops.op_canvas_resize(this._canvasId, state.width, state.height);
+            if (state.canvasId) {
+                ops.op_canvas_resize(state.canvasId, state.width, state.height);
             }
         }
-        getContext(type, _opts) {
+        get oncontextlost() { return _requireOffscreenCanvasState(this).oncontextlost; }
+        set oncontextlost(value) {
+            _requireOffscreenCanvasState(this).oncontextlost =
+                typeof value === 'function' ? value : null;
+        }
+        get oncontextrestored() { return _requireOffscreenCanvasState(this).oncontextrestored; }
+        set oncontextrestored(value) {
+            _requireOffscreenCanvasState(this).oncontextrestored =
+                typeof value === 'function' ? value : null;
+        }
+        getContext(type) {
+            const state = _requireOffscreenCanvasState(this);
             if (type === "2d") {
-                if (!this._canvasId) {
-                    this._canvasId = ops.op_canvas_create(this.width, this.height, _getOsName(), _getCanvasSeed());
+                if (!state.canvasId) {
+                    state.canvasId = ops.op_canvas_create(
+                        state.width, state.height, _getOsName(), _getCanvasSeed()
+                    );
                 }
-                if (!this._context) {
-                    this._context = new CanvasRenderingContext2D(this._canvasId);
-                    this._context.canvas = this;
+                if (!state.context2d) {
+                    state.context2d = new CanvasRenderingContext2D(state.canvasId);
+                    state.context2d.canvas = this;
                 }
-                return this._context;
+                return state.context2d;
             }
             if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {
                 // FP parity: a real OffscreenCanvas exposes WebGL. Some
@@ -1793,40 +1813,43 @@
                 // supports WebGL).
                 // Back it with the same profile-spoofed context that <canvas>
                 // getContext uses (canvas_bootstrap.js:1232-1234).
-                if (!this._canvasId) {
-                    this._canvasId = ops.op_canvas_create(this.width, this.height, _getOsName(), _getCanvasSeed());
+                if (!state.canvasId) {
+                    state.canvasId = ops.op_canvas_create(
+                        state.width, state.height, _getOsName(), _getCanvasSeed()
+                    );
                 }
-                const _k = (type === "webgl2") ? "_glctx2" : "_glctx1";
-                if (!this[_k]) {
+                const key = (type === "webgl2") ? "glctx2" : "glctx1";
+                if (!state[key]) {
                     const isV2 = (type === "webgl2");
                     const gl = isV2
-                        ? new WebGL2RenderingContext(this._canvasId, this.width, this.height)
-                        : new WebGLRenderingContext(this._canvasId, this.width, this.height);
+                        ? new WebGL2RenderingContext(state.canvasId, state.width, state.height)
+                        : new WebGLRenderingContext(state.canvasId, state.width, state.height);
                     gl._isWebGL2 = isV2;
                     gl.canvas = this;
-                    this[_k] = gl;
+                    state[key] = gl;
                 }
-                return this[_k];
+                return state[key];
             }
             return null;
         }
         transferToImageBitmap() {
-            const self = this;
-            return {
-                width: self.width,
-                height: self.height,
-                _canvasId: self._canvasId,
-                close() {},
-            };
+            const state = _requireOffscreenCanvasState(this);
+            return _makeImageBitmap({
+                canvasId: state.canvasId,
+                width: state.width,
+                height: state.height,
+            });
         }
-        async convertToBlob(options) {
+        async convertToBlob() {
+            const state = _requireOffscreenCanvasState(this);
+            const options = arguments[0];
             const type = (options && options.type) || "image/png";
-            if (!this._canvasId) {
+            if (!state.canvasId) {
                 return new Blob([], { type });
             }
             // toDataURL returns `data:<type>;base64,<data>` — strip
             // the prefix and decode to bytes for a real Blob body.
-            const url = ops.op_canvas_to_data_url(this._canvasId);
+            const url = ops.op_canvas_to_data_url(state.canvasId);
             const comma = url.indexOf(",");
             if (comma < 0) return new Blob([], { type });
             const b64 = url.slice(comma + 1);
@@ -1834,6 +1857,16 @@
             const bytes = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
             return new Blob([bytes], { type });
+        }
+    }
+    for (const name of [
+        'width', 'height', 'oncontextlost', 'oncontextrestored',
+        'getContext', 'transferToImageBitmap', 'convertToBlob',
+    ]) {
+        const descriptor = Object.getOwnPropertyDescriptor(RealOffscreenCanvas.prototype, name);
+        if (descriptor) {
+            descriptor.enumerable = true;
+            Object.defineProperty(RealOffscreenCanvas.prototype, name, descriptor);
         }
     }
     Object.defineProperty(RealOffscreenCanvas.prototype, Symbol.toStringTag, {
@@ -1854,7 +1887,11 @@
             'createRadialGradient', 'createPattern', 'getImageData', 'putImageData',
             'drawImage', 'isPointInPath', 'isPointInStroke');
         
-        _maskAsNative(RealOffscreenCanvas.prototype, 'getContext', 'transferToImageBitmap', 'convertToBlob');
+        _maskAsNative(
+            RealOffscreenCanvas.prototype,
+            'width', 'height', 'oncontextlost', 'oncontextrestored',
+            'getContext', 'transferToImageBitmap', 'convertToBlob'
+        );
 
         // HTMLCanvasElement.prototype.transferControlToOffscreen — Chrome
         // 69+ method that returns a new OffscreenCanvas bound to this
