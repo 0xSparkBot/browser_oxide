@@ -10409,3 +10409,127 @@ async fn binary_file_and_fetch_objects_match_chrome_webidl_shape() {
     assert_eq!(value["response"]["contentType"], "text/plain");
     assert_eq!(value["readerConstants"], serde_json::json!([0, 1, 2]));
 }
+
+#[tokio::test]
+async fn dom_core_extended_webidl_matches_chrome_shape_and_behavior() {
+    let raw = check(
+        r#"(() => {
+            let nodeCtor;
+            try { new Node(); nodeCtor = 'ok'; }
+            catch (e) { nodeCtor = e.name + ':' + e.message; }
+
+            const host = document.createElement('div');
+            document.body.appendChild(host);
+            const shadow = host.attachShadow({ mode: 'open' });
+            shadow.innerHTML = '<span id="inside">hello</span>';
+            const frag = new DocumentFragment();
+            frag.append('b');
+            frag.prepend('a');
+            const em = document.createElement('em');
+            em.textContent = 'c';
+            frag.append(em);
+            frag.moveBefore(em, frag.firstChild);
+            const orderAfterMove = Array.from(frag.childNodes).map(n => n.textContent).join('');
+            frag.replaceChildren('x', document.createElement('i'));
+            frag.lastChild.textContent = 'y';
+
+            const nodeProto = Node.prototype;
+            const fragProto = DocumentFragment.prototype;
+            const shadowProto = ShadowRoot.prototype;
+            const nodeEnum = ['nodeType','nodeName','nodeValue','textContent','appendChild','removeChild',
+                'replaceChild','insertBefore','cloneNode','contains','hasChildNodes','getRootNode','normalize',
+                'isEqualNode','isSameNode','compareDocumentPosition','lookupNamespaceURI','lookupPrefix',
+                'isDefaultNamespace'].every(name => Object.getOwnPropertyDescriptor(nodeProto, name)?.enumerable === true);
+            const fragEnum = ['children','firstElementChild','lastElementChild','childElementCount','querySelector',
+                'querySelectorAll','getElementById','append','prepend','replaceChildren','moveBefore']
+                .every(name => Object.getOwnPropertyDescriptor(fragProto, name)?.enumerable === true);
+            const shadowEnum = ['host','mode','adoptedStyleSheets','innerHTML','activeElement','clonable',
+                'customElementRegistry','delegatesFocus','elementFromPoint','elementsFromPoint','fullscreenElement',
+                'getAnimations','getHTML','getSelection','onslotchange','pictureInPictureElement','pointerLockElement',
+                'serializable','setHTML','setHTMLUnsafe','slotAssignment','styleSheets']
+                .every(name => Object.getOwnPropertyDescriptor(shadowProto, name)?.enumerable === true);
+
+            return JSON.stringify({
+                nodeCtor,
+                constants: [Node.ELEMENT_NODE, Node.ATTRIBUTE_NODE, Node.TEXT_NODE, Node.COMMENT_NODE,
+                    Node.DOCUMENT_NODE, Node.DOCUMENT_FRAGMENT_NODE, Node.DOCUMENT_POSITION_FOLLOWING,
+                    Node.DOCUMENT_POSITION_CONTAINS, Node.DOCUMENT_POSITION_CONTAINED_BY],
+                protoConstants: [Node.prototype.ELEMENT_NODE, Node.prototype.TEXT_NODE,
+                    Node.prototype.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC],
+                nodeEnum,
+                namespaces: {
+                    html: document.documentElement.lookupNamespaceURI(null),
+                    xml: document.documentElement.lookupNamespaceURI('xml'),
+                    xmlPrefix: document.documentElement.lookupPrefix('http://www.w3.org/XML/1998/namespace'),
+                    htmlDefault: document.documentElement.isDefaultNamespace('http://www.w3.org/1999/xhtml'),
+                },
+                fragment: {
+                    orderAfterMove,
+                    finalText: frag.textContent,
+                    childCount: frag.childElementCount,
+                    firstTag: frag.firstElementChild && frag.firstElementChild.tagName,
+                    scopedPrivate: Object.prototype.hasOwnProperty.call(fragProto, '_scopedElementIds'),
+                    ownKeys: Reflect.ownKeys(frag).map(String),
+                    fragEnum,
+                },
+                shadow: {
+                    tag: Object.prototype.toString.call(shadow),
+                    hostSame: shadow.host === host,
+                    mode: shadow.mode,
+                    html: shadow.getHTML(),
+                    query: shadow.querySelector('#inside')?.textContent || '',
+                    active: shadow.activeElement,
+                    clonable: shadow.clonable,
+                    delegatesFocus: shadow.delegatesFocus,
+                    serializable: shadow.serializable,
+                    slotAssignment: shadow.slotAssignment,
+                    selectionTag: Object.prototype.toString.call(shadow.getSelection()),
+                    animationCount: shadow.getAnimations().length,
+                    ownKeys: Reflect.ownKeys(shadow).map(String),
+                    shadowEnum,
+                },
+            });
+        })()"#,
+    )
+    .await;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("json: {e}; raw={raw}"));
+    assert_eq!(v["nodeCtor"], "TypeError:Illegal constructor");
+    assert_eq!(
+        v["constants"],
+        serde_json::json!([1, 2, 3, 8, 9, 11, 4, 8, 16])
+    );
+    assert_eq!(v["protoConstants"], serde_json::json!([1, 3, 32]));
+    assert_eq!(v["nodeEnum"], true);
+    assert_eq!(v["namespaces"]["html"], "http://www.w3.org/1999/xhtml");
+    assert_eq!(
+        v["namespaces"]["xml"],
+        "http://www.w3.org/XML/1998/namespace"
+    );
+    assert_eq!(v["namespaces"]["xmlPrefix"], "xml");
+    assert_eq!(v["namespaces"]["htmlDefault"], true);
+    assert_eq!(v["fragment"]["orderAfterMove"], "cab");
+    assert_eq!(v["fragment"]["finalText"], "xy");
+    assert_eq!(v["fragment"]["childCount"], 1);
+    assert_eq!(v["fragment"]["firstTag"], "I");
+    assert_eq!(v["fragment"]["scopedPrivate"], false);
+    assert_eq!(v["fragment"]["ownKeys"], serde_json::json!([]));
+    assert_eq!(v["fragment"]["fragEnum"], true);
+    assert_eq!(v["shadow"]["tag"], "[object ShadowRoot]");
+    assert_eq!(v["shadow"]["hostSame"], true);
+    assert_eq!(v["shadow"]["mode"], "open");
+    assert!(v["shadow"]["html"]
+        .as_str()
+        .unwrap_or("")
+        .contains("inside"));
+    assert_eq!(v["shadow"]["query"], "hello");
+    assert_eq!(v["shadow"]["active"], serde_json::Value::Null);
+    assert_eq!(v["shadow"]["clonable"], false);
+    assert_eq!(v["shadow"]["delegatesFocus"], false);
+    assert_eq!(v["shadow"]["serializable"], false);
+    assert_eq!(v["shadow"]["slotAssignment"], "named");
+    assert_eq!(v["shadow"]["selectionTag"], "[object Selection]");
+    assert_eq!(v["shadow"]["animationCount"], 0);
+    assert_eq!(v["shadow"]["ownKeys"], serde_json::json!([]));
+    assert_eq!(v["shadow"]["shadowEnum"], true);
+}

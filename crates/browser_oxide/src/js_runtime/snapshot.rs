@@ -163,6 +163,8 @@ pub fn get_snapshot() -> &'static [u8] {
             "\n",
             include_str!("js/webidl_surface_bootstrap.js"),
             "\n",
+            include_str!("js/dom_core_webidl_bootstrap.js"),
+            "\n",
             include_str!("js/traversal_bootstrap.js"),
             "\n",
             include_str!("js/attributes_bootstrap.js"),
