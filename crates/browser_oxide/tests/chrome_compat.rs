@@ -536,6 +536,72 @@ async fn xml_serializer_matches_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn dom_traversal_matches_chrome_148() {
+    let result = check(
+        r#"(() => {
+            const root = document.createElement('div');
+            root.id = 'root';
+            const skip = document.createElement('section'); skip.id = 'skip';
+            const s1 = document.createElement('i'); s1.id = 's1'; skip.appendChild(s1);
+            const reject = document.createElement('section'); reject.id = 'reject';
+            const r1 = document.createElement('i'); r1.id = 'r1'; reject.appendChild(r1);
+            const ok = document.createElement('span'); ok.id = 'ok';
+            root.appendChild(skip); root.appendChild(reject); root.appendChild(ok);
+            document.body.appendChild(root);
+
+            const filter = { acceptNode(node) {
+                if (node.id === 'skip') return NodeFilter.FILTER_SKIP;
+                if (node.id === 'reject') return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }};
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, filter);
+            const tree = [];
+            let node;
+            while ((node = walker.nextNode())) tree.push(node.id);
+
+            const iterator = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT, filter);
+            const iter = [];
+            while ((node = iterator.nextNode())) iter.push(node.id);
+
+            let treeCtor = '', iteratorCtor = '', filterCtor = '';
+            try { new TreeWalker(); treeCtor = 'ok'; }
+            catch (error) { treeCtor = error.name + ':' + error.message; }
+            try { new NodeIterator(); iteratorCtor = 'ok'; }
+            catch (error) { iteratorCtor = error.name + ':' + error.message; }
+            try { new NodeFilter(); filterCtor = 'ok'; }
+            catch (error) { filterCtor = error.name + ':' + error.message; }
+
+            return JSON.stringify({
+                tree,
+                iter,
+                treeKeys:Reflect.ownKeys(walker).map(String),
+                iteratorKeys:Reflect.ownKeys(iterator).map(String),
+                tags:[Object.prototype.toString.call(walker), Object.prototype.toString.call(iterator)],
+                constructors:[TreeWalker.length, NodeIterator.length],
+                createLengths:[Document.prototype.createTreeWalker.length, Document.prototype.createNodeIterator.length],
+                ctorErrors:[treeCtor, iteratorCtor, filterCtor],
+                nativeSources:[String(TreeWalker), String(NodeIterator), String(NodeFilter)],
+                nodeFilter:{
+                    hasPrototype:Object.prototype.hasOwnProperty.call(NodeFilter, 'prototype'),
+                    accept:NodeFilter.FILTER_ACCEPT,
+                    reject:NodeFilter.FILTER_REJECT,
+                    skip:NodeFilter.FILTER_SKIP,
+                    showAll:NodeFilter.SHOW_ALL,
+                    showElement:NodeFilter.SHOW_ELEMENT
+                },
+                filters:[walker.filter === filter, iterator.filter === filter],
+                show:[walker.whatToShow, iterator.whatToShow]
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"tree":["s1","ok"],"iter":["root","s1","r1","ok"],"treeKeys":[],"iteratorKeys":[],"tags":["[object TreeWalker]","[object NodeIterator]"],"constructors":[0,0],"createLengths":[1,1],"ctorErrors":["TypeError:Failed to construct 'TreeWalker': Illegal constructor","TypeError:Failed to construct 'NodeIterator': Illegal constructor","TypeError:NodeFilter is not a constructor"],"nativeSources":["function TreeWalker() { [native code] }","function NodeIterator() { [native code] }","function NodeFilter() { [native code] }"],"nodeFilter":{"hasPrototype":false,"accept":1,"reject":2,"skip":3,"showAll":4294967295,"showElement":1},"filters":[true,true],"show":[1,1]}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================

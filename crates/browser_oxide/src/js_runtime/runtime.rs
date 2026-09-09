@@ -384,6 +384,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/webidl_surface_bootstrap.js"),
             "\n",
+            include_str!("js/traversal_bootstrap.js"),
+            "\n",
             include_str!("js/structured_clone.js"),
         );
 
