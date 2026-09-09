@@ -2098,13 +2098,46 @@
     // flag. Desktop presets (width >= height) keep landscape-primary.
     const _scrW0 = _pInt("screen_width", 1920);
     const _scrH0 = _pInt("screen_height", 1080);
-    const _screenOrientation = {
+    // ScreenOrientation is its own interface in Chrome, so expose it too.
+    const _ScreenOrientationProto = ScreenOrientation.prototype;
+    try { Object.setPrototypeOf(_ScreenOrientationProto, EventTarget.prototype); } catch (_) {}
+    try { Object.setPrototypeOf(ScreenOrientation, EventTarget); } catch (_) {}
+    const _screenOrientationState = new WeakMap();
+    const _screenOrientation = Object.create(_ScreenOrientationProto);
+    _screenOrientationState.set(_screenOrientation, {
         type: _scrH0 > _scrW0 ? "portrait-primary" : "landscape-primary",
         angle: 0,
         onchange: null,
-    };
-    // ScreenOrientation is its own interface in Chrome, so expose it too.
-    const _ScreenOrientationProto = ScreenOrientation.prototype;
+    });
+    _defProtoGetter(_ScreenOrientationProto, 'type', function type() {
+        return _screenOrientationState.get(this)?.type || "landscape-primary";
+    });
+    _defProtoGetter(_ScreenOrientationProto, 'angle', function angle() {
+        return _screenOrientationState.get(this)?.angle || 0;
+    });
+    _defProtoGetter(
+        _ScreenOrientationProto,
+        'onchange',
+        function onchange() {
+            return _screenOrientationState.get(this)?.onchange || null;
+        },
+        function onchange(value) {
+            let state = _screenOrientationState.get(this);
+            if (!state) {
+                state = { type: "landscape-primary", angle: 0, onchange: null };
+                _screenOrientationState.set(this, state);
+            }
+            state.onchange = typeof value === 'function' ? value : null;
+        },
+    );
+    _defProtoMethod(_ScreenOrientationProto, 'lock', function lock(orientation) {
+        void orientation;
+        return Promise.reject(new DOMException(
+            "Screen orientation locking is not supported in this context.",
+            "NotSupportedError",
+        ));
+    });
+    _defProtoMethod(_ScreenOrientationProto, 'unlock', function unlock() {});
 
     _defProtoGetter(_ScreenProto, 'width', () => _pInt("screen_width", 1920));
     _defProtoGetter(_ScreenProto, 'height', () => _pInt("screen_height", 1080));
@@ -2543,14 +2576,14 @@
 
         const _navUaData = (() => {
             const _UAProto = globalThis.NavigatorUAData && globalThis.NavigatorUAData.prototype;
-            const u = _UAProto ? Object.create(_UAProto) : {};
-            Object.defineProperties(u, {
-                brands: { get: () => _lowCached(), enumerable: true },
-                mobile: { get: () => false, enumerable: true },
-                platform: { get: () => _uaPlatform(), enumerable: true },
-            });
-            u.getHighEntropyValues = ({
-                getHighEntropyValues(hints) {
+            if (!_UAProto) return {};
+            _defProtoGetter(_UAProto, 'brands', function brands() { return _lowCached(); });
+            _defProtoGetter(_UAProto, 'mobile', function mobile() { return false; });
+            _defProtoGetter(_UAProto, 'platform', function platform() { return _uaPlatform(); });
+            _defProtoMethod(
+                _UAProto,
+                'getHighEntropyValues',
+                function getHighEntropyValues(hints) {
                     // Chrome rejects with TypeError on non-array (or missing).
                     if (!Array.isArray(hints)) {
                         return Promise.reject(new TypeError(
@@ -2580,21 +2613,16 @@
                         }
                     }
                     return Promise.resolve(result);
-                }
-            }).getHighEntropyValues;
-            _maskFunction(u.getHighEntropyValues, 'getHighEntropyValues');
-
-            u.toJSON = ({
-                toJSON() {
+                },
+            );
+            _defProtoMethod(_UAProto, 'toJSON', function toJSON() {
                     return {
                         brands: _lowCached().map(b => ({ brand: b.brand, version: b.version })),
                         mobile: false,
                         platform: _uaPlatform(),
                     };
-                }
-            }).toJSON;
-            _maskFunction(u.toJSON, 'toJSON');
-            return u;
+            });
+            return Object.create(_UAProto);
         })();
         // userAgentData is [SecureContext] — return undefined on
         // insecure contexts so probes get a TypeError when reading
@@ -3538,11 +3566,29 @@
     _maskFunction(SpeechSynthesis, 'SpeechSynthesis');
     globalThis.SpeechSynthesis = SpeechSynthesis;
     const _SSProto = SpeechSynthesis.prototype;
+    const _SpeechVoiceProto = globalThis.SpeechSynthesisVoice.prototype;
+    const _speechVoiceState = new WeakMap();
+    for (const name of ['voiceURI', 'name', 'lang', 'localService', 'default']) {
+        _defProtoGetter(_SpeechVoiceProto, name, function speechVoiceField() {
+            return _speechVoiceState.get(this)?.[name];
+        });
+    }
+    const _makeSpeechVoice = (row) => {
+        const voice = Object.create(_SpeechVoiceProto);
+        _speechVoiceState.set(voice, {
+            voiceURI: String(row.voiceURI || ''),
+            name: String(row.name || ''),
+            lang: String(row.lang || ''),
+            localService: !!row.localService,
+            default: !!row.default,
+        });
+        return voice;
+    };
     let _ssVoices = [
         {name:"Google US English",lang:"en-US",localService:false,default:true,voiceURI:"Google US English"},
         {name:"Google UK English Female",lang:"en-GB",localService:false,default:false,voiceURI:"Google UK English Female"},
         {name:"Google UK English Male",lang:"en-GB",localService:false,default:false,voiceURI:"Google UK English Male"},
-    ];
+    ].map(_makeSpeechVoice);
     const _ssOnVoicesChanged = new WeakMap();
     const _ssMarkTrusted = (() => {
         try {
@@ -7713,7 +7759,7 @@
             ],
         };
         const _voices = _voicesByOS[_osName] || _voicesByOS["Linux"];
-        _ssVoices = _voices;
+        _ssVoices = _voices.map(_makeSpeechVoice);
     }
 
     // ================================================================

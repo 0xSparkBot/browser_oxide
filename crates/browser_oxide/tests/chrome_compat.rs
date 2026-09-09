@@ -2938,6 +2938,134 @@ async fn api_speech_synthesis_eventtarget_and_illegal_constructor() {
     );
 }
 
+#[tokio::test]
+async fn voice_orientation_and_ua_data_webidl_shape_match_chrome() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    page.evaluate("speechSynthesis.getVoices()").unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(250))
+        .await
+        .ok();
+    let result = page
+        .evaluate(
+            r#"(() => {
+                const voices = speechSynthesis.getVoices();
+                const voice = voices[0];
+                const orientation = screen.orientation;
+                const ua = navigator.userAgentData;
+                const orientationHandler = () => {};
+                orientation.onchange = orientationHandler;
+                const construction = C => {
+                    try { new C(); return 'ok'; }
+                    catch (error) { return error.name + ':' + error.message; }
+                };
+                return JSON.stringify({
+                    voice:{
+                        exists:!!voice,
+                        tag:voice ? Object.prototype.toString.call(voice) : '',
+                        instance:voice ? voice instanceof SpeechSynthesisVoice : false,
+                        own:voice ? Reflect.ownKeys(voice).map(String) : [],
+                        values:voice ? [voice.voiceURI,voice.name,voice.lang,voice.localService,voice.default] : [],
+                        construction:construction(SpeechSynthesisVoice),
+                        protoNames:Object.getOwnPropertyNames(SpeechSynthesisVoice.prototype).sort(),
+                    },
+                    orientation:{
+                        tag:Object.prototype.toString.call(orientation),
+                        instance:orientation instanceof ScreenOrientation,
+                        eventTarget:orientation instanceof EventTarget,
+                        own:Reflect.ownKeys(orientation).map(String),
+                        proto:Object.getPrototypeOf(ScreenOrientation.prototype) === EventTarget.prototype,
+                        type:orientation.type,
+                        angle:orientation.angle,
+                        handler:orientation.onchange === orientationHandler,
+                        construction:construction(ScreenOrientation),
+                        protoNames:Object.getOwnPropertyNames(ScreenOrientation.prototype).sort(),
+                    },
+                    ua:{
+                        tag:Object.prototype.toString.call(ua),
+                        instance:ua instanceof NavigatorUAData,
+                        own:Reflect.ownKeys(ua).map(String),
+                        brands:Array.isArray(ua.brands),
+                        mobile:typeof ua.mobile,
+                        platform:typeof ua.platform,
+                        construction:construction(NavigatorUAData),
+                        protoNames:Object.getOwnPropertyNames(NavigatorUAData.prototype).sort(),
+                        lengths:[NavigatorUAData.prototype.getHighEntropyValues.length,
+                                 NavigatorUAData.prototype.toJSON.length],
+                    }
+                });
+            })()"#,
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["voice"]["exists"], true);
+    assert_eq!(value["voice"]["tag"], "[object SpeechSynthesisVoice]");
+    assert_eq!(value["voice"]["instance"], true);
+    assert_eq!(value["voice"]["own"], serde_json::json!([]));
+    assert_eq!(value["voice"]["values"].as_array().unwrap().len(), 5);
+    assert!(value["voice"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(
+        value["voice"]["protoNames"],
+        serde_json::json!([
+            "constructor",
+            "default",
+            "lang",
+            "localService",
+            "name",
+            "voiceURI"
+        ])
+    );
+    assert_eq!(value["orientation"]["tag"], "[object ScreenOrientation]");
+    assert_eq!(value["orientation"]["instance"], true);
+    assert_eq!(value["orientation"]["eventTarget"], true);
+    assert_eq!(value["orientation"]["own"], serde_json::json!([]));
+    assert_eq!(value["orientation"]["proto"], true);
+    assert!(matches!(
+        value["orientation"]["type"].as_str(),
+        Some("landscape-primary" | "portrait-primary")
+    ));
+    assert_eq!(value["orientation"]["angle"], 0);
+    assert_eq!(value["orientation"]["handler"], true);
+    assert!(value["orientation"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(
+        value["orientation"]["protoNames"],
+        serde_json::json!(["angle", "constructor", "lock", "onchange", "type", "unlock"])
+    );
+    assert_eq!(value["ua"]["tag"], "[object NavigatorUAData]");
+    assert_eq!(value["ua"]["instance"], true);
+    assert_eq!(value["ua"]["own"], serde_json::json!([]));
+    assert_eq!(value["ua"]["brands"], true);
+    assert_eq!(value["ua"]["mobile"], "boolean");
+    assert_eq!(value["ua"]["platform"], "string");
+    assert!(value["ua"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(
+        value["ua"]["protoNames"],
+        serde_json::json!([
+            "brands",
+            "constructor",
+            "getHighEntropyValues",
+            "mobile",
+            "platform",
+            "toJSON"
+        ])
+    );
+    assert_eq!(value["ua"]["lengths"], serde_json::json!([1, 0]));
+}
+
 // Permissions
 #[tokio::test]
 async fn api_permissions_query() {
