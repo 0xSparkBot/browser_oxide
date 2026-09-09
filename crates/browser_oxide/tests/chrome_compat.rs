@@ -398,6 +398,37 @@ async fn geometry_interfaces_match_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn webidl_operation_arities_match_chrome_148() {
+    let result = check_secure(
+        r#"JSON.stringify({
+            textEncoder:[TextEncoder.prototype.encode.length, TextEncoder.prototype.encodeInto.length],
+            textDecoder:TextDecoder.prototype.decode.length,
+            subtle:[
+                SubtleCrypto.prototype.decrypt.length,
+                SubtleCrypto.prototype.deriveBits.length,
+                SubtleCrypto.prototype.deriveKey.length,
+                SubtleCrypto.prototype.digest.length,
+                SubtleCrypto.prototype.encrypt.length,
+                SubtleCrypto.prototype.exportKey.length,
+                SubtleCrypto.prototype.generateKey.length,
+                SubtleCrypto.prototype.importKey.length,
+                SubtleCrypto.prototype.sign.length,
+                SubtleCrypto.prototype.unwrapKey.length,
+                SubtleCrypto.prototype.verify.length,
+                SubtleCrypto.prototype.wrapKey.length
+            ],
+            mouse:MouseEvent.prototype.initMouseEvent.length,
+            keyboard:KeyboardEvent.prototype.initKeyboardEvent.length
+        })"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"textEncoder":[0,2],"textDecoder":0,"subtle":[3,2,5,2,3,2,3,5,3,7,4,4],"mouse":1,"keyboard":1}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
