@@ -4,6 +4,18 @@
     try { delete globalThis.__bo_get_image_bytes; } catch (_) {}
     const _decodedImageIds = new WeakMap();
     const _imageBitmapState = new WeakMap();
+    const _canvasGradientState = new WeakMap();
+    const _canvasPatternState = new WeakMap();
+    const _path2DState = new WeakMap();
+
+    const _defineIdlMethod = (prototype, name, value) => {
+        Object.defineProperty(prototype, name, {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+    };
 
     const _debugCanvas = (entry) => {
         if (!globalThis.__browser_oxide_debug) return;
@@ -129,6 +141,114 @@
         _maskFunction(ImageBitmap, 'ImageBitmap');
         _maskFunction(ImageBitmap.prototype.close, 'close');
         _maskFunction(globalThis.createImageBitmap, 'createImageBitmap');
+    }
+
+    // Canvas helper objects are WebIDL objects in Chromium, not ordinary
+    // JavaScript bags. Keep implementation state out of own-property
+    // enumeration and expose the same prototype method shape as Blink.
+    function CanvasGradient() {
+        throw new TypeError("Failed to construct 'CanvasGradient': Illegal constructor");
+    }
+    _defineIdlMethod(CanvasGradient.prototype, 'addColorStop', function addColorStop(offset, color) {
+        const state = _canvasGradientState.get(this);
+        if (!state) throw new TypeError('Illegal invocation');
+        state.stops.push({ offset: Number(offset), color: String(color) });
+    });
+    Object.defineProperty(CanvasGradient.prototype, Symbol.toStringTag, {
+        value: 'CanvasGradient', configurable: true,
+    });
+    const _makeCanvasGradient = (state) => {
+        const gradient = Object.create(CanvasGradient.prototype);
+        _canvasGradientState.set(gradient, state);
+        return gradient;
+    };
+
+    function CanvasPattern() {
+        throw new TypeError("Failed to construct 'CanvasPattern': Illegal constructor");
+    }
+    _defineIdlMethod(CanvasPattern.prototype, 'setTransform', function setTransform() {
+        const state = _canvasPatternState.get(this);
+        if (!state) throw new TypeError('Illegal invocation');
+        state.transform = arguments.length ? arguments[0] : null;
+    });
+    Object.defineProperty(CanvasPattern.prototype, Symbol.toStringTag, {
+        value: 'CanvasPattern', configurable: true,
+    });
+    const _makeCanvasPattern = (state) => {
+        const pattern = Object.create(CanvasPattern.prototype);
+        _canvasPatternState.set(pattern, state);
+        return pattern;
+    };
+
+    function Path2D() {
+        if (!new.target) {
+            throw new TypeError("Failed to construct 'Path2D': Please use the 'new' operator");
+        }
+        const source = arguments[0];
+        let commands = [];
+        if (source && _path2DState.has(source)) {
+            commands = _path2DState.get(source).commands.slice();
+        } else if (source !== undefined) {
+            commands.push(['svgPath', String(source)]);
+        }
+        _path2DState.set(this, { commands });
+    }
+    const _pathCommand = (name, arity, normalize) => {
+        let fn;
+        switch (arity) {
+            case 0: fn = function () { normalize(this, arguments); }; break;
+            case 1: fn = function (a) { normalize(this, arguments); }; break;
+            case 2: fn = function (a, b) { normalize(this, arguments); }; break;
+            case 4: fn = function (a, b, c, d) { normalize(this, arguments); }; break;
+            case 5: fn = function (a, b, c, d, e) { normalize(this, arguments); }; break;
+            case 6: fn = function (a, b, c, d, e, f) { normalize(this, arguments); }; break;
+            case 7: fn = function (a, b, c, d, e, f, g) { normalize(this, arguments); }; break;
+            default: fn = function () { normalize(this, arguments); };
+        }
+        Object.defineProperty(fn, 'name', { value: name, configurable: true });
+        return fn;
+    };
+    const _recordPathCommand = (name) => (self, args) => {
+        const state = _path2DState.get(self);
+        if (!state) throw new TypeError('Illegal invocation');
+        state.commands.push([name, ...Array.from(args)]);
+    };
+    const _pathMethods = {
+        addPath: 1,
+        arc: 5,
+        arcTo: 5,
+        bezierCurveTo: 6,
+        closePath: 0,
+        ellipse: 7,
+        lineTo: 2,
+        moveTo: 2,
+        quadraticCurveTo: 4,
+        rect: 4,
+        roundRect: 4,
+    };
+    for (const [name, arity] of Object.entries(_pathMethods)) {
+        _defineIdlMethod(
+            Path2D.prototype,
+            name,
+            _pathCommand(name, arity, _recordPathCommand(name)),
+        );
+    }
+    Object.defineProperty(Path2D.prototype, Symbol.toStringTag, {
+        value: 'Path2D', configurable: true,
+    });
+
+    globalThis.CanvasGradient = CanvasGradient;
+    globalThis.CanvasPattern = CanvasPattern;
+    globalThis.Path2D = Path2D;
+    if (typeof _maskFunction === 'function') {
+        _maskFunction(CanvasGradient, 'CanvasGradient');
+        _maskFunction(CanvasPattern, 'CanvasPattern');
+        _maskFunction(Path2D, 'Path2D');
+        _maskFunction(CanvasGradient.prototype.addColorStop, 'addColorStop');
+        _maskFunction(CanvasPattern.prototype.setTransform, 'setTransform');
+        for (const name of Object.keys(_pathMethods)) {
+            _maskFunction(Path2D.prototype[name], name);
+        }
     }
 
     // -- Canvas-based font detection support -----------------------------
@@ -285,19 +405,24 @@
         set fillStyle(v) {
             _debugCanvas({ op: 'setFillStyle', value: String(v) });
             this._wideGamutFill = typeof v === 'string' ? _parseDisplayP3(v) : null;
-            if (v && typeof v === "object" && v._type) {
-                // Gradient object
-                const stops = (v._stops || []).map(s => {
+            const gradientState = v && typeof v === 'object' ? _canvasGradientState.get(v) : null;
+            if (gradientState) {
+                const stops = gradientState.stops.map(s => {
                     const c = _parseColor(s.color);
                     return [s.offset, c[0], c[1], c[2], c[3]];
                 });
                 let coords;
-                if (v._type === "linear") {
-                    coords = [v._x0, v._y0, v._x1, v._y1];
+                if (gradientState.type === "linear") {
+                    coords = [gradientState.x0, gradientState.y0, gradientState.x1, gradientState.y1];
                 } else {
-                    coords = [v._x0, v._y0, v._r0, v._x1, v._y1, v._r1];
+                    coords = [
+                        gradientState.x0, gradientState.y0, gradientState.r0,
+                        gradientState.x1, gradientState.y1, gradientState.r1,
+                    ];
                 }
-                ops.op_canvas_set_fill_gradient(this.#id, v._type, JSON.stringify({ coords, stops }));
+                ops.op_canvas_set_fill_gradient(
+                    this.#id, gradientState.type, JSON.stringify({ coords, stops })
+                );
             } else {
                 ops.op_canvas_set_fill_style(this.#id, String(v));
             }
@@ -508,20 +633,22 @@
 
         // Gradient — JS-side objects that track color stops
         createLinearGradient(x0, y0, x1, y1) {
-            const stops = [];
-            return {
-                addColorStop(offset, color) { stops.push({ offset, color }); },
-                _stops: stops, _type: 'linear', _x0: x0, _y0: y0, _x1: x1, _y1: y1,
-            };
+            return _makeCanvasGradient({
+                stops: [], type: 'linear', x0, y0, x1, y1,
+            });
         }
         createRadialGradient(x0, y0, r0, x1, y1, r1) {
-            const stops = [];
-            return {
-                addColorStop(offset, color) { stops.push({ offset, color }); },
-                _stops: stops, _type: 'radial', _x0: x0, _y0: y0, _r0: r0, _x1: x1, _y1: y1, _r1: r1,
-            };
+            return _makeCanvasGradient({
+                stops: [], type: 'radial', x0, y0, r0, x1, y1, r1,
+            });
         }
-        createPattern(image, repetition) { return { _image: image, _repetition: repetition || 'repeat' }; }
+        createPattern(image, repetition) {
+            return _makeCanvasPattern({
+                image,
+                repetition: repetition === undefined ? 'repeat' : String(repetition),
+                transform: null,
+            });
+        }
 
         // Clip
         clip() {}
