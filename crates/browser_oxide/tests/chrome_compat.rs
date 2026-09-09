@@ -976,6 +976,90 @@ async fn text_and_character_data_match_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn cssom_core_surface_and_behavior_match_chrome() {
+    let result = check(
+        r#"(() => {
+            const el = document.createElement('div');
+            el.setAttribute('style', 'color: blue');
+            const style = el.style;
+            style.setProperty('color', 'red', 'important');
+            style.cssFloat = 'right';
+            const old = style.removeProperty('color');
+            style.setProperty('color', 'red', 'important');
+
+            const sheet = new CSSStyleSheet();
+            sheet.replaceSync('#a { color: red; float: left; } @media (min-width: 1px) { #b { display: block; } } @font-face { font-family: X; src: url("x"); }');
+            const rows = Array.from(sheet.cssRules).map((rule) => ({
+                ctor: rule.constructor.name,
+                tag: Object.prototype.toString.call(rule),
+                keys: Reflect.ownKeys(rule).map(String),
+                type: rule.type,
+                cssText: rule.cssText,
+                parentSheet: rule.parentStyleSheet === sheet,
+                parentRule: rule.parentRule === null,
+                selector: 'selectorText' in rule ? rule.selectorText : null,
+                media: 'media' in rule ? rule.media.mediaText : null,
+                style: 'style' in rule ? [Object.prototype.toString.call(rule.style), rule.style.cssText, rule.style.parentRule === rule] : null,
+                nested: 'cssRules' in rule ? Array.from(rule.cssRules).map((nested) => nested.cssText) : null,
+            }));
+
+            const before = sheet.cssRules.length;
+            const addResult = sheet.addRule('.x', 'opacity: .5');
+            const afterAdd = sheet.cssRules.length;
+            sheet.removeRule(afterAdd - 1);
+
+            const directCall = (() => {
+                try { CSSStyleSheet(); return 'ok'; }
+                catch (error) { return error.name + ':' + error.message; }
+            })();
+            const illegal = {};
+            for (const name of ['CSSStyleDeclaration','CSSRule','CSSStyleRule','CSSMediaRule','CSSFontFaceRule']) {
+                try { new globalThis[name](); illegal[name] = 'ok'; }
+                catch (error) { illegal[name] = error.name + ':' + error.message; }
+            }
+
+            return JSON.stringify({
+                style:{
+                    tag:Object.prototype.toString.call(style),
+                    instance:style instanceof CSSStyleDeclaration,
+                    length:style.length,
+                    item0:style.item(0),
+                    color:style.getPropertyValue('color'),
+                    priority:style.getPropertyPriority('color'),
+                    cssFloat:style.cssFloat,
+                    cssText:style.cssText,
+                    parentRule:style.parentRule,
+                    old,
+                    attr:el.getAttribute('style')
+                },
+                sheet:{
+                    tag:Object.prototype.toString.call(sheet),
+                    instance:sheet instanceof CSSStyleSheet,
+                    keys:Reflect.ownKeys(sheet).map(String),
+                    before,addResult,afterAdd,afterRemove:sheet.cssRules.length,
+                    ownerRule:sheet.ownerRule,
+                    directCall,
+                    ctorSource:String(CSSStyleSheet)
+                },
+                rows,illegal,
+                constants:[CSSRule.STYLE_RULE,CSSRule.MEDIA_RULE,CSSRule.FONT_FACE_RULE,CSSRule.SUPPORTS_RULE,CSSRule.FONT_FEATURE_VALUES_RULE],
+                parents:{
+                    sheet:Object.getPrototypeOf(CSSStyleSheet.prototype) === StyleSheet.prototype,
+                    styleRule:Object.getPrototypeOf(CSSStyleRule.prototype) === CSSRule.prototype,
+                    fontRule:Object.getPrototypeOf(CSSFontFaceRule.prototype) === CSSRule.prototype,
+                    mediaRule:Object.getPrototypeOf(CSSMediaRule.prototype) === CSSConditionRule.prototype
+                }
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r##"{"style":{"tag":"[object CSSStyleDeclaration]","instance":true,"length":2,"item0":"float","color":"red","priority":"important","cssFloat":"right","cssText":"float: right; color: red !important;","parentRule":null,"old":"red","attr":"float: right; color: red !important;"},"sheet":{"tag":"[object CSSStyleSheet]","instance":true,"keys":[],"before":3,"addResult":-1,"afterAdd":4,"afterRemove":3,"ownerRule":null,"directCall":"TypeError:Failed to construct 'CSSStyleSheet': Please use the 'new' operator, this DOM object constructor cannot be called as a function.","ctorSource":"function CSSStyleSheet() { [native code] }"},"rows":[{"ctor":"CSSStyleRule","tag":"[object CSSStyleRule]","keys":[],"type":1,"cssText":"#a { color: red; float: left; }","parentSheet":true,"parentRule":true,"selector":"#a","media":null,"style":["[object CSSStyleDeclaration]","color: red; float: left;",true],"nested":[]},{"ctor":"CSSMediaRule","tag":"[object CSSMediaRule]","keys":[],"type":4,"cssText":"@media (min-width: 1px) {\n  #b { display: block; }\n}","parentSheet":true,"parentRule":true,"selector":null,"media":"(min-width: 1px)","style":null,"nested":["#b { display: block; }"]},{"ctor":"CSSFontFaceRule","tag":"[object CSSFontFaceRule]","keys":[],"type":5,"cssText":"@font-face { font-family: X; src: url(\"x\"); }","parentSheet":true,"parentRule":true,"selector":null,"media":null,"style":["[object CSSStyleDeclaration]","font-family: X; src: url(\"x\");",true],"nested":null}],"illegal":{"CSSStyleDeclaration":"TypeError:Failed to construct 'CSSStyleDeclaration': Illegal constructor","CSSRule":"TypeError:Failed to construct 'CSSRule': Illegal constructor","CSSStyleRule":"TypeError:Failed to construct 'CSSStyleRule': Illegal constructor","CSSMediaRule":"TypeError:Failed to construct 'CSSMediaRule': Illegal constructor","CSSFontFaceRule":"TypeError:Failed to construct 'CSSFontFaceRule': Illegal constructor"},"constants":[1,4,5,12,14],"parents":{"sheet":true,"styleRule":true,"fontRule":true,"mediaRule":true}}"##
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
