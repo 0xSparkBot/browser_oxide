@@ -907,6 +907,75 @@ async fn range_and_selection_match_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn text_and_character_data_match_chrome_148() {
+    let result = check(
+        r#"(() => {
+            let characterCtor = '';
+            try { new CharacterData(); characterCtor = 'ok'; }
+            catch (error) { characterCtor = error.name + ':' + error.message; }
+
+            const detached = new Text('abc');
+            const detachedSplit = detached.splitText(1);
+
+            const parent = document.createElement('p');
+            const first = document.createTextNode('ab');
+            const second = document.createTextNode('cd');
+            const span = document.createElement('span');
+            const tail = document.createTextNode('ef');
+            parent.appendChild(first);
+            parent.appendChild(second);
+            parent.appendChild(span);
+            parent.appendChild(tail);
+            const split = second.splitText(1);
+            const before = document.createTextNode('B');
+            span.before('x', before);
+            span.after('y');
+            tail.replaceWith('q', document.createTextNode('R'));
+            first.remove();
+
+            return JSON.stringify({
+                constructors:{
+                    text:[Text.length,String(Text),Object.getPrototypeOf(Text) === CharacterData],
+                    character:[CharacterData.length,String(CharacterData),characterCtor],
+                    proto:Object.getPrototypeOf(Text.prototype) === CharacterData.prototype
+                },
+                detached:{
+                    tag:Object.prototype.toString.call(detached),
+                    keys:Reflect.ownKeys(detached).map(String),
+                    data:detached.data,
+                    split:detachedSplit.data,
+                    splitParent:detachedSplit.parentNode
+                },
+                live:{
+                    whole:second.wholeText,
+                    second:second.data,
+                    split:split.data,
+                    splitPrev:split.previousSibling === second,
+                    assigned:second.assignedSlot
+                },
+                mixin:{
+                    html:parent.innerHTML,
+                    previousElement:second.previousElementSibling,
+                    nextElement:second.nextElementSibling?.tagName || null
+                },
+                methods:[
+                    Text.prototype.splitText.length,
+                    CharacterData.prototype.before.length,
+                    CharacterData.prototype.after.length,
+                    CharacterData.prototype.remove.length,
+                    CharacterData.prototype.replaceWith.length
+                ]
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"constructors":{"text":[0,"function Text() { [native code] }",true],"character":[0,"function CharacterData() { [native code] }","TypeError:Failed to construct 'CharacterData': Illegal constructor"],"proto":true},"detached":{"tag":"[object Text]","keys":[],"data":"a","split":"bc","splitParent":null},"live":{"whole":"cdxB","second":"c","split":"d","splitPrev":true,"assigned":null},"mixin":{"html":"cdxB<span></span>yqR","previousElement":null,"nextElement":"SPAN"},"methods":[1,0,0,0,0]}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================

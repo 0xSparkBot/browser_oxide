@@ -18,6 +18,149 @@
         try { if (typeof _maskFunction === 'function' && typeof Ctor === 'function') _maskFunction(Ctor, name); } catch (_) {}
     };
 
+    // CharacterData mixins + Text constructor semantics. Reuse the DOM
+    // backend's existing prototypes so nodes already wrapped by dom_bootstrap
+    // keep identity/instanceof behavior.
+    if (globalThis.CharacterData?.prototype && globalThis.Text?.prototype) {
+        const characterProto = globalThis.CharacterData.prototype;
+        const textProto = globalThis.Text.prototype;
+
+        function CharacterData() {
+            throw new TypeError("Failed to construct 'CharacterData': Illegal constructor");
+        }
+        CharacterData.prototype = characterProto;
+        try { Object.setPrototypeOf(CharacterData, globalThis.Node); } catch (_) {}
+        Object.defineProperty(characterProto, 'constructor', {
+            value: CharacterData, writable: true, configurable: true,
+        });
+
+        function Text() {
+            if (!new.target) {
+                throw new TypeError(
+                    "Failed to construct 'Text': Please use the 'new' operator, this DOM object constructor cannot be called as a function."
+                );
+            }
+            return globalThis.document.createTextNode(arguments.length ? String(arguments[0]) : '');
+        }
+        Text.prototype = textProto;
+        try { Object.setPrototypeOf(Text, CharacterData); } catch (_) {}
+        Object.defineProperty(textProto, 'constructor', {
+            value: Text, writable: true, configurable: true,
+        });
+
+        const toNode = value => value && typeof value === 'object'
+            && typeof value.nodeType === 'number'
+            ? value
+            : globalThis.document.createTextNode(String(value));
+        const insertAllBefore = (parent, reference, values) => {
+            for (const value of values) parent.insertBefore(toNode(value), reference);
+        };
+
+        const siblingElement = (node, direction) => {
+            let cursor = direction < 0 ? node.previousSibling : node.nextSibling;
+            while (cursor) {
+                if (Number(cursor.nodeType) === 1) return cursor;
+                cursor = direction < 0 ? cursor.previousSibling : cursor.nextSibling;
+            }
+            return null;
+        };
+        Object.defineProperties(characterProto, {
+            previousElementSibling: {
+                get: function previousElementSibling() { return siblingElement(this, -1); },
+                enumerable: true, configurable: true,
+            },
+            nextElementSibling: {
+                get: function nextElementSibling() { return siblingElement(this, 1); },
+                enumerable: true, configurable: true,
+            },
+            before: {
+                value: function before() {
+                    const parent = this.parentNode;
+                    if (!parent) return;
+                    insertAllBefore(parent, this, Array.from(arguments));
+                },
+                writable: true, enumerable: true, configurable: true,
+            },
+            after: {
+                value: function after() {
+                    const parent = this.parentNode;
+                    if (!parent) return;
+                    const reference = this.nextSibling;
+                    insertAllBefore(parent, reference, Array.from(arguments));
+                },
+                writable: true, enumerable: true, configurable: true,
+            },
+            replaceWith: {
+                value: function replaceWith() {
+                    const parent = this.parentNode;
+                    if (!parent) return;
+                    insertAllBefore(parent, this, Array.from(arguments));
+                    parent.removeChild(this);
+                },
+                writable: true, enumerable: true, configurable: true,
+            },
+            remove: {
+                value: function remove() {
+                    if (this.parentNode) this.parentNode.removeChild(this);
+                },
+                writable: true, enumerable: true, configurable: true,
+            },
+        });
+
+        Object.defineProperties(textProto, {
+            wholeText: {
+                get: function wholeText() {
+                    let first = this;
+                    while (first.previousSibling && Number(first.previousSibling.nodeType) === 3) {
+                        first = first.previousSibling;
+                    }
+                    let output = '';
+                    let cursor = first;
+                    while (cursor && Number(cursor.nodeType) === 3) {
+                        output += String(cursor.data ?? cursor.nodeValue ?? '');
+                        cursor = cursor.nextSibling;
+                    }
+                    return output;
+                },
+                enumerable: true, configurable: true,
+            },
+            assignedSlot: {
+                get: function assignedSlot() { return null; },
+                enumerable: true, configurable: true,
+            },
+            splitText: {
+                value: function splitText(offset) {
+                    const data = String(this.data ?? '');
+                    const index = Number(offset) >>> 0;
+                    if (index > data.length) {
+                        throw new DOMException(
+                            `Failed to execute 'splitText' on 'Text': The offset ${index} is greater than the Text node's length.`,
+                            'IndexSizeError'
+                        );
+                    }
+                    const remainder = globalThis.document.createTextNode(data.slice(index));
+                    this.data = data.slice(0, index);
+                    if (this.parentNode) this.parentNode.insertBefore(remainder, this.nextSibling);
+                    return remainder;
+                },
+                writable: true, enumerable: true, configurable: true,
+            },
+        });
+
+        globalThis.CharacterData = CharacterData;
+        globalThis.Text = Text;
+        maskCtor(CharacterData, 'CharacterData');
+        maskCtor(Text, 'Text');
+        try {
+            if (typeof _maskAsNative === 'function') {
+                _maskAsNative(characterProto,
+                    'previousElementSibling', 'nextElementSibling',
+                    'before', 'after', 'replaceWith', 'remove');
+                _maskAsNative(textProto, 'wholeText', 'assignedSlot', 'splitText');
+            }
+        } catch (_) {}
+    }
+
     if (globalThis.XMLSerializer) {
         const escapeText = value => String(value)
             .replace(/&/g, '&amp;')
