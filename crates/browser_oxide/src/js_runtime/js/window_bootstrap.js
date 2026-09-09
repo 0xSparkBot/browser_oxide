@@ -546,7 +546,11 @@
     });
 
     let MediaDevices = globalThis.MediaDevices || class MediaDevices {};
+    try { Object.setPrototypeOf(MediaDevices.prototype, EventTarget.prototype); } catch (_) {}
+    try { Object.setPrototypeOf(MediaDevices, EventTarget); } catch (_) {}
+    const _mediaDevicesHandlerState = new WeakMap();
     const _navMediaDevices = Object.create(MediaDevices.prototype);
+    _mediaDevicesHandlerState.set(_navMediaDevices, { ondevicechange: null });
     // enumerateDevices: apply the two spec behaviors real Chrome does and we
     // previously missed:
     //   (1) WebIDL camelCase on output (deviceId / groupId — NOT snake_case).
@@ -556,8 +560,7 @@
     //       Leaking populated labels pre-permission is a classic automation
     //       tell. _PERMISSION_STATE_MAP is defined below; reference resolves
     //       lazily when this function is called. §6.6 item 9 / item 7.
-    _navMediaDevices.enumerateDevices = ({
-        enumerateDevices() {
+    _defProtoMethod(MediaDevices.prototype, 'enumerateDevices', function enumerateDevices() {
             const raw = _pJson("media_devices", []);
             const permFor = (kind) => {
                 if (kind === "videoinput") return _PERMISSION_STATE_MAP["camera"] || "prompt";
@@ -572,31 +575,35 @@
                 return { deviceId, kind: d.kind || "", label, groupId };
             });
             return Promise.resolve(out);
-        }
-    }).enumerateDevices;
-    _maskFunction(_navMediaDevices.enumerateDevices, 'enumerateDevices');
+    });
 
-    _navMediaDevices.getUserMedia = ({ getUserMedia() { return Promise.reject(new Error("Permission denied")); } }).getUserMedia;
-    _maskFunction(_navMediaDevices.getUserMedia, 'getUserMedia');
+    _defProtoMethod(MediaDevices.prototype, 'getUserMedia', function getUserMedia() {
+        return Promise.reject(new Error("Permission denied"));
+    });
 
-    _navMediaDevices.getDisplayMedia = ({ getDisplayMedia() { return Promise.reject(new Error("Permission denied")); } }).getDisplayMedia;
-    _maskFunction(_navMediaDevices.getDisplayMedia, 'getDisplayMedia');
+    _defProtoMethod(MediaDevices.prototype, 'getDisplayMedia', function getDisplayMedia() {
+        return Promise.reject(new Error("Permission denied"));
+    });
 
-    _navMediaDevices.getSupportedConstraints = ({
-        getSupportedConstraints() {
+    _defProtoMethod(MediaDevices.prototype, 'getSupportedConstraints', function getSupportedConstraints() {
             return { aspectRatio: true, autoGainControl: true, brightness: true, channelCount: true, colorTemperature: true, contrast: true, deviceId: true, displaySurface: true, echoCancellation: true, exposureCompensation: true, exposureMode: true, exposureTime: true, facingMode: true, focusDistance: true, focusMode: true, frameRate: true, groupId: true, height: true, iso: true, latency: true, noiseSuppression: true, pan: true, pointsOfInterest: true, resizeMode: true, sampleRate: true, sampleSize: true, saturation: true, sharpness: true, suppressLocalAudioPlayback: true, tilt: true, torch: true, whiteBalanceMode: true, width: true, zoom: true };
-        }
-    }).getSupportedConstraints;
-    _maskFunction(_navMediaDevices.getSupportedConstraints, 'getSupportedConstraints');
-
-    _navMediaDevices.addEventListener = ({ addEventListener() {} }).addEventListener;
-    _maskFunction(_navMediaDevices.addEventListener, 'addEventListener');
-
-    _navMediaDevices.removeEventListener = ({ removeEventListener() {} }).removeEventListener;
-    _maskFunction(_navMediaDevices.removeEventListener, 'removeEventListener');
-
-    _navMediaDevices.dispatchEvent = ({ dispatchEvent() { return true; } }).dispatchEvent;
-    _maskFunction(_navMediaDevices.dispatchEvent, 'dispatchEvent');
+    });
+    _defProtoMethod(MediaDevices.prototype, 'setCaptureHandleConfig', function setCaptureHandleConfig() {});
+    _defProtoGetter(
+        MediaDevices.prototype,
+        'ondevicechange',
+        function ondevicechange() {
+            return _mediaDevicesHandlerState.get(this)?.ondevicechange || null;
+        },
+        function ondevicechange(value) {
+            let state = _mediaDevicesHandlerState.get(this);
+            if (!state) {
+                state = { ondevicechange: null };
+                _mediaDevicesHandlerState.set(this, state);
+            }
+            state.ondevicechange = typeof value === 'function' ? value : null;
+        },
+    );
 
     // Permission name → state map matching headed Chrome defaults.
     // W3C PermissionState enum: 'granted' | 'denied' | 'prompt'. Headless
@@ -1283,18 +1290,48 @@
 
     globalThis.ServiceWorkerContainer = ServiceWorkerContainer;
     const _navServiceWorker = new ServiceWorkerContainer();
-    const _navClipboard = (() => {
-        const _CProto = globalThis.Clipboard && globalThis.Clipboard.prototype;
-        const c = _CProto ? Object.create(_CProto) : {};
-        c.readText = ({ readText() { return Promise.resolve(""); } }).readText;
-        _maskFunction(c.readText, 'readText');
-
-        c.writeText = ({ writeText() { return Promise.resolve(); } }).writeText;
-        _maskFunction(c.writeText, 'writeText');
-
-        return c;
-    })();
-    Object.defineProperty(_navClipboard, Symbol.toStringTag, { value: "Clipboard", configurable: true });
+    const _ClipboardCtor = globalThis.Clipboard;
+    const _ClipboardProto = _ClipboardCtor && _ClipboardCtor.prototype;
+    if (_ClipboardProto) {
+        try { Object.setPrototypeOf(_ClipboardProto, EventTarget.prototype); } catch (_) {}
+        try { Object.setPrototypeOf(_ClipboardCtor, EventTarget); } catch (_) {}
+    }
+    const _clipboardHandlerState = new WeakMap();
+    let _clipboardText = "";
+    let _clipboardItems = [];
+    if (_ClipboardProto) {
+        _defProtoMethod(_ClipboardProto, 'read', function read() {
+            return Promise.resolve(_clipboardItems.slice());
+        });
+        _defProtoMethod(_ClipboardProto, 'readText', function readText() {
+            return Promise.resolve(_clipboardText);
+        });
+        _defProtoMethod(_ClipboardProto, 'write', function write(items) {
+            _clipboardItems = items == null ? [] : Array.from(items);
+            return Promise.resolve();
+        });
+        _defProtoMethod(_ClipboardProto, 'writeText', function writeText(text) {
+            _clipboardText = String(text);
+            return Promise.resolve();
+        });
+        _defProtoGetter(
+            _ClipboardProto,
+            'onclipboardchange',
+            function onclipboardchange() {
+                return _clipboardHandlerState.get(this)?.onclipboardchange || null;
+            },
+            function onclipboardchange(value) {
+                let state = _clipboardHandlerState.get(this);
+                if (!state) {
+                    state = { onclipboardchange: null };
+                    _clipboardHandlerState.set(this, state);
+                }
+                state.onclipboardchange = typeof value === 'function' ? value : null;
+            },
+        );
+    }
+    const _navClipboard = _ClipboardProto ? Object.create(_ClipboardProto) : {};
+    _clipboardHandlerState.set(_navClipboard, { onclipboardchange: null });
     const _navGeolocation = (() => {
         const _GProto = globalThis.Geolocation && globalThis.Geolocation.prototype;
         const g = _GProto ? Object.create(_GProto) : {};

@@ -2007,6 +2007,125 @@ async fn nav_clipboard() {
     assert_eq!(check_secure("typeof navigator.clipboard").await, "object");
 }
 #[tokio::test]
+async fn clipboard_and_media_devices_webidl_shape_match_chrome() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    page.evaluate(
+        r#"globalThis.__cmshape = null;
+        (async () => {
+            const clipboardHandler = () => {};
+            const mediaHandler = () => {};
+            navigator.clipboard.onclipboardchange = clipboardHandler;
+            navigator.mediaDevices.ondevicechange = mediaHandler;
+            await navigator.clipboard.writeText('hello');
+            const text = await navigator.clipboard.readText();
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const construction = C => {
+                try { new C(); return 'ok'; }
+                catch (error) { return error.name + ':' + error.message; }
+            };
+            globalThis.__cmshape = {
+                clipboard:{
+                    own:Reflect.ownKeys(navigator.clipboard).map(String),
+                    tag:Object.prototype.toString.call(navigator.clipboard),
+                    instance:navigator.clipboard instanceof Clipboard,
+                    eventTarget:navigator.clipboard instanceof EventTarget,
+                    proto:Object.getPrototypeOf(Clipboard.prototype) === EventTarget.prototype,
+                    construction:construction(Clipboard),
+                    handler:navigator.clipboard.onclipboardchange === clipboardHandler,
+                    text,
+                    methods:['read','readText','write','writeText'].map(name =>
+                        [name, Clipboard.prototype[name].length,
+                         Object.getOwnPropertyDescriptor(Clipboard.prototype,name).enumerable]),
+                    handlerEnumerable:Object.getOwnPropertyDescriptor(
+                        Clipboard.prototype,'onclipboardchange').enumerable,
+                },
+                media:{
+                    own:Reflect.ownKeys(navigator.mediaDevices).map(String),
+                    tag:Object.prototype.toString.call(navigator.mediaDevices),
+                    instance:navigator.mediaDevices instanceof MediaDevices,
+                    eventTarget:navigator.mediaDevices instanceof EventTarget,
+                    proto:Object.getPrototypeOf(MediaDevices.prototype) === EventTarget.prototype,
+                    construction:construction(MediaDevices),
+                    handler:navigator.mediaDevices.ondevicechange === mediaHandler,
+                    devices:Array.isArray(devices),
+                    methods:[
+                        'enumerateDevices','getDisplayMedia','getSupportedConstraints',
+                        'getUserMedia','setCaptureHandleConfig'
+                    ].map(name => [
+                        name, MediaDevices.prototype[name].length,
+                        Object.getOwnPropertyDescriptor(MediaDevices.prototype,name).enumerable
+                    ]),
+                    handlerEnumerable:Object.getOwnPropertyDescriptor(
+                        MediaDevices.prototype,'ondevicechange').enumerable,
+                }
+            };
+        })();"#,
+    )
+    .unwrap();
+    for _ in 0..10 {
+        let _ = page
+            .event_loop()
+            .run_until_idle(std::time::Duration::from_millis(20))
+            .await;
+        if page.evaluate("globalThis.__cmshape !== null").unwrap() == "true" {
+            break;
+        }
+    }
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__cmshape)")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["clipboard"]["own"], serde_json::json!([]));
+    assert_eq!(value["clipboard"]["tag"], "[object Clipboard]");
+    assert_eq!(value["clipboard"]["instance"], true);
+    assert_eq!(value["clipboard"]["eventTarget"], true);
+    assert_eq!(value["clipboard"]["proto"], true);
+    assert!(value["clipboard"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(value["clipboard"]["handler"], true);
+    assert_eq!(value["clipboard"]["text"], "hello");
+    assert_eq!(
+        value["clipboard"]["methods"],
+        serde_json::json!([
+            ["read", 0, true],
+            ["readText", 0, true],
+            ["write", 1, true],
+            ["writeText", 1, true]
+        ])
+    );
+    assert_eq!(value["clipboard"]["handlerEnumerable"], true);
+    assert_eq!(value["media"]["own"], serde_json::json!([]));
+    assert_eq!(value["media"]["tag"], "[object MediaDevices]");
+    assert_eq!(value["media"]["instance"], true);
+    assert_eq!(value["media"]["eventTarget"], true);
+    assert_eq!(value["media"]["proto"], true);
+    assert!(value["media"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(value["media"]["handler"], true);
+    assert_eq!(value["media"]["devices"], true);
+    assert_eq!(
+        value["media"]["methods"],
+        serde_json::json!([
+            ["enumerateDevices", 0, true],
+            ["getDisplayMedia", 0, true],
+            ["getSupportedConstraints", 0, true],
+            ["getUserMedia", 0, true],
+            ["setCaptureHandleConfig", 0, true]
+        ])
+    );
+    assert_eq!(value["media"]["handlerEnumerable"], true);
+}
+#[tokio::test]
 async fn nav_storage() {
     assert_eq!(check_secure("typeof navigator.storage").await, "object");
 }
