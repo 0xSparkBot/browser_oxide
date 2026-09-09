@@ -1337,6 +1337,95 @@ async fn window_local_storage() {
     assert_eq!(check("typeof localStorage").await, "object");
 }
 #[tokio::test]
+async fn storage_webidl_shape_and_named_properties_match_chrome() {
+    let result = check(
+        r#"(() => {
+            localStorage.clear();
+            const get1 = localStorage.getItem;
+            const get2 = localStorage.getItem;
+            localStorage.setItem('alpha', '1');
+            localStorage.beta = '2';
+            let illegal = '';
+            try { Storage.prototype.getItem.call({}); illegal = 'ok'; }
+            catch (error) { illegal = error.name + ':' + error.message; }
+            let construction = '';
+            try { new Storage(); construction = 'ok'; }
+            catch (error) { construction = error.name + ':' + error.message; }
+            const beforeDelete = {
+                tag:Object.prototype.toString.call(localStorage),
+                instance:localStorage instanceof Storage,
+                proto:Object.getPrototypeOf(localStorage) === Storage.prototype,
+                methodIdentity:get1 === get2,
+                own:Reflect.ownKeys(localStorage).map(String).sort(),
+                objectKeys:Object.keys(localStorage).sort(),
+                alpha:localStorage.alpha,
+                beta:localStorage.getItem('beta'),
+                length:localStorage.length,
+                key0:localStorage.key(0),
+                illegal,
+                construction,
+                protoNames:Object.getOwnPropertyNames(Storage.prototype).sort(),
+                enumerable:['length','key','getItem','setItem','removeItem','clear'].map(name =>
+                    Object.getOwnPropertyDescriptor(Storage.prototype,name).enumerable),
+            };
+            delete localStorage.alpha;
+            const afterDelete = {
+                alpha:localStorage.getItem('alpha'),
+                length:localStorage.length,
+            };
+            localStorage.clear();
+            return JSON.stringify({beforeDelete,afterDelete});
+        })()"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["beforeDelete"]["tag"], "[object Storage]");
+    assert_eq!(value["beforeDelete"]["instance"], true);
+    assert_eq!(value["beforeDelete"]["proto"], true);
+    assert_eq!(value["beforeDelete"]["methodIdentity"], true);
+    assert_eq!(
+        value["beforeDelete"]["own"],
+        serde_json::json!(["alpha", "beta"])
+    );
+    assert_eq!(
+        value["beforeDelete"]["objectKeys"],
+        serde_json::json!(["alpha", "beta"])
+    );
+    assert_eq!(value["beforeDelete"]["alpha"], "1");
+    assert_eq!(value["beforeDelete"]["beta"], "2");
+    assert_eq!(value["beforeDelete"]["length"], 2);
+    assert!(matches!(
+        value["beforeDelete"]["key0"].as_str(),
+        Some("alpha" | "beta")
+    ));
+    assert!(value["beforeDelete"]["illegal"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal invocation"));
+    assert!(value["beforeDelete"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(
+        value["beforeDelete"]["protoNames"],
+        serde_json::json!([
+            "clear",
+            "constructor",
+            "getItem",
+            "key",
+            "length",
+            "removeItem",
+            "setItem"
+        ])
+    );
+    assert_eq!(
+        value["beforeDelete"]["enumerable"],
+        serde_json::json!([true, true, true, true, true, true])
+    );
+    assert!(value["afterDelete"]["alpha"].is_null());
+    assert_eq!(value["afterDelete"]["length"], 1);
+}
+#[tokio::test]
 async fn window_session_storage() {
     assert_eq!(check("typeof sessionStorage").await, "object");
 }

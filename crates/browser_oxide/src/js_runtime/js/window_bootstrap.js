@@ -4961,19 +4961,42 @@
         return true;
     }
 
-    function makeStorage(type) {
-        const STORAGE_METHODS = ["getItem", "setItem", "removeItem", "clear", "key", "length"];
-        return new Proxy({}, {
-            get(target, key) {
-                if (key === "getItem") return (k) => ops.op_dom_storage_get(type, String(k));
-                if (key === "setItem") return (k, v) => { setStorageItem(type, String(k), v); };
-                if (key === "removeItem") return (k) => { ops.op_dom_storage_remove(type, String(k)); };
-                if (key === "clear") return () => { ops.op_dom_storage_clear(type); };
-                if (key === "key") return (i) => ops.op_dom_storage_keys(type)[i] ?? null;
-                if (key === "length") return ops.op_dom_storage_keys(type).length;
+    const _storageAreaType = new WeakMap();
+    const _storageTypeFor = (storage) => {
+        const type = _storageAreaType.get(storage);
+        if (!type) throw new TypeError("Illegal invocation");
+        return type;
+    };
+    const _StorageProto = globalThis.Storage.prototype;
+    _defProtoGetter(_StorageProto, 'length', function length() {
+        return ops.op_dom_storage_keys(_storageTypeFor(this)).length;
+    });
+    _defProtoMethod(_StorageProto, 'key', function key(index) {
+        return ops.op_dom_storage_keys(_storageTypeFor(this))[Number(index) >>> 0] ?? null;
+    });
+    _defProtoMethod(_StorageProto, 'getItem', function getItem(key) {
+        return ops.op_dom_storage_get(_storageTypeFor(this), String(key));
+    });
+    _defProtoMethod(_StorageProto, 'setItem', function setItem(key, value) {
+        setStorageItem(_storageTypeFor(this), String(key), value);
+    });
+    _defProtoMethod(_StorageProto, 'removeItem', function removeItem(key) {
+        ops.op_dom_storage_remove(_storageTypeFor(this), String(key));
+    });
+    _defProtoMethod(_StorageProto, 'clear', function clear() {
+        ops.op_dom_storage_clear(_storageTypeFor(this));
+    });
 
-                // Fallback to getting the item directly if it's not a method
-                return ops.op_dom_storage_get(type, String(key)) ?? undefined;
+    function makeStorage(type) {
+        const STORAGE_METHODS = new Set(["getItem", "setItem", "removeItem", "clear", "key", "length"]);
+        const target = Object.create(_StorageProto);
+        const proxy = new Proxy(target, {
+            get(target, key, receiver) {
+                if (typeof key === 'symbol' || STORAGE_METHODS.has(key)) {
+                    return Reflect.get(target, key, receiver);
+                }
+                const value = ops.op_dom_storage_get(type, String(key));
+                return value !== null ? value : Reflect.get(target, key, receiver);
             },
             // V8 Proxy invariant: `has` must agree with `ownKeys` about what
             // keys exist. Without an explicit trap, V8 falls back to the empty
@@ -4981,8 +5004,9 @@
             // real list. The reconciliation is hot work that fingerprint scripts hit
             // repeatedly via `'name' in storage` style probes.
             has(target, key) {
-                if (STORAGE_METHODS.includes(key)) return true;
-                return ops.op_dom_storage_get(type, String(key)) !== null;
+                if (typeof key === 'symbol') return Reflect.has(target, key);
+                if (STORAGE_METHODS.has(key)) return true;
+                return ops.op_dom_storage_get(type, String(key)) !== null || Reflect.has(target, key);
             },
             set(target, key, value) { return setStorageItem(type, String(key), value); },
             deleteProperty(target, key) {
@@ -4999,6 +5023,9 @@
                 }
             }
         });
+        _storageAreaType.set(target, type);
+        _storageAreaType.set(proxy, type);
+        return proxy;
     }
     globalThis.localStorage = makeStorage("local");
     globalThis.sessionStorage = makeStorage("session");
