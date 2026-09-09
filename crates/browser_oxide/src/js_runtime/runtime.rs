@@ -376,6 +376,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/window_bootstrap.js"),
             "\n",
+            include_str!("js/geometry_bootstrap.js"),
+            "\n",
             include_str!("js/streams_bootstrap.js"),
             "\n",
             include_str!("js/structured_clone.js"),
@@ -635,6 +637,10 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/shared_apis_bootstrap.js"))
         .expect("worker: shared_apis bootstrap failed");
+
+    runtime
+        .execute_script("<anonymous>", include_str!("js/geometry_bootstrap.js"))
+        .expect("worker: geometry bootstrap failed");
 
     // Page runtimes may unref long setTimeout/setInterval sleeps so analytics
     // and retry timers do not pin render-settle detection. A DedicatedWorker

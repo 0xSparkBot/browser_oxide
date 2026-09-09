@@ -328,6 +328,76 @@ async fn streams_webidl_shape_matches_chrome() {
     );
 }
 
+#[tokio::test]
+async fn geometry_interfaces_match_chrome_148() {
+    let result = check(
+        r#"(() => {
+            const names = proto => Object.getOwnPropertyNames(proto).sort().join(',');
+            const rectRO = new DOMRectReadOnly(1, 2, 3, 4);
+            const rect = new DOMRect(1, 2, 3, 4);
+            const pointRO = new DOMPointReadOnly(1, 2, 3, 4);
+            const point = new DOMPoint(1, 2, 3, 4);
+            const matrixRO = new DOMMatrixReadOnly([1, 2, 3, 4, 5, 6]);
+            const matrix = new DOMMatrix([1, 2, 3, 4, 5, 6]);
+
+            const instances = [rectRO, rect, pointRO, point, matrixRO, matrix];
+            const prototypeNames = [
+                names(DOMRectReadOnly.prototype),
+                names(DOMRect.prototype),
+                names(DOMPointReadOnly.prototype),
+                names(DOMPoint.prototype),
+                names(DOMMatrixReadOnly.prototype),
+                names(DOMMatrix.prototype)
+            ];
+
+            const mutable = new DOMMatrix();
+            const selfOps = [
+                mutable.translateSelf(2, 3) === mutable,
+                mutable.scaleSelf(2) === mutable,
+                mutable.rotateSelf(0) === mutable
+            ];
+
+            return JSON.stringify({
+                ctorLengths:[
+                    DOMRectReadOnly.length, DOMRect.length,
+                    DOMPointReadOnly.length, DOMPoint.length,
+                    DOMMatrixReadOnly.length, DOMMatrix.length
+                ],
+                prototypeNames,
+                ownKeys:instances.map(value => Reflect.ownKeys(value).map(String)),
+                tags:instances.map(value => Object.prototype.toString.call(value)),
+                inheritance:[
+                    Object.getPrototypeOf(DOMRect.prototype) === DOMRectReadOnly.prototype,
+                    Object.getPrototypeOf(DOMPoint.prototype) === DOMPointReadOnly.prototype,
+                    Object.getPrototypeOf(DOMMatrix.prototype) === DOMMatrixReadOnly.prototype
+                ],
+                webkit:WebKitCSSMatrix === DOMMatrix,
+                rect:[rectRO.top, rectRO.right, rectRO.bottom, rectRO.left],
+                pointTransform:new DOMPointReadOnly(2, 3)
+                    .matrixTransform(new DOMMatrix().translate(5, 7)).toJSON(),
+                matrix:[
+                    matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f,
+                    matrix.m11, matrix.m12, matrix.m21, matrix.m22, matrix.m41, matrix.m42,
+                    matrix.is2D, matrix.isIdentity, matrix.toString()
+                ],
+                matrixPoint:matrix.transformPoint(new DOMPoint(2,3,0,1)).toJSON(),
+                selfOps,
+                mutable:mutable.toJSON(),
+                statics:[
+                    DOMRect.fromRect({x:7,y:8,width:9,height:10}).toJSON(),
+                    DOMPoint.fromPoint({x:7,y:8,z:9,w:10}).toJSON(),
+                    DOMMatrix.fromMatrix({a:2,d:3,e:4,f:5}).toJSON()
+                ]
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"ctorLengths":[0,0,0,0,0,0],"prototypeNames":["bottom,constructor,height,left,right,toJSON,top,width,x,y","constructor,height,width,x,y","constructor,matrixTransform,toJSON,w,x,y,z","constructor,w,x,y,z","a,b,c,constructor,d,e,f,flipX,flipY,inverse,is2D,isIdentity,m11,m12,m13,m14,m21,m22,m23,m24,m31,m32,m33,m34,m41,m42,m43,m44,multiply,rotate,rotateAxisAngle,rotateFromVector,scale,scale3d,scaleNonUniform,skewX,skewY,toFloat32Array,toFloat64Array,toJSON,toString,transformPoint,translate","a,b,c,constructor,d,e,f,invertSelf,m11,m12,m13,m14,m21,m22,m23,m24,m31,m32,m33,m34,m41,m42,m43,m44,multiplySelf,preMultiplySelf,rotateAxisAngleSelf,rotateFromVectorSelf,rotateSelf,scale3dSelf,scaleSelf,setMatrixValue,skewXSelf,skewYSelf,translateSelf"],"ownKeys":[[],[],[],[],[],[]],"tags":["[object DOMRectReadOnly]","[object DOMRect]","[object DOMPointReadOnly]","[object DOMPoint]","[object DOMMatrixReadOnly]","[object DOMMatrix]"],"inheritance":[true,true,true],"webkit":true,"rect":[2,4,6,1],"pointTransform":{"x":7,"y":10,"z":0,"w":1},"matrix":[1,2,3,4,5,6,1,2,3,4,5,6,true,false,"matrix(1, 2, 3, 4, 5, 6)"],"matrixPoint":{"x":16,"y":22,"z":0,"w":1},"selfOps":[true,true,true],"mutable":{"a":2,"b":0,"c":0,"d":2,"e":2,"f":3,"m11":2,"m12":0,"m13":0,"m14":0,"m21":0,"m22":2,"m23":0,"m24":0,"m31":0,"m32":0,"m33":1,"m34":0,"m41":2,"m42":3,"m43":0,"m44":1,"is2D":true,"isIdentity":false},"statics":[{"x":7,"y":8,"width":9,"height":10,"top":8,"right":16,"bottom":18,"left":7},{"x":7,"y":8,"z":9,"w":10},{"a":2,"b":0,"c":0,"d":3,"e":4,"f":5,"m11":2,"m12":0,"m13":0,"m14":0,"m21":0,"m22":3,"m23":0,"m24":0,"m31":0,"m32":0,"m33":1,"m34":0,"m41":4,"m42":5,"m43":0,"m44":1,"is2D":true,"isIdentity":false}]}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
