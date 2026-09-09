@@ -9447,6 +9447,104 @@ async fn location_origin_secure_page() {
     );
 }
 
+#[tokio::test]
+async fn location_legacy_unforgeable_shape_matches_chrome() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/base?q=1#old",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    let result = page
+        .evaluate(
+            r#"(() => {
+                const names = [
+                    'ancestorOrigins','href','origin','protocol','host','hostname','port',
+                    'pathname','search','hash','assign','reload','replace','toString'
+                ];
+                const before = {
+                    tag:Object.prototype.toString.call(location),
+                    instance:location instanceof Location,
+                    own:Object.getOwnPropertyNames(location).sort(),
+                    proto:Object.getOwnPropertyNames(Location.prototype).sort(),
+                    descriptors:names.map(name => {
+                        const d=Object.getOwnPropertyDescriptor(location,name);
+                        return [name,!!d,!!d.enumerable,!!d.configurable,
+                            'value' in d ? !!d.writable : typeof d.get,
+                            'value' in d ? typeof d.value : (d.set ? typeof d.set : 'undefined')];
+                    }),
+                    href:location.href,
+                };
+                location.port='9443';
+                location.pathname='next';
+                location.search='x=2';
+                location.hash='tail';
+                const after={
+                    href:location.href,
+                    port:location.port,
+                    pathname:location.pathname,
+                    search:location.search,
+                    hash:location.hash,
+                    pending:globalThis.__pendingNavigation,
+                };
+                return JSON.stringify({before,after});
+            })()"#,
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["before"]["tag"], "[object Location]");
+    assert_eq!(value["before"]["instance"], true);
+    assert_eq!(value["before"]["proto"], serde_json::json!(["constructor"]));
+    assert_eq!(
+        value["before"]["own"],
+        serde_json::json!([
+            "ancestorOrigins",
+            "assign",
+            "hash",
+            "host",
+            "hostname",
+            "href",
+            "origin",
+            "pathname",
+            "port",
+            "protocol",
+            "reload",
+            "replace",
+            "search",
+            "toString",
+            "valueOf"
+        ])
+    );
+    for row in value["before"]["descriptors"].as_array().unwrap() {
+        assert_eq!(row[1], true, "missing Location own descriptor: {row}");
+        assert_eq!(row[2], true, "Location member must be enumerable: {row}");
+        assert_eq!(row[3], false, "Location member must be unforgeable: {row}");
+        if matches!(
+            row[0].as_str(),
+            Some("assign" | "reload" | "replace" | "toString")
+        ) {
+            assert_eq!(row[4], false, "Location methods are non-writable: {row}");
+            assert_eq!(row[5], "function");
+        } else {
+            assert_eq!(row[4], "function");
+        }
+    }
+    assert_eq!(value["after"]["port"], "9443");
+    assert_eq!(value["after"]["pathname"], "/next");
+    assert_eq!(value["after"]["search"], "?x=2");
+    assert_eq!(value["after"]["hash"], "#tail");
+    assert_eq!(
+        value["after"]["href"],
+        "https://example.com:9443/next?x=2#tail"
+    );
+    assert_eq!(value["after"]["pending"]["kind"], "assign");
+    assert_eq!(
+        value["after"]["pending"]["url"],
+        "https://example.com:9443/next?x=2#old"
+    );
+}
+
 // ================================================================
 // every patched native must return `function NAME() { [native code] }`
 // from Function.prototype.toString — 11 of 12 anti-bot vendors fingerprint

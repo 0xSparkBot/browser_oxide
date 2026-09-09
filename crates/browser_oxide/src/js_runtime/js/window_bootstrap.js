@@ -1818,9 +1818,29 @@
     // Location class and instance
     const _LocProto = globalThis.Location.prototype;
     Object.defineProperty(_LocProto, Symbol.toStringTag, { value: "Location", enumerable: false, configurable: true });
+    const _locationInstance = Object.create(_LocProto);
 
     function _defLoc(prop, getter, setter) {
-        _defProtoGetter(_LocProto, prop, getter, setter);
+        _maskFunction(getter, `get ${prop}`);
+        if (setter) _maskFunction(setter, `set ${prop}`);
+        Object.defineProperty(_locationInstance, prop, {
+            get: getter,
+            set: setter,
+            enumerable: true,
+            configurable: false,
+        });
+    }
+
+    function _defLocMethod(name, fn, length) {
+        const wrapped = ({ [name](...args) { return fn.apply(this, args); } })[name];
+        try { Object.defineProperty(wrapped, 'length', { value: length, configurable: true }); } catch (_) {}
+        _maskFunction(wrapped, name);
+        Object.defineProperty(_locationInstance, name, {
+            value: wrapped,
+            writable: false,
+            enumerable: true,
+            configurable: false,
+        });
     }
 
     // Signal the Rust event loop that a navigation is pending. Without this,
@@ -1830,6 +1850,18 @@
     // let in-flight fetch().then(setCookie) land in the jar). See
     // crates/js_runtime/src/extensions/nav_ext.rs.
     const _signalNav = () => { try { ops.op_set_pending_nav(); } catch (_) {} };
+    const _setLocationPart = (name, value) => {
+        try {
+            const url = new URL(_locationData.href);
+            url[name] = value;
+            _parseLocationUrl(url.href);
+        } catch (_) {
+            return false;
+        }
+        _browser_oxide.__pendingNavigation = { url: _locationData.href, kind: "assign" };
+        _signalNav();
+        return true;
+    };
 
     // Mirror `_browser_oxide.__pendingNavigation` onto `globalThis.__pendingNavigation`
     // — JS-side consumers (and the navigation_primitives tests) read it
@@ -1850,26 +1882,17 @@
     });
     _defLoc('origin', () => _locationData.origin);
     _defLoc('protocol', () => _locationData.protocol, (v) => {
-        _parseLocationUrl(v + "//" + _locationData.host + _locationData.pathname);
-        _browser_oxide.__pendingNavigation = 
- { url: _locationData.href, kind: "assign" };
-        _signalNav();
+        _setLocationPart('protocol', v);
     });
     _defLoc('host', () => _locationData.host, (v) => {
-        _parseLocationUrl(_locationData.protocol + "//" + v + _locationData.pathname);
-        _browser_oxide.__pendingNavigation = 
- { url: _locationData.href, kind: "assign" };
-        _signalNav();
+        _setLocationPart('host', v);
     });
     _defLoc('hostname', () => _locationData.hostname, (v) => {
-        _parseLocationUrl(_locationData.protocol + "//" + v + (_locationData.port ? ":" + _locationData.port : "") + _locationData.pathname);
-        _browser_oxide.__pendingNavigation = 
- { url: _locationData.href, kind: "assign" };
-        _signalNav();
+        _setLocationPart('hostname', v);
     });
-    _defLoc('port', () => _locationData.port);
-    _defLoc('pathname', () => _locationData.pathname);
-    _defLoc('search', () => _locationData.search);
+    _defLoc('port', () => _locationData.port, (v) => { _setLocationPart('port', v); });
+    _defLoc('pathname', () => _locationData.pathname, (v) => { _setLocationPart('pathname', v); });
+    _defLoc('search', () => _locationData.search, (v) => { _setLocationPart('search', v); });
     _defLoc('hash', () => _locationData.hash, (v) => {
         _locationData.hash = String(v).startsWith('#') ? v : '#' + v;
         _locationData.href = _locationData.origin + _locationData.pathname + _locationData.search + _locationData.hash;
@@ -1886,29 +1909,32 @@
         return _ao;
     });
 
-    _defProtoMethod(_LocProto, 'assign', (url) => {
+    _defLocMethod('assign', (url) => {
         _parseLocationUrl(url);
         _browser_oxide.__pendingNavigation = 
  { url: _locationData.href, kind: "assign" };
         _signalNav();
-    });
-    _defProtoMethod(_LocProto, 'replace', (url) => {
+    }, 1);
+    _defLocMethod('replace', (url) => {
         _parseLocationUrl(url);
         _browser_oxide.__pendingNavigation = 
  { url: _locationData.href, kind: "replace" };
         _signalNav();
-    });
-    _defProtoMethod(_LocProto, 'reload', () => {
+    }, 1);
+    _defLocMethod('reload', () => {
         _browser_oxide.__pendingNavigation = 
  { url: _locationData.href, kind: "reload" };
         _signalNav();
+    }, 0);
+    _defLocMethod('toString', function() { return this.href; }, 0);
+    const _valueOf = ({ valueOf() { return this; } }).valueOf;
+    _maskFunction(_valueOf, 'valueOf');
+    Object.defineProperty(_locationInstance, 'valueOf', {
+        value: _valueOf,
+        writable: false,
+        enumerable: false,
+        configurable: false,
     });
-    _defProtoMethod(_LocProto, 'toString', function() { return this.href; });
-    _LocProto[Symbol.toPrimitive] = function() { return this.href; };
-
-    _maskAsNative(_LocProto, 'assign', 'replace', 'reload', 'toString');
-
-    const _locationInstance = Object.create(_LocProto);
     try {
         // Delete Deno's location getter if it exists
         delete globalThis.location;
