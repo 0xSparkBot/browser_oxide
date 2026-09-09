@@ -9412,6 +9412,102 @@ async fn message_channel_close_detaches() {
     assert_eq!(len, "0", "post-close postMessage must not deliver: {len}");
 }
 
+#[tokio::test]
+async fn message_channel_webidl_shape_and_explicit_start_match_chrome() {
+    let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"(() => {
+            const ch = new MessageChannel();
+            globalThis.__mcshape = { ch, got: [] };
+            ch.port2.addEventListener('message', event => globalThis.__mcshape.got.push(event.data));
+            ch.port1.postMessage('queued');
+            let portConstruction = '';
+            try { new MessagePort(); portConstruction = 'ok'; }
+            catch (error) { portConstruction = error.name + ':' + error.message; }
+            globalThis.__mcshape.before = {
+                channelOwn:Reflect.ownKeys(ch).map(String),
+                portOwn:Reflect.ownKeys(ch.port1).map(String),
+                channelTag:Object.prototype.toString.call(ch),
+                portTag:Object.prototype.toString.call(ch.port1),
+                eventTarget:ch.port1 instanceof EventTarget,
+                portConstruction,
+                channelProto:Object.getOwnPropertyNames(MessageChannel.prototype).sort(),
+                portProto:Object.getOwnPropertyNames(MessagePort.prototype).sort(),
+                channelEnumerable:['port1','port2'].map(name =>
+                    Object.getOwnPropertyDescriptor(MessageChannel.prototype,name).enumerable),
+                portEnumerable:['onmessage','onmessageerror','postMessage','start','close'].map(name =>
+                    Object.getOwnPropertyDescriptor(MessagePort.prototype,name).enumerable),
+                hasOwnAddEventListener:Object.prototype.hasOwnProperty.call(
+                    MessagePort.prototype,'addEventListener'),
+            };
+        })()"#,
+    )
+    .unwrap();
+    for _ in 0..5 {
+        let _ = page
+            .event_loop()
+            .run_until_idle(std::time::Duration::from_millis(20))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        page.evaluate("globalThis.__mcshape.got.length").unwrap(),
+        "0",
+        "addEventListener alone must not start a MessagePort"
+    );
+    page.evaluate("globalThis.__mcshape.ch.port2.start()")
+        .unwrap();
+    for _ in 0..10 {
+        let _ = page
+            .event_loop()
+            .run_until_idle(std::time::Duration::from_millis(20))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let result = page
+        .evaluate(
+            "JSON.stringify({before:globalThis.__mcshape.before,got:globalThis.__mcshape.got})",
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["before"]["channelOwn"], serde_json::json!([]));
+    assert_eq!(value["before"]["portOwn"], serde_json::json!([]));
+    assert_eq!(value["before"]["channelTag"], "[object MessageChannel]");
+    assert_eq!(value["before"]["portTag"], "[object MessagePort]");
+    assert_eq!(value["before"]["eventTarget"], true);
+    assert!(value["before"]["portConstruction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(
+        value["before"]["channelProto"],
+        serde_json::json!(["constructor", "port1", "port2"])
+    );
+    assert_eq!(
+        value["before"]["portProto"],
+        serde_json::json!([
+            "close",
+            "constructor",
+            "onmessage",
+            "onmessageerror",
+            "postMessage",
+            "start"
+        ])
+    );
+    assert_eq!(
+        value["before"]["channelEnumerable"],
+        serde_json::json!([true, true])
+    );
+    assert_eq!(
+        value["before"]["portEnumerable"],
+        serde_json::json!([true, true, true, true, true])
+    );
+    assert_eq!(value["before"]["hasOwnAddEventListener"], false);
+    assert_eq!(value["got"], serde_json::json!(["queued"]));
+}
+
 // ================================================================
 // v0.1.0-parity Fix 9 — RAF cadence jitter
 // Real Chrome's

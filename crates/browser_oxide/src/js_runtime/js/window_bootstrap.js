@@ -3301,6 +3301,8 @@
         const _PortQueue = new WeakMap();    // port → Array<msg> queued pre-start
         const _PortEnabled = new WeakMap();  // port → bool (start gate)
         const _PortClosed = new WeakMap();   // port → bool
+        const _PortHandlers = new WeakMap(); // port → {onmessage,onmessageerror}
+        const _PortInternalToken = {};
 
         const _clone = (data) => {
             try {
@@ -3360,42 +3362,63 @@
             try { globalThis.setTimeout(_fire, 0); } catch (_e) { _fire(); }
         };
 
-        globalThis.MessagePort = class MessagePort extends EventTarget {
-            constructor() {
+        class MessagePort extends EventTarget {
+            constructor(token = undefined) {
                 super();
-                this._onmessage = null;
-                this.onmessageerror = null;
+                if (token !== _PortInternalToken) {
+                    throw new TypeError("Failed to construct 'MessagePort': Illegal constructor");
+                }
+                _PortQueue.set(this, []);
+                _PortEnabled.set(this, false);
+                _PortClosed.set(this, false);
+                _PortHandlers.set(this, { onmessage: null, onmessageerror: null });
             }
-            get onmessage() { return this._onmessage; }
-            set onmessage(fn) {
-                this._onmessage = (typeof fn === 'function') ? fn : null;
-                // Spec: setting onmessage implicitly enables dispatch.
-                if (this._onmessage) _enable(this);
-            }
-            postMessage(data /*, transfer */) {
+        }
+        const _createPort = () => new MessagePort(_PortInternalToken);
+        _defProtoGetter(
+            MessagePort.prototype,
+            'onmessage',
+            function onmessage() { return _PortHandlers.get(this)?.onmessage || null; },
+            function onmessage(value) {
+                const state = _PortHandlers.get(this);
+                if (!state) return;
+                state.onmessage = typeof value === 'function' ? value : null;
+                // Spec: assigning a non-null onmessage handler implicitly
+                // starts the port. addEventListener alone does not.
+                if (state.onmessage) _enable(this);
+            },
+        );
+        _defProtoGetter(
+            MessagePort.prototype,
+            'onmessageerror',
+            function onmessageerror() { return _PortHandlers.get(this)?.onmessageerror || null; },
+            function onmessageerror(value) {
+                const state = _PortHandlers.get(this);
+                if (state) state.onmessageerror = typeof value === 'function' ? value : null;
+            },
+        );
+        _defProtoMethod(MessagePort.prototype, 'postMessage', function postMessage(data) {
                 if (_PortClosed.get(this)) return;
                 const paired = _PortPaired.get(this);
                 if (!paired) return;
                 const cloned = _clone(data);
                 // Delivery to the PAIRED port (spec semantics).
                 _deliver(paired, cloned);
-            }
-            start() { _enable(this); }
-            close() {
+        });
+        _defProtoMethod(MessagePort.prototype, 'start', function start() { _enable(this); });
+        _defProtoMethod(MessagePort.prototype, 'close', function close() {
                 _PortClosed.set(this, true);
                 // Detach from pair so the other side stops being able
                 // to deliver to us. Pair is preserved on the other
                 // port's side so its close() still works.
                 const paired = _PortPaired.get(this);
                 if (paired) _PortPaired.delete(this);
-            }
-            addEventListener(type, listener, options) {
-                super.addEventListener(type, listener, options);
-                // Spec: addEventListener('message', …) also implicitly
-                // enables dispatch (mirrors onmessage setter).
-                if (type === 'message') _enable(this);
-            }
-        };
+        });
+        Object.defineProperty(MessagePort.prototype, Symbol.toStringTag, {
+            value: 'MessagePort', configurable: true,
+        });
+        _maskFunction(MessagePort, 'MessagePort');
+        globalThis.MessagePort = MessagePort;
 
         // Re-tag the constructor + prototype methods so the universal
         // mask sweep (cleanup_bootstrap) tags them with the right name;
@@ -3403,14 +3426,27 @@
         // fine. The Symbol-tagged closures (_PortPaired et al.) live in
         // the bootstrap IIFE scope and survive the snapshot.
 
-        globalThis.MessageChannel = class MessageChannel {
+        const _MessageChannelState = new WeakMap();
+        class MessageChannel {
             constructor() {
-                this.port1 = new globalThis.MessagePort();
-                this.port2 = new globalThis.MessagePort();
-                _PortPaired.set(this.port1, this.port2);
-                _PortPaired.set(this.port2, this.port1);
+                const port1 = _createPort();
+                const port2 = _createPort();
+                _PortPaired.set(port1, port2);
+                _PortPaired.set(port2, port1);
+                _MessageChannelState.set(this, { port1, port2 });
             }
-        };
+        }
+        _defProtoGetter(MessageChannel.prototype, 'port1', function port1() {
+            return _MessageChannelState.get(this)?.port1;
+        });
+        _defProtoGetter(MessageChannel.prototype, 'port2', function port2() {
+            return _MessageChannelState.get(this)?.port2;
+        });
+        Object.defineProperty(MessageChannel.prototype, Symbol.toStringTag, {
+            value: 'MessageChannel', configurable: true,
+        });
+        _maskFunction(MessageChannel, 'MessageChannel');
+        globalThis.MessageChannel = MessageChannel;
     }
 
     if (!globalThis.EventSource) {
