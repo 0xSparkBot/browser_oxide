@@ -10533,3 +10533,191 @@ async fn dom_core_extended_webidl_matches_chrome_shape_and_behavior() {
     assert_eq!(v["shadow"]["ownKeys"], serde_json::json!([]));
     assert_eq!(v["shadow"]["shadowEnum"], true);
 }
+
+#[tokio::test]
+async fn element_html_webidl_layers_preserve_behavior_and_ownership() {
+    let raw = check(
+        r#"(() => {
+            const ctorResults = {};
+            for (const name of ['Element','HTMLElement','HTMLDivElement','HTMLInputElement','HTMLIFrameElement']) {
+                try { new globalThis[name](); ctorResults[name] = 'ok'; }
+                catch (e) { ctorResults[name] = e.name + ':' + e.message; }
+            }
+
+            const div = document.createElement('div');
+            document.body.appendChild(div);
+            div.align = 'center';
+            div.ariaLabel = 'hello';
+            const ariaBefore = [div.ariaLabel, div.getAttribute('aria-label')];
+            div.ariaLabel = null;
+            const ariaAfter = [div.ariaLabel, div.hasAttribute('aria-label')];
+            div.role = 'button';
+            div.part.add('card', 'active');
+            div.part.remove('active');
+            div.classList = 'a b';
+            const styleA = div.style;
+            div.style = 'color: red; display: block';
+            const styleB = div.style;
+            div.dataset.fooBar = 'baz';
+            div.setAttribute('data-extra', '1');
+            div.setPointerCapture(7);
+            const pointerHeld = div.hasPointerCapture(7);
+            div.releasePointerCapture(7);
+            const pointerReleased = div.hasPointerCapture(7);
+            div.setHTML('<span id="inside">ok</span>');
+
+            const input = document.createElement('input');
+            input.value = '12';
+            input.accept = 'image/*';
+            input.multiple = true;
+            input.maxLength = 5;
+            input.defaultValue = '34';
+            input.setSelectionRange(1, 2, 'forward');
+            input.setRangeText('X');
+            input.setCustomValidity('bad');
+            const invalid = [input.checkValidity(), input.reportValidity(), input.validationMessage, input.validity.valid, input.validity.customError];
+            input.setCustomValidity('');
+            input.step = '2';
+            input.value = '10';
+            input.stepUp();
+
+            const iframe = document.createElement('iframe');
+            iframe.width = '320';
+            iframe.allowFullscreen = true;
+            iframe.sandbox.add('allow-scripts');
+            iframe.src = 'about:blank';
+            iframe.setAttribute('name', 'childFrame');
+
+            const script = document.createElement('script');
+            script.src = '/a.js';
+            script.async = true;
+            const anchor = document.createElement('a');
+            anchor.href = '/x';
+
+            return JSON.stringify({
+                ctorResults,
+                ownership: {
+                    elementStyle: Object.prototype.hasOwnProperty.call(Element.prototype, 'style'),
+                    elementDataset: Object.prototype.hasOwnProperty.call(Element.prototype, 'dataset'),
+                    elementSrc: Object.prototype.hasOwnProperty.call(Element.prototype, 'src'),
+                    htmlStyle: Object.prototype.hasOwnProperty.call(HTMLElement.prototype, 'style'),
+                    htmlDataset: Object.prototype.hasOwnProperty.call(HTMLElement.prototype, 'dataset'),
+                    divAlign: Object.prototype.hasOwnProperty.call(HTMLDivElement.prototype, 'align'),
+                    iframeSetAttr: Object.prototype.hasOwnProperty.call(HTMLIFrameElement.prototype, 'setAttribute'),
+                    iframeSrc: Object.prototype.hasOwnProperty.call(HTMLIFrameElement.prototype, 'src'),
+                },
+                div: {
+                    align: div.align,
+                    ariaBefore, ariaAfter, role: div.role,
+                    part: div.part.value,
+                    className: div.className,
+                    styleIdentity: styleA === styleB,
+                    styleText: div.getAttribute('style'),
+                    datasetIdentity: div.dataset === div.dataset,
+                    datasetValue: div.dataset.fooBar,
+                    attrNames: div.getAttributeNames().sort(),
+                    pointerHeld, pointerReleased,
+                    html: div.getHTML(),
+                    query: div.querySelector('#inside')?.textContent || '',
+                    ownKeys: Reflect.ownKeys(div).map(String),
+                },
+                input: {
+                    accept: input.accept,
+                    multiple: input.multiple,
+                    maxLength: input.maxLength,
+                    defaultValue: input.defaultValue,
+                    valueAfterRange: input.value,
+                    selection: [input.selectionStart, input.selectionEnd, input.selectionDirection],
+                    invalid,
+                    validAfterClear: input.checkValidity(),
+                    valueAfterStep: input.value,
+                    ownKeys: Reflect.ownKeys(input).map(String),
+                },
+                iframe: {
+                    width: iframe.width,
+                    allowFullscreen: iframe.allowFullscreen,
+                    sandbox: iframe.sandbox.value,
+                    src: iframe.src,
+                    name: iframe.name,
+                    setAttrInherited: typeof iframe.setAttribute === 'function',
+                    ownKeys: Reflect.ownKeys(iframe).map(String),
+                },
+                specific: {
+                    scriptSrc: script.src,
+                    scriptAsync: script.async,
+                    anchorHref: anchor.href,
+                },
+            });
+        })()"#,
+    )
+    .await;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("json: {e}; raw={raw}"));
+    for name in [
+        "Element",
+        "HTMLElement",
+        "HTMLDivElement",
+        "HTMLInputElement",
+        "HTMLIFrameElement",
+    ] {
+        assert_eq!(
+            v["ctorResults"][name], "TypeError:Illegal constructor",
+            "{name}: {raw}"
+        );
+    }
+    assert_eq!(v["ownership"]["elementStyle"], false);
+    assert_eq!(v["ownership"]["elementDataset"], false);
+    assert_eq!(v["ownership"]["elementSrc"], false);
+    assert_eq!(v["ownership"]["htmlStyle"], true);
+    assert_eq!(v["ownership"]["htmlDataset"], true);
+    assert_eq!(v["ownership"]["divAlign"], true);
+    assert_eq!(v["ownership"]["iframeSetAttr"], false);
+    assert_eq!(v["ownership"]["iframeSrc"], true);
+    assert_eq!(v["div"]["align"], "center");
+    assert_eq!(
+        v["div"]["ariaBefore"],
+        serde_json::json!(["hello", "hello"])
+    );
+    assert_eq!(v["div"]["ariaAfter"], serde_json::json!([null, false]));
+    assert_eq!(v["div"]["role"], "button");
+    assert_eq!(v["div"]["part"], "card");
+    assert_eq!(v["div"]["className"], "a b");
+    assert_eq!(v["div"]["styleIdentity"], true);
+    assert!(v["div"]["styleText"]
+        .as_str()
+        .unwrap_or("")
+        .contains("color"));
+    assert_eq!(v["div"]["datasetIdentity"], true);
+    assert_eq!(v["div"]["datasetValue"], "baz");
+    assert_eq!(v["div"]["pointerHeld"], true);
+    assert_eq!(v["div"]["pointerReleased"], false);
+    assert!(v["div"]["html"].as_str().unwrap_or("").contains("inside"));
+    assert_eq!(v["div"]["query"], "ok");
+    assert!(!v["div"]["ownKeys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x == "_style"));
+    assert_eq!(v["input"]["accept"], "image/*");
+    assert_eq!(v["input"]["multiple"], true);
+    assert_eq!(v["input"]["maxLength"], 5);
+    assert_eq!(v["input"]["defaultValue"], "34");
+    assert_eq!(
+        v["input"]["invalid"],
+        serde_json::json!([false, false, "bad", false, true])
+    );
+    assert_eq!(v["input"]["validAfterClear"], true);
+    assert_eq!(v["input"]["valueAfterStep"], "12");
+    assert_eq!(v["iframe"]["width"], "320");
+    assert_eq!(v["iframe"]["allowFullscreen"], true);
+    assert_eq!(v["iframe"]["sandbox"], "allow-scripts");
+    assert_eq!(v["iframe"]["src"], "about:blank");
+    assert_eq!(v["iframe"]["name"], "childFrame");
+    assert_eq!(v["iframe"]["setAttrInherited"], true);
+    assert!(v["specific"]["scriptSrc"]
+        .as_str()
+        .unwrap_or("")
+        .ends_with("/a.js"));
+    assert_eq!(v["specific"]["scriptAsync"], true);
+    assert_eq!(v["specific"]["anchorHref"], "/x");
+}
