@@ -396,6 +396,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/cssom_bootstrap.js"),
             "\n",
+            include_str!("js/performance_webidl_bootstrap.js"),
+            "\n",
             include_str!("js/structured_clone.js"),
         );
 
@@ -731,6 +733,13 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/webidl_surface_bootstrap.js"))
         .expect("worker: WebIDL surface bootstrap failed");
+
+    runtime
+        .execute_script(
+            "<anonymous>",
+            include_str!("js/performance_webidl_bootstrap.js"),
+        )
+        .expect("worker: performance WebIDL bootstrap failed");
 
     // Final cleanup in worker
     runtime

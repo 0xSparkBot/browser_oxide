@@ -1060,6 +1060,64 @@ async fn cssom_core_surface_and_behavior_match_chrome() {
     );
 }
 
+#[tokio::test]
+async fn performance_timeline_webidl_matches_chrome() {
+    let result = check(
+        r#"(() => {
+            const ctors = {};
+            for (const name of ['PerformanceEntry','PerformanceResourceTiming','PerformanceNavigationTiming','PerformanceMeasure']) {
+                try { new globalThis[name](); ctors[name] = 'ok'; }
+                catch (error) { ctors[name] = error.name + ':' + error.message; }
+            }
+            let call;
+            try { PerformanceMark('x'); call = 'ok'; }
+            catch (error) { call = error.name + ':' + error.message; }
+            const direct = new PerformanceMark('x', { startTime: 12.5, detail: { a: 1 } });
+            performance.clearMarks(); performance.clearMeasures();
+            const pm = performance.mark('a', { startTime: 5, detail: 'd' });
+            const measure = performance.measure('m', { start: 1, duration: 3, detail: { z: 2 } });
+            const pick = (entry) => ({
+                tag: Object.prototype.toString.call(entry), ctor: entry.constructor.name,
+                keys: Reflect.ownKeys(entry).map(String), name: entry.name, entryType: entry.entryType,
+                startTime: entry.startTime, duration: entry.duration,
+                detail: 'detail' in entry ? entry.detail : undefined,
+                json: [entry.toJSON().name, entry.toJSON().entryType, entry.toJSON().startTime, entry.toJSON().duration],
+            });
+            const nav = performance.getEntriesByType('navigation')[0];
+            const beforeClear = {
+                marks: performance.getEntriesByType('mark').length,
+                measures: performance.getEntriesByType('measure').length,
+                markSame: performance.getEntriesByName('a', 'mark')[0] === pm,
+                measureSame: performance.getEntriesByName('m', 'measure')[0] === measure,
+            };
+            performance.clearMarks('a'); performance.clearMeasures('m');
+            return JSON.stringify({
+                ctors,call,direct:pick(direct),pm:pick(pm),measure:pick(measure),beforeClear,
+                afterClear:[performance.getEntriesByType('mark').length,performance.getEntriesByType('measure').length],
+                nav:nav?{
+                    tag:Object.prototype.toString.call(nav), keys:Reflect.ownKeys(nav).map(String),
+                    instances:[nav instanceof PerformanceNavigationTiming,nav instanceof PerformanceResourceTiming,nav instanceof PerformanceEntry],
+                    nameType:[typeof nav.name,nav.entryType,nav.startTime,typeof nav.duration],
+                    resource:[nav.initiatorType,typeof nav.fetchStart,typeof nav.responseEnd,Array.isArray(nav.serverTiming)],
+                    navigation:[nav.type,typeof nav.redirectCount,typeof nav.activationStart,typeof nav.criticalCHRestart,nav.notRestoredReasons===null,'confidence'in nav],
+                    jsonMatch:[nav.toJSON().name===nav.name,nav.toJSON().entryType===nav.entryType,nav.toJSON().responseEnd===nav.responseEnd,nav.toJSON().type===nav.type]
+                }:null,
+                parents:{
+                    r:Object.getPrototypeOf(PerformanceResourceTiming.prototype)===PerformanceEntry.prototype,
+                    n:Object.getPrototypeOf(PerformanceNavigationTiming.prototype)===PerformanceResourceTiming.prototype,
+                    mark:Object.getPrototypeOf(PerformanceMark.prototype)===PerformanceEntry.prototype,
+                    measure:Object.getPrototypeOf(PerformanceMeasure.prototype)===PerformanceEntry.prototype
+                }
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"ctors":{"PerformanceEntry":"TypeError:Failed to construct 'PerformanceEntry': Illegal constructor","PerformanceResourceTiming":"TypeError:Failed to construct 'PerformanceResourceTiming': Illegal constructor","PerformanceNavigationTiming":"TypeError:Failed to construct 'PerformanceNavigationTiming': Illegal constructor","PerformanceMeasure":"TypeError:Failed to construct 'PerformanceMeasure': Illegal constructor"},"call":"TypeError:Failed to construct 'PerformanceMark': Please use the 'new' operator, this DOM object constructor cannot be called as a function.","direct":{"tag":"[object PerformanceMark]","ctor":"PerformanceMark","keys":[],"name":"x","entryType":"mark","startTime":12.5,"duration":0,"detail":{"a":1},"json":["x","mark",12.5,0]},"pm":{"tag":"[object PerformanceMark]","ctor":"PerformanceMark","keys":[],"name":"a","entryType":"mark","startTime":5,"duration":0,"detail":"d","json":["a","mark",5,0]},"measure":{"tag":"[object PerformanceMeasure]","ctor":"PerformanceMeasure","keys":[],"name":"m","entryType":"measure","startTime":1,"duration":3,"detail":{"z":2},"json":["m","measure",1,3]},"beforeClear":{"marks":1,"measures":1,"markSame":true,"measureSame":true},"afterClear":[0,0],"nav":{"tag":"[object PerformanceNavigationTiming]","keys":[],"instances":[true,true,true],"nameType":["string","navigation",0,"number"],"resource":["navigation","number","number",true],"navigation":["navigate","number","number","number",true,true],"jsonMatch":[true,true,true,true]},"parents":{"r":true,"n":true,"mark":true,"measure":true}}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
