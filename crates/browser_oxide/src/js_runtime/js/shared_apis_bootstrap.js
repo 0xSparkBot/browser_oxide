@@ -275,62 +275,185 @@
         _maskAsNative(globalThis.URLSearchParams);
     }
     {
-        globalThis.URL = class URL {
-            constructor(url, base) {
-                let full = String(url);
-                if (base && !full.match(/^[a-z]+:\/\//i)) {
-                    const b = String(base);
-                    if (full.startsWith('//')) { const proto = b.match(/^([a-z]+:)/i); full = (proto ? proto[1] : 'https:') + full; }
-                    else if (full.startsWith('/')) { const m = b.match(/^([a-z]+:\/\/[^/]+)/i); full = m ? m[1] + full : full; }
-                    else { full = b.replace(/[^/]*$/, '') + full; }
-                }
-                // Non-special-scheme handling (WHATWG URL spec: blob, data,
-                // javascript, about). Blob URLs are the exception to the
-                // otherwise opaque origin rule: a blob:http(s) URL inherits
-                // the embedded origin. This is observable inside blob-backed
-                // workers through self.location.origin and is also the origin
-                // used by their fetch CORS checks.
-                const _opaqueMatch = full.match(/^(blob|data|javascript|about):/i);
-                if (_opaqueMatch) {
-                    const scheme = _opaqueMatch[1].toLowerCase();
-                    const remainder = full.slice(scheme.length + 1);
-                    const hashAt = remainder.indexOf('#');
-                    const beforeHash = hashAt < 0 ? remainder : remainder.slice(0, hashAt);
-                    const queryAt = beforeHash.indexOf('?');
-                    this.protocol = scheme + ':';
-                    this.href = full;
-                    this.pathname = queryAt < 0 ? beforeHash : beforeHash.slice(0, queryAt);
-                    this.search = queryAt < 0 ? '' : beforeHash.slice(queryAt);
-                    this.hash = hashAt < 0 ? '' : remainder.slice(hashAt);
-                    this.host = '';
-                    this.hostname = '';
-                    this.port = '';
-                    this.origin = 'null';
-                    if (scheme === 'blob') {
-                        const inherited = this.pathname.match(/^(https?):\/\/([^\/?#]+)/i);
-                        if (inherited) {
-                            this.origin = inherited[1].toLowerCase() + '://' + inherited[2];
-                        }
-                    }
-                    this.username = '';
-                    this.password = '';
-                    this.searchParams = new URLSearchParams('');
-                    return;
-                }
-                const m = full.match(/^([a-z]+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
-                if (m) {
-                    this.protocol = m[1].toLowerCase() + ':'; this.hostname = m[2]; this.port = m[3] || '';
-                    this.pathname = m[4] || '/'; this.search = m[5] || ''; this.hash = m[6] || '';
-                    this.host = this.port ? this.hostname + ':' + this.port : this.hostname;
-                    this.origin = this.protocol + '//' + this.host; this.href = this.origin + this.pathname + this.search + this.hash;
+        const _urlState = new WeakMap();
+        const _resolveInput = (url, base) => {
+            let full = String(url);
+            if (base && !full.match(/^[a-z]+:\/\//i)) {
+                const b = String(base);
+                if (full.startsWith('//')) {
+                    const proto = b.match(/^([a-z]+:)/i);
+                    full = (proto ? proto[1] : 'https:') + full;
+                } else if (full.startsWith('/')) {
+                    const m = b.match(/^([a-z]+:\/\/[^/]+)/i);
+                    full = m ? m[1] + full : full;
                 } else {
-                    this.href = full; this.protocol = ''; this.hostname = ''; this.port = '';
-                    this.pathname = full; this.search = ''; this.hash = ''; this.host = ''; this.origin = 'null';
+                    full = b.replace(/[^/]*$/, '') + full;
                 }
-                this.username = ''; this.password = ''; this.searchParams = new URLSearchParams(this.search);
             }
-            toString() { return this.href; }
-            toJSON() { return this.href; }
+            return full;
+        };
+        const _parseUrlState = (url, base) => {
+            const full = _resolveInput(url, base);
+            const opaque = full.match(/^(blob|data|javascript|about):/i);
+            if (opaque) {
+                const scheme = opaque[1].toLowerCase();
+                const remainder = full.slice(scheme.length + 1);
+                const hashAt = remainder.indexOf('#');
+                const beforeHash = hashAt < 0 ? remainder : remainder.slice(0, hashAt);
+                const queryAt = beforeHash.indexOf('?');
+                const pathname = queryAt < 0 ? beforeHash : beforeHash.slice(0, queryAt);
+                const search = queryAt < 0 ? '' : beforeHash.slice(queryAt);
+                let origin = 'null';
+                if (scheme === 'blob') {
+                    const inherited = pathname.match(/^(https?):\/\/([^\/?#]+)/i);
+                    if (inherited) origin = inherited[1].toLowerCase() + '://' + inherited[2];
+                }
+                return {
+                    opaque: true,
+                    protocol: scheme + ':',
+                    username: '',
+                    password: '',
+                    host: '',
+                    hostname: '',
+                    port: '',
+                    pathname,
+                    search,
+                    hash: hashAt < 0 ? '' : remainder.slice(hashAt),
+                    origin,
+                    href: full,
+                    searchParams: new URLSearchParams(search),
+                };
+            }
+            const m = full.match(/^([a-z]+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+            if (m) {
+                const protocol = m[1].toLowerCase() + ':';
+                const hostname = m[2];
+                const port = m[3] || '';
+                const host = port ? hostname + ':' + port : hostname;
+                const pathname = m[4] || '/';
+                const search = m[5] || '';
+                const hash = m[6] || '';
+                const origin = protocol + '//' + host;
+                return {
+                    opaque: false,
+                    protocol,
+                    username: '',
+                    password: '',
+                    host,
+                    hostname,
+                    port,
+                    pathname,
+                    search,
+                    hash,
+                    origin,
+                    href: origin + pathname + search + hash,
+                    searchParams: new URLSearchParams(search),
+                };
+            }
+            return {
+                opaque: true,
+                protocol: '',
+                username: '',
+                password: '',
+                host: '',
+                hostname: '',
+                port: '',
+                pathname: full,
+                search: '',
+                hash: '',
+                origin: 'null',
+                href: full,
+                searchParams: new URLSearchParams(''),
+            };
+        };
+        const _urlGet = (self) => {
+            const state = _urlState.get(self);
+            if (!state) throw new TypeError("Illegal invocation");
+            return state;
+        };
+        const _rebuildUrl = (state) => {
+            if (state.opaque) {
+                const suffix = state.pathname + state.search + state.hash;
+                state.href = state.protocol ? state.protocol + suffix : suffix;
+                if (state.protocol === 'blob:') {
+                    const inherited = state.pathname.match(/^(https?):\/\/([^\/?#]+)/i);
+                    state.origin = inherited
+                        ? inherited[1].toLowerCase() + '://' + inherited[2]
+                        : 'null';
+                } else {
+                    state.origin = 'null';
+                }
+                return;
+            }
+            state.host = state.port ? state.hostname + ':' + state.port : state.hostname;
+            state.origin = state.protocol + '//' + state.host;
+            const credentials = state.username || state.password
+                ? encodeURIComponent(state.username)
+                    + (state.password ? ':' + encodeURIComponent(state.password) : '') + '@'
+                : '';
+            state.href = state.protocol + '//' + credentials + state.host
+                + state.pathname + state.search + state.hash;
+        };
+
+        class URL {
+            constructor(url, base) {
+                _urlState.set(this, _parseUrlState(url, base));
+            }
+            get href() { return _urlGet(this).href; }
+            set href(value) { _urlState.set(this, _parseUrlState(value)); }
+            get origin() { return _urlGet(this).origin; }
+            get protocol() { return _urlGet(this).protocol; }
+            set protocol(value) {
+                const state = _urlGet(this);
+                state.protocol = String(value).replace(/:?$/, ':').toLowerCase();
+                _rebuildUrl(state);
+            }
+            get username() { return _urlGet(this).username; }
+            set username(value) { const state = _urlGet(this); state.username = String(value); _rebuildUrl(state); }
+            get password() { return _urlGet(this).password; }
+            set password(value) { const state = _urlGet(this); state.password = String(value); _rebuildUrl(state); }
+            get host() { return _urlGet(this).host; }
+            set host(value) {
+                const state = _urlGet(this);
+                const text = String(value);
+                const match = text.match(/^([^:]+)(?::(\d+))?$/);
+                if (match) {
+                    state.hostname = match[1];
+                    state.port = match[2] || '';
+                    state.opaque = false;
+                    _rebuildUrl(state);
+                }
+            }
+            get hostname() { return _urlGet(this).hostname; }
+            set hostname(value) { const state = _urlGet(this); state.hostname = String(value); state.opaque = false; _rebuildUrl(state); }
+            get port() { return _urlGet(this).port; }
+            set port(value) { const state = _urlGet(this); state.port = String(value); state.opaque = false; _rebuildUrl(state); }
+            get pathname() { return _urlGet(this).pathname; }
+            set pathname(value) {
+                const state = _urlGet(this);
+                let text = String(value);
+                if (!state.opaque && text && !text.startsWith('/')) text = '/' + text;
+                state.pathname = text;
+                _rebuildUrl(state);
+            }
+            get search() { return _urlGet(this).search; }
+            set search(value) {
+                const state = _urlGet(this);
+                const text = String(value);
+                state.search = text && !text.startsWith('?') ? '?' + text : text;
+                state.searchParams = new URLSearchParams(state.search);
+                _rebuildUrl(state);
+            }
+            get searchParams() { return _urlGet(this).searchParams; }
+            get hash() { return _urlGet(this).hash; }
+            set hash(value) {
+                const state = _urlGet(this);
+                const text = String(value);
+                state.hash = text && !text.startsWith('#') ? '#' + text : text;
+                _rebuildUrl(state);
+            }
+            toString() { return _urlGet(this).href; }
+            toJSON() { return _urlGet(this).href; }
             static createObjectURL(obj) {
                 const u = 'blob:' + (globalThis.location && globalThis.location.origin || 'null') + '/' + _randomUUID();
                 let data, contentType = '';
@@ -342,7 +465,25 @@
                 return u;
             }
             static revokeObjectURL(url) { try { ops.op_blob_revoke(url); } catch (e) {} }
-        };
+        }
+        globalThis.URL = URL;
+        for (const name of [
+            'href', 'origin', 'protocol', 'username', 'password', 'host',
+            'hostname', 'port', 'pathname', 'search', 'searchParams', 'hash',
+            'toString', 'toJSON',
+        ]) {
+            const descriptor = Object.getOwnPropertyDescriptor(URL.prototype, name);
+            if (descriptor) {
+                Object.defineProperty(URL.prototype, name, {
+                    ...descriptor,
+                    enumerable: true,
+                });
+            }
+        }
+        Object.defineProperty(URL.prototype, Symbol.toStringTag, {
+            value: 'URL',
+            configurable: true,
+        });
         _maskAsNative(globalThis.URL);
     }
     function _randomUUID() {

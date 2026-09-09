@@ -3126,6 +3126,109 @@ async fn cls_url() {
     assert_eq!(check("typeof URL").await, "function");
 }
 #[tokio::test]
+async fn url_webidl_shape_and_mutation_match_chrome() {
+    let result = check(
+        r#"(() => {
+            const url = new URL('https://example.com:8443/a?q=1#h');
+            const initialParams = url.searchParams;
+            const before = {
+                own:Reflect.ownKeys(url).map(String),
+                tag:Object.prototype.toString.call(url),
+                instance:url instanceof URL,
+                href:url.href,
+                origin:url.origin,
+                paramsSame:initialParams === url.searchParams,
+                protoNames:Object.getOwnPropertyNames(URL.prototype).sort(),
+                enumerable:[
+                    'href','origin','protocol','username','password','host','hostname',
+                    'port','pathname','search','searchParams','hash','toString','toJSON'
+                ].map(name => Object.getOwnPropertyDescriptor(URL.prototype,name).enumerable),
+            };
+            url.protocol = 'http';
+            url.username = 'u';
+            url.password = 'p';
+            url.hostname = 'other.test';
+            url.port = '8080';
+            url.pathname = 'next';
+            url.search = 'x=2';
+            url.hash = 'tail';
+            let illegal = '';
+            try { Object.getOwnPropertyDescriptor(URL.prototype,'href').get.call({}); illegal = 'ok'; }
+            catch (error) { illegal = error.name + ':' + error.message; }
+            const opaque = new URL('blob:https://example.com/id?q=1#h');
+            return JSON.stringify({
+                before,
+                after:{
+                    href:url.href,
+                    origin:url.origin,
+                    protocol:url.protocol,
+                    username:url.username,
+                    password:url.password,
+                    host:url.host,
+                    hostname:url.hostname,
+                    port:url.port,
+                    pathname:url.pathname,
+                    search:url.search,
+                    hash:url.hash,
+                    param:url.searchParams.get('x'),
+                    text:String(url),
+                    json:url.toJSON(),
+                    illegal,
+                },
+                opaque:{
+                    protocol:opaque.protocol,
+                    origin:opaque.origin,
+                    pathname:opaque.pathname,
+                    search:opaque.search,
+                    hash:opaque.hash,
+                    own:Reflect.ownKeys(opaque).map(String),
+                }
+            });
+        })()"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["before"]["own"], serde_json::json!([]));
+    assert_eq!(value["before"]["tag"], "[object URL]");
+    assert_eq!(value["before"]["instance"], true);
+    assert_eq!(value["before"]["href"], "https://example.com:8443/a?q=1#h");
+    assert_eq!(value["before"]["origin"], "https://example.com:8443");
+    assert_eq!(value["before"]["paramsSame"], true);
+    assert_eq!(
+        value["before"]["enumerable"],
+        serde_json::json!([
+            true, true, true, true, true, true, true, true, true, true, true, true, true, true
+        ])
+    );
+    assert_eq!(
+        value["after"]["href"],
+        "http://u:p@other.test:8080/next?x=2#tail"
+    );
+    assert_eq!(value["after"]["origin"], "http://other.test:8080");
+    assert_eq!(value["after"]["protocol"], "http:");
+    assert_eq!(value["after"]["username"], "u");
+    assert_eq!(value["after"]["password"], "p");
+    assert_eq!(value["after"]["host"], "other.test:8080");
+    assert_eq!(value["after"]["hostname"], "other.test");
+    assert_eq!(value["after"]["port"], "8080");
+    assert_eq!(value["after"]["pathname"], "/next");
+    assert_eq!(value["after"]["search"], "?x=2");
+    assert_eq!(value["after"]["hash"], "#tail");
+    assert_eq!(value["after"]["param"], "2");
+    assert_eq!(value["after"]["text"], value["after"]["href"]);
+    assert_eq!(value["after"]["json"], value["after"]["href"]);
+    assert!(value["after"]["illegal"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal invocation"));
+    assert_eq!(value["opaque"]["protocol"], "blob:");
+    assert_eq!(value["opaque"]["origin"], "https://example.com");
+    assert_eq!(value["opaque"]["pathname"], "https://example.com/id");
+    assert_eq!(value["opaque"]["search"], "?q=1");
+    assert_eq!(value["opaque"]["hash"], "#h");
+    assert_eq!(value["opaque"]["own"], serde_json::json!([]));
+}
+#[tokio::test]
 async fn cls_url_search_params() {
     assert_eq!(check("typeof URLSearchParams").await, "function");
 }
