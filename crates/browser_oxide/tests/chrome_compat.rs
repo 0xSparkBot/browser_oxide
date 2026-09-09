@@ -744,6 +744,51 @@ async fn intersection_observer_surface_matches_chrome_148() {
 }
 
 #[tokio::test]
+async fn mutation_observer_surface_and_delivery_match_chrome() {
+    let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"(() => {
+            let noarg = '', wrong = '', call = '';
+            try { new MutationObserver(); noarg = 'ok'; }
+            catch (error) { noarg = error.name + ':' + error.message; }
+            try { new MutationObserver(1); wrong = 'ok'; }
+            catch (error) { wrong = error.name + ':' + error.message; }
+            try { MutationObserver(() => {}); call = 'ok'; }
+            catch (error) { call = error.name + ':' + error.message; }
+            const target = document.createElement('div');
+            const observer = new MutationObserver((records, self) => {
+                globalThis.__mutationObserverResult = JSON.stringify({
+                    noarg,wrong,call,
+                    keys:Reflect.ownKeys(observer).map(String),
+                    tag:Object.prototype.toString.call(observer),
+                    instance:observer instanceof MutationObserver,
+                    alias:WebKitMutationObserver === MutationObserver,
+                    source:String(MutationObserver),
+                    lengths:[MutationObserver.length,MutationObserver.prototype.observe.length,MutationObserver.prototype.disconnect.length,MutationObserver.prototype.takeRecords.length],
+                    callback:{len:records.length,same:self===observer,type:records[0]?.type,target:records[0]?.target?.nodeName},
+                    recordsAfterCallback:observer.takeRecords().length,
+                });
+            });
+            observer.observe(target, { attributes:true, attributeOldValue:true });
+            target.setAttribute('data-x', '1');
+        })()"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
+    let result = page
+        .evaluate("globalThis.__mutationObserverResult || ''")
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"noarg":"TypeError:Failed to construct 'MutationObserver': 1 argument required, but only 0 present.","wrong":"TypeError:Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.","call":"TypeError:Failed to construct 'MutationObserver': Please use the 'new' operator, this DOM object constructor cannot be called as a function.","keys":[],"tag":"[object MutationObserver]","instance":true,"alias":true,"source":"function MutationObserver() { [native code] }","lengths":[1,1,0,0],"callback":{"len":1,"same":true,"type":"attributes","target":"DIV"},"recordsAfterCallback":0}"#
+    );
+}
+
+#[tokio::test]
 async fn event_data_subclasses_match_chrome_148() {
     let result = check(
         r#"(() => {

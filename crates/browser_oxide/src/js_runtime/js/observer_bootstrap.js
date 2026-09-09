@@ -3,6 +3,8 @@
 ((globalThis) => {
     if (!globalThis.document) return;
 
+    const LegacyMutationObserver = globalThis.MutationObserver;
+
     const observerState = new WeakMap();
     const entryState = new WeakMap();
     const requireState = (map, value) => {
@@ -145,6 +147,65 @@
 
     globalThis.IntersectionObserverEntry = IntersectionObserverEntry;
     globalThis.IntersectionObserver = IntersectionObserver;
+
+    // Keep the DOM bootstrap's mutation delivery engine as an internal
+    // implementation detail. The public wrapper delegates to that engine but
+    // exposes no `_callback/_records/_active/_targets/_notify` state.
+    if (typeof LegacyMutationObserver === 'function') {
+        const mutationState = new WeakMap();
+
+        function MutationObserver(callback) {
+            if (!new.target) {
+                throw new TypeError("Failed to construct 'MutationObserver': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+            }
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to construct 'MutationObserver': 1 argument required, but only 0 present.");
+            }
+            if (typeof callback !== 'function') {
+                throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
+            }
+            let wrapper = this;
+            const inner = new LegacyMutationObserver((records) => callback(records, wrapper));
+            mutationState.set(this, inner);
+        }
+        const mutationInner = (value) => {
+            const inner = mutationState.get(value);
+            if (!inner) throw new TypeError('Illegal invocation');
+            return inner;
+        };
+        const mutationMethods = {
+            disconnect() { mutationInner(this).disconnect(); },
+            observe(target) {
+                const options = arguments.length > 1 ? arguments[1] : undefined;
+                mutationInner(this).observe(target, options);
+            },
+            takeRecords() { return mutationInner(this).takeRecords(); },
+        };
+        const mutationLengths = { disconnect: 0, observe: 1, takeRecords: 0 };
+        for (const name of ['disconnect', 'observe', 'takeRecords']) {
+            const method = mutationMethods[name];
+            Object.defineProperty(method, 'length', {
+                value: mutationLengths[name], configurable: true,
+            });
+            Object.defineProperty(MutationObserver.prototype, name, {
+                value: method, writable: true, enumerable: true, configurable: true,
+            });
+        }
+        Object.defineProperty(MutationObserver.prototype, Symbol.toStringTag, {
+            value: 'MutationObserver', configurable: true,
+        });
+        globalThis.MutationObserver = MutationObserver;
+        if (typeof globalThis.WebKitMutationObserver === 'function') {
+            globalThis.WebKitMutationObserver = MutationObserver;
+        }
+
+        try {
+            if (typeof _maskFunction === 'function') _maskFunction(MutationObserver, 'MutationObserver');
+            if (typeof _maskAsNative === 'function') {
+                _maskAsNative(MutationObserver.prototype, 'disconnect', 'observe', 'takeRecords');
+            }
+        } catch (_) {}
+    }
 
     try {
         if (typeof _maskFunction === 'function') {
