@@ -5829,49 +5829,98 @@
 
 
     // --- AbortController / AbortSignal ---
-    class AbortSignal {
-        constructor() {
-            this.aborted = false;
-            this.reason = undefined;
-            this._listeners = [];
-        }
-        addEventListener(type, cb) {
-            if (type === "abort") this._listeners.push(cb);
-        }
-        removeEventListener(type, cb) {
-            if (type === "abort") this._listeners = this._listeners.filter(l => l !== cb);
-        }
-        throwIfAborted() {
-            if (this.aborted) throw this.reason;
-        }
-        static abort(reason) {
-            const sig = new AbortSignal();
-            sig.aborted = true;
-            sig.reason = reason || new DOMException("The operation was aborted.", "AbortError");
-            return sig;
-        }
-        static timeout(ms) {
-            const sig = new AbortSignal();
-            setTimeout(() => {
-                sig.aborted = true;
-                sig.reason = new DOMException("The operation timed out.", "TimeoutError");
-                for (const cb of sig._listeners) cb();
-            }, ms);
-            return sig;
+    // Keep observable state out of instance own-properties. Blink exposes
+    // AbortSignal as an EventTarget subclass with WebIDL accessors on the
+    // prototype, while AbortSignal itself is an illegal public constructor.
+    const _abortSignalInternalToken = {};
+    const _abortSignalState = new WeakMap();
+    class AbortSignal extends EventTarget {
+        constructor(token = undefined) {
+            super();
+            if (token !== _abortSignalInternalToken) {
+                throw new TypeError("Failed to construct 'AbortSignal': Illegal constructor");
+            }
+            _abortSignalState.set(this, {
+                aborted: false,
+                reason: undefined,
+                onabort: null,
+            });
         }
     }
+    const _abortSignalCreate = () => new AbortSignal(_abortSignalInternalToken);
+    const _abortSignalFire = (signal, reason) => {
+        const state = _abortSignalState.get(signal);
+        if (!state || state.aborted) return;
+        state.aborted = true;
+        state.reason = reason === undefined
+            ? new DOMException("The operation was aborted.", "AbortError")
+            : reason;
+        signal.dispatchEvent(new Event("abort"));
+    };
+    _defProtoGetter(AbortSignal.prototype, 'aborted', function aborted() {
+        return !!_abortSignalState.get(this)?.aborted;
+    });
+    _defProtoGetter(AbortSignal.prototype, 'reason', function reason() {
+        return _abortSignalState.get(this)?.reason;
+    });
+    _defProtoGetter(
+        AbortSignal.prototype,
+        'onabort',
+        function onabort() {
+            return _abortSignalState.get(this)?.onabort || null;
+        },
+        function onabort(value) {
+            const state = _abortSignalState.get(this);
+            if (!state) return;
+            state.onabort = typeof value === 'function' ? value : null;
+        },
+    );
+    _defProtoMethod(AbortSignal.prototype, 'throwIfAborted', function throwIfAborted() {
+        const state = _abortSignalState.get(this);
+        if (state?.aborted) throw state.reason;
+    });
+    Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, {
+        value: 'AbortSignal', configurable: true,
+    });
+    Object.defineProperty(AbortSignal, 'abort', {
+        value: _maskFunction(function abort(reason = undefined) {
+            const signal = _abortSignalCreate();
+            _abortSignalFire(signal, reason);
+            return signal;
+        }, 'abort'),
+        writable: true, enumerable: true, configurable: true,
+    });
+    Object.defineProperty(AbortSignal, 'timeout', {
+        value: _maskFunction(function timeout(ms) {
+            const signal = _abortSignalCreate();
+            setTimeout(() => {
+                _abortSignalFire(
+                    signal,
+                    new DOMException("The operation timed out.", "TimeoutError"),
+                );
+            }, Number(ms));
+            return signal;
+        }, 'timeout'),
+        writable: true, enumerable: true, configurable: true,
+    });
+    _maskFunction(AbortSignal, 'AbortSignal');
 
+    const _abortControllerState = new WeakMap();
     class AbortController {
         constructor() {
-            this.signal = new AbortSignal();
-        }
-        abort(reason) {
-            if (this.signal.aborted) return;
-            this.signal.aborted = true;
-            this.signal.reason = reason || new DOMException("The operation was aborted.", "AbortError");
-            for (const cb of this.signal._listeners) cb();
+            _abortControllerState.set(this, _abortSignalCreate());
         }
     }
+    _defProtoGetter(AbortController.prototype, 'signal', function signal() {
+        return _abortControllerState.get(this);
+    });
+    _defProtoMethod(AbortController.prototype, 'abort', function abort(reason = undefined) {
+        _abortSignalFire(_abortControllerState.get(this), reason);
+    });
+    Object.defineProperty(AbortController.prototype, Symbol.toStringTag, {
+        value: 'AbortController', configurable: true,
+    });
+    _maskFunction(AbortController, 'AbortController');
 
     globalThis.AbortController = AbortController;
     globalThis.AbortSignal = AbortSignal;

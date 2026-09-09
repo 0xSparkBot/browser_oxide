@@ -2802,6 +2802,103 @@ async fn cls_abort_signal() {
     assert_eq!(check("typeof AbortSignal").await, "function");
 }
 #[tokio::test]
+async fn abort_controller_and_signal_match_chrome_webidl_shape() {
+    let result = check(
+        r#"(() => {
+            const controller = new AbortController();
+            const signal = controller.signal;
+            let listenerCalls = 0;
+            let handlerCalls = 0;
+            signal.addEventListener('abort', () => listenerCalls++);
+            signal.onabort = () => handlerCalls++;
+            const construction = (() => {
+                try { new AbortSignal(); return 'ok'; }
+                catch (error) { return error.name + ':' + error.message; }
+            })();
+            const before = {
+                controllerOwn:Reflect.ownKeys(controller).map(String),
+                signalOwn:Reflect.ownKeys(signal).map(String),
+                controllerTag:Object.prototype.toString.call(controller),
+                signalTag:Object.prototype.toString.call(signal),
+                signalEventTarget:signal instanceof EventTarget,
+                signalProto:Object.getPrototypeOf(AbortSignal.prototype) === EventTarget.prototype,
+                construction,
+                protoNames:Object.getOwnPropertyNames(AbortSignal.prototype).sort(),
+                controllerProtoNames:Object.getOwnPropertyNames(AbortController.prototype).sort(),
+                enumerable:['aborted','onabort','reason','throwIfAborted'].map(name =>
+                    Object.getOwnPropertyDescriptor(AbortSignal.prototype,name).enumerable),
+                controllerEnumerable:['signal','abort'].map(name =>
+                    Object.getOwnPropertyDescriptor(AbortController.prototype,name).enumerable),
+                aborted:signal.aborted,
+                reason:signal.reason,
+            };
+            controller.abort('because');
+            let thrown = null;
+            try { signal.throwIfAborted(); } catch (error) { thrown = error; }
+            const staticSignal = AbortSignal.abort('static-reason');
+            return JSON.stringify({
+                before,
+                after:{
+                    aborted:signal.aborted,
+                    reason:signal.reason,
+                    listenerCalls,
+                    handlerCalls,
+                    thrown,
+                    handlerIdentity:typeof signal.onabort === 'function',
+                    staticAborted:staticSignal.aborted,
+                    staticReason:staticSignal.reason,
+                    staticOwn:Reflect.ownKeys(staticSignal).map(String),
+                }
+            });
+        })()"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["before"]["controllerOwn"], serde_json::json!([]));
+    assert_eq!(value["before"]["signalOwn"], serde_json::json!([]));
+    assert_eq!(value["before"]["controllerTag"], "[object AbortController]");
+    assert_eq!(value["before"]["signalTag"], "[object AbortSignal]");
+    assert_eq!(value["before"]["signalEventTarget"], true);
+    assert_eq!(value["before"]["signalProto"], true);
+    assert!(value["before"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(
+        value["before"]["protoNames"],
+        serde_json::json!([
+            "aborted",
+            "constructor",
+            "onabort",
+            "reason",
+            "throwIfAborted"
+        ])
+    );
+    assert_eq!(
+        value["before"]["controllerProtoNames"],
+        serde_json::json!(["abort", "constructor", "signal"])
+    );
+    assert_eq!(
+        value["before"]["enumerable"],
+        serde_json::json!([true, true, true, true])
+    );
+    assert_eq!(
+        value["before"]["controllerEnumerable"],
+        serde_json::json!([true, true])
+    );
+    assert_eq!(value["before"]["aborted"], false);
+    assert!(value["before"]["reason"].is_null());
+    assert_eq!(value["after"]["aborted"], true);
+    assert_eq!(value["after"]["reason"], "because");
+    assert_eq!(value["after"]["listenerCalls"], 1);
+    assert_eq!(value["after"]["handlerCalls"], 1);
+    assert_eq!(value["after"]["thrown"], "because");
+    assert_eq!(value["after"]["handlerIdentity"], true);
+    assert_eq!(value["after"]["staticAborted"], true);
+    assert_eq!(value["after"]["staticReason"], "static-reason");
+    assert_eq!(value["after"]["staticOwn"], serde_json::json!([]));
+}
+#[tokio::test]
 async fn cls_headers() {
     assert_eq!(check("typeof Headers").await, "function");
 }
