@@ -377,25 +377,86 @@
         return { p3, srgb, alpha };
     }
 
+    const _imageDataState = new WeakMap();
     class ImageData {
-        constructor(data, width, height, settings) {
-            if (arguments.length === 2) {
-                // constructor(width, height)
-                height = width;
-                width = data;
-                data = new Uint8ClampedArray(width * height * 4);
+        constructor(data, width) {
+            let pixels;
+            let actualWidth;
+            let actualHeight;
+            let settings;
+            if (typeof data === 'number') {
+                // constructor(width, height, settings?)
+                actualWidth = Number(data) >>> 0;
+                actualHeight = Number(width) >>> 0;
+                settings = arguments[2];
+                pixels = new Uint8ClampedArray(actualWidth * actualHeight * 4);
+            } else {
+                // constructor(data, width, height?, settings?)
+                pixels = data;
+                actualWidth = Number(width) >>> 0;
+                actualHeight = arguments[2] === undefined
+                    ? (actualWidth ? Math.floor(pixels.length / 4 / actualWidth) : 0)
+                    : Number(arguments[2]) >>> 0;
+                settings = arguments[3];
             }
-            this.data = data;
-            this.width = width;
-            this.height = height;
-            this.colorSpace = settings && settings.colorSpace === 'display-p3'
-                ? 'display-p3' : 'srgb';
-            this.pixelFormat = settings && settings.pixelFormat === 'rgba-float16'
-                ? 'rgba-float16' : 'rgba-unorm8';
+            const state = {
+                data: pixels,
+                width: actualWidth,
+                height: actualHeight,
+                colorSpace: settings && settings.colorSpace === 'display-p3'
+                    ? 'display-p3' : 'srgb',
+                pixelFormat: settings && settings.pixelFormat === 'rgba-float16'
+                    ? 'rgba-float16' : 'rgba-unorm8',
+            };
+            _imageDataState.set(this, state);
+            // Blink materializes `data` as the sole own property while also
+            // keeping the WebIDL getter on the prototype.
+            Object.defineProperty(this, 'data', {
+                value: pixels,
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            });
+        }
+        get data() {
+            const state = _imageDataState.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state.data;
+        }
+        get width() {
+            const state = _imageDataState.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state.width;
+        }
+        get height() {
+            const state = _imageDataState.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state.height;
+        }
+        get colorSpace() {
+            const state = _imageDataState.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state.colorSpace;
+        }
+        get pixelFormat() {
+            const state = _imageDataState.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state.pixelFormat;
         }
     }
+    for (const name of ['data', 'width', 'height', 'colorSpace', 'pixelFormat']) {
+        const descriptor = Object.getOwnPropertyDescriptor(ImageData.prototype, name);
+        descriptor.enumerable = true;
+        Object.defineProperty(ImageData.prototype, name, descriptor);
+    }
+    Object.defineProperty(ImageData.prototype, Symbol.toStringTag, {
+        value: 'ImageData', configurable: true,
+    });
     globalThis.ImageData = ImageData;
     _maskFunction(ImageData, 'ImageData');
+    if (typeof _maskAsNative === 'function') {
+        _maskAsNative(ImageData.prototype, 'data', 'width', 'height', 'colorSpace', 'pixelFormat');
+    }
 
     class CanvasRenderingContext2D {
         #id;
