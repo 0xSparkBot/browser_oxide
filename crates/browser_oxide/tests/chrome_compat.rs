@@ -5365,6 +5365,88 @@ async fn nav_permissions_query_is_native() {
     );
 }
 
+#[tokio::test]
+async fn permissions_webidl_shape_matches_chrome_148() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    page.evaluate(
+        r#"globalThis.__permissionShape = null;
+        navigator.permissions.query({name:'geolocation'}).then(status => {
+            const handler = () => {};
+            status.onchange = handler;
+            const construction = C => {
+                try { new C(); return 'ok'; }
+                catch (error) { return error.name + ':' + error.message; }
+            };
+            globalThis.__permissionShape = {
+                permissions: {
+                    tag:Object.prototype.toString.call(navigator.permissions),
+                    own:Reflect.ownKeys(navigator.permissions).map(String),
+                    instance:navigator.permissions instanceof Permissions,
+                    source:String(Permissions),
+                    construction:construction(Permissions),
+                },
+                status: {
+                    tag:Object.prototype.toString.call(status),
+                    own:Reflect.ownKeys(status).map(String),
+                    instance:status instanceof PermissionStatus,
+                    eventTarget:status instanceof EventTarget,
+                    source:String(PermissionStatus),
+                    construction:construction(PermissionStatus),
+                    name:status.name,
+                    state:status.state,
+                    handler:status.onchange === handler,
+                    enumerable:['name','state','onchange'].map(name =>
+                        Object.getOwnPropertyDescriptor(PermissionStatus.prototype,name).enumerable),
+                }
+            };
+        });"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__permissionShape)")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["permissions"]["tag"], "[object Permissions]");
+    assert_eq!(value["permissions"]["own"], serde_json::json!([]));
+    assert_eq!(value["permissions"]["instance"], true);
+    assert_eq!(
+        value["permissions"]["source"],
+        "function Permissions() { [native code] }"
+    );
+    assert!(value["permissions"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(value["status"]["tag"], "[object PermissionStatus]");
+    assert_eq!(value["status"]["own"], serde_json::json!([]));
+    assert_eq!(value["status"]["instance"], true);
+    assert_eq!(value["status"]["eventTarget"], true);
+    assert_eq!(
+        value["status"]["source"],
+        "function PermissionStatus() { [native code] }"
+    );
+    assert!(value["status"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(value["status"]["name"], "geolocation");
+    assert_eq!(value["status"]["state"], "prompt");
+    assert_eq!(value["status"]["handler"], true);
+    assert_eq!(
+        value["status"]["enumerable"],
+        serde_json::json!([true, true, true])
+    );
+}
+
 // --- navigator.keyboard (CreepJS + challenge-vendor probe) ---
 // Real Chrome exposes a Keyboard object with getLayoutMap() -> KeyboardLayoutMap.
 // An empty {} object or missing getLayoutMap() is an immediate lie signal.

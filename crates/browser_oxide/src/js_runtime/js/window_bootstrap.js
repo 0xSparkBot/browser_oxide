@@ -635,22 +635,51 @@
         "nfc", "display-capture", "window-management",
     ]);
 
+    const _permissionStatusState = new WeakMap();
     class PermissionStatus extends EventTarget {
-        constructor(name) { super(); this._name = name; }
-        get name() { return this._name; }
+        constructor(name) {
+            super();
+            _permissionStatusState.set(this, { name, onchange: null });
+        }
+        get name() { return _permissionStatusState.get(this)?.name || ""; }
         get state() {
-            if (!_secure() && _SC_GATED_PERMISSIONS.has(this._name)) {
+            const name = _permissionStatusState.get(this)?.name || "";
+            if (!_secure() && _SC_GATED_PERMISSIONS.has(name)) {
                 return "denied";
             }
-            return _PERMISSION_STATE_MAP[this._name] || "prompt";
+            return _PERMISSION_STATE_MAP[name] || "prompt";
         }
-        get onchange() { return null; }
-        set onchange(_v) {}
+        get onchange() { return _permissionStatusState.get(this)?.onchange || null; }
+        set onchange(value) {
+            const state = _permissionStatusState.get(this);
+            if (state) state.onchange = typeof value === "function" ? value : null;
+        }
     }
     Object.defineProperty(PermissionStatus.prototype, Symbol.toStringTag, {
         value: "PermissionStatus", configurable: true,
     });
-    globalThis.PermissionStatus = PermissionStatus;
+    for (const name of ["name", "state", "onchange"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(PermissionStatus.prototype, name);
+        if (descriptor) {
+            Object.defineProperty(PermissionStatus.prototype, name, {
+                ...descriptor,
+                enumerable: true,
+            });
+        }
+    }
+    const _PermissionStatusPublic = function PermissionStatus() {
+        throw new TypeError("Failed to construct 'PermissionStatus': Illegal constructor");
+    };
+    Object.setPrototypeOf(_PermissionStatusPublic, EventTarget);
+    Object.defineProperty(_PermissionStatusPublic, 'prototype', { value: PermissionStatus.prototype });
+    Object.defineProperty(PermissionStatus.prototype, 'constructor', {
+        value: _PermissionStatusPublic,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+    _maskFunction(_PermissionStatusPublic, 'PermissionStatus');
+    globalThis.PermissionStatus = _PermissionStatusPublic;
 
     class Permissions {}
     Object.defineProperty(Permissions.prototype, Symbol.toStringTag, {
@@ -671,8 +700,19 @@
         }
         return Promise.resolve(new PermissionStatus(name));
     });
-    globalThis.Permissions = Permissions;
     const _navPermissions = Object.create(Permissions.prototype);
+    const _PermissionsPublic = function Permissions() {
+        throw new TypeError("Failed to construct 'Permissions': Illegal constructor");
+    };
+    Object.defineProperty(_PermissionsPublic, 'prototype', { value: Permissions.prototype });
+    Object.defineProperty(Permissions.prototype, 'constructor', {
+        value: _PermissionsPublic,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+    _maskFunction(_PermissionsPublic, 'Permissions');
+    globalThis.Permissions = _PermissionsPublic;
 
     // ================================================================
     // WebAuthn + FedCM (detection-shape only)
