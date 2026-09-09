@@ -3130,6 +3130,34 @@ async fn cls_url_search_params() {
     assert_eq!(check("typeof URLSearchParams").await, "function");
 }
 #[tokio::test]
+async fn url_search_params_sort_and_size_match_chrome() {
+    assert_eq!(
+        check(
+            r#"(() => {
+                const params = new URLSearchParams('b=2&a=1&a=0');
+                const sizeDescriptor = Object.getOwnPropertyDescriptor(
+                    URLSearchParams.prototype, 'size');
+                const sortDescriptor = Object.getOwnPropertyDescriptor(
+                    URLSearchParams.prototype, 'sort');
+                const before = params.size;
+                params.sort();
+                return JSON.stringify({
+                    before,
+                    after:params.size,
+                    value:String(params),
+                    sizeDescriptor:[sizeDescriptor.enumerable,sizeDescriptor.configurable,
+                                    typeof sizeDescriptor.get,sizeDescriptor.get.length],
+                    sortDescriptor:[sortDescriptor.enumerable,sortDescriptor.configurable,
+                                    sortDescriptor.writable,sortDescriptor.value.length,
+                                    String(sortDescriptor.value)]
+                });
+            })()"#,
+        )
+        .await,
+        r#"{"before":3,"after":3,"value":"a=1&a=0&b=2","sizeDescriptor":[true,true,"function",0],"sortDescriptor":[true,true,true,0,"function sort() { [native code] }"]}"#
+    );
+}
+#[tokio::test]
 async fn cls_abort_controller() {
     assert_eq!(check("typeof AbortController").await, "function");
 }

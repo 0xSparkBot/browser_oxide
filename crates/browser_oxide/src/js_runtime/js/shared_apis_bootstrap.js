@@ -252,13 +252,22 @@
         URLSearchParams.prototype.set = function(name, value) { const p = _uspMap.get(this); let f = false; const np = p.filter(([k]) => { if (k === name && !f) { f = true; return true; } return k !== name; }); if (f) np.find(([k]) => k === name)[1] = String(value); else np.push([name, String(value)]); _uspMap.set(this, np); };
         URLSearchParams.prototype.append = function(name, value) { _uspMap.get(this).push([String(name), String(value)]); };
         URLSearchParams.prototype.delete = function(name) { _uspMap.set(this, _uspMap.get(this).filter(([k]) => k !== name)); };
+        URLSearchParams.prototype.sort = function sort() {
+            const p = _uspMap.get(this);
+            p.sort((a, b) => a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0));
+        };
         URLSearchParams.prototype.toString = function() { return _uspMap.get(this).map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&"); };
         URLSearchParams.prototype.forEach = function(cb, t) { for (const [k, v] of _uspMap.get(this)) cb.call(t, v, k, this); };
         URLSearchParams.prototype.keys = function() { return _uspMap.get(this).map(([k]) => k)[Symbol.iterator](); };
         URLSearchParams.prototype.values = function() { return _uspMap.get(this).map(([, v]) => v)[Symbol.iterator](); };
         URLSearchParams.prototype.entries = function() { return _uspMap.get(this)[Symbol.iterator](); };
         URLSearchParams.prototype[Symbol.iterator] = function() { return this.entries(); };
-        Object.defineProperty(URLSearchParams.prototype, 'size', { get: function() { return _uspMap.get(this).length; } });
+        Object.defineProperty(URLSearchParams.prototype, 'size', {
+            get: function() { return _uspMap.get(this).length; },
+            enumerable: true,
+            configurable: true,
+        });
+        _defProtoMethod(URLSearchParams.prototype, 'sort', URLSearchParams.prototype.sort);
         Object.defineProperty(URLSearchParams, 'name', { value: 'URLSearchParams', configurable: true });
         try {
             Object.defineProperty(globalThis, 'URLSearchParams', { value: URLSearchParams, writable: true, configurable: true, enumerable: false });
