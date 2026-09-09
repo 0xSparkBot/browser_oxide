@@ -47,6 +47,13 @@
     if (globalThis.Worker?.prototype) {
         setLength(globalThis.Worker.prototype, 'postMessage', 1);
     }
+    if (globalThis.Keyboard?.prototype) {
+        setLength(globalThis.Keyboard.prototype, 'lock', 0);
+    }
+    setConstructorLength('KeyboardLayoutMap', 0);
+    if (globalThis.KeyboardLayoutMap?.prototype) {
+        setLength(globalThis.KeyboardLayoutMap.prototype, 'forEach', 1);
+    }
     if (globalThis.SpeechSynthesis?.prototype) {
         setLength(globalThis.SpeechSynthesis.prototype, 'speak', 1);
     }

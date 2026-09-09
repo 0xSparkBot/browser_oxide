@@ -900,17 +900,18 @@
         ['Minus', '-'], ['Period', '.'], ['Quote', "'"], ['Semicolon', ';'], ['Slash', '/'],
     ]);
 
+    const _keyboardLayoutState = new WeakMap();
     class KeyboardLayoutMap {
-        constructor(map) { this._m = map; }
-        get size() { return this._m.size; }
-        get(key) { return this._m.get(key); }
-        has(key) { return this._m.has(key); }
-        entries() { return this._m.entries(); }
-        keys() { return this._m.keys(); }
-        values() { return this._m.values(); }
-        forEach(cb, thisArg) { return this._m.forEach(cb, thisArg); }
+        constructor(map) { _keyboardLayoutState.set(this, map); }
+        get size() { return _keyboardLayoutState.get(this).size; }
+        get(key) { return _keyboardLayoutState.get(this).get(key); }
+        has(key) { return _keyboardLayoutState.get(this).has(key); }
+        entries() { return _keyboardLayoutState.get(this).entries(); }
+        keys() { return _keyboardLayoutState.get(this).keys(); }
+        values() { return _keyboardLayoutState.get(this).values(); }
+        forEach(cb, thisArg) { return _keyboardLayoutState.get(this).forEach(cb, thisArg); }
         [Symbol.iterator]() {
-            const it = this._m[Symbol.iterator]();
+            const it = _keyboardLayoutState.get(this)[Symbol.iterator]();
             return {
                 next() { return it.next(); },
                 [Symbol.iterator]() { return this; }
@@ -920,7 +921,27 @@
     Object.defineProperty(KeyboardLayoutMap.prototype, Symbol.toStringTag, {
         value: 'KeyboardLayoutMap', configurable: true,
     });
-    globalThis.KeyboardLayoutMap = KeyboardLayoutMap;
+    for (const name of ['size', 'get', 'has', 'entries', 'keys', 'values', 'forEach']) {
+        const descriptor = Object.getOwnPropertyDescriptor(KeyboardLayoutMap.prototype, name);
+        if (descriptor) {
+            Object.defineProperty(KeyboardLayoutMap.prototype, name, {
+                ...descriptor,
+                enumerable: true,
+            });
+        }
+    }
+    const _KeyboardLayoutMapPublic = function KeyboardLayoutMap() {
+        throw new TypeError("Failed to construct 'KeyboardLayoutMap': Illegal constructor");
+    };
+    Object.defineProperty(_KeyboardLayoutMapPublic, 'prototype', { value: KeyboardLayoutMap.prototype });
+    Object.defineProperty(KeyboardLayoutMap.prototype, 'constructor', {
+        value: _KeyboardLayoutMapPublic,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+    _maskFunction(_KeyboardLayoutMapPublic, 'KeyboardLayoutMap');
+    globalThis.KeyboardLayoutMap = _KeyboardLayoutMapPublic;
 
     const _keyboardNativeSetTimeout = globalThis.setTimeout;
     const _keyboardPrivateTraceEnabled = (() => {
@@ -1005,8 +1026,29 @@
     Object.defineProperty(Keyboard.prototype, Symbol.toStringTag, {
         value: 'Keyboard', configurable: true,
     });
-    globalThis.Keyboard = Keyboard;
     const _navKeyboard = new Keyboard();
+    for (const name of ['getLayoutMap', 'lock', 'unlock']) {
+        const descriptor = Object.getOwnPropertyDescriptor(Keyboard.prototype, name);
+        if (descriptor) {
+            Object.defineProperty(Keyboard.prototype, name, {
+                ...descriptor,
+                enumerable: true,
+            });
+        }
+    }
+    const _KeyboardPublic = function Keyboard() {
+        throw new TypeError("Failed to construct 'Keyboard': Illegal constructor");
+    };
+    Object.setPrototypeOf(_KeyboardPublic, EventTarget);
+    Object.defineProperty(_KeyboardPublic, 'prototype', { value: Keyboard.prototype });
+    Object.defineProperty(Keyboard.prototype, 'constructor', {
+        value: _KeyboardPublic,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+    _maskFunction(_KeyboardPublic, 'Keyboard');
+    globalThis.Keyboard = _KeyboardPublic;
 
     class StorageManager {}
     Object.defineProperty(StorageManager.prototype, Symbol.toStringTag, {
@@ -3380,6 +3422,7 @@
             throw new TypeError("Failed to construct 'SpeechSynthesis': Illegal constructor");
         }
     }
+    _maskFunction(SpeechSynthesis, 'SpeechSynthesis');
     globalThis.SpeechSynthesis = SpeechSynthesis;
     const _SSProto = SpeechSynthesis.prototype;
     let _ssVoices = [
@@ -5395,10 +5438,21 @@
     // --- history — prototype-backed ---
     const _historyStack = [{ state: null, title: "", url: globalThis.location?.href || "about:blank" }];
     let _historyIndex = 0;
+    let _historyScrollRestoration = "auto";
     const _HistoryProto = History.prototype;
     _defProtoGetter(_HistoryProto, 'length', () => _historyStack.length);
     _defProtoGetter(_HistoryProto, 'state', () => _historyStack[_historyIndex]?.state || null);
-    _defProtoGetter(_HistoryProto, 'scrollRestoration', () => "auto");
+    _defProtoGetter(
+        _HistoryProto,
+        'scrollRestoration',
+        () => _historyScrollRestoration,
+        value => {
+            const normalized = String(value);
+            if (normalized === "auto" || normalized === "manual") {
+                _historyScrollRestoration = normalized;
+            }
+        },
+    );
     _defProtoMethod(_HistoryProto, 'pushState', function pushState(state, title, url) {
         _historyStack.splice(_historyIndex + 1);
         _historyStack.push({ state, title, url: url || "" });

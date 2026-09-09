@@ -5434,6 +5434,114 @@ async fn nav_keyboard_getlayoutmap_has_entries() {
 }
 
 #[tokio::test]
+async fn keyboard_speech_and_history_webidl_shape_matches_chrome_148() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    page.evaluate(
+        r#"globalThis.__shape = null;
+        navigator.keyboard.getLayoutMap().then(map => {
+            const construction = C => {
+                try { new C(); return 'ok'; }
+                catch (error) { return error.name + ':' + error.message; }
+            };
+            history.scrollRestoration = 'manual';
+            const keyboardNames = ['getLayoutMap','lock','unlock'];
+            const layoutNames = ['size','get','has','entries','keys','values','forEach'];
+            globalThis.__shape = {
+                keyboard: {
+                    tag: Object.prototype.toString.call(navigator.keyboard),
+                    own: Reflect.ownKeys(navigator.keyboard).map(String),
+                    construction: construction(Keyboard),
+                    source: String(Keyboard),
+                    enumerable: keyboardNames.map(name =>
+                        Object.getOwnPropertyDescriptor(Keyboard.prototype, name).enumerable),
+                    lengths: keyboardNames.map(name => Keyboard.prototype[name].length),
+                },
+                layout: {
+                    tag: Object.prototype.toString.call(map),
+                    own: Reflect.ownKeys(map).map(String),
+                    construction: construction(KeyboardLayoutMap),
+                    source: String(KeyboardLayoutMap),
+                    enumerable: layoutNames.map(name =>
+                        Object.getOwnPropertyDescriptor(KeyboardLayoutMap.prototype, name).enumerable),
+                    forEachLength: KeyboardLayoutMap.prototype.forEach.length,
+                    size: map.size,
+                },
+                speech: {
+                    source: String(SpeechSynthesis),
+                    construction: construction(SpeechSynthesis),
+                    speakLength: SpeechSynthesis.prototype.speak.length,
+                },
+                history: {
+                    value: history.scrollRestoration,
+                    setter: typeof Object.getOwnPropertyDescriptor(
+                        History.prototype, 'scrollRestoration').set,
+                    lengths: [
+                        History.prototype.go.length,
+                        History.prototype.pushState.length,
+                        History.prototype.replaceState.length,
+                    ],
+                },
+            };
+        });"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(200))
+        .await
+        .unwrap();
+    let result = page.evaluate("JSON.stringify(globalThis.__shape)").unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["keyboard"]["tag"], "[object Keyboard]");
+    assert_eq!(value["keyboard"]["own"], serde_json::json!([]));
+    assert!(value["keyboard"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(
+        value["keyboard"]["source"],
+        "function Keyboard() { [native code] }"
+    );
+    assert_eq!(
+        value["keyboard"]["enumerable"],
+        serde_json::json!([true, true, true])
+    );
+    assert_eq!(value["keyboard"]["lengths"], serde_json::json!([0, 0, 0]));
+    assert_eq!(value["layout"]["tag"], "[object KeyboardLayoutMap]");
+    assert_eq!(value["layout"]["own"], serde_json::json!([]));
+    assert!(value["layout"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(
+        value["layout"]["source"],
+        "function KeyboardLayoutMap() { [native code] }"
+    );
+    assert_eq!(
+        value["layout"]["enumerable"],
+        serde_json::json!([true, true, true, true, true, true, true])
+    );
+    assert_eq!(value["layout"]["forEachLength"], 1);
+    assert!(value["layout"]["size"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(
+        value["speech"]["source"],
+        "function SpeechSynthesis() { [native code] }"
+    );
+    assert!(value["speech"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert_eq!(value["speech"]["speakLength"], 1);
+    assert_eq!(value["history"]["value"], "manual");
+    assert_eq!(value["history"]["setter"], "function");
+    assert_eq!(value["history"]["lengths"], serde_json::json!([0, 2, 2]));
+}
+
+#[tokio::test]
 async fn nav_keyboard_getlayoutmap_has_keya() {
     // KeyA is always present in any Latin keyboard layout.
     let mut page = Page::from_html_with_url(
