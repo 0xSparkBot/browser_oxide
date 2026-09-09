@@ -388,6 +388,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/attributes_bootstrap.js"),
             "\n",
+            include_str!("js/observer_bootstrap.js"),
+            "\n",
             include_str!("js/structured_clone.js"),
         );
 

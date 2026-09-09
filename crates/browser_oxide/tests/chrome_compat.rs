@@ -686,6 +686,63 @@ async fn attr_and_named_node_map_match_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn intersection_observer_surface_matches_chrome_148() {
+    let result = check(
+        r#"(() => {
+            const observer = new IntersectionObserver(() => {}, {
+                root:null,
+                rootMargin:'1px 2px',
+                scrollMargin:'3px',
+                threshold:[0.75, 0.25, 0.75],
+                delay:20,
+                trackVisibility:false
+            });
+            const thresholds = observer.thresholds;
+            const thresholdsAgain = observer.thresholds;
+            let noCallback = '', entryCtor = '';
+            try { new IntersectionObserver(); noCallback = 'ok'; }
+            catch (error) { noCallback = error.name + ':' + error.message; }
+            try { new IntersectionObserverEntry(); entryCtor = 'ok'; }
+            catch (error) { entryCtor = error.name + ':' + error.message; }
+            return JSON.stringify({
+                observer:{
+                    keys:Reflect.ownKeys(observer).map(String),
+                    tag:Object.prototype.toString.call(observer),
+                    root:observer.root,
+                    rootMargin:observer.rootMargin,
+                    scrollMargin:observer.scrollMargin,
+                    thresholds,
+                    thresholdSame:thresholds === thresholdsAgain,
+                    thresholdFrozen:Object.isFrozen(thresholds),
+                    delay:observer.delay,
+                    trackVisibility:observer.trackVisibility,
+                    ctorLength:IntersectionObserver.length,
+                    source:String(IntersectionObserver),
+                    noCallback
+                },
+                entry:{
+                    ctorLength:IntersectionObserverEntry.length,
+                    source:String(IntersectionObserverEntry),
+                    noConstruct:entryCtor,
+                    names:Object.getOwnPropertyNames(IntersectionObserverEntry.prototype).sort()
+                },
+                methods:[
+                    IntersectionObserver.prototype.observe.length,
+                    IntersectionObserver.prototype.unobserve.length,
+                    IntersectionObserver.prototype.disconnect.length,
+                    IntersectionObserver.prototype.takeRecords.length
+                ]
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"observer":{"keys":[],"tag":"[object IntersectionObserver]","root":null,"rootMargin":"1px 2px 1px 2px","scrollMargin":"3px 3px 3px 3px","thresholds":[0.25,0.75,0.75],"thresholdSame":false,"thresholdFrozen":true,"delay":20,"trackVisibility":false,"ctorLength":1,"source":"function IntersectionObserver() { [native code] }","noCallback":"TypeError:Failed to construct 'IntersectionObserver': 1 argument required, but only 0 present."},"entry":{"ctorLength":0,"source":"function IntersectionObserverEntry() { [native code] }","noConstruct":"TypeError:Failed to construct 'IntersectionObserverEntry': Illegal constructor","names":["boundingClientRect","constructor","intersectionRatio","intersectionRect","isIntersecting","isVisible","rootBounds","target","time"]},"methods":[1,1,0,0]}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
