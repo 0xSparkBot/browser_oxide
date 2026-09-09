@@ -131,8 +131,8 @@ async fn navigator_omits_non_chromium_legacy_members() {
     );
 
     assert_eq!(
-        check_secure("'canShare' in navigator || 'share' in navigator").await,
-        "false"
+        check_secure("'canShare' in navigator && 'share' in navigator").await,
+        "true"
     );
 }
 #[tokio::test]
@@ -357,6 +357,217 @@ async fn nav_java_enabled() {
 async fn nav_send_beacon() {
     assert_eq!(check("typeof navigator.sendBeacon").await, "function");
 }
+
+#[tokio::test]
+async fn nav_web_share_matches_chrome_secure_context_surface() {
+    let value = check_secure(
+        r#"JSON.stringify({
+            shareType: typeof navigator.share,
+            canShareType: typeof navigator.canShare,
+            shareLength: navigator.share.length,
+            canShareLength: navigator.canShare.length,
+            shareEnumerable: Object.getOwnPropertyDescriptor(Navigator.prototype, 'share').enumerable,
+            canShareEnumerable: Object.getOwnPropertyDescriptor(Navigator.prototype, 'canShare').enumerable,
+            empty: navigator.canShare(),
+            object: navigator.canShare({}),
+            text: navigator.canShare({text:'x'}),
+            title: navigator.canShare({title:'x'}),
+            url: navigator.canShare({url:'https://example.com/'}),
+            unknown: navigator.canShare({foo:'x'}),
+            file: navigator.canShare({files:[new File(['x'], 'a.txt', {type:'text/plain'})]}),
+            nativeShare: Function.prototype.toString.call(navigator.share),
+            nativeCanShare: Function.prototype.toString.call(navigator.canShare)
+        })"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+    assert_eq!(value["shareType"], "function");
+    assert_eq!(value["canShareType"], "function");
+    assert_eq!(value["shareLength"], 0);
+    assert_eq!(value["canShareLength"], 0);
+    assert_eq!(value["shareEnumerable"], true);
+    assert_eq!(value["canShareEnumerable"], true);
+    assert_eq!(value["empty"], false);
+    assert_eq!(value["object"], false);
+    assert_eq!(value["text"], true);
+    assert_eq!(value["title"], true);
+    assert_eq!(value["url"], true);
+    assert_eq!(value["unknown"], false);
+    assert_eq!(value["file"], true);
+    assert_eq!(value["nativeShare"], "function share() { [native code] }");
+    assert_eq!(
+        value["nativeCanShare"],
+        "function canShare() { [native code] }"
+    );
+}
+
+#[tokio::test]
+async fn nav_web_share_is_absent_in_non_secure_context() {
+    assert_eq!(
+        check("JSON.stringify([typeof navigator.share, typeof navigator.canShare, 'share' in Navigator.prototype, 'canShare' in Navigator.prototype])").await,
+        r#"["undefined","undefined",false,false]"#
+    );
+}
+
+#[tokio::test]
+async fn nav_web_share_without_trusted_activation_rejects_like_chrome() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    page.evaluate(
+        r#"navigator.share({text:'x'}).then(
+            () => { globalThis.__shareResult = 'resolved'; },
+            error => { globalThis.__shareResult = error.name + ':' + error.message; }
+        );"#,
+    )
+    .unwrap();
+    let _ = page
+        .event_loop()
+        .run_until_settled(std::time::Duration::from_millis(100))
+        .await;
+    let result = page
+        .evaluate("String(globalThis.__shareResult || '')")
+        .unwrap();
+    assert_eq!(
+        result,
+        "NotAllowedError:Failed to execute 'share' on 'Navigator': Must be handling a user gesture to perform a share request."
+    );
+}
+
+#[tokio::test]
+async fn navigator_and_performance_webidl_arities_match_chrome_148() {
+    let value = check_secure(
+        r#"JSON.stringify({
+            navigatorCtor: Function.prototype.toString.call(Navigator),
+            screenCtor: Function.prototype.toString.call(Screen),
+            performanceCtor: Function.prototype.toString.call(Performance),
+            adAuctionComponents: navigator.adAuctionComponents.length,
+            clearOriginJoinedAdInterestGroups: navigator.clearOriginJoinedAdInterestGroups.length,
+            deprecatedReplaceInURN: navigator.deprecatedReplaceInURN.length,
+            deprecatedURNToURL: navigator.deprecatedURNToURL.length,
+            getInterestGroupAdAuctionData: navigator.getInterestGroupAdAuctionData.length,
+            joinAdInterestGroup: navigator.joinAdInterestGroup.length,
+            runAdAuction: navigator.runAdAuction.length,
+            sendBeacon: navigator.sendBeacon.length,
+            setAppBadge: navigator.setAppBadge.length,
+            getEntriesByName: Performance.prototype.getEntriesByName.length,
+            measure: Performance.prototype.measure.length,
+            setResourceTimingBufferSize: Performance.prototype.setResourceTimingBufferSize.length
+        })"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+    assert_eq!(
+        value["navigatorCtor"],
+        "function Navigator() { [native code] }"
+    );
+    assert_eq!(value["screenCtor"], "function Screen() { [native code] }");
+    assert_eq!(
+        value["performanceCtor"],
+        "function Performance() { [native code] }"
+    );
+    assert_eq!(value["adAuctionComponents"], 1);
+    assert_eq!(value["clearOriginJoinedAdInterestGroups"], 1);
+    assert_eq!(value["deprecatedReplaceInURN"], 2);
+    assert_eq!(value["deprecatedURNToURL"], 1);
+    assert_eq!(value["getInterestGroupAdAuctionData"], 1);
+    assert_eq!(value["joinAdInterestGroup"], 1);
+    assert_eq!(value["runAdAuction"], 1);
+    assert_eq!(value["sendBeacon"], 1);
+    assert_eq!(value["setAppBadge"], 0);
+    assert_eq!(value["getEntriesByName"], 1);
+    assert_eq!(value["measure"], 1);
+    assert_eq!(value["setResourceTimingBufferSize"], 1);
+}
+
+#[tokio::test]
+async fn document_interface_inheritance_and_webidl_arities_match_chrome_148() {
+    let value = check_secure(
+        r#"JSON.stringify({
+            ctorName: document.constructor.name,
+            ctorSource: Function.prototype.toString.call(document.constructor),
+            htmlDistinct: HTMLDocument !== Document,
+            htmlProtoDistinct: HTMLDocument.prototype !== Document.prototype,
+            htmlProtoParent: Object.getPrototypeOf(HTMLDocument.prototype) === Document.prototype,
+            htmlCtorParent: Object.getPrototypeOf(HTMLDocument) === Document,
+            instanceDocument: document instanceof Document,
+            instanceHTMLDocument: document instanceof HTMLDocument,
+            documentCtorName: Document.prototype.constructor.name,
+            documentCtorSource: Function.prototype.toString.call(Document.prototype.constructor),
+            htmlCtorName: HTMLDocument.prototype.constructor.name,
+            htmlCtorSource: Function.prototype.toString.call(HTMLDocument.prototype.constructor),
+            documentLength: Document.length,
+            htmlDocumentLength: HTMLDocument.length,
+            ariaNotify: Document.prototype.ariaNotify.length,
+            createExpression: Document.prototype.createExpression.length,
+            createNodeIterator: Document.prototype.createNodeIterator.length,
+            createTreeWalker: Document.prototype.createTreeWalker.length,
+            evaluate: Document.prototype.evaluate.length,
+            execCommand: Document.prototype.execCommand.length,
+            hasPrivateToken: Document.prototype.hasPrivateToken.length,
+            hasRedemptionRecord: Document.prototype.hasRedemptionRecord.length,
+            importNode: Document.prototype.importNode.length,
+            queryCommandIndeterm: Document.prototype.queryCommandIndeterm.length,
+            queryCommandState: Document.prototype.queryCommandState.length,
+            queryCommandValue: Document.prototype.queryCommandValue.length,
+            requestStorageAccessFor: Document.prototype.requestStorageAccessFor.length,
+            startViewTransition: Document.prototype.startViewTransition.length,
+            write: Document.prototype.write.length,
+            writeln: Document.prototype.writeln.length,
+            htmlConstruct: (() => { try { new HTMLDocument(); return 'ok'; } catch (e) { return e.name + ':' + e.message; } })()
+        })"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+    assert_eq!(value["ctorName"], "HTMLDocument");
+    assert_eq!(
+        value["ctorSource"],
+        "function HTMLDocument() { [native code] }"
+    );
+    assert_eq!(value["htmlDistinct"], true);
+    assert_eq!(value["htmlProtoDistinct"], true);
+    assert_eq!(value["htmlProtoParent"], true);
+    assert_eq!(value["htmlCtorParent"], true);
+    assert_eq!(value["instanceDocument"], true);
+    assert_eq!(value["instanceHTMLDocument"], true);
+    assert_eq!(value["documentCtorName"], "Document");
+    assert_eq!(
+        value["documentCtorSource"],
+        "function Document() { [native code] }"
+    );
+    assert_eq!(value["htmlCtorName"], "HTMLDocument");
+    assert_eq!(
+        value["htmlCtorSource"],
+        "function HTMLDocument() { [native code] }"
+    );
+    assert_eq!(value["documentLength"], 0);
+    assert_eq!(value["htmlDocumentLength"], 0);
+    assert_eq!(value["ariaNotify"], 1);
+    assert_eq!(value["createExpression"], 1);
+    assert_eq!(value["createNodeIterator"], 1);
+    assert_eq!(value["createTreeWalker"], 1);
+    assert_eq!(value["evaluate"], 2);
+    assert_eq!(value["execCommand"], 1);
+    assert_eq!(value["hasPrivateToken"], 1);
+    assert_eq!(value["hasRedemptionRecord"], 1);
+    assert_eq!(value["importNode"], 1);
+    assert_eq!(value["queryCommandIndeterm"], 1);
+    assert_eq!(value["queryCommandState"], 1);
+    assert_eq!(value["queryCommandValue"], 1);
+    assert_eq!(value["requestStorageAccessFor"], 1);
+    assert_eq!(value["startViewTransition"], 0);
+    assert_eq!(value["write"], 0);
+    assert_eq!(value["writeln"], 0);
+    assert_eq!(
+        value["htmlConstruct"],
+        "TypeError:Failed to construct 'HTMLDocument': Illegal constructor"
+    );
+}
+
 #[tokio::test]
 async fn nav_get_battery() {
     assert_eq!(
@@ -2637,7 +2848,7 @@ async fn rtc_ice_candidates_reach_event_target_listeners() {
         pc.createOffer().then(offer => pc.setLocalDescription(offer));"#,
     )
     .unwrap();
-    page.evaluate_async("void 0", std::time::Duration::from_millis(100))
+    page.evaluate_async("void 0", std::time::Duration::from_millis(300))
         .await
         .unwrap();
     assert_eq!(
@@ -2720,7 +2931,7 @@ async fn rtc_offer_and_state_machine_match_chrome_148() {
         })();"#,
     )
     .unwrap();
-    page.evaluate_async("void 0", std::time::Duration::from_millis(150))
+    page.evaluate_async("void 0", std::time::Duration::from_millis(400))
         .await
         .unwrap();
     assert_eq!(

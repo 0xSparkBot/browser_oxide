@@ -2798,7 +2798,8 @@
     };
 
     class Document extends Node {
-        constructor(nodeId) {
+        constructor() {
+            const nodeId = arguments[0];
             // Forward the document node id to Node so _getNodeId returns
             // the real Rust-side Document. Without this, document.nodeType
             // resolved to 0 (the "no such node" sentinel), which broke
@@ -2929,13 +2930,13 @@
         createRange() {
             return new Range();
         }
-        createTreeWalker(root, whatToShow, filter) {
+        createTreeWalker(root) {
             return { currentNode: root, nextNode() { return null; }, previousNode() { return null; } };
         }
-        createNodeIterator(root, whatToShow, filter) {
+        createNodeIterator(root) {
             return { nextNode() { return null; }, previousNode() { return null; } };
         }
-        importNode(node, deep) { return node.cloneNode(deep); }
+        importNode(node) { return node.cloneNode(arguments[1]); }
         adoptNode(node) {
             // Detach from current parent, adopt into this document
             if (node.parentNode) node.parentNode.removeChild(node);
@@ -2947,10 +2948,11 @@
         // document.open/close — reset and finalize document stream
         open() { return this; }
         close() {}
-        write(html) {
+        write() {
             // Document.write in Chrome synchronously executes any <script> tags
             // it inserts. Since op_dom_document_write returns the IDs of the
             // newly created nodes, we wrap them and trigger our insertion logic.
+            const html = Array.prototype.map.call(arguments, String).join("");
             const newIds = ops.op_dom_document_write(String(html));
             if (Array.isArray(newIds)) {
                 for (const id of newIds) {
@@ -2959,11 +2961,11 @@
                 }
             }
         }
-        writeln(html) {
-            this.write(html + "\n");
+        writeln() {
+            this.write(Array.prototype.map.call(arguments, String).join("") + "\n");
         }
         // Selection and editing
-        execCommand(command, showUI, value) { return false; }
+        execCommand(command) { return false; }
         queryCommandSupported(command) { return false; }
         queryCommandEnabled(command) { return false; }
         getSelection() { return globalThis.getSelection ? globalThis.getSelection() : null; }
@@ -3132,6 +3134,22 @@
         exitPointerLock() {}
     }
 
+    // Chrome exposes HTMLDocument as a distinct, illegal-to-construct
+    // interface whose prototype inherits Document.prototype. The live HTML
+    // document instance uses that derived prototype, while `new Document()`
+    // remains constructable.
+    function HTMLDocument() {
+        throw new TypeError("Failed to construct 'HTMLDocument': Illegal constructor");
+    }
+    Object.setPrototypeOf(HTMLDocument, Document);
+    HTMLDocument.prototype = Object.create(Document.prototype);
+    Object.defineProperty(HTMLDocument.prototype, 'constructor', {
+        value: HTMLDocument, writable: true, configurable: true,
+    });
+    Object.defineProperty(HTMLDocument, Symbol.for('__browser_oxide_native__'), {
+        value: 'HTMLDocument', configurable: true,
+    });
+
     // Document mixins and legacy HTMLDocument members exposed by Chrome 148.
     // Keep them on the prototype (rather than one-off instance properties):
     // fingerprinting code enumerates Document.prototype and child realms mirror
@@ -3186,7 +3204,7 @@
         this.append(...nodes);
     });
     _defineDocumentMethod('moveBefore', function(node, child) { return this.insertBefore(node, child); });
-    _defineDocumentMethod('ariaNotify', function() {});
+    _defineDocumentMethod('ariaNotify', function(_message) {});
     _defineDocumentMethod('browsingTopics', function() { return Promise.resolve([]); });
     _defineDocumentMethod('captureEvents', function() {});
     _defineDocumentMethod('releaseEvents', function() {});
@@ -3195,19 +3213,20 @@
     _defineDocumentMethod('createAttributeNS', function(_namespace, name) { return this.createAttribute(name); });
     _defineDocumentMethod('createCDATASection', function(data) { return this.createTextNode(data); });
     _defineDocumentMethod('createProcessingInstruction', function(_target, data) { return this.createTextNode(data); });
-    _defineDocumentMethod('createExpression', function(expression, resolver) {
+    _defineDocumentMethod('createExpression', function(expression) {
+        const resolver = arguments[1];
         return { expression: String(expression), resolver: resolver || null, evaluate() { return null; } };
     });
     _defineDocumentMethod('createNSResolver', function(node) { return node; });
-    _defineDocumentMethod('evaluate', function() { return { resultType: 0, numberValue: 0, stringValue: '', booleanValue: false, singleNodeValue: null, invalidIteratorState: false, snapshotLength: 0, iterateNext() { return null; }, snapshotItem() { return null; } }; });
+    _defineDocumentMethod('evaluate', function(_expression, _contextNode) { return { resultType: 0, numberValue: 0, stringValue: '', booleanValue: false, singleNodeValue: null, invalidIteratorState: false, snapshotLength: 0, iterateNext() { return null; }, snapshotItem() { return null; } }; });
     _defineDocumentMethod('exitPictureInPicture', function() { return Promise.resolve(); });
     _defineDocumentMethod('getAnimations', function() { return []; });
     _defineDocumentMethod('getElementsByTagNameNS', function(_namespace, name) { return this.getElementsByTagName(name); });
     _defineDocumentMethod('hasUnpartitionedCookieAccess', function() { return Promise.resolve(false); });
-    _defineDocumentMethod('queryCommandIndeterm', function() { return false; });
-    _defineDocumentMethod('queryCommandState', function() { return false; });
-    _defineDocumentMethod('queryCommandValue', function() { return ''; });
-    _defineDocumentMethod('requestStorageAccessFor', function() { return Promise.reject(new DOMException('Permission denied', 'NotAllowedError')); });
+    _defineDocumentMethod('queryCommandIndeterm', function(_command) { return false; });
+    _defineDocumentMethod('queryCommandState', function(_command) { return false; });
+    _defineDocumentMethod('queryCommandValue', function(_command) { return ''; });
+    _defineDocumentMethod('requestStorageAccessFor', function(_origin) { return Promise.reject(new DOMException('Permission denied', 'NotAllowedError')); });
     _defineDocumentMethod('webkitCancelFullScreen', function() { return this.exitFullscreen(); });
     _defineDocumentMethod('webkitExitFullscreen', function() { return this.exitFullscreen(); });
 
@@ -3332,6 +3351,7 @@
 
     // Create the global document
     const _document = new Document(ops.op_dom_document_node());
+    Object.setPrototypeOf(_document, HTMLDocument.prototype);
     // Blink exposes document.location on the HTML document instance rather
     // than as an own member of Document.prototype.
     try {
@@ -3443,8 +3463,8 @@
     _tag(Text, "Text");
     _tag(Comment, "Comment");
     _tag(DocumentFragment, "DocumentFragment");
-    // Chrome exposes document as HTMLDocument (which extends Document).
-    _tag(Document, "HTMLDocument");
+    _tag(Document, "Document");
+    _tag(HTMLDocument, "HTMLDocument");
     _tag(NodeList, "NodeList");
     _tag(DOMTokenList, "DOMTokenList");
 
@@ -3521,7 +3541,7 @@
 
     globalThis.document = _document;
     globalThis.Document = Document;
-    globalThis.HTMLDocument = Document;
+    globalThis.HTMLDocument = HTMLDocument;
     globalThis.Node = Node;
     globalThis.Element = Element;
     // Expose the real HTMLElement subclasses — the prototype chain is

@@ -1383,8 +1383,9 @@
     // actually receives the payload. A no-op stub silently drops data that
     // challenge scripts send on completion, blocking
     // the session from being upgraded.
-    _defNavMethod('sendBeacon', function sendBeacon(url, data) {
+    _defNavMethod('sendBeacon', function sendBeacon(url) {
         try {
+            const data = arguments[1];
             let absUrl = String(url);
             if (!/^https?:/i.test(absUrl)) {
                 const _base = globalThis.location && globalThis.location.href || 'about:blank';
@@ -1519,6 +1520,53 @@
     _defNavMethod('getGamepads', function getGamepads() { return [null, null, null, null]; });
     _defNavMethod('registerProtocolHandler', function registerProtocolHandler(scheme, url) {});
     _defNavMethod('unregisterProtocolHandler', function unregisterProtocolHandler(scheme, url) {});
+    // Web Share API is [SecureContext] in Chromium. Chrome 148 on macOS
+    // exposes both methods on Navigator.prototype with WebIDL arity 0.
+    // BrowserOxide has no native OS share sheet, so a valid activated share
+    // request is modeled as a user cancellation rather than a false success.
+    if (_secure()) {
+        const _canShareData = (data) => {
+            if (!data || typeof data !== 'object') return false;
+            try {
+                if ('title' in data || 'text' in data || 'url' in data) return true;
+                if ('files' in data) {
+                    const files = data.files;
+                    if (!files || typeof files[Symbol.iterator] !== 'function') return false;
+                    const list = Array.from(files);
+                    if (list.length === 0) return false;
+                    if (typeof File !== 'function') return false;
+                    return list.every((file) => file instanceof File);
+                }
+            } catch (_) {
+                return false;
+            }
+            return false;
+        };
+        _defNavMethod('canShare', function canShare() {
+            return _canShareData(arguments.length ? arguments[0] : undefined);
+        });
+        _defNavMethod('share', function share() {
+            if (arguments.length === 0 || arguments[0] === undefined) {
+                return Promise.reject(new TypeError(
+                    "Failed to execute 'share' on 'Navigator': No known share data fields supplied. " +
+                    "If using only new fields (other than title, text and url), you must feature-detect them first."
+                ));
+            }
+            if (!_hasTrustedUserActivation) {
+                return Promise.reject(new DOMException(
+                    "Failed to execute 'share' on 'Navigator': Must be handling a user gesture to perform a share request.",
+                    'NotAllowedError'
+                ));
+            }
+            if (!_canShareData(arguments[0])) {
+                return Promise.reject(new TypeError(
+                    "Failed to execute 'share' on 'Navigator': No known share data fields supplied. " +
+                    "If using only new fields (other than title, text and url), you must feature-detect them first."
+                ));
+            }
+            return Promise.reject(new DOMException('Share canceled', 'AbortError'));
+        });
+    }
     _defNavMethod('requestMediaKeySystemAccess', function requestMediaKeySystemAccess(keySystem, configs) {
         // org.w3.clearkey is required by the W3C EME spec on all platforms.
         // com.widevine.alpha is available on Windows and macOS (not Linux desktop).
@@ -1575,7 +1623,7 @@
         return Promise.resolve(_access);
     });
     _defNavMethod('clearAppBadge', function clearAppBadge() { return Promise.resolve(); });
-    _defNavMethod('setAppBadge', function setAppBadge(count) { return Promise.resolve(); });
+    _defNavMethod('setAppBadge', function setAppBadge() { return Promise.resolve(); });
 
     // Symbol.toStringTag — some scripts check Object.prototype.toString.call(navigator)
     // and expect "[object Navigator]". Without this, it returns "[object Object]".
@@ -2181,22 +2229,27 @@
         // Chrome 148 Protected Audience/MIDI and singleton-backed Navigator
         // members. These are part of Navigator.prototype even when a call is
         // later rejected by permissions or page policy.
-        for (const [name, result] of [
-            ['adAuctionComponents', []],
-            ['canLoadAdAuctionFencedFrame', false],
-            ['clearOriginJoinedAdInterestGroups', undefined],
-            ['createAuctionNonce', ''],
-            ['deprecatedReplaceInURN', undefined],
-            ['deprecatedURNToURL', null],
-            ['getInterestGroupAdAuctionData', null],
-            ['joinAdInterestGroup', undefined],
-            ['leaveAdInterestGroup', undefined],
-            ['requestMIDIAccess', null],
-            ['runAdAuction', null],
-            ['updateAdInterestGroups', undefined],
+        for (const [name, result, arity] of [
+            ['adAuctionComponents', [], 1],
+            ['canLoadAdAuctionFencedFrame', false, 0],
+            ['clearOriginJoinedAdInterestGroups', undefined, 1],
+            ['createAuctionNonce', '', 0],
+            ['deprecatedReplaceInURN', undefined, 2],
+            ['deprecatedURNToURL', null, 1],
+            ['getInterestGroupAdAuctionData', null, 1],
+            ['joinAdInterestGroup', undefined, 1],
+            ['leaveAdInterestGroup', undefined, 0],
+            ['requestMIDIAccess', null, 0],
+            ['runAdAuction', null, 1],
+            ['updateAdInterestGroups', undefined, 0],
         ]) {
             if (!Object.getOwnPropertyDescriptor(_NavProto, name)) {
-                _defNavMethod(name, function() { return Promise.resolve(result); });
+                const method = arity === 2
+                    ? function(_a, _b) { return Promise.resolve(result); }
+                    : arity === 1
+                        ? function(_a) { return Promise.resolve(result); }
+                        : function() { return Promise.resolve(result); };
+                _defNavMethod(name, method);
             }
         }
         if (!Object.getOwnPropertyDescriptor(_NavProto, 'deprecatedRunAdAuctionEnforcesKAnonymity')) {
@@ -4216,7 +4269,8 @@
             }
             return [];
         });
-        _defProtoMethod(_PerfProto, 'getEntriesByName', function getEntriesByName(name, type) {
+        _defProtoMethod(_PerfProto, 'getEntriesByName', function getEntriesByName(name) {
+            const type = arguments[1];
             return globalThis.performance
                 .getEntries()
                 .filter((e) => e.name === name && (!type || e.entryType === type));
@@ -4224,7 +4278,7 @@
         _defProtoMethod(_PerfProto, 'mark', function mark(name) {
             return { name, entryType: "mark", startTime: performance.now(), duration: 0 };
         });
-        _defProtoMethod(_PerfProto, 'measure', function measure(name, startMark, endMark) {
+        _defProtoMethod(_PerfProto, 'measure', function measure(name) {
             return { name, entryType: "measure", startTime: 0, duration: 0 };
         });
         _defProtoMethod(_PerfProto, 'clearMarks', function clearMarks() {});
@@ -4232,7 +4286,7 @@
         _defProtoMethod(_PerfProto, 'clearResourceTimings', function clearResourceTimings() {
             // No-op for now, as we dynamically fetch from document.
         });
-        _defProtoMethod(_PerfProto, 'setResourceTimingBufferSize', function setResourceTimingBufferSize() {});
+        _defProtoMethod(_PerfProto, 'setResourceTimingBufferSize', function setResourceTimingBufferSize(size) {});
         _defProtoMethod(_PerfProto, 'toJSON', function toJSON() {
             // Read live via the op so a snapshot-
             // hosted value doesn't leak.
@@ -9218,7 +9272,8 @@
             value: "ViewTransition", configurable: true,
         });
         globalThis.ViewTransition = ViewTransition;
-        const _startViewTransition = function startViewTransition(updateCallback) {
+        const _startViewTransition = function startViewTransition() {
+            const updateCallback = arguments[0];
             return new ViewTransition(updateCallback);
         };
         if (typeof _maskFunction === "function") {
@@ -9250,10 +9305,10 @@
     // (12) Document.prototype.hasPrivateToken / hasRedemptionRecord (Trust Tokens API)
     // Chrome 130+ ad-fraud prevention APIs. Absence differs from real Chrome.
     if (globalThis.Document && typeof globalThis.Document.prototype.hasPrivateToken === "undefined") {
-        const _hasPrivateToken = function hasPrivateToken() { 
+        const _hasPrivateToken = function hasPrivateToken(_issuer) {
             return Promise.reject(new DOMException("The Trust Token API is not supported.", "NotSupportedError"));
         };
-        const _hasRedemptionRecord = function hasRedemptionRecord() {
+        const _hasRedemptionRecord = function hasRedemptionRecord(_issuer) {
             return Promise.reject(new DOMException("The Trust Token API is not supported.", "NotSupportedError"));
         };
         if (typeof _maskFunction === "function") {

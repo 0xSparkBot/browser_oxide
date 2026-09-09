@@ -43,6 +43,13 @@
         const C = function() {
             throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
         };
+        // stealth_bootstrap.js installs Function.prototype.toString later in
+        // startup and recognizes this shared Symbol tag. Tag interfaces here
+        // even though this bootstrap intentionally runs first, so singleton
+        // WebIDL constructors reflect as native functions in the final realm.
+        Object.defineProperty(C, Symbol.for('__browser_oxide_native__'), {
+            value: name, configurable: true
+        });
         if (base !== Object) {
             C.prototype = Object.create(base.prototype);
             C.prototype.constructor = C;
