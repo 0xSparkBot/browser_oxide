@@ -817,6 +817,96 @@ async fn event_data_subclasses_match_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn range_and_selection_match_chrome_148() {
+    let result = check(
+        r#"(() => {
+            const root = document.createElement('div');
+            const p1 = document.createElement('p');
+            const first = document.createTextNode('hello ');
+            const bold = document.createElement('b');
+            const boldText = document.createTextNode('world');
+            bold.appendChild(boldText);
+            p1.appendChild(first); p1.appendChild(bold); root.appendChild(p1);
+            document.body.appendChild(root);
+
+            const range = document.createRange();
+            range.setStart(first, 1);
+            range.setEnd(boldText, 3);
+            const clone = range.cloneContents();
+            const holder = document.createElement('div');
+            holder.appendChild(clone.cloneNode(true));
+
+            const selection = getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            const initial = {
+                text:String(range),
+                clone:holder.innerHTML,
+                rangeKeys:Reflect.ownKeys(range).map(String),
+                selectionKeys:Reflect.ownKeys(selection).map(String),
+                tags:[Object.prototype.toString.call(range), Object.prototype.toString.call(selection)],
+                anchor:[selection.anchorNode === first, selection.anchorOffset],
+                focus:[selection.focusNode === boldText, selection.focusOffset],
+                direction:selection.direction,
+                count:selection.rangeCount,
+                sameRange:selection.getRangeAt(0) === range,
+                rectList:Object.prototype.toString.call(range.getClientRects()),
+                rect:Object.prototype.toString.call(range.getBoundingClientRect())
+            };
+
+            selection.collapse(first, 2);
+            selection.extend(boldText, 2);
+            const extended = {
+                anchor:[selection.anchorNode === first, selection.anchorOffset],
+                focus:[selection.focusNode === boldText, selection.focusOffset],
+                direction:selection.direction,
+                text:String(selection)
+            };
+            selection.collapseToStart();
+            const collapsed = [selection.anchorNode === first, selection.anchorOffset, selection.isCollapsed];
+            selection.removeAllRanges();
+
+            const mutationRoot = document.createElement('div');
+            const mutationText = document.createTextNode('abcdef');
+            mutationRoot.appendChild(mutationText);
+            const mutationRange = document.createRange();
+            mutationRange.setStart(mutationText, 2);
+            mutationRange.setEnd(mutationText, 4);
+            mutationRange.deleteContents();
+            const marker = document.createElement('i'); marker.textContent = 'X';
+            mutationRange.insertNode(marker);
+
+            let selectionCtor = '', rangeCall = '';
+            try { new Selection(); selectionCtor = 'ok'; }
+            catch (error) { selectionCtor = error.name + ':' + error.message; }
+            try { Range(); rangeCall = 'ok'; }
+            catch (error) { rangeCall = error.name + ':' + error.message; }
+
+            return JSON.stringify({
+                initial,
+                extended,
+                collapsed,
+                empty:[selection.rangeCount,selection.anchorNode,selection.anchorOffset,selection.focusNode,selection.focusOffset,selection.isCollapsed,selection.direction,String(selection)],
+                mutation:mutationRoot.innerHTML,
+                constructors:{
+                    range:[Range.length,String(Range),rangeCall],
+                    selection:[Selection.length,String(Selection),selectionCtor],
+                    abstract:[AbstractRange.length,String(AbstractRange),Object.getPrototypeOf(Range.prototype) === AbstractRange.prototype]
+                },
+                constants:[Range.START_TO_START,Range.START_TO_END,Range.END_TO_END,Range.END_TO_START],
+                createLength:Document.prototype.createRange.length,
+                singleton:getSelection() === getSelection() && document.getSelection() === getSelection()
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"initial":{"text":"ello wor","clone":"ello <b>wor</b>","rangeKeys":[],"selectionKeys":[],"tags":["[object Range]","[object Selection]"],"anchor":[true,1],"focus":[true,3],"direction":"none","count":1,"sameRange":true,"rectList":"[object DOMRectList]","rect":"[object DOMRect]"},"extended":{"anchor":[true,2],"focus":[true,2],"direction":"forward","text":"llo wo"},"collapsed":[true,2,true],"empty":[0,null,0,null,0,true,"none",""],"mutation":"ab<i>X</i>ef","constructors":{"range":[0,"function Range() { [native code] }","TypeError:Failed to construct 'Range': Please use the 'new' operator, this DOM object constructor cannot be called as a function."],"selection":[0,"function Selection() { [native code] }","TypeError:Failed to construct 'Selection': Illegal constructor"],"abstract":[0,"function AbstractRange() { [native code] }",true]},"constants":[0,1,2,3],"createLength":0,"singleton":true}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
