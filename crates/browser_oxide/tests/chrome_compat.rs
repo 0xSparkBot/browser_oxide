@@ -219,6 +219,115 @@ async fn image_data_webidl_shape_matches_chrome() {
     );
 }
 
+#[tokio::test]
+async fn streams_webidl_shape_matches_chrome() {
+    let result = check(
+        r#"(() => {
+            const method = (proto, name, length) => {
+                const d = Object.getOwnPropertyDescriptor(proto, name);
+                return !!d && d.enumerable === true && d.configurable === true
+                    && d.writable === true && typeof d.value === 'function'
+                    && d.value.name === name && d.value.length === length
+                    && String(d.value) === `function ${name}() { [native code] }`;
+            };
+            const getter = (proto, name) => {
+                const d = Object.getOwnPropertyDescriptor(proto, name);
+                return !!d && d.enumerable === true && d.configurable === true
+                    && typeof d.get === 'function' && d.get.length === 0
+                    && d.set === undefined
+                    && String(d.get) === `function get ${name}() { [native code] }`;
+            };
+            const tag = (proto, expected) => {
+                const d = Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag);
+                return !!d && d.value === expected && d.enumerable === false
+                    && d.configurable === true && d.writable === false;
+            };
+            const names = proto => Object.getOwnPropertyNames(proto).sort().join(',');
+
+            const rs = new ReadableStream();
+            const reader = rs.getReader();
+            const ws = new WritableStream();
+            const writer = ws.getWriter();
+            const ts = new TransformStream();
+
+            const expectedNames = {
+                ReadableStream: 'cancel,constructor,getReader,locked,pipeThrough,pipeTo,tee,values',
+                ReadableStreamDefaultReader: 'cancel,closed,constructor,read,releaseLock',
+                ReadableStreamDefaultController: 'close,constructor,desiredSize,enqueue,error',
+                WritableStream: 'abort,close,constructor,getWriter,locked',
+                WritableStreamDefaultWriter: 'abort,close,closed,constructor,desiredSize,ready,releaseLock,write',
+                WritableStreamDefaultController: 'constructor,error,signal',
+                TransformStream: 'constructor,readable,writable'
+            };
+
+            const prototypes = [
+                ['ReadableStream', ReadableStream, {
+                    methods:{cancel:0,getReader:0,pipeThrough:1,pipeTo:1,tee:0,values:0},
+                    getters:['locked']
+                }],
+                ['ReadableStreamDefaultReader', ReadableStreamDefaultReader, {
+                    methods:{cancel:0,read:0,releaseLock:0}, getters:['closed']
+                }],
+                ['ReadableStreamDefaultController', ReadableStreamDefaultController, {
+                    methods:{close:0,enqueue:0,error:0}, getters:['desiredSize']
+                }],
+                ['WritableStream', WritableStream, {
+                    methods:{abort:0,close:0,getWriter:0}, getters:['locked']
+                }],
+                ['WritableStreamDefaultWriter', WritableStreamDefaultWriter, {
+                    methods:{abort:0,close:0,releaseLock:0,write:0},
+                    getters:['closed','desiredSize','ready']
+                }],
+                ['WritableStreamDefaultController', WritableStreamDefaultController, {
+                    methods:{error:0}, getters:['signal']
+                }],
+                ['TransformStream', TransformStream, {
+                    methods:{}, getters:['readable','writable']
+                }]
+            ];
+
+            const protoOk = prototypes.every(([name, C, spec]) => {
+                const p = C.prototype;
+                return names(p) === expectedNames[name]
+                    && Object.entries(spec.methods).every(([n, l]) => method(p, n, l))
+                    && spec.getters.every(n => getter(p, n))
+                    && tag(p, name)
+                    && String(C) === `function ${name}() { [native code] }`;
+            });
+
+            const asyncIterator = Object.getOwnPropertyDescriptor(
+                ReadableStream.prototype, Symbol.asyncIterator
+            );
+
+            return JSON.stringify({
+                ctorLengths:[
+                    ReadableStream.length,
+                    ReadableStreamDefaultReader.length,
+                    ReadableStreamDefaultController.length,
+                    WritableStream.length,
+                    WritableStreamDefaultWriter.length,
+                    WritableStreamDefaultController.length,
+                    TransformStream.length
+                ],
+                protoOk,
+                noStaticFrom:!Object.prototype.hasOwnProperty.call(ReadableStream, 'from'),
+                asyncIterator:!!asyncIterator
+                    && asyncIterator.value === ReadableStream.prototype.values
+                    && asyncIterator.enumerable === false
+                    && asyncIterator.configurable === true
+                    && asyncIterator.writable === true,
+                instanceKeys:[rs,reader,ws,writer,ts].map(x => Reflect.ownKeys(x).map(String)),
+                instanceTags:[rs,reader,ws,writer,ts].map(x => Object.prototype.toString.call(x))
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"ctorLengths":[0,1,0,0,1,0,0],"protoOk":true,"noStaticFrom":true,"asyncIterator":true,"instanceKeys":[[],[],[],[],[]],"instanceTags":["[object ReadableStream]","[object ReadableStreamDefaultReader]","[object WritableStream]","[object WritableStreamDefaultWriter]","[object TransformStream]"]}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================

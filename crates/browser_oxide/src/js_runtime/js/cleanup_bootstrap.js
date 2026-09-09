@@ -606,6 +606,7 @@
                 'PerformanceEntry', 'ReportingObserver', 'ReadableStream',
                 'WritableStream', 'TransformStream', 'ReadableStreamDefaultReader',
                 'WritableStreamDefaultWriter', 'ReadableStreamDefaultController',
+                'WritableStreamDefaultController',
                 'BroadcastChannel', 'MessagePort', 'MessageChannel',
                 'EventSource', 'CompressionStream', 'DecompressionStream',
                 'Crypto', 'SubtleCrypto', 'CloseEvent', 'AbortController',
