@@ -429,6 +429,81 @@ async fn webidl_operation_arities_match_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn domtokenlist_and_media_query_list_match_chrome_148() {
+    let result = check(
+        r#"(() => {
+            const element = document.createElement('div');
+            element.className = 'a b';
+            const list = element.classList;
+            const sameList = list === element.classList;
+            const indexDescriptor = Object.getOwnPropertyDescriptor(list, '0');
+            list.add('c', 'd');
+            list.remove('a', 'c');
+            const replaced = list.replace('b', 'x');
+            const beforeSet = list.value;
+            list.value = 'p q';
+            element.setAttribute('class', 'live one two');
+            let supportsError = '';
+            try { list.supports('anything'); } catch (error) { supportsError = error.name; }
+
+            const mql = matchMedia('(min-width: 1px)');
+            let mqlConstruct = '';
+            try { new MediaQueryList(); mqlConstruct = 'ok'; }
+            catch (error) { mqlConstruct = error.name + ':' + error.message; }
+
+            const parserDescriptor = Object.getOwnPropertyDescriptor(
+                DOMParser.prototype, 'parseFromString'
+            );
+            const resizeDescriptors = ['observe', 'unobserve', 'disconnect'].map(name =>
+                Object.getOwnPropertyDescriptor(ResizeObserver.prototype, name)?.enumerable === true
+            );
+
+            return JSON.stringify({
+                domToken:{
+                    sameList,
+                    initialIndex:[
+                        indexDescriptor?.enumerable,
+                        indexDescriptor?.configurable,
+                        indexDescriptor?.writable,
+                        indexDescriptor?.value
+                    ],
+                    replaced,
+                    beforeSet,
+                    afterSet:list.value,
+                    liveKeys:Reflect.ownKeys(list).map(String),
+                    liveValues:Array.from(list.values()),
+                    has0:'0' in list,
+                    tag:Object.prototype.toString.call(list),
+                    ownNames:Object.getOwnPropertyNames(DOMTokenList.prototype).sort().join(','),
+                    ctorLength:DOMTokenList.length,
+                    supportsError
+                },
+                mql:{
+                    keys:Reflect.ownKeys(mql).map(String),
+                    tag:Object.prototype.toString.call(mql),
+                    instance:mql instanceof MediaQueryList,
+                    media:mql.media,
+                    matches:mql.matches,
+                    onchange:mql.onchange,
+                    construct:mqlConstruct,
+                    ctorLength:MediaQueryList.length,
+                    ctorParent:Object.getPrototypeOf(MediaQueryList) === EventTarget,
+                    protoParent:Object.getPrototypeOf(MediaQueryList.prototype) === EventTarget.prototype,
+                    ctorSource:String(MediaQueryList)
+                },
+                parser:[String(DOMParser), parserDescriptor?.enumerable],
+                resizeDescriptors
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"domToken":{"sameList":true,"initialIndex":[true,true,false,"a"],"replaced":true,"beforeSet":"x d","afterSet":"live one two","liveKeys":["0","1","2"],"liveValues":["live","one","two"],"has0":true,"tag":"[object DOMTokenList]","ownNames":"add,constructor,contains,entries,forEach,item,keys,length,remove,replace,supports,toString,toggle,value,values","ctorLength":0,"supportsError":"TypeError"},"mql":{"keys":[],"tag":"[object MediaQueryList]","instance":true,"media":"(min-width: 1px)","matches":true,"onchange":null,"construct":"TypeError:Failed to construct 'MediaQueryList': Illegal constructor","ctorLength":0,"ctorParent":true,"protoParent":true,"ctorSource":"function MediaQueryList() { [native code] }"},"parser":["function DOMParser() { [native code] }",true],"resizeDescriptors":[true,true,true]}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
