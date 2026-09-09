@@ -743,6 +743,80 @@ async fn intersection_observer_surface_matches_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn event_data_subclasses_match_chrome_148() {
+    let result = check(
+        r#"(() => {
+            const promise = Promise.resolve(1);
+            const formData = new FormData();
+            const cases = [
+                ['ProgressEvent', new ProgressEvent('x', {lengthComputable:true,loaded:2,total:3}), ['lengthComputable','loaded','total']],
+                ['ErrorEvent', new ErrorEvent('x', {message:'m',filename:'f',lineno:2,colno:3,error:null}), ['message','filename','lineno','colno','error']],
+                ['PromiseRejectionEvent', new PromiseRejectionEvent('unhandledrejection', {promise,reason:'why'}), ['promise','reason']],
+                ['DragEvent', new DragEvent('drag', {dataTransfer:null}), ['dataTransfer']],
+                ['ClipboardEvent', new ClipboardEvent('copy', {clipboardData:null}), ['clipboardData']],
+                ['SubmitEvent', new SubmitEvent('submit', {submitter:null}), ['submitter']],
+                ['FormDataEvent', new FormDataEvent('formdata', {formData}), ['formData']],
+                ['CloseEvent', new CloseEvent('close', {wasClean:true,code:1000,reason:'bye'}), ['wasClean','code','reason']],
+                ['HashChangeEvent', new HashChangeEvent('hashchange', {oldURL:'a',newURL:'b'}), ['oldURL','newURL']],
+                ['PopStateEvent', new PopStateEvent('popstate', {state:{a:1},hasUAVisualTransition:true}), ['state','hasUAVisualTransition']],
+                ['PageTransitionEvent', new PageTransitionEvent('pageshow', {persisted:true}), ['persisted']],
+                ['SecurityPolicyViolationEvent', new SecurityPolicyViolationEvent('securitypolicyviolation', {
+                    documentURI:'d',referrer:'r',blockedURI:'b',violatedDirective:'v',effectiveDirective:'e',
+                    originalPolicy:'o',sourceFile:'s',sample:'x',disposition:'enforce',statusCode:200,lineNumber:2,columnNumber:3
+                }), ['documentURI','referrer','blockedURI','violatedDirective','effectiveDirective','originalPolicy','sourceFile','sample','disposition','statusCode','lineNumber','columnNumber']]
+            ];
+            const expectedLengths = {
+                ProgressEvent:1, ErrorEvent:1, PromiseRejectionEvent:2,
+                DragEvent:1, ClipboardEvent:1, SubmitEvent:1, FormDataEvent:2,
+                CloseEvent:1, HashChangeEvent:1, PopStateEvent:1,
+                PageTransitionEvent:1, SecurityPolicyViolationEvent:1
+            };
+            const rows = cases.map(([name,event,fields]) => ({
+                name,
+                ctorLength:globalThis[name].length,
+                native:String(globalThis[name]) === `function ${name}() { [native code] }`,
+                own:Reflect.ownKeys(event).map(String),
+                tag:Object.prototype.toString.call(event),
+                event:event instanceof Event,
+                descriptors:fields.every(field => {
+                    const descriptor = Object.getOwnPropertyDescriptor(globalThis[name].prototype, field);
+                    return !!descriptor && descriptor.enumerable === true
+                        && descriptor.configurable === true
+                        && typeof descriptor.get === 'function'
+                        && descriptor.set === undefined;
+                }),
+                lengthOk:globalThis[name].length === expectedLengths[name]
+            }));
+            let beforeUnload = '';
+            try { new BeforeUnloadEvent(); beforeUnload = 'ok'; }
+            catch (error) { beforeUnload = error.name + ':' + error.message; }
+            const pointerDescriptor = Object.getOwnPropertyDescriptor(PointerEvent.prototype, 'getCoalescedEvents');
+            return JSON.stringify({
+                rows,
+                values:{
+                    progress:[cases[0][1].lengthComputable,cases[0][1].loaded,cases[0][1].total],
+                    error:[cases[1][1].message,cases[1][1].filename,cases[1][1].lineno,cases[1][1].colno,cases[1][1].error],
+                    promise:[cases[2][1].promise === promise,cases[2][1].reason],
+                    formData:cases[6][1].formData === formData,
+                    close:[cases[7][1].wasClean,cases[7][1].code,cases[7][1].reason],
+                    hash:[cases[8][1].oldURL,cases[8][1].newURL],
+                    pop:[cases[9][1].state.a,cases[9][1].hasUAVisualTransition],
+                    page:cases[10][1].persisted,
+                    security:[cases[11][1].documentURI,cases[11][1].statusCode,cases[11][1].lineNumber,cases[11][1].columnNumber]
+                },
+                beforeUnload:[BeforeUnloadEvent.length,String(BeforeUnloadEvent),beforeUnload],
+                pointer:[!!pointerDescriptor,pointerDescriptor?.enumerable,PointerEvent.prototype.getCoalescedEvents.length,JSON.stringify(new PointerEvent('x').getCoalescedEvents())]
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"rows":[{"name":"ProgressEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object ProgressEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"ErrorEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object ErrorEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"PromiseRejectionEvent","ctorLength":2,"native":true,"own":["isTrusted"],"tag":"[object PromiseRejectionEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"DragEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object DragEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"ClipboardEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object ClipboardEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"SubmitEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object SubmitEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"FormDataEvent","ctorLength":2,"native":true,"own":["isTrusted"],"tag":"[object FormDataEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"CloseEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object CloseEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"HashChangeEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object HashChangeEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"PopStateEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object PopStateEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"PageTransitionEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object PageTransitionEvent]","event":true,"descriptors":true,"lengthOk":true},{"name":"SecurityPolicyViolationEvent","ctorLength":1,"native":true,"own":["isTrusted"],"tag":"[object SecurityPolicyViolationEvent]","event":true,"descriptors":true,"lengthOk":true}],"values":{"progress":[true,2,3],"error":["m","f",2,3,null],"promise":[true,"why"],"formData":true,"close":[true,1000,"bye"],"hash":["a","b"],"pop":[1,true],"page":true,"security":["d",200,2,3]},"beforeUnload":[0,"function BeforeUnloadEvent() { [native code] }","TypeError:Failed to construct 'BeforeUnloadEvent': Illegal constructor"],"pointer":[true,true,0,"[]"]}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
