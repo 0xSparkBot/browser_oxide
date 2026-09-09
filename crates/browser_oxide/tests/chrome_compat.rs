@@ -482,13 +482,43 @@ async fn webidl_operation_arities_match_chrome_148() {
                 SubtleCrypto.prototype.wrapKey.length
             ],
             mouse:MouseEvent.prototype.initMouseEvent.length,
-            keyboard:KeyboardEvent.prototype.initKeyboardEvent.length
+            keyboard:KeyboardEvent.prototype.initKeyboardEvent.length,
+            eventTarget:[
+                EventTarget.prototype.addEventListener.length,
+                EventTarget.prototype.removeEventListener.length
+            ],
+            eventInitializers:[
+                CustomEvent.prototype.initCustomEvent.length,
+                MessageEvent.prototype.initMessageEvent.length
+            ],
+            constructorLengths:[
+                Node.length, DocumentFragment.length, URL.length,
+                URLSearchParams.length, Worker.length, Response.length
+            ],
+            urlSearchParams:URLSearchParams.prototype.forEach.length,
+            worker:Worker.prototype.postMessage.length,
+            speech:SpeechSynthesis.prototype.speak.length,
+            rtc:[
+                RTCPeerConnection.prototype.addIceCandidate.length,
+                RTCPeerConnection.prototype.addTransceiver.length,
+                RTCPeerConnection.prototype.getStats.length,
+                RTCPeerConnection.prototype.setLocalDescription.length
+            ],
+            history:[
+                History.prototype.go.length,
+                History.prototype.pushState.length,
+                History.prototype.replaceState.length
+            ],
+            performanceObserver:[
+                PerformanceObserver.prototype.observe.length,
+                PerformanceObserverEntryList.prototype.getEntriesByName.length
+            ]
         })"#,
     )
     .await;
     assert_eq!(
         result,
-        r#"{"textEncoder":[0,2],"textDecoder":0,"subtle":[3,2,5,2,3,2,3,5,3,7,4,4],"mouse":1,"keyboard":1}"#
+        r#"{"textEncoder":[0,2],"textDecoder":0,"subtle":[3,2,5,2,3,2,3,5,3,7,4,4],"mouse":1,"keyboard":1,"eventTarget":[2,2],"eventInitializers":[1,1],"constructorLengths":[0,0,1,0,1,0],"urlSearchParams":1,"worker":1,"speech":1,"rtc":[0,1,0,0],"history":[0,2,2],"performanceObserver":[0,1]}"#
     );
 }
 

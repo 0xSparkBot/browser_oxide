@@ -14,6 +14,60 @@
         } catch (_) {}
     };
 
+    const setConstructorLength = (name, length) => {
+        try {
+            const fn = globalThis[name];
+            if (typeof fn !== 'function') return;
+            Object.defineProperty(fn, 'length', {
+                value: length,
+                configurable: true,
+            });
+        } catch (_) {}
+    };
+
+    if (globalThis.EventTarget?.prototype) {
+        setLength(globalThis.EventTarget.prototype, 'addEventListener', 2);
+        setLength(globalThis.EventTarget.prototype, 'removeEventListener', 2);
+    }
+    if (globalThis.CustomEvent?.prototype) {
+        setLength(globalThis.CustomEvent.prototype, 'initCustomEvent', 1);
+    }
+    if (globalThis.MessageEvent?.prototype) {
+        setLength(globalThis.MessageEvent.prototype, 'initMessageEvent', 1);
+    }
+    setConstructorLength('Node', 0);
+    setConstructorLength('DocumentFragment', 0);
+    setConstructorLength('URL', 1);
+    setConstructorLength('URLSearchParams', 0);
+    setConstructorLength('Worker', 1);
+    setConstructorLength('Response', 0);
+    if (globalThis.URLSearchParams?.prototype) {
+        setLength(globalThis.URLSearchParams.prototype, 'forEach', 1);
+    }
+    if (globalThis.Worker?.prototype) {
+        setLength(globalThis.Worker.prototype, 'postMessage', 1);
+    }
+    if (globalThis.SpeechSynthesis?.prototype) {
+        setLength(globalThis.SpeechSynthesis.prototype, 'speak', 1);
+    }
+    if (globalThis.RTCPeerConnection?.prototype) {
+        setLength(globalThis.RTCPeerConnection.prototype, 'addIceCandidate', 0);
+        setLength(globalThis.RTCPeerConnection.prototype, 'addTransceiver', 1);
+        setLength(globalThis.RTCPeerConnection.prototype, 'getStats', 0);
+        setLength(globalThis.RTCPeerConnection.prototype, 'setLocalDescription', 0);
+    }
+    if (globalThis.History?.prototype) {
+        setLength(globalThis.History.prototype, 'go', 0);
+        setLength(globalThis.History.prototype, 'pushState', 2);
+        setLength(globalThis.History.prototype, 'replaceState', 2);
+    }
+    if (globalThis.PerformanceObserver?.prototype) {
+        setLength(globalThis.PerformanceObserver.prototype, 'observe', 0);
+    }
+    if (globalThis.PerformanceObserverEntryList?.prototype) {
+        setLength(globalThis.PerformanceObserverEntryList.prototype, 'getEntriesByName', 1);
+    }
+
     if (globalThis.TextEncoder?.prototype) {
         setLength(globalThis.TextEncoder.prototype, 'encode', 0);
     }
