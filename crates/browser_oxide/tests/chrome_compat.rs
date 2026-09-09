@@ -83,6 +83,142 @@ async fn check_secure(js: &str) -> String {
     page.evaluate(js).unwrap_or_else(|e| format!("ERROR: {e}"))
 }
 
+#[tokio::test]
+async fn canvas_helper_webidl_prototypes_match_chrome() {
+    let result = check(
+        r#"(() => {
+            const names = proto => Object.getOwnPropertyNames(proto).sort().join(',');
+            const method = (proto, name, length) => {
+                const d = Object.getOwnPropertyDescriptor(proto, name);
+                return !!d && d.enumerable === true && d.configurable === true
+                    && d.writable === true && typeof d.value === 'function'
+                    && d.value.name === name && d.value.length === length
+                    && String(d.value) === `function ${name}() { [native code] }`;
+            };
+            const pathMethods = {
+                addPath:1, arc:5, arcTo:5, bezierCurveTo:6, closePath:0,
+                ellipse:7, lineTo:2, moveTo:2, quadraticCurveTo:4,
+                rect:4, roundRect:4
+            };
+            return JSON.stringify({
+                gradientNames:names(CanvasGradient.prototype),
+                gradientMethod:method(CanvasGradient.prototype, 'addColorStop', 2),
+                patternNames:names(CanvasPattern.prototype),
+                patternMethod:method(CanvasPattern.prototype, 'setTransform', 0),
+                pathNames:names(Path2D.prototype),
+                pathMethods:Object.entries(pathMethods).every(([name, length]) =>
+                    method(Path2D.prototype, name, length)),
+                ctorLengths:[CanvasGradient.length, CanvasPattern.length, Path2D.length],
+                tags:[
+                    Object.prototype.toString.call(
+                        document.createElement('canvas').getContext('2d')
+                            .createLinearGradient(0, 0, 1, 1)),
+                    Object.prototype.toString.call(
+                        document.createElement('canvas').getContext('2d')
+                            .createPattern(document.createElement('canvas'), 'repeat')),
+                    Object.prototype.toString.call(new Path2D())
+                ]
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"gradientNames":"addColorStop,constructor","gradientMethod":true,"patternNames":"constructor,setTransform","patternMethod":true,"pathNames":"addPath,arc,arcTo,bezierCurveTo,closePath,constructor,ellipse,lineTo,moveTo,quadraticCurveTo,rect,roundRect","pathMethods":true,"ctorLengths":[0,0,0],"tags":["[object CanvasGradient]","[object CanvasPattern]","[object Path2D]"]}"#
+    );
+}
+
+#[tokio::test]
+async fn offscreen_canvas_webidl_shape_matches_chrome() {
+    let result = check(
+        r#"(() => {
+            const canvas = new OffscreenCanvas(3, 4);
+            const protoNames = Object.getOwnPropertyNames(OffscreenCanvas.prototype)
+                .sort().join(',');
+            const descriptorOk = [
+                ['width', 'accessor', 0, 1],
+                ['height', 'accessor', 0, 1],
+                ['oncontextlost', 'accessor', 0, 1],
+                ['oncontextrestored', 'accessor', 0, 1],
+                ['getContext', 'method', 1, 0],
+                ['transferToImageBitmap', 'method', 0, 0],
+                ['convertToBlob', 'method', 0, 0]
+            ].every(([name, kind, a, b]) => {
+                const d = Object.getOwnPropertyDescriptor(OffscreenCanvas.prototype, name);
+                if (!d || d.enumerable !== true || d.configurable !== true) return false;
+                if (kind === 'method') {
+                    return d.writable === true && typeof d.value === 'function'
+                        && d.value.length === a
+                        && String(d.value) === `function ${name}() { [native code] }`;
+                }
+                return typeof d.get === 'function' && d.get.length === a
+                    && typeof d.set === 'function' && d.set.length === b
+                    && String(d.get) === `function get ${name}() { [native code] }`
+                    && String(d.set) === `function set ${name}() { [native code] }`;
+            });
+            const beforeKeys = Reflect.ownKeys(canvas).map(String);
+            canvas.getContext('2d');
+            canvas.getContext('webgl');
+            const afterKeys = Reflect.ownKeys(canvas).map(String);
+            const bitmap = canvas.transferToImageBitmap();
+            return JSON.stringify({
+                ctorLength:OffscreenCanvas.length,
+                protoNames,
+                descriptorOk,
+                beforeKeys,
+                afterKeys,
+                tag:Object.prototype.toString.call(canvas),
+                bitmapTag:Object.prototype.toString.call(bitmap),
+                bitmapInstance:bitmap instanceof ImageBitmap,
+                bitmapKeys:Reflect.ownKeys(bitmap).map(String),
+                bitmapSize:[bitmap.width, bitmap.height]
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"ctorLength":2,"protoNames":"constructor,convertToBlob,getContext,height,oncontextlost,oncontextrestored,transferToImageBitmap,width","descriptorOk":true,"beforeKeys":[],"afterKeys":[],"tag":"[object OffscreenCanvas]","bitmapTag":"[object ImageBitmap]","bitmapInstance":true,"bitmapKeys":[],"bitmapSize":[3,4]}"#
+    );
+}
+
+#[tokio::test]
+async fn image_data_webidl_shape_matches_chrome() {
+    let result = check(
+        r#"(() => {
+            const image = new ImageData(2, 3);
+            const dataDescriptor = Object.getOwnPropertyDescriptor(image, 'data');
+            const accessors = ['data', 'width', 'height', 'colorSpace', 'pixelFormat']
+                .every(name => {
+                    const d = Object.getOwnPropertyDescriptor(ImageData.prototype, name);
+                    return !!d && d.enumerable === true && d.configurable === true
+                        && typeof d.get === 'function' && d.get.length === 0
+                        && d.set === undefined
+                        && String(d.get) === `function get ${name}() { [native code] }`;
+                });
+            return JSON.stringify({
+                ctorLength:ImageData.length,
+                protoNames:Object.getOwnPropertyNames(ImageData.prototype).sort().join(','),
+                accessors,
+                ownKeys:Reflect.ownKeys(image).map(String),
+                dataDescriptor:[
+                    dataDescriptor.enumerable,
+                    dataDescriptor.configurable,
+                    dataDescriptor.writable
+                ],
+                tag:Object.prototype.toString.call(image),
+                dataTag:Object.prototype.toString.call(image.data),
+                values:[image.data.length, image.width, image.height, image.colorSpace, image.pixelFormat]
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"ctorLength":2,"protoNames":"colorSpace,constructor,data,height,pixelFormat,width","accessors":true,"ownKeys":["data"],"dataDescriptor":[true,true,false],"tag":"[object ImageData]","dataTag":"[object Uint8ClampedArray]","values":[24,2,3,"srgb","rgba-unorm8"]}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
