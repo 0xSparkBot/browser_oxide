@@ -3336,11 +3336,13 @@
             static CONNECTING = 0;
             static OPEN = 1;
             static CLOSED = 2;
-            constructor(url) {
+            constructor(url, options = {}) {
                 super();
-                this.url = String(url);
-                this.readyState = 0;
-                this.withCredentials = false;
+                Object.defineProperties(this, {
+                    url: { value: String(url), writable: true, enumerable: true, configurable: true },
+                    readyState: { value: 0, writable: true, enumerable: true, configurable: true },
+                    withCredentials: { value: !!options.withCredentials, writable: true, enumerable: true, configurable: true },
+                });
                 this.onopen = null;
                 this.onmessage = null;
                 this.onerror = null;
@@ -5046,14 +5048,16 @@
     globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
         constructor() {
             super();
-            this.readyState = 0;
-            this.status = 0;
-            this.statusText = "";
-            this.responseText = "";
-            this.responseXML = null;
-            this.response = "";
+            Object.defineProperties(this, {
+                readyState: { value: 0, writable: true, enumerable: true, configurable: true },
+                status: { value: 0, writable: true, enumerable: true, configurable: true },
+                statusText: { value: "", writable: true, enumerable: true, configurable: true },
+                responseText: { value: "", writable: true, enumerable: true, configurable: true },
+                responseXML: { value: null, writable: true, enumerable: true, configurable: true },
+                response: { value: "", writable: true, enumerable: true, configurable: true },
+                responseURL: { value: "", writable: true, enumerable: true, configurable: true },
+            });
             this.responseType = "";
-            this.responseURL = "";
             this.withCredentials = false;
             this.timeout = 0;
             this._method = "GET";
@@ -5085,7 +5089,9 @@
                 }
             };
             Object.defineProperty(_XHRU.prototype, Symbol.toStringTag, { value: "XMLHttpRequestUpload", configurable: true });
-            this.upload = new _XHRU();
+            Object.defineProperty(this, 'upload', {
+                value: new _XHRU(), writable: true, enumerable: true, configurable: true,
+            });
         }
         static UNSENT = 0;
         static OPENED = 1;
@@ -5297,7 +5303,28 @@
     };
     Object.defineProperty(globalThis.XMLHttpRequest.prototype, Symbol.toStringTag, { value: "XMLHttpRequest", configurable: true });
 
-    // WebSocket — real connections via tokio-tungstenite ops
+    // WebSocket — real connections via tokio-tungstenite ops. Keep the
+    // receive pump in closure-private code: Chromium does not expose an
+    // engine helper such as `_pollMessages` on WebSocket.prototype.
+    async function _pollWebSocketMessages(socket) {
+        while (socket.readyState === WebSocket.OPEN && socket._wsId >= 0) {
+            try {
+                const msg = await ops.op_ws_recv(socket._wsId);
+                if (!msg && msg !== "") {
+                    socket.readyState = WebSocket.CLOSED;
+                    if (socket.onclose) socket.onclose(new CloseEvent("close", { code: 1000 }));
+                    break;
+                }
+                if (msg !== "" && socket.onmessage) {
+                    socket.onmessage(new MessageEvent("message", { data: msg }));
+                }
+            } catch (e) {
+                socket.readyState = WebSocket.CLOSED;
+                if (socket.onerror) socket.onerror(new Event("error"));
+                break;
+            }
+        }
+    }
     globalThis.WebSocket = class WebSocket extends EventTarget {
         static CONNECTING = 0;
         static OPEN = 1;
@@ -5305,8 +5332,10 @@
         static CLOSED = 3;
         constructor(url, protocols) {
             super();
-            this.url = url;
-            this.readyState = WebSocket.CONNECTING;
+            Object.defineProperties(this, {
+                url: { value: url, writable: true, enumerable: true, configurable: true },
+                readyState: { value: WebSocket.CONNECTING, writable: true, enumerable: true, configurable: true },
+            });
             this.onopen = null;
             this.onmessage = null;
             this.onclose = null;
@@ -5320,7 +5349,7 @@
                     this.readyState = WebSocket.OPEN;
                     if (this.onopen) this.onopen(new Event("open"));
                     // Start receive loop
-                    this._pollMessages();
+                    _pollWebSocketMessages(this);
                 } else {
                     this.readyState = WebSocket.CLOSED;
                     if (this.onerror) this.onerror(new Event("error"));
@@ -5330,26 +5359,6 @@
                 this.readyState = WebSocket.CLOSED;
                 if (this.onerror) this.onerror(new Event("error"));
             });
-        }
-        async _pollMessages() {
-            while (this.readyState === WebSocket.OPEN && this._wsId >= 0) {
-                try {
-                    const msg = await ops.op_ws_recv(this._wsId);
-                    if (!msg && msg !== "") {
-                        // Connection closed
-                        this.readyState = WebSocket.CLOSED;
-                        if (this.onclose) this.onclose(new CloseEvent("close", { code: 1000 }));
-                        break;
-                    }
-                    if (msg !== "" && this.onmessage) {
-                        this.onmessage(new MessageEvent("message", { data: msg }));
-                    }
-                } catch (e) {
-                    this.readyState = WebSocket.CLOSED;
-                    if (this.onerror) this.onerror(new Event("error"));
-                    break;
-                }
-            }
         }
         send(data) {
             if (this.readyState === WebSocket.OPEN && this._wsId >= 0) {

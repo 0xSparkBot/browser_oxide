@@ -2849,6 +2849,152 @@ async fn xhr_dispatches_onreadystatechange_once_per_transition() {
         "[1,1,1]"
     );
 }
+
+#[tokio::test]
+async fn network_webidl_instances_match_chrome_shape() {
+    let result = check(
+        r#"(() => {
+            const xhr = new XMLHttpRequest();
+            let listenerCalls = 0;
+            xhr.addEventListener('readystatechange', () => listenerCalls++);
+            const readyHandler = () => {};
+            xhr.onreadystatechange = readyHandler;
+            const initialStatus = xhr.status;
+            xhr.status = 99;
+            xhr.open('GET', '/probe', true);
+
+            const source = new EventSource('/events', { withCredentials: true });
+            const sourceHandler = () => {};
+            source.onmessage = sourceHandler;
+            source.readyState = 99;
+            source.close();
+
+            const socket = new WebSocket('ws://127.0.0.1:9/');
+            const socketHandler = () => {};
+            socket.onmessage = socketHandler;
+            const socketState = socket.readyState;
+            socket.readyState = 99;
+
+            const construction = fn => {
+                try { fn(); return 'ok'; }
+                catch (error) { return error.name + ':' + error.message; }
+            };
+
+            return JSON.stringify({
+                xhr: {
+                    own: Reflect.ownKeys(xhr).map(String),
+                    tag: Object.prototype.toString.call(xhr),
+                    instance: xhr instanceof XMLHttpRequest,
+                    eventTarget: xhr instanceof XMLHttpRequestEventTarget,
+                    genericTarget: xhr instanceof EventTarget,
+                    proto: Object.getPrototypeOf(XMLHttpRequest.prototype)
+                        === XMLHttpRequestEventTarget.prototype,
+                    eventProto: Object.getPrototypeOf(XMLHttpRequestEventTarget.prototype)
+                        === EventTarget.prototype,
+                    readyState: xhr.readyState,
+                    listenerCalls,
+                    handler: xhr.onreadystatechange === readyHandler,
+                    readonlyStatus: xhr.status === initialStatus,
+                    directGetter: Object.getOwnPropertyDescriptor(
+                        XMLHttpRequest.prototype, 'readyState').get.call(xhr),
+                    upload: {
+                        own: Reflect.ownKeys(xhr.upload).map(String),
+                        tag: Object.prototype.toString.call(xhr.upload),
+                        upload: xhr.upload instanceof XMLHttpRequestUpload,
+                        eventTarget: xhr.upload instanceof XMLHttpRequestEventTarget,
+                        genericTarget: xhr.upload instanceof EventTarget,
+                    },
+                },
+                source: {
+                    own: Reflect.ownKeys(source).map(String),
+                    tag: Object.prototype.toString.call(source),
+                    target: source instanceof EventTarget,
+                    credentials: source.withCredentials,
+                    handler: source.onmessage === sourceHandler,
+                    closed: source.readyState === EventSource.CLOSED,
+                },
+                socket: {
+                    own: Reflect.ownKeys(socket).map(String),
+                    tag: Object.prototype.toString.call(socket),
+                    target: socket instanceof EventTarget,
+                    handler: socket.onmessage === socketHandler,
+                    readonlyState: socket.readyState === socketState,
+                },
+                construction: {
+                    wsMissing: construction(() => new WebSocket()),
+                    wsCall: construction(() => WebSocket('ws://127.0.0.1:9/')),
+                    sourceMissing: construction(() => new EventSource()),
+                    sourceCall: construction(() => EventSource('/events')),
+                    xhrCall: construction(() => XMLHttpRequest()),
+                    xhrEventTarget: construction(() => new XMLHttpRequestEventTarget()),
+                    xhrUpload: construction(() => new XMLHttpRequestUpload()),
+                },
+            });
+        })()"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["xhr"]["own"], serde_json::json!([]));
+    assert_eq!(value["xhr"]["tag"], "[object XMLHttpRequest]");
+    assert_eq!(value["xhr"]["instance"], true);
+    assert_eq!(value["xhr"]["eventTarget"], true);
+    assert_eq!(value["xhr"]["genericTarget"], true);
+    assert_eq!(value["xhr"]["proto"], true);
+    assert_eq!(value["xhr"]["eventProto"], true);
+    assert_eq!(value["xhr"]["readyState"], 1);
+    assert_eq!(value["xhr"]["listenerCalls"], 1);
+    assert_eq!(value["xhr"]["handler"], true);
+    assert_eq!(value["xhr"]["readonlyStatus"], true);
+    assert_eq!(value["xhr"]["directGetter"], 1);
+    assert_eq!(value["xhr"]["upload"]["own"], serde_json::json!([]));
+    assert_eq!(
+        value["xhr"]["upload"]["tag"],
+        "[object XMLHttpRequestUpload]"
+    );
+    assert_eq!(value["xhr"]["upload"]["upload"], true);
+    assert_eq!(value["xhr"]["upload"]["eventTarget"], true);
+    assert_eq!(value["xhr"]["upload"]["genericTarget"], true);
+    assert_eq!(value["source"]["own"], serde_json::json!([]));
+    assert_eq!(value["source"]["tag"], "[object EventSource]");
+    assert_eq!(value["source"]["target"], true);
+    assert_eq!(value["source"]["credentials"], true);
+    assert_eq!(value["source"]["handler"], true);
+    assert_eq!(value["source"]["closed"], true);
+    assert_eq!(value["socket"]["own"], serde_json::json!([]));
+    assert_eq!(value["socket"]["tag"], "[object WebSocket]");
+    assert_eq!(value["socket"]["target"], true);
+    assert_eq!(value["socket"]["handler"], true);
+    assert_eq!(value["socket"]["readonlyState"], true);
+    assert_eq!(
+        value["construction"]["wsMissing"],
+        "TypeError:Failed to construct 'WebSocket': 1 argument required, but only 0 present."
+    );
+    assert_eq!(
+        value["construction"]["sourceMissing"],
+        "TypeError:Failed to construct 'EventSource': 1 argument required, but only 0 present."
+    );
+    assert!(value["construction"]["wsCall"]
+        .as_str()
+        .unwrap()
+        .contains("Please use the 'new' operator"));
+    assert!(value["construction"]["sourceCall"]
+        .as_str()
+        .unwrap()
+        .contains("Please use the 'new' operator"));
+    assert!(value["construction"]["xhrCall"]
+        .as_str()
+        .unwrap()
+        .contains("Please use the 'new' operator"));
+    assert!(value["construction"]["xhrEventTarget"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert!(value["construction"]["xhrUpload"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+}
+
 #[tokio::test]
 async fn cls_websocket() {
     assert_eq!(check("typeof WebSocket").await, "function");
