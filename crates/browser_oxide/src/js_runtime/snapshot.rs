@@ -165,6 +165,8 @@ pub fn get_snapshot() -> &'static [u8] {
             "\n",
             include_str!("js/traversal_bootstrap.js"),
             "\n",
+            include_str!("js/attributes_bootstrap.js"),
+            "\n",
             include_str!("js/structured_clone.js"),
         );
 

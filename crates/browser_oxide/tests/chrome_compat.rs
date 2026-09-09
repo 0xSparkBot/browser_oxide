@@ -602,6 +602,90 @@ async fn dom_traversal_matches_chrome_148() {
     );
 }
 
+#[tokio::test]
+async fn attr_and_named_node_map_match_chrome_148() {
+    let result = check(
+        r#"(() => {
+            const element = document.createElement('div');
+            element.setAttribute('id', 'x');
+            element.setAttribute('data-a', '1');
+            const attrs = element.attributes;
+            const first = attrs.item(0);
+            const indexDescriptor = Object.getOwnPropertyDescriptor(attrs, '0');
+            const namedDescriptor = Object.getOwnPropertyDescriptor(attrs, 'id');
+
+            const created = document.createAttribute('title');
+            created.value = 'hello';
+            const replaced = attrs.setNamedItem(created);
+            const afterSet = element.getAttribute('title');
+            const removed = attrs.removeNamedItem('title');
+
+            let attrCtor = '', mapCtor = '';
+            try { new Attr(); attrCtor = 'ok'; }
+            catch (error) { attrCtor = error.name + ':' + error.message; }
+            try { new NamedNodeMap(); mapCtor = 'ok'; }
+            catch (error) { mapCtor = error.name + ':' + error.message; }
+
+            return JSON.stringify({
+                map:{
+                    same:attrs === element.attributes,
+                    tag:Object.prototype.toString.call(attrs),
+                    instance:attrs instanceof NamedNodeMap,
+                    keys:Reflect.ownKeys(attrs).map(String),
+                    objectKeys:Object.keys(attrs),
+                    length:attrs.length,
+                    indexDescriptor:indexDescriptor && [
+                        indexDescriptor.enumerable,
+                        indexDescriptor.configurable,
+                        indexDescriptor.writable,
+                        Object.prototype.toString.call(indexDescriptor.value)
+                    ],
+                    namedDescriptor:namedDescriptor && [
+                        namedDescriptor.enumerable,
+                        namedDescriptor.configurable,
+                        namedDescriptor.writable,
+                        Object.prototype.toString.call(namedDescriptor.value)
+                    ]
+                },
+                attr:{
+                    tag:Object.prototype.toString.call(first),
+                    instance:first instanceof Attr,
+                    node:first instanceof Node,
+                    keys:Reflect.ownKeys(first).map(String),
+                    nodeType:first.nodeType,
+                    nodeName:first.nodeName,
+                    textContent:first.textContent,
+                    parentNode:first.parentNode,
+                    name:first.name,
+                    localName:first.localName,
+                    namespaceURI:first.namespaceURI,
+                    prefix:first.prefix,
+                    owner:first.ownerElement === element,
+                    specified:first.specified,
+                    value:first.value,
+                    stable:first === attrs.getNamedItem(first.name)
+                },
+                constructors:{
+                    attr:[Attr.length, String(Attr), attrCtor],
+                    map:[NamedNodeMap.length, String(NamedNodeMap), mapCtor],
+                    attrProtoNode:Object.getPrototypeOf(Attr.prototype) === Node.prototype
+                },
+                mutations:{
+                    replaced:replaced === null,
+                    afterSet,
+                    removedTag:Object.prototype.toString.call(removed),
+                    detached:created.ownerElement === null
+                }
+            });
+        })()"#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        r#"{"map":{"same":true,"tag":"[object NamedNodeMap]","instance":true,"keys":["0","1","id","data-a"],"objectKeys":["0","1"],"length":2,"indexDescriptor":[true,true,false,"[object Attr]"],"namedDescriptor":[false,true,false,"[object Attr]"]},"attr":{"tag":"[object Attr]","instance":true,"node":true,"keys":[],"nodeType":2,"nodeName":"id","textContent":"x","parentNode":null,"name":"id","localName":"id","namespaceURI":null,"prefix":null,"owner":true,"specified":true,"value":"x","stable":true},"constructors":{"attr":[0,"function Attr() { [native code] }","TypeError:Failed to construct 'Attr': Illegal constructor"],"map":[0,"function NamedNodeMap() { [native code] }","TypeError:Failed to construct 'NamedNodeMap': Illegal constructor"],"attrProtoNode":true},"mutations":{"replaced":true,"afterSet":"hello","removedTag":"[object Attr]","detached":true}}"#
+    );
+}
+
 // ================================================================
 // Window globals
 // ================================================================
