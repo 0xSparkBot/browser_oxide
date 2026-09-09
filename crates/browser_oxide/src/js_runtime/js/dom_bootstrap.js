@@ -744,6 +744,36 @@
     const _collectionIndex = (prop) => typeof prop === "string" && /^(0|[1-9]\d*)$/.test(prop);
     const _collectionState = new WeakMap();
 
+    function _refreshCollection(collection, explicitData) {
+        const state = _collectionState.get(collection);
+        if (!state || (explicitData === undefined && !state.source)) return;
+        const data = explicitData === undefined && state.source ? state.source() : (explicitData || []);
+        for (let i = 0; i < state.ids.length; i++) delete collection[i];
+        state.ids = [];
+        const defineIndex = (index, value) => {
+            Object.defineProperty(collection, String(index), {
+                value,
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            });
+        };
+        if (state.mode === 1) {
+            for (let i = 0; i < data.length; i += 2) {
+                const id = data[i];
+                state.ids.push(id);
+                defineIndex(i / 2, _wrapNodeWithType(id, data[i + 1]));
+            }
+        } else {
+            state.ids = data.slice ? data.slice() : Array.from(data || []);
+            for (let i = 0; i < state.ids.length; i++) {
+                defineIndex(i, state.mode === 2
+                    ? _wrapNodeWithType(state.ids[i], 1)
+                    : _wrapNode(state.ids[i]));
+            }
+        }
+    }
+
     class NodeList {
         constructor(data, mode = 0) {
             const state = {
@@ -752,47 +782,27 @@
                 ids: [],
             };
             _collectionState.set(this, state);
-            this._refresh(state.source ? undefined : data);
+            _refreshCollection(this, state.source ? undefined : data);
             if (!state.source) return;
             const proxy = new Proxy(this, {
                 get(target, prop, receiver) {
-                    if (prop === "length" || _collectionIndex(prop)) target._refresh();
+                    if (prop === "length" || _collectionIndex(prop)) _refreshCollection(target);
                     return Reflect.get(target, prop, receiver);
                 },
-                ownKeys(target) { target._refresh(); return Reflect.ownKeys(target); },
+                ownKeys(target) { _refreshCollection(target); return Reflect.ownKeys(target); },
                 getOwnPropertyDescriptor(target, prop) {
-                    if (_collectionIndex(prop)) target._refresh();
+                    if (_collectionIndex(prop)) _refreshCollection(target);
                     return Reflect.getOwnPropertyDescriptor(target, prop);
                 },
             });
             _collectionState.set(proxy, state);
             return proxy;
         }
-        _refresh(explicitData) {
-            const state = _collectionState.get(this);
-            if (!state || (explicitData === undefined && !state.source)) return;
-            const data = explicitData === undefined && state.source ? state.source() : (explicitData || []);
-            for (let i = 0; i < state.ids.length; i++) delete this[i];
-            state.ids = [];
-            if (state.mode === 1) {
-                for (let i = 0; i < data.length; i += 2) {
-                    const id = data[i];
-                    state.ids.push(id);
-                    this[i / 2] = _wrapNodeWithType(id, data[i + 1]);
-                }
-            } else {
-                state.ids = data.slice ? data.slice() : Array.from(data || []);
-                for (let i = 0; i < state.ids.length; i++) {
-                    this[i] = state.mode === 2
-                        ? _wrapNodeWithType(state.ids[i], 1)
-                        : _wrapNode(state.ids[i]);
-                }
-            }
-        }
-        get length() { this._refresh(); return (_collectionState.get(this)?.ids || []).length; }
-        item(index) { this._refresh(); const ids = _collectionState.get(this)?.ids || []; return index < ids.length ? this[index] : null; }
-        forEach(cb, thisArg) {
-            this._refresh();
+        get length() { _refreshCollection(this); return (_collectionState.get(this)?.ids || []).length; }
+        item(index) { _refreshCollection(this); const ids = _collectionState.get(this)?.ids || []; return index < ids.length ? this[index] : null; }
+        forEach(cb) {
+            const thisArg = arguments[1];
+            _refreshCollection(this);
             const ids = _collectionState.get(this)?.ids || [];
             for (let i = 0; i < ids.length; i++) cb.call(thisArg, this[i], i, this);
         }
@@ -806,8 +816,7 @@
             let i = 0;
             return { next() { return i < self.length ? { value: i++, done: false } : { done: true }; }, [Symbol.iterator]() { return this; } };
         }
-        values() { return this[Symbol.iterator](); }
-        [Symbol.iterator]() {
+        values() {
             let i = 0;
             const self = this;
             return {
@@ -819,6 +828,11 @@
             };
         }
     }
+    Object.defineProperty(NodeList.prototype, Symbol.iterator, {
+        value: NodeList.prototype.values,
+        writable: true,
+        configurable: true,
+    });
 
     class HTMLCollection {
         constructor(data, mode = 0) {
@@ -828,56 +842,80 @@
                 ids: [],
             };
             _collectionState.set(this, state);
-            this._refresh(state.source ? undefined : data);
-            if (!state.source) return;
+            _refreshCollection(this, state.source ? undefined : data);
             const proxy = new Proxy(this, {
                 get(target, prop, receiver) {
-                    if (prop === "length" || _collectionIndex(prop)) target._refresh();
-                    return Reflect.get(target, prop, receiver);
+                    if (prop === "length" || _collectionIndex(prop)) _refreshCollection(target);
+                    const ordinary = Reflect.get(target, prop, receiver);
+                    if (ordinary !== undefined || typeof prop !== "string" || _collectionIndex(prop)) return ordinary;
+                    return _htmlCollectionNamedItem(target, prop) ?? undefined;
                 },
-                ownKeys(target) { target._refresh(); return Reflect.ownKeys(target); },
+                has(target, prop) {
+                    if (Reflect.has(target, prop)) return true;
+                    return typeof prop === "string" && !_collectionIndex(prop)
+                        ? _htmlCollectionNamedItem(target, prop) !== null
+                        : false;
+                },
+                ownKeys(target) {
+                    _refreshCollection(target);
+                    const keys = Reflect.ownKeys(target);
+                    for (const name of _htmlCollectionSupportedNames(target)) {
+                        if (!keys.includes(name) && !Reflect.has(target, name)) keys.push(name);
+                    }
+                    return keys;
+                },
                 getOwnPropertyDescriptor(target, prop) {
-                    if (_collectionIndex(prop)) target._refresh();
-                    return Reflect.getOwnPropertyDescriptor(target, prop);
+                    if (_collectionIndex(prop)) _refreshCollection(target);
+                    const ordinary = Reflect.getOwnPropertyDescriptor(target, prop);
+                    if (ordinary) return ordinary;
+                    if (typeof prop === "string" && !_collectionIndex(prop) && !Reflect.has(target, prop)) {
+                        const value = _htmlCollectionNamedItem(target, prop);
+                        if (value !== null) {
+                            return { value, writable: false, enumerable: false, configurable: true };
+                        }
+                    }
+                    return undefined;
                 },
             });
             _collectionState.set(proxy, state);
             return proxy;
         }
-        _refresh(explicitData) {
-            const state = _collectionState.get(this);
-            if (!state || (explicitData === undefined && !state.source)) return;
-            const data = explicitData === undefined && state.source ? state.source() : (explicitData || []);
-            for (let i = 0; i < state.ids.length; i++) delete this[i];
-            state.ids = [];
-            if (state.mode === 1) {
-                for (let i = 0; i < data.length; i += 2) {
-                    const id = data[i];
-                    state.ids.push(id);
-                    this[i / 2] = _wrapNodeWithType(id, data[i + 1]);
-                }
-            } else {
-                state.ids = data.slice ? data.slice() : Array.from(data || []);
-                for (let i = 0; i < state.ids.length; i++) {
-                    this[i] = state.mode === 2
-                        ? _wrapNodeWithType(state.ids[i], 1)
-                        : _wrapNode(state.ids[i]);
-                }
+        get length() { _refreshCollection(this); return (_collectionState.get(this)?.ids || []).length; }
+        item(index) { _refreshCollection(this); const ids = _collectionState.get(this)?.ids || []; return index >= 0 && index < ids.length ? this[index] : null; }
+        namedItem(name) { return _htmlCollectionNamedItem(this, String(name)); }
+    }
+
+    function _htmlCollectionNamedItem(collection, wanted) {
+        _refreshCollection(collection);
+        const ids = _collectionState.get(collection)?.ids || [];
+        for (let i = 0; i < ids.length; i++) {
+            const el = collection[i];
+            if (!el) continue;
+            if (String(el.id || "") === wanted) return el;
+            if (String(el.getAttribute?.("name") || "") === wanted) return el;
+        }
+        return null;
+    }
+
+    function _htmlCollectionSupportedNames(collection) {
+        _refreshCollection(collection);
+        const ids = _collectionState.get(collection)?.ids || [];
+        const names = [];
+        const seen = new Set();
+        for (let i = 0; i < ids.length; i++) {
+            const el = collection[i];
+            if (!el) continue;
+            for (const candidate of [String(el.id || ""), String(el.getAttribute?.("name") || "")]) {
+                if (!candidate || seen.has(candidate)) continue;
+                seen.add(candidate);
+                names.push(candidate);
             }
         }
-        get length() { this._refresh(); return (_collectionState.get(this)?.ids || []).length; }
-        item(index) { this._refresh(); const ids = _collectionState.get(this)?.ids || []; return index >= 0 && index < ids.length ? this[index] : null; }
-        namedItem(name) {
-            this._refresh();
-            const ids = _collectionState.get(this)?.ids || [];
-            const wanted = String(name);
-            for (let i = 0; i < ids.length; i++) {
-                const el = this[i];
-                if (el && (el.id === wanted || el.getAttribute?.("name") === wanted)) return el;
-            }
-            return null;
-        }
-        [Symbol.iterator]() {
+        return names;
+    }
+
+    const _htmlCollectionValues = {
+        values() {
             let i = 0;
             const self = this;
             return {
@@ -888,8 +926,13 @@
                 },
                 [Symbol.iterator]() { return this; },
             };
-        }
-    }
+        },
+    }.values;
+    Object.defineProperty(HTMLCollection.prototype, Symbol.iterator, {
+        value: _htmlCollectionValues,
+        writable: true,
+        configurable: true,
+    });
 
     Object.defineProperty(NodeList.prototype, Symbol.toStringTag, {
         value: "NodeList",
@@ -899,6 +942,17 @@
         value: "HTMLCollection",
         configurable: true,
     });
+
+    Object.defineProperty(NodeList, "length", { value: 0, configurable: true });
+    Object.defineProperty(HTMLCollection, "length", { value: 0, configurable: true });
+    for (const name of ["length", "item", "forEach", "entries", "keys", "values"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(NodeList.prototype, name);
+        if (descriptor) Object.defineProperty(NodeList.prototype, name, { ...descriptor, enumerable: true });
+    }
+    for (const name of ["length", "item", "namedItem"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLCollection.prototype, name);
+        if (descriptor) Object.defineProperty(HTMLCollection.prototype, name, { ...descriptor, enumerable: true });
+    }
 
     class DOMTokenList {
         #nodeId;
@@ -3629,8 +3683,28 @@
     globalThis.DocumentFragment = DocumentFragment;
     globalThis.ShadowRoot = ShadowRoot;
     globalThis.Document = Document;
-    globalThis.NodeList = NodeList;
-    globalThis.HTMLCollection = HTMLCollection;
+    const _NodeListPublic = function NodeList() {
+        throw new TypeError("Failed to construct 'NodeList': Illegal constructor");
+    };
+    const _HTMLCollectionPublic = function HTMLCollection() {
+        throw new TypeError("Failed to construct 'HTMLCollection': Illegal constructor");
+    };
+    Object.defineProperty(_NodeListPublic, "prototype", { value: NodeList.prototype });
+    Object.defineProperty(_HTMLCollectionPublic, "prototype", { value: HTMLCollection.prototype });
+    Object.defineProperty(NodeList.prototype, "constructor", {
+        value: _NodeListPublic,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+    Object.defineProperty(HTMLCollection.prototype, "constructor", {
+        value: _HTMLCollectionPublic,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+    globalThis.NodeList = _NodeListPublic;
+    globalThis.HTMLCollection = _HTMLCollectionPublic;
     globalThis.DOMTokenList = DOMTokenList;
     globalThis.DOMRect = DOMRect;
     globalThis.DOMRectReadOnly = DOMRect;

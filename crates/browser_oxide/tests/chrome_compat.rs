@@ -54,6 +54,69 @@ async fn window_named_properties_match_chrome_element_and_frame_lookup() {
     assert_eq!(dynamic, "true");
 }
 
+#[tokio::test]
+async fn dom_collections_match_chrome_legacy_platform_object_shape() {
+    let mut page = Page::from_html_with_url(
+        "<!doctype html><html><body><div id='a' name='n1'></div><span id='b'></span></body></html>",
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    let result = page
+        .evaluate(
+            r#"(() => {
+                const nodes = document.body.childNodes;
+                const elements = document.body.children;
+                let nodeCtor, htmlCtor;
+                try { new NodeList(); nodeCtor = 'ok'; }
+                catch (e) { nodeCtor = e.name + ':' + e.message; }
+                try { new HTMLCollection(); htmlCtor = 'ok'; }
+                catch (e) { htmlCtor = e.name + ':' + e.message; }
+                const zero = Object.getOwnPropertyDescriptor(nodes, '0');
+                const named = Object.getOwnPropertyDescriptor(elements, 'a');
+                const em = document.createElement('em');
+                em.id = 'later';
+                document.body.appendChild(em);
+                return JSON.stringify({
+                    nodeCtor,
+                    htmlCtor,
+                    nodeKeys: Object.keys(nodes),
+                    htmlKeys: Object.keys(elements),
+                    nodeZero: zero && [zero.enumerable, zero.configurable, zero.writable],
+                    namedA: named && [named.enumerable, named.configurable, named.writable],
+                    namedIdentity: elements.a === document.getElementById('a')
+                        && elements.n1 === document.getElementById('a'),
+                    later: elements.later === em,
+                    iteratorSame: NodeList.prototype[Symbol.iterator] === NodeList.prototype.values,
+                    iteratorName: NodeList.prototype[Symbol.iterator].name,
+                    forEachLength: NodeList.prototype.forEach.length,
+                    nodeLength: nodes.length,
+                    htmlLength: elements.length,
+                });
+            })()"#,
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        value["nodeCtor"],
+        "TypeError:Failed to construct 'NodeList': Illegal constructor"
+    );
+    assert_eq!(
+        value["htmlCtor"],
+        "TypeError:Failed to construct 'HTMLCollection': Illegal constructor"
+    );
+    assert_eq!(value["nodeZero"], serde_json::json!([true, true, false]));
+    assert_eq!(value["namedA"], serde_json::json!([false, true, false]));
+    assert_eq!(value["namedIdentity"], true);
+    assert_eq!(value["later"], true);
+    assert_eq!(value["iteratorSame"], true);
+    assert_eq!(value["iteratorName"], "values");
+    assert_eq!(value["forEachLength"], 1);
+    assert_eq!(value["nodeLength"], 3);
+    assert_eq!(value["htmlLength"], 3);
+}
+
 fn html(body: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head></head><body>{}</body></html>",
