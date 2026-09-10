@@ -185,10 +185,11 @@ fn matches_simple<E: Element>(element: &E, simple: &SimpleSelector, scope: Optio
             case_sensitivity,
         } => match_attribute(element, name, operator, value, case_sensitivity),
         SimpleSelector::PseudoClass(pc) => matches_pseudo_class(element, pc, scope),
-        SimpleSelector::PseudoElement(_) => {
-            // Pseudo-elements don't affect element matching in querySelectorAll
-            true
-        }
+        // Pseudo-element selectors are valid selector syntax, but DOM selector
+        // APIs only return real Elements. Chrome therefore parses `::before`
+        // successfully while `querySelector`, `matches`, and `closest` never
+        // match an Element for it.
+        SimpleSelector::PseudoElement(_) => false,
         SimpleSelector::Nesting => {
             // `&` in matching context: depends on outer context.
             // For standalone matching, treat as universal.

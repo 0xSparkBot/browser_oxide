@@ -51,6 +51,27 @@ async fn scope_selector_matches_document_and_element_semantics() {
 }
 
 #[tokio::test]
+async fn pseudo_elements_parse_but_never_match_dom_elements() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<html><body><div id="target"></div></body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    assert_eq!(
+        rt.execute_script(
+            r#"JSON.stringify({
+                q: document.querySelector('html::before') === null,
+                qa: document.querySelectorAll('html::before').length,
+                m: document.documentElement.matches('html::before'),
+                c: document.documentElement.closest('html::before') === null
+            })"#,
+            None,
+        )
+        .unwrap(),
+        r#"{"q":true,"qa":0,"m":false,"c":true}"#
+    );
+}
+
+#[tokio::test]
 async fn module_evaluation_does_not_wait_for_unrelated_refed_timer() {
     let mut rt = create_test_runtime();
     let started = Instant::now();
