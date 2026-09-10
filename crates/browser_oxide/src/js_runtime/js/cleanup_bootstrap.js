@@ -568,6 +568,17 @@
                 'clearInterval', 'queueMicrotask', 'structuredClone']) {
                 _natMethod(globalThis, _k);
             }
+            // Chrome's structuredClone WebIDL function has one required
+            // argument. The cleanup wrapper above is method-shorthand (length=0),
+            // so restore the observable WebIDL arity after replacing it.
+            try {
+                if (typeof globalThis.structuredClone === 'function') {
+                    Object.defineProperty(globalThis.structuredClone, 'length', {
+                        value: 1,
+                        configurable: true,
+                    });
+                }
+            } catch (_e) {}
             try {
                 const _ca = globalThis.chrome && globalThis.chrome.app;
                 if (_ca) {

@@ -714,6 +714,10 @@
         _commitPreparedTransfers(transferState);
         return result;
     };
+    Object.defineProperty(globalThis.structuredClone, 'length', {
+        value: 1,
+        configurable: true,
+    });
     // Mask as native — some scripts inspect the toString() of built-ins
     // for raw JS bodies of polyfills. Without this, `structuredClone
     // .toString()` returns the function source and identifies the engine

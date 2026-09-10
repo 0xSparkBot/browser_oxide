@@ -512,13 +512,14 @@ async fn webidl_operation_arities_match_chrome_148() {
             performanceObserver:[
                 PerformanceObserver.prototype.observe.length,
                 PerformanceObserverEntryList.prototype.getEntriesByName.length
-            ]
+            ],
+            structuredClone:structuredClone.length
         })"#,
     )
     .await;
     assert_eq!(
         result,
-        r#"{"textEncoder":[0,2],"textDecoder":0,"subtle":[3,2,5,2,3,2,3,5,3,7,4,4],"mouse":1,"keyboard":1,"eventTarget":[2,2],"eventInitializers":[1,1],"constructorLengths":[0,0,1,0,1,0],"urlSearchParams":1,"worker":1,"speech":1,"rtc":[0,1,0,0],"history":[0,2,2],"performanceObserver":[0,1]}"#
+        r#"{"textEncoder":[0,2],"textDecoder":0,"subtle":[3,2,5,2,3,2,3,5,3,7,4,4],"mouse":1,"keyboard":1,"eventTarget":[2,2],"eventInitializers":[1,1],"constructorLengths":[0,0,1,0,1,0],"urlSearchParams":1,"worker":1,"speech":1,"rtc":[0,1,0,0],"history":[0,2,2],"performanceObserver":[0,1],"structuredClone":1}"#
     );
 }
 
@@ -10433,6 +10434,91 @@ async fn message_channel_close_detaches() {
 }
 
 #[tokio::test]
+async fn broadcast_channel_webidl_and_delivery_match_chrome_148() {
+    let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"(() => {
+            const capture = fn => {
+                try { return { ok:true, value:fn() }; }
+                catch (error) { return { ok:false, error:error.name + ':' + error.message }; }
+            };
+            const missing = capture(() => new BroadcastChannel());
+            const direct = capture(() => BroadcastChannel('room'));
+            const a = new BroadcastChannel('room');
+            const b = new BroadcastChannel('room');
+            const other = new BroadcastChannel('other');
+            globalThis.__bc = { a, b, other, got:[], missing, direct };
+            b.onmessage = event => globalThis.__bc.got.push({
+                who:'b', data:event.data, trusted:event.isTrusted,
+                tag:Object.prototype.toString.call(event)
+            });
+            other.onmessage = event => globalThis.__bc.got.push({ who:'other', data:event.data });
+            globalThis.__bc.before = {
+                proto:Reflect.ownKeys(BroadcastChannel.prototype).map(String),
+                own:Reflect.ownKeys(a).map(String),
+                tag:Object.prototype.toString.call(a),
+                name:a.name,
+                postLength:BroadcastChannel.prototype.postMessage.length,
+                closeLength:BroadcastChannel.prototype.close.length,
+                parent:Object.getPrototypeOf(BroadcastChannel) === EventTarget,
+            };
+            a.postMessage({x:1});
+        })()"#,
+    )
+    .unwrap();
+    for _ in 0..10 {
+        let _ = page
+            .event_loop()
+            .run_until_idle(std::time::Duration::from_millis(20))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    page.evaluate(
+        r#"(() => {
+            __bc.b.close();
+            __bc.closeAgain = (() => { try { __bc.b.close(); return 'ok'; } catch(e) { return e.name+':'+e.message; } })();
+            __bc.postClosed = (() => { try { __bc.b.postMessage('x'); return 'ok'; } catch(e) { return e.name+':'+e.message; } })();
+            __bc.a.close(); __bc.other.close();
+        })()"#,
+    )
+    .unwrap();
+    let raw = page.evaluate(r#"JSON.stringify({before:__bc.before,got:__bc.got,missing:__bc.missing,direct:__bc.direct,closeAgain:__bc.closeAgain,postClosed:__bc.postClosed})"#).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        value["before"]["proto"],
+        serde_json::json!([
+            "name",
+            "onmessage",
+            "onmessageerror",
+            "close",
+            "postMessage",
+            "constructor",
+            "Symbol(Symbol.toStringTag)"
+        ])
+    );
+    assert_eq!(value["before"]["own"], serde_json::json!([]));
+    assert_eq!(value["before"]["tag"], "[object BroadcastChannel]");
+    assert_eq!(value["before"]["name"], "room");
+    assert_eq!(value["before"]["postLength"], 1);
+    assert_eq!(value["before"]["closeLength"], 0);
+    assert_eq!(value["before"]["parent"], true);
+    assert_eq!(
+        value["got"],
+        serde_json::json!([{
+            "who":"b", "data":{"x":1}, "trusted":true, "tag":"[object MessageEvent]"
+        }])
+    );
+    assert_eq!(value["missing"]["ok"], false);
+    assert_eq!(value["missing"]["error"], "TypeError:Failed to construct 'BroadcastChannel': 1 argument required, but only 0 present.");
+    assert_eq!(value["direct"]["ok"], false);
+    assert_eq!(value["direct"]["error"], "TypeError:Failed to construct 'BroadcastChannel': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    assert_eq!(value["closeAgain"], "ok");
+    assert_eq!(value["postClosed"], "InvalidStateError:Failed to execute 'postMessage' on 'BroadcastChannel': Channel is closed");
+}
+
+#[tokio::test]
 async fn message_channel_webidl_shape_and_explicit_start_match_chrome() {
     let mut page = Page::from_html(&html(""), None::<browser_oxide::stealth::StealthProfile>)
         .await
@@ -10455,6 +10541,8 @@ async fn message_channel_webidl_shape_and_explicit_start_match_chrome() {
                 portConstruction,
                 channelProto:Object.getOwnPropertyNames(MessageChannel.prototype).sort(),
                 portProto:Object.getOwnPropertyNames(MessagePort.prototype).sort(),
+                channelProtoOrder:Reflect.ownKeys(MessageChannel.prototype).map(String),
+                portProtoOrder:Reflect.ownKeys(MessagePort.prototype).map(String),
                 channelEnumerable:['port1','port2'].map(name =>
                     Object.getOwnPropertyDescriptor(MessageChannel.prototype,name).enumerable),
                 portEnumerable:['onmessage','onmessageerror','postMessage','start','close'].map(name =>
@@ -10515,6 +10603,27 @@ async fn message_channel_webidl_shape_and_explicit_start_match_chrome() {
             "onmessageerror",
             "postMessage",
             "start"
+        ])
+    );
+    assert_eq!(
+        value["before"]["channelProtoOrder"],
+        serde_json::json!([
+            "port1",
+            "port2",
+            "constructor",
+            "Symbol(Symbol.toStringTag)"
+        ])
+    );
+    assert_eq!(
+        value["before"]["portProtoOrder"],
+        serde_json::json!([
+            "onmessage",
+            "onmessageerror",
+            "close",
+            "postMessage",
+            "start",
+            "constructor",
+            "Symbol(Symbol.toStringTag)"
         ])
     );
     assert_eq!(

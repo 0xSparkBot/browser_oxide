@@ -3350,11 +3350,107 @@
     if (!globalThis.WritableStreamDefaultWriter) globalThis.WritableStreamDefaultWriter = class WritableStreamDefaultWriter {};
 
     if (!globalThis.BroadcastChannel) {
-        globalThis.BroadcastChannel = class BroadcastChannel extends EventTarget {
-            constructor(name) { super(); this.name = name; this.onmessage = null; this.onmessageerror = null; }
-            postMessage() {}
-            close() {}
-        };
+        const _BroadcastState = new WeakMap();
+        const _BroadcastRegistry = new Map();
+        class BroadcastChannelImpl extends EventTarget {
+            constructor(name) {
+                super();
+                const channelName = String(name);
+                const state = { name: channelName, closed: false, onmessage: null, onmessageerror: null };
+                _BroadcastState.set(this, state);
+                let peers = _BroadcastRegistry.get(channelName);
+                if (!peers) _BroadcastRegistry.set(channelName, peers = new Set());
+                peers.add(this);
+            }
+        }
+        function BroadcastChannel(name) {
+            if (!new.target) {
+                throw new TypeError(
+                    "Failed to construct 'BroadcastChannel': Please use the 'new' operator, this DOM object constructor cannot be called as a function."
+                );
+            }
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required, but only 0 present.");
+            }
+            return Reflect.construct(BroadcastChannelImpl, [name], new.target);
+        }
+        Object.setPrototypeOf(BroadcastChannel, EventTarget);
+        BroadcastChannel.prototype = BroadcastChannelImpl.prototype;
+        _defProtoGetter(BroadcastChannel.prototype, 'name', function name() {
+            return _BroadcastState.get(this)?.name || '';
+        });
+        _defProtoGetter(
+            BroadcastChannel.prototype,
+            'onmessage',
+            function onmessage() { return _BroadcastState.get(this)?.onmessage || null; },
+            function onmessage(value) {
+                const state = _BroadcastState.get(this);
+                if (state) state.onmessage = typeof value === 'function' ? value : null;
+            },
+        );
+        _defProtoGetter(
+            BroadcastChannel.prototype,
+            'onmessageerror',
+            function onmessageerror() { return _BroadcastState.get(this)?.onmessageerror || null; },
+            function onmessageerror(value) {
+                const state = _BroadcastState.get(this);
+                if (state) state.onmessageerror = typeof value === 'function' ? value : null;
+            },
+        );
+        _defProtoMethod(BroadcastChannel.prototype, 'close', function close() {
+            const state = _BroadcastState.get(this);
+            if (!state || state.closed) return;
+            state.closed = true;
+            const peers = _BroadcastRegistry.get(state.name);
+            if (peers) {
+                peers.delete(this);
+                if (peers.size === 0) _BroadcastRegistry.delete(state.name);
+            }
+        });
+        _defProtoMethod(BroadcastChannel.prototype, 'postMessage', function postMessage(message) {
+            const state = _BroadcastState.get(this);
+            if (!state || state.closed) {
+                throw new DOMException(
+                    "Failed to execute 'postMessage' on 'BroadcastChannel': Channel is closed",
+                    'InvalidStateError',
+                );
+            }
+            const peers = _BroadcastRegistry.get(state.name);
+            if (!peers || peers.size <= 1) return;
+            for (const peer of Array.from(peers)) {
+                if (peer === this) continue;
+                const peerState = _BroadcastState.get(peer);
+                if (!peerState || peerState.closed) continue;
+                const data = typeof globalThis.structuredClone === 'function'
+                    ? globalThis.structuredClone(message)
+                    : message;
+                globalThis.setTimeout(() => {
+                    const latest = _BroadcastState.get(peer);
+                    if (!latest || latest.closed) return;
+                    peer.dispatchEvent(_markTrustedEvent(new MessageEvent('message', {
+                        data,
+                        origin: '',
+                        lastEventId: '',
+                        source: null,
+                        ports: [],
+                    })));
+                }, 0);
+            }
+        });
+        // WebIDL prototype order is observable through Reflect.ownKeys().
+        // Move the class-created constructor property behind the methods.
+        delete BroadcastChannel.prototype.constructor;
+        Object.defineProperty(BroadcastChannel.prototype, 'constructor', {
+            value: BroadcastChannel,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(BroadcastChannel.prototype, Symbol.toStringTag, {
+            value: 'BroadcastChannel', configurable: true,
+        });
+        _maskFunction(BroadcastChannel, 'BroadcastChannel');
+        globalThis.BroadcastChannel = BroadcastChannel;
     }
 
     // Proper MessageChannel / MessagePort
@@ -3518,6 +3614,19 @@
                 if (state) state.onmessageerror = typeof value === 'function' ? value : null;
             },
         );
+        _defProtoMethod(MessagePort.prototype, 'close', function close() {
+                _PortClosed.set(this, true);
+                _PortRemoteActive.delete(this);
+                const remote = _PortRemote.get(this);
+                if (remote && !remote.pending && remote.generation) {
+                    try { ops.op_message_port_close(remote.id, remote.generation); } catch (_) {}
+                }
+                // Detach from pair so the other side stops being able
+                // to deliver to us. Pair is preserved on the other
+                // port's side so its close() still works.
+                const paired = _PortPaired.get(this);
+                if (paired) _PortPaired.delete(this);
+        });
         _defProtoMethod(MessagePort.prototype, 'postMessage', function postMessage(data, transfer) {
                 if (_PortClosed.get(this)) return;
                 if (_PortTransferred.has(this)) return;
@@ -3551,18 +3660,12 @@
             configurable: true,
         });
         _defProtoMethod(MessagePort.prototype, 'start', function start() { _enable(this); });
-        _defProtoMethod(MessagePort.prototype, 'close', function close() {
-                _PortClosed.set(this, true);
-                _PortRemoteActive.delete(this);
-                const remote = _PortRemote.get(this);
-                if (remote && !remote.pending && remote.generation) {
-                    try { ops.op_message_port_close(remote.id, remote.generation); } catch (_) {}
-                }
-                // Detach from pair so the other side stops being able
-                // to deliver to us. Pair is preserved on the other
-                // port's side so its close() still works.
-                const paired = _PortPaired.get(this);
-                if (paired) _PortPaired.delete(this);
+        delete MessagePort.prototype.constructor;
+        Object.defineProperty(MessagePort.prototype, 'constructor', {
+            value: MessagePort,
+            writable: true,
+            enumerable: false,
+            configurable: true,
         });
         Object.defineProperty(MessagePort.prototype, Symbol.toStringTag, {
             value: 'MessagePort', configurable: true,
@@ -3688,6 +3791,13 @@
         });
         _defProtoGetter(MessageChannel.prototype, 'port2', function port2() {
             return _MessageChannelState.get(this)?.port2;
+        });
+        delete MessageChannel.prototype.constructor;
+        Object.defineProperty(MessageChannel.prototype, 'constructor', {
+            value: MessageChannel,
+            writable: true,
+            enumerable: false,
+            configurable: true,
         });
         Object.defineProperty(MessageChannel.prototype, Symbol.toStringTag, {
             value: 'MessageChannel', configurable: true,
