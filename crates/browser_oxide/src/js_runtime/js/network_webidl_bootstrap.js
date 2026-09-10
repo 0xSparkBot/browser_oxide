@@ -155,19 +155,126 @@
             _constant(Impl, P, name, value);
         }
         for (const name of ['url','readyState','bufferedAmount','extensions','protocol']) _accessor(P, name, false);
-        _accessor(P, 'binaryType', true);
         for (const name of ['onopen','onmessage','onerror','onclose']) _handler(P, name);
+
+        const _wsBinaryType = new WeakMap();
+        Object.defineProperty(P, 'binaryType', {
+            get: _native(function() {
+                return _wsBinaryType.get(_raw(this)) || 'blob';
+            }, 'get binaryType'),
+            set: _native(function(value) {
+                const normalized = String(value);
+                if (normalized === 'blob' || normalized === 'arraybuffer') {
+                    _wsBinaryType.set(_raw(this), normalized);
+                }
+            }, 'set binaryType'),
+            enumerable: true,
+            configurable: true,
+        });
+
         const oldSend = P.send;
         const oldClose = P.close;
-        _method(P, 'send', 1, function(data) { return oldSend.call(_raw(this), data); });
-        _method(P, 'close', 0, function() { return oldClose.apply(_raw(this), arguments); });
+        _method(P, 'send', 1, function(data) {
+            const raw = _raw(this);
+            if (raw.readyState === 0) {
+                throw new DOMException(
+                    "Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.",
+                    'InvalidStateError',
+                );
+            }
+            return oldSend.call(raw, data);
+        });
+        _method(P, 'close', 0, function(code, reason) {
+            const raw = _raw(this);
+            if (arguments.length > 0 && code !== undefined) {
+                const numeric = Number(code);
+                const converted = Number.isFinite(numeric) ? (Math.trunc(numeric) & 0xffff) : 0;
+                if (converted !== 1000 && (converted < 3000 || converted > 4999)) {
+                    throw new DOMException(
+                        `Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. ${converted} is neither.`,
+                        'InvalidAccessError',
+                    );
+                }
+                code = converted;
+            }
+            if (arguments.length > 1) {
+                reason = String(reason);
+                if (new TextEncoder().encode(reason).byteLength > 123) {
+                    throw new DOMException(
+                        "Failed to execute 'close' on 'WebSocket': The close reason must not be greater than 123 UTF-8 bytes.",
+                        'SyntaxError',
+                    );
+                }
+            }
+            return oldClose.call(raw, code, reason);
+        });
         Object.defineProperty(P, Symbol.toStringTag, { value: 'WebSocket', configurable: true });
+
+        const _normalizeWebSocketUrl = (input) => {
+            const source = String(input);
+            if (!/^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)) {
+                throw new DOMException(
+                    `Failed to construct 'WebSocket': The URL '${source}' is invalid.`,
+                    'SyntaxError',
+                );
+            }
+            let parsed;
+            try { parsed = new URL(source); } catch (_) {
+                throw new DOMException(
+                    `Failed to construct 'WebSocket': The URL '${source}' is invalid.`,
+                    'SyntaxError',
+                );
+            }
+            if (parsed.hash) {
+                throw new DOMException(
+                    `Failed to construct 'WebSocket': The URL contains a fragment identifier ('${parsed.hash.slice(1)}'). Fragment identifiers are not allowed in WebSocket URLs.`,
+                    'SyntaxError',
+                );
+            }
+            if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+            else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+            else if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+                throw new DOMException(
+                    `Failed to construct 'WebSocket': The URL's scheme must be either 'http', 'https', 'ws', or 'wss'. '${parsed.protocol.slice(0, -1)}' is not allowed.`,
+                    'SyntaxError',
+                );
+            }
+            return parsed.href;
+        };
+        const _normalizeProtocols = (protocols) => {
+            if (protocols === undefined) return undefined;
+            const values = typeof protocols === 'string' ? [protocols] : Array.from(protocols);
+            const seen = new Set();
+            const token = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+            return values.map((value) => {
+                const protocol = String(value);
+                if (!token.test(protocol)) {
+                    throw new DOMException(
+                        `Failed to construct 'WebSocket': The subprotocol '${protocol}' is invalid.`,
+                        'SyntaxError',
+                    );
+                }
+                if (seen.has(protocol)) {
+                    throw new DOMException(
+                        `Failed to construct 'WebSocket': The subprotocol '${protocol}' is duplicated.`,
+                        'SyntaxError',
+                    );
+                }
+                seen.add(protocol);
+                return protocol;
+            });
+        };
 
         const Public = _publicConstructor('WebSocket', 1, Impl, function(url) {
             if (arguments.length < 1) {
                 throw new TypeError("Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
             }
-            const target = new Impl(url, arguments[1]);
+            const normalizedUrl = _normalizeWebSocketUrl(url);
+            const protocols = _normalizeProtocols(arguments[1]);
+            const target = protocols === undefined
+                ? new Impl(normalizedUrl)
+                : new Impl(normalizedUrl, protocols);
+            _wsBinaryType.set(target, 'blob');
             return _hideImplementationSlots(target, [
                 'url','readyState','bufferedAmount','extensions','protocol',
             ]);

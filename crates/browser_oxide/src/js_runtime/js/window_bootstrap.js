@@ -5978,15 +5978,15 @@
                 const msg = await ops.op_ws_recv(socket._wsId);
                 if (!msg && msg !== "") {
                     socket.readyState = WebSocket.CLOSED;
-                    if (socket.onclose) socket.onclose(new CloseEvent("close", { code: 1000 }));
+                    socket.dispatchEvent(_markTrustedEvent(new CloseEvent("close", {
+                        code: 1000, wasClean: true,
+                    })));
                     break;
                 }
-                if (msg !== "" && socket.onmessage) {
-                    socket.onmessage(new MessageEvent("message", { data: msg }));
-                }
+                socket.dispatchEvent(_markTrustedEvent(new MessageEvent("message", { data: msg })));
             } catch (e) {
                 socket.readyState = WebSocket.CLOSED;
-                if (socket.onerror) socket.onerror(new Event("error"));
+                socket.dispatchEvent(_markTrustedEvent(new Event("error")));
                 break;
             }
         }
@@ -6013,17 +6013,19 @@
                 if (result.ok) {
                     this._wsId = result.id;
                     this.readyState = WebSocket.OPEN;
-                    if (this.onopen) this.onopen(new Event("open"));
+                    this.dispatchEvent(_markTrustedEvent(new Event("open")));
                     // Start receive loop
                     _pollWebSocketMessages(this);
                 } else {
                     this.readyState = WebSocket.CLOSED;
-                    if (this.onerror) this.onerror(new Event("error"));
-                    if (this.onclose) this.onclose(new CloseEvent("close", { code: 1006, reason: result.error }));
+                    this.dispatchEvent(_markTrustedEvent(new Event("error")));
+                    this.dispatchEvent(_markTrustedEvent(new CloseEvent("close", {
+                        code: 1006, reason: result.error, wasClean: false,
+                    })));
                 }
             }).catch((e) => {
                 this.readyState = WebSocket.CLOSED;
-                if (this.onerror) this.onerror(new Event("error"));
+                this.dispatchEvent(_markTrustedEvent(new Event("error")));
             });
         }
         send(data) {
@@ -6037,7 +6039,9 @@
                 this._wsId = -1;
             }
             this.readyState = WebSocket.CLOSED;
-            if (this.onclose) this.onclose(new CloseEvent("close", { code: code || 1000, reason: reason || "" }));
+            this.dispatchEvent(_markTrustedEvent(new CloseEvent("close", {
+                code: code || 1000, reason: reason || "", wasClean: true,
+            })));
         }
         get bufferedAmount() { return 0; }
         get extensions() { return ""; }

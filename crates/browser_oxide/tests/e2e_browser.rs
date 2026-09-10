@@ -1171,7 +1171,7 @@ async fn e2e_websocket_constructor_stores_url() {
         &html(
             r#"
         <script>
-            const ws = new WebSocket('wss://echo.websocket.org');
+            const ws = new WebSocket('wss://127.0.0.1:9');
             globalThis.wsUrl = ws.url;
             globalThis.wsState = ws.readyState;
         </script>
@@ -1182,7 +1182,7 @@ async fn e2e_websocket_constructor_stores_url() {
     .await
     .unwrap();
 
-    assert_eq!(page.evaluate("wsUrl").unwrap(), "wss://echo.websocket.org");
+    assert_eq!(page.evaluate("wsUrl").unwrap(), "wss://127.0.0.1:9/");
     // readyState should be 0 (CONNECTING) since async connect is pending
     assert_eq!(page.evaluate("wsState").unwrap(), "0");
 }
