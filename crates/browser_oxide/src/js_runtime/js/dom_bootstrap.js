@@ -284,11 +284,22 @@
         return node;
     }
 
-    // Tracks base URLs (query-stripped) of scripts currently being sync-fetched.
-    // Guards against re-entrant fetch loops: e.g. Yandex Metrika's bootstrap IIFE
-    // inserts a new <script src="tag.js?timestamp"> while tag.js is still being
-    // evaluated. Without this guard the fetch recurses infinitely.
+    // Tracks base URLs (query-stripped) of parser-inserted scripts currently
+    // being synchronously fetched. This is a generic re-entrancy guard for a
+    // script that inserts another URL-equivalent script while it is executing.
     const _syncFetchInFlight = new Set();
+
+    // HTML's "force async" flag is state, not merely the `async` content
+    // attribute. A script-created element starts force-async even though it has
+    // no `async` attribute; assigning `.async` (true OR false) clears that flag.
+    // Keep it in a WeakMap so the state is not observable as an own property.
+    const _scriptForceAsync = new WeakMap();
+
+    // Script-created classic scripts with `async=false` start fetching in
+    // parallel but execute in insertion order. Each queue entry owns an eager
+    // fetch promise; the drain awaits those promises in queue order.
+    const _orderedDynamicScripts = [];
+    let _orderedDynamicScriptDrainActive = false;
 
     // Tracks nesting depth of sync eval chains. Each _onNodeInserted call that
     // fetches+evals a script increments this. Scripts beyond MAX nesting are
@@ -306,6 +317,95 @@
     function _externalScriptCode(code, url) {
         const safeUrl = String(url || "").replace(/[\r\n\u2028\u2029]/g, "");
         return String(code) + "\n//# sourceURL=" + safeUrl;
+    }
+
+    function _dispatchScriptResourceEvent(scriptEl, type) {
+        try {
+            const event = new Event(type);
+            if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
+            scriptEl.dispatchEvent(event);
+        } catch (_) {}
+    }
+
+    function _executeDynamicClassicScript(scriptEl, code, url) {
+        const previous = _currentScript;
+        _setCurrentScript(scriptEl);
+        try {
+            (0, eval)(_externalScriptCode(code, url));
+        } finally {
+            _setCurrentScript(previous);
+        }
+    }
+
+    function _fetchDynamicClassicScript(fullUrl) {
+        const referer = globalThis.location?.href || "";
+        return ops.op_net_fetch_script_async(fullUrl, referer);
+    }
+
+    async function _completeDynamicClassicScript(scriptEl, fullUrl, fetchPromise) {
+        try {
+            const result = await fetchPromise;
+            if (!result || result.status < 200 || result.status >= 400) {
+                _dispatchScriptResourceEvent(scriptEl, 'error');
+                return;
+            }
+            try {
+                _executeDynamicClassicScript(scriptEl, result.body || '', fullUrl);
+            } catch (_) {
+                _dispatchScriptResourceEvent(scriptEl, 'error');
+                return;
+            }
+            _dispatchScriptResourceEvent(scriptEl, 'load');
+        } catch (_) {
+            _dispatchScriptResourceEvent(scriptEl, 'error');
+        }
+    }
+
+    function _startAsyncDynamicClassicScript(scriptEl, fullUrl) {
+        void _completeDynamicClassicScript(
+            scriptEl,
+            fullUrl,
+            _fetchDynamicClassicScript(fullUrl),
+        );
+    }
+
+    function _drainOrderedDynamicScripts() {
+        if (_orderedDynamicScriptDrainActive) return;
+        _orderedDynamicScriptDrainActive = true;
+        void (async () => {
+            try {
+                while (_orderedDynamicScripts.length) {
+                    const job = _orderedDynamicScripts[0];
+                    await _completeDynamicClassicScript(job.scriptEl, job.fullUrl, job.fetchPromise);
+                    _orderedDynamicScripts.shift();
+                }
+            } finally {
+                _orderedDynamicScriptDrainActive = false;
+                if (_orderedDynamicScripts.length) _drainOrderedDynamicScripts();
+            }
+        })();
+    }
+
+    function _startOrderedDynamicClassicScript(scriptEl, fullUrl) {
+        _orderedDynamicScripts.push({
+            scriptEl,
+            fullUrl,
+            // Start the network operation immediately; only evaluation waits
+            // for preceding ordered script-inserted entries.
+            fetchPromise: _fetchDynamicClassicScript(fullUrl),
+        });
+        _drainOrderedDynamicScripts();
+    }
+
+    function _startDynamicExternalModule(scriptEl, fullUrl) {
+        // A script-created external module must enter the ES-module loader,
+        // not classic eval(). Native dynamic import shares the runtime's
+        // BrowserModuleLoader/module map, resolves the dependency graph, and
+        // keeps document.currentScript null during module evaluation.
+        void import(fullUrl).then(
+            () => _dispatchScriptResourceEvent(scriptEl, 'load'),
+            () => _dispatchScriptResourceEvent(scriptEl, 'error'),
+        );
     }
 
     // Guards against unbounded `document.write` chains. Two failure modes
@@ -527,30 +627,28 @@
                 } catch(e) {}
             }
 
-            // Third-party trackers known to trigger uncontrolled C-stack recursion
-            // inside their own VM (not in our shims). Skip them — they add no
-            // signal to fingerprint scoring, and crashing the engine on them
-            // costs us all subsequent tests on the page.
-            // Known offenders identified via stack-overflow crashes on real
-            // sites: bot.sannysoft.com loads Yandex Metrika; leboncoin.fr
-            // loads it too.
-            const _RECURSIVE_TRACKERS = [
-                "mc.yandex.ru/metrika/tag.js",
-                "mc.yandex.ru/metrika/watch.js",
-                "mc.yandex.ru/webvisor/",
-            ];
-            for (const pat of _RECURSIVE_TRACKERS) {
-                if (fullUrl.includes(pat)) {
-                    if (scriptEl.onload) scriptEl.onload(new Event('load'));
-                    scriptEl.dispatchEvent && scriptEl.dispatchEvent(new Event('load'));
-                    return;
+            if (_scriptForceAsync.has(scriptEl) && type === 'module') {
+                _startDynamicExternalModule(scriptEl, fullUrl);
+                return;
+            }
+
+            // Script-created classic external scripts never synchronously
+            // block appendChild()/insertBefore(). They start force-async; an
+            // explicit `.async = false` opts into the ordered script-inserted
+            // queue while keeping the network fetch asynchronous.
+            if (_scriptForceAsync.has(scriptEl) && type !== 'module') {
+                if (scriptEl.async) {
+                    _startAsyncDynamicClassicScript(scriptEl, fullUrl);
+                } else {
+                    _startOrderedDynamicClassicScript(scriptEl, fullUrl);
                 }
+                return;
             }
 
             if (sync) {
                 // Strip query params for in-flight dedup: scripts that reload themselves
-                // with a cache-busting timestamp (e.g. Yandex Metrika tag.js?<timestamp>)
-                // share the same base URL and would recurse infinitely without this guard.
+                // with a cache-busting query share the same base URL and would
+                // recurse indefinitely without this guard.
                 const baseUrl = fullUrl.split('?')[0];
                 if (_syncFetchInFlight.has(baseUrl)) {
                     // Re-entrant same-URL fetch — fire load event and bail to break the cycle.
@@ -1415,8 +1513,19 @@
         set type(val) { this.setAttribute("type", String(val)); }
         get rel() { return this.getAttribute("rel") || ""; }
         set rel(val) { this.setAttribute("rel", String(val)); }
-        get async() { return this.hasAttribute("async"); }
-        set async(val) { if (val) this.setAttribute("async", ""); else this.removeAttribute("async"); }
+        get async() {
+            if (String(this.localName || "").toLowerCase() === "script"
+                && _scriptForceAsync.get(this) === true) return true;
+            return this.hasAttribute("async");
+        }
+        set async(val) {
+            if (String(this.localName || "").toLowerCase() === "script") {
+                // Per HTML, assigning the IDL property clears force-async even
+                // when the assigned value is true.
+                _scriptForceAsync.set(this, false);
+            }
+            if (val) this.setAttribute("async", ""); else this.removeAttribute("async");
+        }
         get defer() { return this.hasAttribute("defer"); }
         set defer(val) { if (val) this.setAttribute("defer", ""); else this.removeAttribute("defer"); }
         get crossOrigin() { return this.getAttribute("crossorigin"); }
@@ -2932,6 +3041,9 @@
         }
         createElement(tag) {
             const el = _wrapNode(ops.op_dom_create_element(tag));
+            if (String(tag || "").toLowerCase() === "script") {
+                _scriptForceAsync.set(el, true);
+            }
             _domPrivateTrace({ phase: "createElement", tag: String(tag || ""), node: _domPrivateMeta(el) });
             return el;
         }

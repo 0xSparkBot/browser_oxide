@@ -3,6 +3,7 @@
 use browser_oxide::Page;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::time::Duration;
 
 fn script_endpoint(source: &'static str) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -35,11 +36,19 @@ async fn dynamic_external_script_stack_uses_request_url() {
     .await
     .unwrap();
 
-    page.evaluate(&format!(
-        r#"const script = document.createElement('script');
-        script.src = {script_url:?};
-        document.head.appendChild(script);"#,
-    ))
+    page.evaluate_async(
+        &format!(
+            r#"new Promise((resolve, reject) => {{
+                const script = document.createElement('script');
+                script.onload = () => resolve();
+                script.onerror = () => reject(new Error('dynamic script failed'));
+                script.src = {script_url:?};
+                document.head.appendChild(script);
+            }})"#,
+        ),
+        Duration::from_secs(2),
+    )
+    .await
     .unwrap();
     server.join().unwrap();
 

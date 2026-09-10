@@ -4,6 +4,7 @@ use deno_core::OpState;
 use serde::Serialize;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use url::Url;
 
 /// Per-page sync-fetch chain ceiling. Without this, sites like
@@ -683,6 +684,79 @@ pub fn op_net_fetch_frame_sync(
     result.body
 }
 
+#[derive(Serialize)]
+pub struct ScriptFetchResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Asynchronous fetch for a script-created classic `<script src>` element.
+///
+/// Unlike `op_net_fetch_sync`, this never blocks the V8 thread.  Script-created
+/// external scripts fetch in parallel with the document; their execution
+/// ordering is handled by the DOM bootstrap (`async=false` uses the ordered
+/// script-inserted queue).  The network request still uses browser script
+/// subresource metadata rather than Fetch API metadata.
+#[op2(async(deferred), fast)]
+#[serde]
+pub async fn op_net_fetch_script_async(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+    #[string] referer: String,
+) -> Result<ScriptFetchResponse, deno_error::JsErrorBox> {
+    if let Ok(parsed) = Url::parse(&url) {
+        let document_origin = Url::parse(&referer).ok();
+        if let Err(violated) = check_csp_for_document_origin(
+            crate::net::csp::Directive::ScriptSrcElem,
+            &parsed,
+            None,
+            false,
+            document_origin.as_ref(),
+        ) {
+            eprintln!(
+                "[csp] Refused to load the script '{}' because it violates: \"{}\".",
+                url, violated
+            );
+            return Ok(ScriptFetchResponse {
+                status: 0,
+                body: String::new(),
+            });
+        }
+    }
+
+    if crate::net::blocker::should_block(
+        &url,
+        &referer,
+        crate::net::blocker::classify_request_type(&url, Some("script")),
+    ) {
+        return Ok(ScriptFetchResponse {
+            status: 0,
+            body: String::new(),
+        });
+    }
+
+    let client = FETCH_CLIENT
+        .with(|slot| slot.borrow().clone())
+        .ok_or_else(|| deno_error::JsErrorBox::generic("fetch client not initialized"))?;
+    let request_origin = Url::parse(&referer).ok().and_then(|url| {
+        let origin = url.origin();
+        origin.is_tuple().then(|| origin.ascii_serialization())
+    });
+    let _net = crate::js_runtime::readiness::RequestGuard::new();
+    let mut response = client
+        .get_script_resource(&url, &referer, request_origin.as_deref(), false, 10)
+        .await
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+    // Resource Timing names the element's requested URL even if the network
+    // layer followed a redirect to a versioned asset.
+    response.timings.name = url;
+    record_resource_timing(&mut state.borrow_mut(), response.timings.clone());
+    Ok(ScriptFetchResponse {
+        status: response.status,
+        body: response.text(),
+    })
+}
+
 /// Shared body of the sync fetch ops. CSP, if any, is applied by the calling
 /// op before this runs, not here.
 #[derive(Default)]
@@ -979,6 +1053,7 @@ deno_core::extension!(
         op_cookie_set_sync,
         op_net_fetch_sync,
         op_net_fetch_frame_sync,
+        op_net_fetch_script_async,
         op_net_xhr_sync,
         op_drain_csp_violations
     ],
