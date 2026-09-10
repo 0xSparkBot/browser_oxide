@@ -26,6 +26,67 @@ pub struct ScriptInfo {
     pub node_id: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptKind {
+    Classic,
+    Module,
+    Data,
+}
+
+/// Classify an HTML `<script type>` value using browser-style semantics.
+///
+/// Missing/empty `type` is classic JavaScript. `module` is an ES-module
+/// entry. Otherwise only JavaScript MIME types execute; every other value is
+/// a data block and must not be handed to V8 as source code.
+fn classify_script_type(raw: Option<&str>) -> ScriptKind {
+    let Some(raw) = raw else {
+        return ScriptKind::Classic;
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return ScriptKind::Classic;
+    }
+    if value.eq_ignore_ascii_case("module") {
+        return ScriptKind::Module;
+    }
+    if value.eq_ignore_ascii_case("importmap") || value.eq_ignore_ascii_case("speculationrules") {
+        return ScriptKind::Data;
+    }
+
+    // MIME parameters do not change the JavaScript MIME essence, e.g.
+    // `text/javascript; charset=utf-8` is still executable JavaScript.
+    let essence = value
+        .split_once(';')
+        .map_or(value, |(essence, _)| essence)
+        .trim();
+    let is_javascript_mime = [
+        "application/ecmascript",
+        "application/javascript",
+        "application/x-ecmascript",
+        "application/x-javascript",
+        "text/ecmascript",
+        "text/javascript",
+        "text/javascript1.0",
+        "text/javascript1.1",
+        "text/javascript1.2",
+        "text/javascript1.3",
+        "text/javascript1.4",
+        "text/javascript1.5",
+        "text/jscript",
+        "text/livescript",
+        "text/x-ecmascript",
+        "text/x-javascript",
+    ]
+    .iter()
+    .any(|candidate| essence.eq_ignore_ascii_case(candidate));
+
+    if is_javascript_mime {
+        ScriptKind::Classic
+    } else {
+        ScriptKind::Data
+    }
+}
+
 /// Find all <script> elements in the DOM and extract their content.
 /// Returns both inline scripts (code) and external scripts (src URL).
 pub fn find_scripts(dom: &Dom) -> Vec<ScriptInfo> {
@@ -47,22 +108,15 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
         if let Some(node) = dom.get(child_id) {
             if let NodeData::Element(elem) = &node.data {
                 if elem.name.local.eq_ignore_ascii_case("script") {
-                    // Skip non-JS script types (JSON-LD, templates, etc.)
                     let script_type = elem
                         .attrs
                         .iter()
                         .find(|a| a.name.local == "type")
                         .map(|a| a.value.as_str());
-                    match script_type {
-                        Some("application/ld+json")
-                        | Some("application/json")
-                        | Some("text/template")
-                        | Some("text/html")
-                        | Some("text/x-template") => {
-                            collect_scripts(dom, child_id, scripts);
-                            continue;
-                        }
-                        _ => {}
+                    let script_kind = classify_script_type(script_type);
+                    if script_kind == ScriptKind::Data {
+                        collect_scripts(dom, child_id, scripts);
+                        continue;
                     }
 
                     let src = elem
@@ -78,15 +132,7 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
                         .map(|a| a.value.to_string())
                         .filter(|n| !n.is_empty());
 
-                    // `type="module"` (and the rarer `type="text/javascript;
-                    // version=module"` is not a thing — only the exact "module"
-                    // token) routes to the ES-module path. `type="importmap"`
-                    // is handled separately (skipped here, not executable code).
-                    let is_module = script_type == Some("module");
-                    if script_type == Some("importmap") || script_type == Some("speculationrules") {
-                        collect_scripts(dom, child_id, scripts);
-                        continue;
-                    }
+                    let is_module = script_kind == ScriptKind::Module;
 
                     if src.is_some() {
                         // External script — store the URL for fetching
@@ -123,4 +169,64 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_script_type, find_scripts, ScriptKind};
+
+    #[test]
+    fn script_type_classification_matches_browser_execution_rules() {
+        assert_eq!(classify_script_type(None), ScriptKind::Classic);
+        assert_eq!(classify_script_type(Some("")), ScriptKind::Classic);
+        assert_eq!(classify_script_type(Some("  \t")), ScriptKind::Classic);
+        assert_eq!(classify_script_type(Some("module")), ScriptKind::Module);
+        assert_eq!(classify_script_type(Some("MODULE")), ScriptKind::Module);
+        assert_eq!(
+            classify_script_type(Some("text/javascript; charset=utf-8")),
+            ScriptKind::Classic
+        );
+        assert_eq!(
+            classify_script_type(Some("application/javascript")),
+            ScriptKind::Classic
+        );
+        assert_eq!(classify_script_type(Some("a-state")), ScriptKind::Data);
+        assert_eq!(
+            classify_script_type(Some("application/ld+json")),
+            ScriptKind::Data
+        );
+        assert_eq!(classify_script_type(Some("importmap")), ScriptKind::Data);
+        assert_eq!(
+            classify_script_type(Some("speculationrules")),
+            ScriptKind::Data
+        );
+        assert_eq!(
+            classify_script_type(Some("application/x-custom-data")),
+            ScriptKind::Data
+        );
+    }
+
+    #[test]
+    fn find_scripts_skips_unknown_data_blocks_but_keeps_js_and_modules() {
+        let dom = crate::html_parser::parse_html(
+            r#"<html><body>
+                <script>globalThis.a = 1;</script>
+                <script type="a-state">{"not":"javascript"}</script>
+                <script type="application/x-custom-data">value: still-data</script>
+                <script type="text/javascript; charset=utf-8">globalThis.b = 2;</script>
+                <script type="module">globalThis.c = 3;</script>
+                <script type="importmap">{"imports":{}}</script>
+                <script type="speculationrules">{"prefetch":[]}</script>
+            </body></html>"#,
+        );
+
+        let scripts = find_scripts(&dom);
+        assert_eq!(scripts.len(), 3);
+        assert!(!scripts[0].is_module);
+        assert!(scripts[0].code.contains("globalThis.a"));
+        assert!(!scripts[1].is_module);
+        assert!(scripts[1].code.contains("globalThis.b"));
+        assert!(scripts[2].is_module);
+        assert!(scripts[2].code.contains("globalThis.c"));
+    }
 }
