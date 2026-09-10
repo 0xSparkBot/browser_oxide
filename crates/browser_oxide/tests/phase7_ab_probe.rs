@@ -303,7 +303,7 @@ async fn phase7_d4_screen_webgl_tostringtag() {
 }
 
 /// Phase 7 D3 gates — scrollX/Y own-accessor placement (Phase 6 D2
-/// revert), eventCounts pre-population, userAgentData GREASE "8".
+/// revert), eventCounts pre-population, userAgentData GREASE "24".
 #[tokio::test]
 async fn phase7_d3_scroll_eventcounts_grease() {
     use browser_oxide::stealth::presets::chrome_148_macos;
@@ -355,18 +355,14 @@ async fn phase7_d3_scroll_eventcounts_grease() {
         "pointerdown,touchend,input,keydown,mouseleave,mouseenter,drop,beforeinput,pointerenter,dragend"
     );
 
-    // 3c) GREASE "8" not "24"
+    // 3c) Chrome 148 headed capture uses GREASE version "24".
     let brands = p
         .evaluate("navigator.userAgentData.brands.map(b=>b.brand+':'+b.version).join(',')")
         .unwrap();
     let s = brands.trim_matches('"');
     assert!(
-        s.contains("Not.A/Brand:8"),
-        "Not.A/Brand version should be '8', got: {s}"
-    );
-    assert!(
-        !s.contains("Not.A/Brand:24"),
-        "stale GREASE version 24 leaked into brands: {s}"
+        s.contains("Not(A:Brand:24"),
+        "Chrome 148 GREASE version should be '24', got: {s}"
     );
 }
 
