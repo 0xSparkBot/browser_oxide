@@ -1,4 +1,5 @@
 use browser_oxide::js_runtime::BrowserJsRuntime;
+use std::time::{Duration, Instant};
 
 fn create_test_runtime() -> BrowserJsRuntime {
     let dom = browser_oxide::html_parser::parse_html(
@@ -12,6 +13,38 @@ async fn basic_js_execution() {
     let mut rt = create_test_runtime();
     let result = rt.execute_script("1 + 2", None).unwrap();
     assert_eq!(result, "3");
+}
+
+#[tokio::test]
+async fn module_evaluation_does_not_wait_for_unrelated_refed_timer() {
+    let mut rt = create_test_runtime();
+    let started = Instant::now();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        rt.load_eval_module_code(
+            "https://example.test/entry.js",
+            r#"
+                setInterval(() => {}, 25);
+                await new Promise(resolve => setTimeout(resolve, 10));
+                globalThis.__moduleDone = true;
+            "#
+            .to_string(),
+        ),
+    )
+    .await
+    .expect("module evaluation must not wait for unrelated page background timers")
+    .expect("module evaluation");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "module evaluation was pinned by unrelated runtime work"
+    );
+    assert_eq!(
+        rt.execute_script("String(globalThis.__moduleDone)", None)
+            .unwrap(),
+        "true"
+    );
 }
 
 #[tokio::test]

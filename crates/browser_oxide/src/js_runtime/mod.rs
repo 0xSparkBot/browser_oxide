@@ -652,15 +652,32 @@ impl BrowserJsRuntime {
         // v8-149: see `run_event_loop` — mod_evaluate + the loop drive run on
         // this runtime's isolate; re-enter it in case a child is current.
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
-        let eval = self.inner.mod_evaluate(mod_id);
-        // Drive the loop so the loader's async fetches + any top-level await
-        // resolve, THEN await the module's evaluation result.
-        self.inner
-            .run_event_loop(deno_core::PollEventLoopOptions::default())
-            .await
-            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
-        eval.await
-            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))
+        let mut eval = self.inner.mod_evaluate(mod_id);
+        // Module evaluation and the runtime event loop must be driven
+        // concurrently. A browser module script is complete when its own
+        // evaluation promise settles; unrelated ref'ed page timers/fetches may
+        // legitimately keep the runtime event loop alive afterwards. Waiting
+        // for global event-loop idle first turns those background tasks into a
+        // false module timeout. This mirrors deno_core's own module-evaluation
+        // tests: return as soon as `mod_evaluate` settles, otherwise keep
+        // driving the event loop until it becomes idle and then await the
+        // evaluation receiver.
+        tokio::select! {
+            biased;
+
+            result = &mut eval => {
+                result.map_err(|e| deno_core::error::AnyError::msg(e.to_string()))
+            }
+
+            event_loop_result = self.inner.run_event_loop(
+                deno_core::PollEventLoopOptions::default()
+            ) => {
+                event_loop_result
+                    .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
+                eval.await
+                    .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))
+            }
+        }
     }
 
     /// Get console output captured so far.
