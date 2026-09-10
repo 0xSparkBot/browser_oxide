@@ -28,6 +28,9 @@ pub mod specificity;
 pub use ast::*;
 pub use element::Element;
 pub use error::SelectorParseError;
-pub use matching::{matches_any, matches_selector, query_selector, query_selector_all};
+pub use matching::{
+    matches_any, matches_any_in_scope, matches_selector, matches_selector_in_scope, query_selector,
+    query_selector_all, query_selector_all_including_root, query_selector_including_root,
+};
 pub use parser::{parse_selector_list, parse_selector_list_forgiving};
 pub use specificity::compute_specificity;

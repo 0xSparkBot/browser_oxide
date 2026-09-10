@@ -420,6 +420,7 @@ impl<'a> SelectorParser<'a> {
                     "read-write" => PseudoClass::ReadWrite,
                     "read-only" => PseudoClass::ReadOnly,
                     "placeholder-shown" => PseudoClass::PlaceholderShown,
+                    "scope" => PseudoClass::Scope,
                     "root" => PseudoClass::Root,
                     "empty" => PseudoClass::Empty,
                     "first-child" => PseudoClass::FirstChild,
@@ -815,6 +816,15 @@ mod tests {
         assert!(matches!(
             &list[0].components()[0],
             Component::Simple(SimpleSelector::PseudoClass(PseudoClass::FirstChild))
+        ));
+    }
+
+    #[test]
+    fn parse_scope() {
+        let list = parse_selector_list(":scope > .child").unwrap();
+        assert!(matches!(
+            &list[0].components()[2],
+            Component::Simple(SimpleSelector::PseudoClass(PseudoClass::Scope))
         ));
     }
 

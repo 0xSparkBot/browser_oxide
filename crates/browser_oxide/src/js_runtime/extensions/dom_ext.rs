@@ -307,8 +307,11 @@ pub fn op_dom_query_selector(
             }
             match DomElement::new(&state.dom, children[0]) {
                 Some(el) => {
-                    // Search from root element
-                    if let Ok(Some(found)) = crate::css_selectors::query_selector(&el, selector) {
+                    // A Document query includes documentElement itself as a
+                    // candidate and uses it as the :scope root.
+                    if let Ok(Some(found)) =
+                        crate::css_selectors::query_selector_including_root(&el, selector)
+                    {
                         return found.node_id().to_raw() as i32;
                     }
                     return -1;
@@ -332,15 +335,23 @@ pub fn op_dom_query_selector_all(
 ) -> Vec<i32> {
     let state = state.borrow::<DomState>();
     let id = NodeId::from_raw(node_id as u32);
-    // For document or element, try to build a DomElement for querying
-    let root_el = DomElement::new(&state.dom, id).or_else(|| {
+    if let Some(el) = DomElement::new(&state.dom, id) {
+        return crate::css_selectors::query_selector_all(&el, &selector)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| e.node_id().to_raw() as i32)
+            .collect();
+    }
+
+    // A Document query includes documentElement itself as a candidate.
+    let root_el = {
         let children = state.dom.child_elements(id);
         children
             .first()
             .and_then(|&c| DomElement::new(&state.dom, c))
-    });
+    };
     match root_el {
-        Some(el) => crate::css_selectors::query_selector_all(&el, &selector)
+        Some(el) => crate::css_selectors::query_selector_all_including_root(&el, &selector)
             .unwrap_or_default()
             .iter()
             .map(|e| e.node_id().to_raw() as i32)
@@ -412,7 +423,7 @@ pub fn op_dom_matches(state: &mut OpState, #[smi] node_id: i32, #[string] select
         None => return false,
     };
     match crate::css_selectors::parse_selector_list(selector) {
-        Ok(list) => crate::css_selectors::matches_any(&el, &list),
+        Ok(list) => crate::css_selectors::matches_any_in_scope(&el, &list, &el),
         Err(_) => false,
     }
 }
@@ -425,10 +436,14 @@ pub fn op_dom_closest(state: &mut OpState, #[smi] node_id: i32, #[string] select
         Ok(l) => l,
         Err(_) => return -1,
     };
+    let scope = match DomElement::new(&state.dom, NodeId::from_raw(node_id as u32)) {
+        Some(el) => el,
+        None => return -1,
+    };
     let mut cur = Some(NodeId::from_raw(node_id as u32));
     while let Some(id) = cur {
         if let Some(el) = DomElement::new(&state.dom, id) {
-            if crate::css_selectors::matches_any(&el, &list) {
+            if crate::css_selectors::matches_any_in_scope(&el, &list, &scope) {
                 return id.to_raw() as i32;
             }
         }

@@ -47,6 +47,10 @@ impl<'a> std::fmt::Debug for DomElement<'a> {
 }
 
 impl<'a> Element for DomElement<'a> {
+    fn same_element(&self, other: &Self) -> bool {
+        std::ptr::eq(self.dom, other.dom) && self.id == other.id
+    }
+
     fn local_name(&self) -> &str {
         &self.element_data().name.local
     }

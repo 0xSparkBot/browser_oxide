@@ -3,6 +3,13 @@
 /// This trait is generic — implement it for any DOM tree representation.
 /// The matching engine uses only these methods to traverse and query the tree.
 pub trait Element: Sized + Clone {
+    /// Whether `self` and `other` refer to the same underlying DOM element.
+    /// DOM handle implementations override this with stable node identity so
+    /// `:scope` survives clones made while walking the tree.
+    fn same_element(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+
     /// The element's local name (e.g., `"div"`, `"span"`).
     fn local_name(&self) -> &str;
 

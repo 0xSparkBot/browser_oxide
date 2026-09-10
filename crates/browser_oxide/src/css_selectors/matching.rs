@@ -7,7 +7,14 @@ pub fn matches_selector<E: Element>(element: &E, selector: &Selector) -> bool {
     // Components are stored right-to-left.
     // Walk forward = matching from rightmost (the subject) toward the root.
     let components = selector.components();
-    match_components(element, components, 0)
+    match_components(element, components, 0, None)
+}
+
+/// Check whether an element matches a selector with an explicit scoping root.
+/// DOM `matches()` / `closest()` and scoped query APIs use this path so
+/// `:scope` is anchored to the invoking element rather than the document root.
+pub fn matches_selector_in_scope<E: Element>(element: &E, selector: &Selector, scope: &E) -> bool {
+    match_components(element, selector.components(), 0, Some(scope))
 }
 
 /// Query the first matching element (depth-first pre-order).
@@ -16,7 +23,20 @@ pub fn query_selector<E: Element>(
     selector_str: &str,
 ) -> Result<Option<E>, crate::css_selectors::error::SelectorParseError> {
     let selectors = parse_selector_list(selector_str)?;
-    Ok(find_first(root, &selectors))
+    Ok(find_first(root, &selectors, root))
+}
+
+/// Document query variant: `documentElement` is both the `:scope` root and a
+/// candidate. Element queries intentionally exclude their invoking element.
+pub fn query_selector_including_root<E: Element>(
+    root: &E,
+    selector_str: &str,
+) -> Result<Option<E>, crate::css_selectors::error::SelectorParseError> {
+    let selectors = parse_selector_list(selector_str)?;
+    if matches_any_in_scope(root, &selectors, root) {
+        return Ok(Some(root.clone()));
+    }
+    Ok(find_first(root, &selectors, root))
 }
 
 /// Query all matching elements (depth-first pre-order).
@@ -26,29 +46,43 @@ pub fn query_selector_all<E: Element>(
 ) -> Result<Vec<E>, crate::css_selectors::error::SelectorParseError> {
     let selectors = parse_selector_list(selector_str)?;
     let mut results = Vec::new();
-    find_all(root, &selectors, &mut results);
+    find_all(root, &selectors, root, &mut results);
     Ok(results)
 }
 
-fn find_first<E: Element>(root: &E, selectors: &SelectorList) -> Option<E> {
+/// Document query-all variant that includes `documentElement` as a candidate.
+pub fn query_selector_all_including_root<E: Element>(
+    root: &E,
+    selector_str: &str,
+) -> Result<Vec<E>, crate::css_selectors::error::SelectorParseError> {
+    let selectors = parse_selector_list(selector_str)?;
+    let mut results = Vec::new();
+    if matches_any_in_scope(root, &selectors, root) {
+        results.push(root.clone());
+    }
+    find_all(root, &selectors, root, &mut results);
+    Ok(results)
+}
+
+fn find_first<E: Element>(root: &E, selectors: &SelectorList, scope: &E) -> Option<E> {
     // Check children recursively
     for child in root.child_elements() {
-        if matches_any(&child, selectors) {
+        if matches_any_in_scope(&child, selectors, scope) {
             return Some(child);
         }
-        if let Some(found) = find_first(&child, selectors) {
+        if let Some(found) = find_first(&child, selectors, scope) {
             return Some(found);
         }
     }
     None
 }
 
-fn find_all<E: Element>(root: &E, selectors: &SelectorList, results: &mut Vec<E>) {
+fn find_all<E: Element>(root: &E, selectors: &SelectorList, scope: &E, results: &mut Vec<E>) {
     for child in root.child_elements() {
-        if matches_any(&child, selectors) {
+        if matches_any_in_scope(&child, selectors, scope) {
             results.push(child.clone());
         }
-        find_all(&child, selectors, results);
+        find_all(&child, selectors, scope, results);
     }
 }
 
@@ -57,8 +91,20 @@ pub fn matches_any<E: Element>(element: &E, selectors: &SelectorList) -> bool {
     selectors.iter().any(|s| matches_selector(element, s))
 }
 
+/// Check if an element matches any selector using `scope` for `:scope`.
+pub fn matches_any_in_scope<E: Element>(element: &E, selectors: &SelectorList, scope: &E) -> bool {
+    selectors
+        .iter()
+        .any(|selector| matches_selector_in_scope(element, selector, scope))
+}
+
 /// Core matching: walk the components array (right-to-left order).
-fn match_components<E: Element>(element: &E, components: &[Component], pos: usize) -> bool {
+fn match_components<E: Element>(
+    element: &E,
+    components: &[Component],
+    pos: usize,
+    scope: Option<&E>,
+) -> bool {
     // Collect the compound selector at current position
     let mut i = pos;
 
@@ -67,7 +113,7 @@ fn match_components<E: Element>(element: &E, components: &[Component], pos: usiz
         match &components[i] {
             Component::Combinator(_) => break,
             Component::Simple(simple) => {
-                if !matches_simple(element, simple) {
+                if !matches_simple(element, simple, scope) {
                     return false;
                 }
                 i += 1;
@@ -91,7 +137,7 @@ fn match_components<E: Element>(element: &E, components: &[Component], pos: usiz
     match combinator {
         Combinator::Child => {
             if let Some(parent) = element.parent_element() {
-                match_components(&parent, components, i)
+                match_components(&parent, components, i, scope)
             } else {
                 false
             }
@@ -99,7 +145,7 @@ fn match_components<E: Element>(element: &E, components: &[Component], pos: usiz
         Combinator::Descendant => {
             let mut ancestor = element.parent_element();
             while let Some(anc) = ancestor {
-                if match_components(&anc, components, i) {
+                if match_components(&anc, components, i, scope) {
                     return true;
                 }
                 ancestor = anc.parent_element();
@@ -108,7 +154,7 @@ fn match_components<E: Element>(element: &E, components: &[Component], pos: usiz
         }
         Combinator::NextSibling => {
             if let Some(prev) = element.prev_sibling_element() {
-                match_components(&prev, components, i)
+                match_components(&prev, components, i, scope)
             } else {
                 false
             }
@@ -116,7 +162,7 @@ fn match_components<E: Element>(element: &E, components: &[Component], pos: usiz
         Combinator::SubsequentSibling => {
             let mut prev = element.prev_sibling_element();
             while let Some(sib) = prev {
-                if match_components(&sib, components, i) {
+                if match_components(&sib, components, i, scope) {
                     return true;
                 }
                 prev = sib.prev_sibling_element();
@@ -126,7 +172,7 @@ fn match_components<E: Element>(element: &E, components: &[Component], pos: usiz
     }
 }
 
-fn matches_simple<E: Element>(element: &E, simple: &SimpleSelector) -> bool {
+fn matches_simple<E: Element>(element: &E, simple: &SimpleSelector, scope: Option<&E>) -> bool {
     match simple {
         SimpleSelector::Type(name) => element.local_name().eq_ignore_ascii_case(name),
         SimpleSelector::Universal => true,
@@ -138,7 +184,7 @@ fn matches_simple<E: Element>(element: &E, simple: &SimpleSelector) -> bool {
             value,
             case_sensitivity,
         } => match_attribute(element, name, operator, value, case_sensitivity),
-        SimpleSelector::PseudoClass(pc) => matches_pseudo_class(element, pc),
+        SimpleSelector::PseudoClass(pc) => matches_pseudo_class(element, pc, scope),
         SimpleSelector::PseudoElement(_) => {
             // Pseudo-elements don't affect element matching in querySelectorAll
             true
@@ -227,7 +273,7 @@ fn str_eq(a: &str, b: &str, case_insensitive: bool) -> bool {
     }
 }
 
-fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass) -> bool {
+fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass, scope: Option<&E>) -> bool {
     match pc {
         PseudoClass::Hover => element.is_hover(),
         PseudoClass::Active => element.is_active(),
@@ -253,6 +299,9 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass) -> bool {
         PseudoClass::ReadOnly => element.is_read_only(),
         PseudoClass::PlaceholderShown => element.is_placeholder_shown(),
 
+        PseudoClass::Scope => scope
+            .map(|scope_root| element.same_element(scope_root))
+            .unwrap_or_else(|| element.is_root()),
         PseudoClass::Root => element.is_root(),
         PseudoClass::Empty => element.is_empty(),
 
@@ -269,14 +318,14 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass) -> bool {
         PseudoClass::NthChild(nth, of_sel) => {
             let index = match of_sel {
                 None => element.sibling_index(),
-                Some(sel_list) => nth_of_index(element, sel_list, false),
+                Some(sel_list) => nth_of_index(element, sel_list, false, scope),
             };
             nth.matches(index)
         }
         PseudoClass::NthLastChild(nth, of_sel) => {
             let index = match of_sel {
                 None => element.sibling_index_from_end(),
-                Some(sel_list) => nth_of_index(element, sel_list, true),
+                Some(sel_list) => nth_of_index(element, sel_list, true, scope),
             };
             nth.matches(index)
         }
@@ -296,13 +345,15 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass) -> bool {
             }
         }
 
-        PseudoClass::Is(list) | PseudoClass::Where(list) => matches_any(element, list),
-        PseudoClass::Not(list) => !matches_any(element, list),
+        PseudoClass::Is(list) | PseudoClass::Where(list) => {
+            matches_any_with_optional_scope(element, list, scope)
+        }
+        PseudoClass::Not(list) => !matches_any_with_optional_scope(element, list, scope),
 
         PseudoClass::Has(relatives) => {
             for rel in relatives {
                 // Check descendants
-                if has_matching_descendant(element, &rel.selector) {
+                if has_matching_descendant(element, &rel.selector, Some(element)) {
                     return true;
                 }
             }
@@ -311,7 +362,22 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass) -> bool {
     }
 }
 
-fn nth_of_index<E: Element>(element: &E, sel_list: &SelectorList, from_end: bool) -> i32 {
+fn matches_any_with_optional_scope<E: Element>(
+    element: &E,
+    selectors: &SelectorList,
+    scope: Option<&E>,
+) -> bool {
+    selectors
+        .iter()
+        .any(|selector| match_components(element, selector.components(), 0, scope))
+}
+
+fn nth_of_index<E: Element>(
+    element: &E,
+    sel_list: &SelectorList,
+    from_end: bool,
+    scope: Option<&E>,
+) -> i32 {
     let mut index = 1;
     let sib_fn = if from_end {
         Element::next_sibling_element
@@ -320,7 +386,7 @@ fn nth_of_index<E: Element>(element: &E, sel_list: &SelectorList, from_end: bool
     };
     let mut sib = sib_fn(element);
     while let Some(s) = sib {
-        if matches_any(&s, sel_list) {
+        if matches_any_with_optional_scope(&s, sel_list, scope) {
             index += 1;
         }
         sib = sib_fn(&s);
@@ -328,12 +394,16 @@ fn nth_of_index<E: Element>(element: &E, sel_list: &SelectorList, from_end: bool
     index
 }
 
-fn has_matching_descendant<E: Element>(element: &E, selector: &Selector) -> bool {
+fn has_matching_descendant<E: Element>(
+    element: &E,
+    selector: &Selector,
+    scope: Option<&E>,
+) -> bool {
     for child in element.child_elements() {
-        if matches_selector(&child, selector) {
+        if match_components(&child, selector.components(), 0, scope) {
             return true;
         }
-        if has_matching_descendant(&child, selector) {
+        if has_matching_descendant(&child, selector, scope) {
             return true;
         }
     }

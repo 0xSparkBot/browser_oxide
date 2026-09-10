@@ -127,6 +127,7 @@ pub enum PseudoClass {
     PlaceholderShown,
 
     // Tree-structural
+    Scope,
     Root,
     Empty,
     FirstChild,

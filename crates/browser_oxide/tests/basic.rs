@@ -16,6 +16,41 @@ async fn basic_js_execution() {
 }
 
 #[tokio::test]
+async fn scope_selector_matches_document_and_element_semantics() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<html><body><div id="root"><span id="a"></span><div><span id="b"></span></div></div></body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    let result = rt
+        .execute_script(
+            r#"
+            (() => {
+                const root = document.getElementById('root');
+                const id = el => el ? el.id : null;
+                return JSON.stringify({
+                    qScope: id(root.querySelector(':scope')),
+                    qaScope: Array.from(root.querySelectorAll(':scope')).map(id),
+                    direct: Array.from(root.querySelectorAll(':scope > span')).map(id),
+                    nested: Array.from(root.querySelectorAll(':scope span')).map(id),
+                    matches: root.matches(':scope'),
+                    closest: id(root.closest(':scope')),
+                    childMatches: document.getElementById('a').matches(':scope'),
+                    docScope: document.querySelector(':scope').tagName,
+                    docHtml: document.querySelector('html').tagName,
+                    docAllScope: Array.from(document.querySelectorAll(':scope')).map(el => el.tagName),
+                });
+            })()
+            "#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"qScope":null,"qaScope":[],"direct":["a"],"nested":["a","b"],"matches":true,"closest":"root","childMatches":true,"docScope":"HTML","docHtml":"HTML","docAllScope":["HTML"]}"#
+    );
+}
+
+#[tokio::test]
 async fn module_evaluation_does_not_wait_for_unrelated_refed_timer() {
     let mut rt = create_test_runtime();
     let started = Instant::now();
