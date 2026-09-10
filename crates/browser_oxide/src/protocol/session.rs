@@ -1,7 +1,22 @@
 use crate::protocol::types::*;
 use crate::Page;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
+
+const MAX_CACHED_RESPONSE_BODIES: usize = 32;
+const MAX_CACHED_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingNavigation {
+    pub url: String,
+    pub loader_id: String,
+    pub request_id: String,
+}
+
+struct CachedResponseBody {
+    body: Vec<u8>,
+    mime_type: String,
+}
 
 /// Per-connection CDP session state.
 pub struct CdpSession {
@@ -14,7 +29,10 @@ pub struct CdpSession {
     request_interception_enabled: bool,
     /// Set by Page.navigate — the server handles the actual page replacement
     /// because V8 isolates must be dropped in LIFO order.
-    pub pending_navigate: Option<String>,
+    pub(crate) pending_navigate: Option<PendingNavigation>,
+    response_bodies: HashMap<String, CachedResponseBody>,
+    response_body_order: VecDeque<String>,
+    response_body_bytes: usize,
     /// Last known mouse coordinates for trajectory generation.
     last_mouse_x: f32,
     last_mouse_y: f32,
@@ -39,6 +57,9 @@ impl CdpSession {
             extra_headers: std::collections::HashMap::new(),
             request_interception_enabled: false,
             pending_navigate: None,
+            response_bodies: HashMap::new(),
+            response_body_order: VecDeque::new(),
+            response_body_bytes: 0,
             last_mouse_x: 0.0,
             last_mouse_y: 0.0,
             behavior: crate::stealth::behavior::BehaviorProfile::default(),
@@ -61,6 +82,117 @@ impl CdpSession {
 
     pub fn enable_domain(&mut self, domain: &str) {
         self.enabled_domains.insert(domain.to_string());
+    }
+
+    fn cache_response_body(&mut self, request_id: &str, response: &crate::net::Response) {
+        if let Some(previous) = self.response_bodies.remove(request_id) {
+            self.response_body_bytes = self.response_body_bytes.saturating_sub(previous.body.len());
+            self.response_body_order.retain(|id| id != request_id);
+        }
+
+        // Keep the CDP session bounded. Chrome may retain a much larger
+        // inspector cache, but silently retaining arbitrary response bodies in
+        // this lightweight server would make long-lived automation sessions
+        // unbounded. Oversized single bodies remain unavailable by request id.
+        if response.body.len() > MAX_CACHED_RESPONSE_BODY_BYTES {
+            return;
+        }
+        while self.response_bodies.len() >= MAX_CACHED_RESPONSE_BODIES
+            || self.response_body_bytes + response.body.len() > MAX_CACHED_RESPONSE_BODY_BYTES
+        {
+            let Some(oldest) = self.response_body_order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.response_bodies.remove(&oldest) {
+                self.response_body_bytes = self.response_body_bytes.saturating_sub(old.body.len());
+            }
+        }
+
+        let mime_type = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.split(';').next().unwrap_or(value).trim().to_string())
+            .unwrap_or_default();
+        self.response_body_bytes += response.body.len();
+        self.response_body_order.push_back(request_id.to_string());
+        self.response_bodies.insert(
+            request_id.to_string(),
+            CachedResponseBody {
+                body: response.body.clone(),
+                mime_type,
+            },
+        );
+    }
+
+    pub(crate) fn record_navigation_response(
+        &mut self,
+        navigation: &PendingNavigation,
+        response: &crate::net::Response,
+    ) -> Vec<CdpEvent> {
+        self.cache_response_body(&navigation.request_id, response);
+        if !self.is_domain_enabled("Network") {
+            return Vec::new();
+        }
+
+        let mime_type = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.split(';').next().unwrap_or(value).trim())
+            .unwrap_or("");
+        vec![
+            CdpEvent::new(
+                "Network.responseReceived",
+                serde_json::json!({
+                    "requestId": navigation.request_id,
+                    "loaderId": navigation.loader_id,
+                    "timestamp": timestamp(),
+                    "type": "Document",
+                    "frameId": self.frame_id,
+                    "hasExtraInfo": false,
+                    "response": {
+                        "url": response.url,
+                        "status": response.status,
+                        "statusText": response.status_text,
+                        "headers": response.headers,
+                        "mimeType": mime_type,
+                        "connectionReused": false,
+                        "connectionId": 0,
+                        "encodedDataLength": response.body.len(),
+                        "securityState": if response.url.starts_with("https://") { "secure" } else { "neutral" },
+                    }
+                }),
+            ),
+            CdpEvent::new(
+                "Network.loadingFinished",
+                serde_json::json!({
+                    "requestId": navigation.request_id,
+                    "timestamp": timestamp(),
+                    "encodedDataLength": response.body.len(),
+                }),
+            ),
+        ]
+    }
+
+    pub(crate) fn record_navigation_failure(
+        &self,
+        navigation: &PendingNavigation,
+        error_text: &str,
+    ) -> Vec<CdpEvent> {
+        if !self.is_domain_enabled("Network") {
+            return Vec::new();
+        }
+        vec![CdpEvent::new(
+            "Network.loadingFailed",
+            serde_json::json!({
+                "requestId": navigation.request_id,
+                "timestamp": timestamp(),
+                "type": "Document",
+                "errorText": error_text,
+                "canceled": false,
+            }),
+        )]
     }
 
     /// Handle a CDP request and return response + events to emit.
@@ -155,12 +287,46 @@ impl CdpSession {
                     .and_then(|v| v.as_str())
                     .unwrap_or("about:blank");
                 let loader_id = self.next_loader_id();
+                let request_id = if url != "about:blank" && http_client.is_some() {
+                    Some(self.next_request_id())
+                } else {
+                    None
+                };
 
                 // Signal the server to handle navigation after we release the page borrow.
                 // V8 requires isolates to be dropped in LIFO order, so page replacement
                 // must happen at the server level where we control the RefCell.
-                if url != "about:blank" && http_client.is_some() {
-                    self.pending_navigate = Some(url.to_string());
+                if let Some(request_id) = request_id.as_ref() {
+                    self.pending_navigate = Some(PendingNavigation {
+                        url: url.to_string(),
+                        loader_id: loader_id.clone(),
+                        request_id: request_id.clone(),
+                    });
+
+                    if self.is_domain_enabled("Network") {
+                        let now = timestamp();
+                        events.push(CdpEvent::new(
+                            "Network.requestWillBeSent",
+                            serde_json::json!({
+                                "requestId": request_id,
+                                "loaderId": loader_id,
+                                "documentURL": url,
+                                "request": {
+                                    "url": url,
+                                    "method": "GET",
+                                    "headers": self.extra_headers,
+                                    "initialPriority": "VeryHigh",
+                                    "referrerPolicy": "strict-origin-when-cross-origin",
+                                },
+                                "timestamp": now,
+                                "wallTime": now,
+                                "initiator": { "type": "other" },
+                                "type": "Document",
+                                "frameId": self.frame_id,
+                                "hasUserGesture": false,
+                            }),
+                        ));
+                    }
                 }
 
                 // Emit lifecycle events
@@ -353,11 +519,38 @@ impl CdpSession {
                 Ok(serde_json::json!({}))
             }
             "Network.getResponseBody" => {
-                // Stub — return empty body
-                Ok(serde_json::json!({
-                    "body": "",
-                    "base64Encoded": false,
-                }))
+                let Some(request_id) = req.params.get("requestId").and_then(|v| v.as_str()) else {
+                    let err = CdpError::server(req.id, "Request id is required");
+                    return (to_json(&err), events);
+                };
+                let Some(cached) = self.response_bodies.get(request_id) else {
+                    let err = CdpError::server(
+                        req.id,
+                        &format!("No resource with given identifier found: {request_id}"),
+                    );
+                    return (to_json(&err), events);
+                };
+
+                if is_textual_mime_type(&cached.mime_type) {
+                    if let Ok(body) = std::str::from_utf8(&cached.body) {
+                        Ok(serde_json::json!({
+                            "body": body,
+                            "base64Encoded": false,
+                        }))
+                    } else {
+                        use base64::Engine as _;
+                        Ok(serde_json::json!({
+                            "body": base64::engine::general_purpose::STANDARD.encode(&cached.body),
+                            "base64Encoded": true,
+                        }))
+                    }
+                } else {
+                    use base64::Engine as _;
+                    Ok(serde_json::json!({
+                        "body": base64::engine::general_purpose::STANDARD.encode(&cached.body),
+                        "base64Encoded": true,
+                    }))
+                }
             }
             "Network.clearBrowserCache" => Ok(serde_json::json!({})),
             "Network.clearBrowserCookies" => Ok(serde_json::json!({})),
@@ -704,6 +897,23 @@ fn timestamp() -> f64 {
         .unwrap_or(0.0)
 }
 
+fn is_textual_mime_type(mime_type: &str) -> bool {
+    let mime = mime_type.to_ascii_lowercase();
+    mime.starts_with("text/")
+        || mime.ends_with("+json")
+        || mime.ends_with("+xml")
+        || matches!(
+            mime.as_str(),
+            "application/json"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/xml"
+                | "application/xhtml+xml"
+                | "application/wasm-text"
+                | "image/svg+xml"
+        )
+}
+
 fn js_type(value: &str) -> &'static str {
     match value {
         "undefined" => "undefined",
@@ -717,6 +927,21 @@ fn js_type(value: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_with_body(body: Vec<u8>, content_type: &str) -> crate::net::Response {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-type".to_string(), content_type.to_string());
+        crate::net::Response {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers,
+            set_cookies: Vec::new(),
+            body,
+            url: "https://example.test/resource".to_string(),
+            accept_ch_upgrade: false,
+            timings: crate::net::TimingStats::default(),
+        }
+    }
 
     #[tokio::test]
     async fn handle_page_enable() {
@@ -785,6 +1010,90 @@ mod tests {
         assert_eq!(events[0].method, "Page.frameNavigated");
         assert_eq!(events[1].method, "Page.domContentEventFired");
         assert_eq!(events[2].method, "Page.loadEventFired");
+    }
+
+    #[tokio::test]
+    async fn network_page_navigate_emits_request_id_for_real_navigation() {
+        let mut session = CdpSession::new();
+        session.enable_domain("Page");
+        session.enable_domain("Network");
+        let mut page = Page::from_html("<html><body></body></html>", None)
+            .await
+            .unwrap();
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let client = crate::net::HttpClient::new(&profile).unwrap();
+        let req = CdpRequest {
+            id: 40,
+            method: "Page.navigate".to_string(),
+            params: serde_json::json!({"url": "https://example.test/document"}),
+        };
+
+        let (_, events) = session.handle_request(&mut page, &req, Some(&client)).await;
+        assert_eq!(events[0].method, "Network.requestWillBeSent");
+        assert_eq!(events[0].params["type"], "Document");
+        assert_eq!(events[0].params["request"]["method"], "GET");
+        let request_id = events[0].params["requestId"].as_str().unwrap();
+        let pending = session.pending_navigate.as_ref().unwrap();
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.loader_id, events[0].params["loaderId"]);
+        assert_eq!(pending.url, "https://example.test/document");
+        assert_eq!(events[1].method, "Page.frameNavigated");
+    }
+
+    #[tokio::test]
+    async fn network_get_response_body_returns_text_or_base64() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html("<html><body></body></html>", None)
+            .await
+            .unwrap();
+
+        session.cache_response_body(
+            "text.1",
+            &response_with_body(b"hello response".to_vec(), "text/plain; charset=utf-8"),
+        );
+        let text_req = CdpRequest {
+            id: 41,
+            method: "Network.getResponseBody".to_string(),
+            params: serde_json::json!({"requestId": "text.1"}),
+        };
+        let (text_resp, _) = session.handle_request(&mut page, &text_req, None).await;
+        let text_json: serde_json::Value = serde_json::from_str(&text_resp).unwrap();
+        assert_eq!(text_json["result"]["body"], "hello response");
+        assert_eq!(text_json["result"]["base64Encoded"], false);
+
+        session.cache_response_body(
+            "binary.1",
+            &response_with_body(vec![0, 159, 146, 150, 255], "application/octet-stream"),
+        );
+        let binary_req = CdpRequest {
+            id: 42,
+            method: "Network.getResponseBody".to_string(),
+            params: serde_json::json!({"requestId": "binary.1"}),
+        };
+        let (binary_resp, _) = session.handle_request(&mut page, &binary_req, None).await;
+        let binary_json: serde_json::Value = serde_json::from_str(&binary_resp).unwrap();
+        assert_eq!(binary_json["result"]["body"], "AJ+Slv8=");
+        assert_eq!(binary_json["result"]["base64Encoded"], true);
+    }
+
+    #[tokio::test]
+    async fn network_get_response_body_unknown_request_matches_cdp_server_error() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html("<html><body></body></html>", None)
+            .await
+            .unwrap();
+        let req = CdpRequest {
+            id: 43,
+            method: "Network.getResponseBody".to_string(),
+            params: serde_json::json!({"requestId": "missing.1"}),
+        };
+        let (resp, _) = session.handle_request(&mut page, &req, None).await;
+        let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(json["error"]["code"], -32000);
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("No resource with given identifier found"));
     }
 
     #[tokio::test]

@@ -385,7 +385,7 @@ async fn handle_connection(
                     }
                 };
 
-                let (response, events) = {
+                let (response, mut events) = {
                     let mut page_ref = page.borrow_mut();
                     let client_ref = http_client.as_deref();
                     session
@@ -396,23 +396,57 @@ async fn handle_connection(
                 // Handle pending navigation (Page.navigate).
                 // Uses reload_html to swap DOM in the existing V8 isolate —
                 // avoids the 17ms cost of creating a new isolate.
-                if let Some(url) = session.pending_navigate.take() {
+                if let Some(navigation) = session.pending_navigate.take() {
                     if let Some(client) = http_client.as_deref() {
-                        if let Ok(resp) = client.get(&url).await {
-                            let html = resp.text();
-                            let mut borrow = page.borrow_mut();
-                            // Same warm-reuse contract as `PagePool` (#33):
-                            // this session keeps ONE `Page` alive for its whole
-                            // lifetime, so without an explicit reset the
-                            // previous document's listeners, DOM registries and
-                            // window properties accumulate for as long as the
-                            // client stays connected — and its listeners misfire
-                            // on the new document, since node IDs restart.
-                            borrow.reset_for_reuse();
-                            borrow.reload_html(&html, &url);
-                            // Re-inject scripts registered via addScriptToEvaluateOnNewDocument
-                            for script in &session.scripts_on_new_document {
-                                let _ = borrow.evaluate(script);
+                        match client.get(&navigation.url).await {
+                            Ok(resp) => {
+                                // Cache the raw response bytes before turning
+                                // them into DOM text, and emit the Network
+                                // response lifecycle using the same request id
+                                // clients received in requestWillBeSent.
+                                let mut network_events =
+                                    session.record_navigation_response(&navigation, &resp);
+                                if !network_events.is_empty() {
+                                    let loading_finished = network_events.pop();
+                                    let response_received = network_events.pop();
+                                    if let Some(response_received) = response_received {
+                                        let insert_at = events
+                                            .iter()
+                                            .position(|event| event.method == "Page.frameNavigated")
+                                            .unwrap_or(events.len());
+                                        events.insert(insert_at, response_received);
+                                    }
+                                    if let Some(loading_finished) = loading_finished {
+                                        events.push(loading_finished);
+                                    }
+                                }
+
+                                let html = resp.text();
+                                let mut borrow = page.borrow_mut();
+                                // Same warm-reuse contract as `PagePool` (#33):
+                                // this session keeps ONE `Page` alive for its whole
+                                // lifetime, so without an explicit reset the
+                                // previous document's listeners, DOM registries and
+                                // window properties accumulate for as long as the
+                                // client stays connected — and its listeners misfire
+                                // on the new document, since node IDs restart.
+                                borrow.reset_for_reuse();
+                                borrow.reload_html(&html, &navigation.url);
+                                // Re-inject scripts registered via addScriptToEvaluateOnNewDocument
+                                for script in &session.scripts_on_new_document {
+                                    let _ = borrow.evaluate(script);
+                                }
+                            }
+                            Err(error) => {
+                                let failure_events = session
+                                    .record_navigation_failure(&navigation, &error.to_string());
+                                let insert_at = events
+                                    .iter()
+                                    .position(|event| event.method == "Page.frameNavigated")
+                                    .unwrap_or(events.len());
+                                for event in failure_events.into_iter().rev() {
+                                    events.insert(insert_at, event);
+                                }
                             }
                         }
                     }
@@ -583,11 +617,140 @@ async fn handle_http(
 mod tests {
     use super::*;
 
+    fn start_local_http_fixture(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{addr}/fixture"), thread)
+    }
+
     #[test]
     fn server_starts_and_stops() {
         let server = CdpServer::start_ephemeral("<html><body>Hello</body></html>").unwrap();
         assert!(server.port() > 0);
         assert!(server.ws_url().contains("127.0.0.1"));
+        drop(server);
+    }
+
+    #[test]
+    fn network_get_response_body_roundtrip() {
+        use futures_util::{SinkExt, StreamExt};
+
+        const BODY: &str = "<!doctype html><title>CDP fixture</title><p>response-body-ok</p>";
+        let (url, fixture_thread) = start_local_http_fixture(BODY);
+        let server = CdpServer::start_navigable(0).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let (ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+                .await
+                .unwrap();
+            let (mut tx, mut rx) = ws.split();
+
+            for (id, method) in [(1_u64, "Network.enable"), (2_u64, "Page.enable")] {
+                tx.send(Message::Text(
+                    serde_json::json!({"id": id, "method": method, "params": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                loop {
+                    let msg = rx.next().await.unwrap().unwrap();
+                    if let Message::Text(text) = msg {
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if value.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            tx.send(Message::Text(
+                serde_json::json!({
+                    "id": 3,
+                    "method": "Page.navigate",
+                    "params": {"url": url},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let mut request_id = None;
+            let mut lifecycle = Vec::new();
+            loop {
+                let msg = rx.next().await.unwrap().unwrap();
+                let Message::Text(text) = msg else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if let Some(method) = value.get("method").and_then(|v| v.as_str()) {
+                    lifecycle.push(method.to_string());
+                    if method == "Network.requestWillBeSent" {
+                        request_id = value["params"]["requestId"].as_str().map(str::to_string);
+                    }
+                }
+                if value.get("id").and_then(|v| v.as_u64()) == Some(3) {
+                    break;
+                }
+            }
+
+            let request_id = request_id.expect("requestWillBeSent requestId");
+            assert_eq!(
+                lifecycle,
+                [
+                    "Network.requestWillBeSent",
+                    "Network.responseReceived",
+                    "Page.frameNavigated",
+                    "Page.domContentEventFired",
+                    "Page.loadEventFired",
+                    "Network.loadingFinished",
+                ]
+            );
+
+            tx.send(Message::Text(
+                serde_json::json!({
+                    "id": 4,
+                    "method": "Network.getResponseBody",
+                    "params": {"requestId": request_id},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            loop {
+                let msg = rx.next().await.unwrap().unwrap();
+                let Message::Text(text) = msg else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value.get("id").and_then(|v| v.as_u64()) == Some(4) {
+                    assert_eq!(value["result"]["body"], BODY);
+                    assert_eq!(value["result"]["base64Encoded"], false);
+                    break;
+                }
+            }
+
+            tx.send(Message::Close(None)).await.ok();
+        });
+
+        fixture_thread.join().unwrap();
         drop(server);
     }
 

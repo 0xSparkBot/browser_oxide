@@ -69,6 +69,18 @@ impl CdpError {
             },
         }
     }
+
+    /// Chrome DevTools Protocol uses the JSON-RPC "server error" range for
+    /// domain-level lookup failures such as an unknown Network request id.
+    pub fn server(id: u64, msg: &str) -> Self {
+        Self {
+            id,
+            error: CdpErrorDetail {
+                code: -32000,
+                message: msg.to_string(),
+            },
+        }
+    }
 }
 
 impl CdpEvent {
@@ -124,6 +136,14 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("-32601"));
         assert!(json.contains("Unknown.method"));
+    }
+
+    #[test]
+    fn serialize_server_error() {
+        let err = CdpError::server(6, "No resource with given identifier found");
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("-32000"));
+        assert!(json.contains("No resource with given identifier found"));
     }
 
     #[test]
