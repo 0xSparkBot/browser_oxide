@@ -13,7 +13,7 @@ pub struct ScriptInfo {
     /// `crate::net::csp::CheckCtx`.
     pub nonce: Option<String>,
     /// `<script type="module">` — must be executed via the ES-module path
-    /// (`load_main_es_module` + `mod_evaluate`) NOT classic `execute_script`,
+    /// (`load_side_es_module` + `mod_evaluate`) NOT classic `execute_script`,
     /// which throws `SyntaxError: Cannot use import statement outside a module`
     /// and silently drops modern Vite/React/Vue bundles. (P2 / thin-render fix.)
     pub is_module: bool,

@@ -610,7 +610,14 @@ impl BrowserJsRuntime {
         // v8-149: see `run_event_loop` — module loading drives V8 and must
         // target this runtime's isolate, not a more-recently-entered child's.
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
-        let mod_id = self.inner.load_main_es_module(&spec).await?;
+        // A document may contain any number of independent
+        // <script type="module"> entry points.  deno_core permits only one
+        // "main" module per runtime, so treating every document module as
+        // main makes the second entry fail with "main module ... already
+        // exists".  Browser document modules are side entry points; module
+        // workers keep using load_main_es_module in worker_ext.rs because a
+        // worker has exactly one entry module.
+        let mod_id = self.inner.load_side_es_module(&spec).await?;
         self.eval_module(mod_id).await
     }
 
@@ -632,7 +639,7 @@ impl BrowserJsRuntime {
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
         let mod_id = self
             .inner
-            .load_main_es_module_from_code(&spec, code)
+            .load_side_es_module_from_code(&spec, code)
             .await?;
         self.eval_module(mod_id).await
     }

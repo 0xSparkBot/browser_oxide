@@ -895,7 +895,10 @@ impl Page {
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
         crate::js_runtime::extensions::fetch_ext::set_fetch_client(client.clone());
 
-        // Execute scripts in document order
+        // Execute scripts in document order. Document module scripts are
+        // independent ES-module entry points (not classic scripts, and not a
+        // single runtime "main" module); route them through the same side-
+        // module path as real navigation.
         for (i, script) in scripts.iter().enumerate() {
             if let Some(n) = &script.src {
                 if let Some(full_url) = Self::resolve_url(url, n) {
@@ -919,12 +922,20 @@ impl Page {
                         Ok(resp) => {
                             let code = resp.text();
                             event_loop.note_executed_script(&full_url, &code);
-                            // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                            event_loop.set_current_script(Some(script.node_id));
-                            if let Err(e) = event_loop.execute_script_with_name(&code, &full_url) {
-                                tracing::warn!(script_src = %n, error = %e, "Script error in external script");
+                            if script.is_module {
+                                if let Err(e) = event_loop.eval_module_code(&full_url, code).await {
+                                    tracing::warn!(script_src = %n, error = %e, "Module script error in external script");
+                                }
+                            } else {
+                                // document.currentScript parity (see build_page_with_scripts_init_and_storage).
+                                event_loop.set_current_script(Some(script.node_id));
+                                if let Err(e) =
+                                    event_loop.execute_script_with_name(&code, &full_url)
+                                {
+                                    tracing::warn!(script_src = %n, error = %e, "Script error in external script");
+                                }
+                                event_loop.set_current_script(None);
                             }
-                            event_loop.set_current_script(None);
                         }
                         Err(e) => {
                             tracing::warn!(script_src = %n, error = %e, "Failed to fetch script")
@@ -933,12 +944,22 @@ impl Page {
                 }
             } else if !script.code.is_empty() {
                 event_loop.note_executed_script(url, &script.code);
-                // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                event_loop.set_current_script(Some(script.node_id));
-                if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
-                    tracing::warn!(script_index = i, error = %e, "Script error in inline script");
+                if script.is_module {
+                    let spec = format!("{url}#oxide-mod-{i}");
+                    if let Err(e) = event_loop
+                        .eval_module_code(&spec, script.code.clone())
+                        .await
+                    {
+                        tracing::warn!(script_index = i, error = %e, "Module script error in inline script");
+                    }
+                } else {
+                    // document.currentScript parity (see build_page_with_scripts_init_and_storage).
+                    event_loop.set_current_script(Some(script.node_id));
+                    if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
+                        tracing::warn!(script_index = i, error = %e, "Script error in inline script");
+                    }
+                    event_loop.set_current_script(None);
                 }
-                event_loop.set_current_script(None);
             }
         }
 
@@ -5070,6 +5091,31 @@ mod tests {
             page.named_form_control_values("a\"] [name=\"b")
                 .expect("unusual named control"),
             vec!["safe".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_document_module_entries_execute_without_main_collision() {
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let html = r#"<!doctype html><html><body>
+            <script type="module">
+                globalThis.__moduleEntries = ['first'];
+                await Promise.resolve();
+                globalThis.__moduleEntries.push('first-after-await');
+            </script>
+            <script type="module">
+                globalThis.__moduleEntries.push('second');
+            </script>
+        </body></html>"#;
+        let mut page =
+            Page::from_html_with_url(html, "https://example.test/multiple-modules", Some(profile))
+                .await
+                .expect("page");
+
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__moduleEntries)")
+                .expect("module result"),
+            r#"["first","first-after-await","second"]"#
         );
     }
 
