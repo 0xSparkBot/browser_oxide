@@ -34,9 +34,24 @@ mod tests {
         "#;
         page.evaluate(js).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // The probe above awaits getHighEntropyValues(). Sleeping the Tokio
+        // task does not drive BrowserOxide's V8 event loop, so the old
+        // diagnostic could print `wait` and still pass. Pump the page runtime
+        // the same way the non-network UAData regressions do.
+        page.evaluate_async("void 0", std::time::Duration::from_millis(500))
+            .await
+            .unwrap();
 
         let r = page.evaluate("globalThis.__surface_res || 'wait'").unwrap();
         println!("JS SURFACE OXIDE:\n{}", r);
+        assert_ne!(r, "wait", "async JS-surface probe never settled");
+
+        let value: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert!(value["screenWidth"].as_i64().is_some_and(|v| v > 0));
+        assert!(value["screenHeight"].as_i64().is_some_and(|v| v > 0));
+        assert!(value["availWidth"].as_i64().is_some_and(|v| v > 0));
+        assert!(value["colorDepth"].as_i64().is_some_and(|v| v > 0));
+        assert!(value["plugins"].as_i64().is_some());
+        assert!(value["formFactors"].is_array());
     }
 }
