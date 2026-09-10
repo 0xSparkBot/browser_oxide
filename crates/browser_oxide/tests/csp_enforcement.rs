@@ -127,16 +127,10 @@ async fn no_csp_does_not_block_anything() {
 /// page-level meta-CSP install → queued violation from a Rust gate →
 /// JS-side dispatcher → event listener with correct fields.
 #[tokio::test]
-#[ignore = "not yet implemented: CSP violation event delivery to document listeners"]
 async fn securitypolicyviolation_event_fires_on_block() {
-    use browser_oxide::js_runtime::extensions::fetch_ext as csp_state;
-    use browser_oxide::net::csp::Directive;
-    use url::Url;
-
     // Page sets its own CSP via meta-tag and installs a listener BEFORE
-    // anything fires. After page init we trip the gate from Rust then
-    // explicitly drain so the test is deterministic (doesn't rely on
-    // setTimeout timing).
+    // anything fires. The blocked fetch is rejected by the CSP gate before
+    // any network request is sent and must dispatch the violation event.
     const HTML: &str = r#"<html><head>
 <meta http-equiv="Content-Security-Policy" content="connect-src 'self'">
 <title>spv</title>
@@ -159,20 +153,13 @@ async fn securitypolicyviolation_event_fires_on_block() {
         .await
         .unwrap();
 
-    // Trip the gate AFTER Page is up so the violation queue is fresh
-    // and the policy hasn't been re-set since the listener registered.
-    let _ = csp_state::check_csp(
-        Directive::ConnectSrc,
-        &Url::parse("https://collector.example/api").unwrap(),
-        None,
-        false,
-    );
-
-    // Force an explicit drain — deterministic; doesn't depend on the
-    // background setTimeout timeline.
     let _ = page
-        .evaluate("globalThis.__drainCspViolations && globalThis.__drainCspViolations()")
+        .evaluate("fetch('https://collector.example/api').catch(() => undefined)")
         .unwrap();
+    let _ = page
+        .event_loop()
+        .run_until_idle(std::time::Duration::from_secs(1))
+        .await;
 
     let n = page
         .evaluate("String(globalThis.__spv_events.length)")
@@ -210,8 +197,6 @@ async fn securitypolicyviolation_event_fires_on_block() {
         disposition.contains("enforce"),
         "disposition must be 'enforce' for this policy, got {disposition}"
     );
-
-    csp_state::clear_csp_policy();
 }
 
 /// CSP `connect-src` enforcement: when the policy doesn't whitelist a

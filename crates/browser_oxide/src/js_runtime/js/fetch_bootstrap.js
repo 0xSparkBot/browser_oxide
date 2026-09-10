@@ -607,6 +607,12 @@
                 url: result.url,
             });
         } catch (e) {
+            // A CSP gate may have rejected the request inside op_fetch and
+            // queued a SecurityPolicyViolationEvent payload. Chromium makes
+            // that event observable as part of the blocked request lifecycle;
+            // drain before exposing the generic Fetch network error so page
+            // listeners do not depend on bootstrap-time polling timers.
+            try { _drainCspViolations(); } catch (_) {}
             // Log error for audit
             const browser_oxide = globalThis._browser_oxide;
             const fetchLog = browser_oxide && browser_oxide.__fetchLog;

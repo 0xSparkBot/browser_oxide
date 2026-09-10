@@ -5460,14 +5460,10 @@ mod tests {
     /// each must produce a distinct width from sans-serif baseline AND
     /// from each other.
     ///
-    /// Ignored: needs real `canvas.getContext('2d')` font-metrics — the
-    /// `Page::from_html` test harness initialises a context that can't
-    /// resolve named font families, so the assertion fails in the
-    /// default test env even though the behaviour is correct against a
-    /// real browser. Run with `--ignored` after wiring a fuller canvas
-    /// context into the unit-test harness.
+    /// The DOM canvas path now shares the same 2D context/font-metrics
+    /// implementation used by normal pages, so this is a default regression
+    /// rather than an on-demand harness diagnostic.
     #[tokio::test]
-    #[ignore = "needs real canvas getContext in the test harness"]
     async fn canvas_font_detection_macos_helvetica_neue() {
         let profile = crate::stealth::presets::chrome_148_macos();
         let mut page = Page::from_html(
@@ -5520,10 +5516,9 @@ mod tests {
     /// aliases everything to Liberation Sans; the canvas_bootstrap shim
     /// adds a deterministic per-family micro-delta to keep widths unique.
     ///
-    /// Ignored: same canvas-getContext harness limitation as
-    /// `canvas_font_detection_macos_helvetica_neue` above.
+    /// Kept as a default regression now that the Page harness exercises the
+    /// same DOM-backed canvas path as normal browser pages.
     #[tokio::test]
-    #[ignore = "needs real canvas getContext in the test harness"]
     async fn canvas_measure_text_distinguishes_named_fonts() {
         let mut page = Page::from_html(
             "<html><head></head><body><canvas id=\"c\" width=\"200\" height=\"50\"></canvas></body></html>",
