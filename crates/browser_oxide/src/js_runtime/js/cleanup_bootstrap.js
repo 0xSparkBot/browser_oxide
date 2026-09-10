@@ -936,23 +936,34 @@
         const _snapshotOnHandlers = (target) => {
             const m = new Map();
             if (!target) return m;
-            let names;
-            try { names = Object.getOwnPropertyNames(target); } catch (_e) { return m; }
-            for (const k of names) {
-                if (!k.startsWith('on')) continue;
-                try { m.set(k, target[k]); } catch (_e) {}
+            // Window exposes most event-handler attributes as own properties,
+            // while Document/HTMLElement expose them through prototype
+            // accessors. Warm reuse keeps the same singleton wrappers, so a
+            // baseline that only inspects own keys misses e.g.
+            // `document.onclick` and retains the page's callback closure.
+            const seen = new Set();
+            let cursor = target;
+            while (cursor) {
+                let names;
+                try { names = Object.getOwnPropertyNames(cursor); } catch (_e) { break; }
+                for (const k of names) {
+                    if (!k.startsWith('on') || seen.has(k)) continue;
+                    seen.add(k);
+                    try { m.set(k, target[k]); } catch (_e) {}
+                }
+                try { cursor = Object.getPrototypeOf(cursor); } catch (_e) { break; }
             }
             return m;
         };
         const _restoreOnHandlers = (target, baseline) => {
             if (!target || !baseline) return;
-            let names;
-            try { names = Object.getOwnPropertyNames(target); } catch (_e) { return; }
-            for (const k of names) {
-                if (!k.startsWith('on')) continue;
+            // Restore the baseline keys themselves rather than re-enumerating
+            // target own properties: inherited handler accessors remain
+            // inherited after assignment, so own-key enumeration cannot find
+            // them on Document.
+            for (const [k, orig] of baseline) {
                 try {
                     if (typeof target[k] !== 'function') continue;
-                    const orig = baseline.get(k);
                     // Already the engine's own handler ⇒ leave it alone.
                     if (orig === target[k]) continue;
                     target[k] = (typeof orig === 'function') ? orig : null;

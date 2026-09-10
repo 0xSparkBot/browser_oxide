@@ -2817,15 +2817,11 @@
     }
 
     let _currentScript = null;
-    // Sticky: keep the last executed <script> visible after its top-level
-    // returns. Next.js Turbopack's async `registerChunk` runs module
-    // factories in a promise continuation, where the app entry
-    // (`getAssetPrefix`) still reads `document.currentScript`; Chrome keeps
-    // the element readable there. A plain `null` clear would turn that read
-    // into an `InvariantError` and sever the hydration bootstrap. The value
-    // is overwritten by the next `set_current_script(Some)` and reset by the
-    // per-navigation bootstrap re-run.
-    function _setCurrentScript(el) { if (el !== null) _currentScript = el; }
+    // Browser execution sets this immediately before running a classic script
+    // and clears it immediately afterwards. Chrome 148 already reports null
+    // from Promise microtasks scheduled by that script, so do not retain the
+    // last script element past its top-level execution.
+    function _setCurrentScript(el) { _currentScript = el; }
 
     class HTMLAllCollection {
         constructor(doc) {
