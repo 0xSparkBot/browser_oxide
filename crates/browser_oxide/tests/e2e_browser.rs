@@ -1366,30 +1366,28 @@ async fn e2e_linked_stylesheet_fetched() {
     // Navigate to a real page that uses <link rel="stylesheet">
     // and verify getComputedStyle picks up external CSS
     let profile = browser_oxide::stealth::chrome_148_linux();
-    match Page::navigate("https://news.ycombinator.com", profile, 0).await {
-        Ok(mut page) => {
-            // HN uses <link rel="stylesheet" href="news.css">
-            // The CSS sets body font, size, and color.  Assert those concrete
-            // values instead of merely printing backgroundColor (HN's body
-            // background is transparent, so that old smoke could pass even if
-            // the linked stylesheet was never applied).
-            let title = page.title();
-            assert_eq!(title, "Hacker News");
-            let font_family = page
-                .evaluate("getComputedStyle(document.body).fontFamily")
-                .unwrap();
-            let font_size = page
-                .evaluate("getComputedStyle(document.body).fontSize")
-                .unwrap();
-            let color = page
-                .evaluate("getComputedStyle(document.body).color")
-                .unwrap();
-            assert_eq!(font_family, "Verdana, Geneva, sans-serif");
-            assert_eq!(font_size, "10pt");
-            assert_eq!(color, "#828282");
-        }
-        Err(e) => eprintln!("navigate failed: {e}"),
-    }
+    let mut page = Page::navigate("https://news.ycombinator.com", profile, 0)
+        .await
+        .expect("Hacker News navigation must succeed for linked stylesheet smoke");
+    // HN uses <link rel="stylesheet" href="news.css">
+    // The CSS sets body font, size, and color.  Assert those concrete
+    // values instead of merely printing backgroundColor (HN's body
+    // background is transparent, so that old smoke could pass even if
+    // the linked stylesheet was never applied).
+    let title = page.title();
+    assert_eq!(title, "Hacker News");
+    let font_family = page
+        .evaluate("getComputedStyle(document.body).fontFamily")
+        .unwrap();
+    let font_size = page
+        .evaluate("getComputedStyle(document.body).fontSize")
+        .unwrap();
+    let color = page
+        .evaluate("getComputedStyle(document.body).color")
+        .unwrap();
+    assert_eq!(font_family, "Verdana, Geneva, sans-serif");
+    assert_eq!(font_size, "10pt");
+    assert_eq!(color, "#828282");
 }
 
 // ================================================================
