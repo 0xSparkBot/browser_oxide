@@ -1,4 +1,4 @@
-//! API completeness — Chrome 147 ships ~1080 globals + ~57 Navigator.prototype
+//! API completeness — Chrome 148 ships a large Web Platform global surface.
 //! entries. CreepJS `features` and fp-collect `navigatorPrototype` walks hash
 //! the constructor list. Missing constructors are tells. This suite asserts
 //! the constructors browser_oxide stubs to land.
@@ -31,7 +31,7 @@ async fn assert_ctor(name: &str) {
 }
 
 // ================================================================
-// Core DOM / Web Platform constructors that real Chrome 147 ships
+// Core DOM / Web Platform constructors that real Chrome 148 ships
 // ================================================================
 
 #[tokio::test]
@@ -60,7 +60,7 @@ async fn ctor_event_exists() {
 }
 
 // ================================================================
-// New / non-trivial Chrome 147 constructors
+// New / non-trivial Chrome 148 constructors
 // ================================================================
 #[tokio::test]
 async fn ctor_css_style_sheet_exists() {
@@ -75,8 +75,9 @@ async fn ctor_highlight_registry_exists() {
     assert_ctor("HighlightRegistry").await
 }
 #[tokio::test]
-async fn ctor_css_pseudo_element_exists() {
-    assert_ctor("CSSPseudoElement").await
+async fn css_pseudo_element_absent_in_chrome_148() {
+    let r = evaluate("typeof globalThis.CSSPseudoElement").await;
+    assert_eq!(r, "undefined");
 }
 #[tokio::test]
 async fn ctor_static_range_exists() {
@@ -87,8 +88,9 @@ async fn ctor_xml_serializer_exists() {
     assert_ctor("XMLSerializer").await
 }
 #[tokio::test]
-async fn ctor_xslt_processor_exists() {
-    assert_ctor("XSLTProcessor").await
+async fn xslt_processor_absent_in_chrome_148() {
+    let r = evaluate("typeof globalThis.XSLTProcessor").await;
+    assert_eq!(r, "undefined");
 }
 
 #[tokio::test]
