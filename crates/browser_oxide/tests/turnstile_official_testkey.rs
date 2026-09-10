@@ -4,7 +4,7 @@
 //! only Cloudflare's public always-pass test configuration and never prints the
 //! response value.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TEST_PAGE_URL: &str = "https://turnstiletestingkeyformprotection.pages.dev/";
 const ALWAYS_PASS_SITEKEY: &str = "1x00000000000000000000AA";
@@ -19,18 +19,18 @@ async fn official_always_pass_populates_response_without_exposing_value() {
         .await
         .expect("navigate official Turnstile test page");
 
-    for _ in 0..16 {
-        if matches!(
-            page.evaluate("typeof globalThis.turnstile").as_deref(),
-            Ok("object")
-        ) {
-            break;
-        }
+    let api_deadline = Instant::now() + Duration::from_secs(20);
+    while !matches!(
+        page.evaluate("typeof globalThis.turnstile").as_deref(),
+        Ok("object")
+    ) && Instant::now() < api_deadline
+    {
         page.drive_frame_tree(&client, &profile).await;
         let _ = page
             .event_loop()
             .run_until_settled(Duration::from_millis(400))
             .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(
         page.evaluate("typeof globalThis.turnstile")
@@ -65,7 +65,8 @@ async fn official_always_pass_populates_response_without_exposing_value() {
     );
 
     let mut completed = false;
-    for _ in 0..48 {
+    let callback_deadline = Instant::now() + Duration::from_secs(130);
+    while Instant::now() < callback_deadline {
         page.drive_frame_tree(&client, &profile).await;
         let _ = page
             .event_loop()
@@ -79,6 +80,7 @@ async fn official_always_pass_populates_response_without_exposing_value() {
             completed = true;
             break;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(completed, "official always-pass callback did not fire");
 
