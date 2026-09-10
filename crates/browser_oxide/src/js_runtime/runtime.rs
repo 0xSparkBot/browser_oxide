@@ -66,6 +66,10 @@ pub struct BrowserRuntimeOptions {
     /// Parsed import map for this document. The module loader keeps a
     /// per-runtime shared handle so warm-reuse can replace it on navigation.
     pub import_map: crate::js_runtime::module_loader::ImportMap,
+    /// Serialized origin of the owning document for ES-module fetches. Module
+    /// dependencies keep this Origin even when their immediate referrer URL is
+    /// cross-origin.
+    pub module_request_origin: Option<String>,
 }
 
 /// Create a deno_core JsRuntime configured with browser extensions.
@@ -179,6 +183,7 @@ pub struct RuntimeInternalFns {
     pub pump_worker_messages: Option<v8::Global<v8::Function>>,
     pub pump_message_ports: Option<v8::Global<v8::Function>>,
     pub import_map_state: crate::js_runtime::module_loader::ImportMapState,
+    pub module_request_state: crate::js_runtime::module_loader::ModuleRequestState,
 }
 
 /// Create a runtime AND return its NavSignal so the event-loop driver
@@ -205,11 +210,14 @@ pub fn create_runtime_with_signals(
     // SPA bundles throw SyntaxError and are dropped (the thin-render gap).
     let import_map_state =
         crate::js_runtime::module_loader::ImportMapState::new(options.import_map);
+    let module_request_state =
+        crate::js_runtime::module_loader::ModuleRequestState::new(options.module_request_origin);
     let module_loader: Option<std::rc::Rc<dyn deno_core::ModuleLoader>> =
         options.stealth_profile.as_ref().map(|p| {
             std::rc::Rc::new(crate::js_runtime::module_loader::BrowserModuleLoader::new(
                 p.clone(),
                 import_map_state.clone(),
+                module_request_state.clone(),
             )) as std::rc::Rc<dyn deno_core::ModuleLoader>
         });
 
@@ -453,6 +461,7 @@ pub fn create_runtime_with_signals(
 
         let mut captured = RuntimeInternalFns {
             import_map_state: import_map_state.clone(),
+            module_request_state: module_request_state.clone(),
             ..Default::default()
         };
         if let Some(bridge) = bridge {

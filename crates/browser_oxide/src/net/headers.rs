@@ -319,26 +319,9 @@ pub fn chrome_headers_fetch(
         format!("\"{}\"", profile.os_name),
     ));
 
-    // Compute sec-fetch-site from target vs origin.
-    let site = match origin {
-        Some(origin) => {
-            let t = url::Url::parse(target_url).ok();
-            let o = url::Url::parse(origin).ok();
-            match (t, o) {
-                (Some(tu), Some(ou)) => {
-                    if tu.host_str() == ou.host_str() {
-                        "same-origin"
-                    } else if same_site(&tu, &ou) {
-                        "same-site"
-                    } else {
-                        "cross-site"
-                    }
-                }
-                _ => "cross-site",
-            }
-        }
-        None => "cross-site",
-    };
+    // Compare the full tuple origin. The same host on a different port is
+    // same-site, but it is not same-origin.
+    let site = fetch_metadata_site(target_url, origin);
     headers.push(("sec-fetch-site".to_string(), site.to_string()));
     headers.push(("sec-fetch-mode".to_string(), "cors".to_string()));
     headers.push(("sec-fetch-dest".to_string(), "empty".to_string()));
@@ -379,6 +362,25 @@ fn same_site(a: &url::Url, b: &url::Url) -> bool {
         Some(parts.join("."))
     }
     tail2(a) == tail2(b)
+}
+
+fn fetch_metadata_site(target_url: &str, origin: Option<&str>) -> &'static str {
+    let Some(origin) = origin else {
+        return "cross-site";
+    };
+    let Some(target) = url::Url::parse(target_url).ok() else {
+        return "cross-site";
+    };
+    let Some(source) = url::Url::parse(origin).ok() else {
+        return "cross-site";
+    };
+    if target.origin() == source.origin() {
+        "same-origin"
+    } else if same_site(&target, &source) {
+        "same-site"
+    } else {
+        "cross-site"
+    }
 }
 
 /// Build headers for a request that should include the high-entropy
@@ -705,25 +707,7 @@ pub fn firefox_headers_fetch(
         "gzip, deflate, br, zstd".to_string(),
     ));
 
-    let site = match origin {
-        Some(origin) => {
-            let t = url::Url::parse(target_url).ok();
-            let o = url::Url::parse(origin).ok();
-            match (t, o) {
-                (Some(tu), Some(ou)) => {
-                    if tu.host_str() == ou.host_str() {
-                        "same-origin"
-                    } else if same_site(&tu, &ou) {
-                        "same-site"
-                    } else {
-                        "cross-site"
-                    }
-                }
-                _ => "cross-site",
-            }
-        }
-        None => "cross-site",
-    };
+    let site = fetch_metadata_site(target_url, origin);
     headers.push(("sec-fetch-dest".to_string(), "empty".to_string()));
     headers.push(("sec-fetch-mode".to_string(), "cors".to_string()));
     headers.push(("sec-fetch-site".to_string(), site.to_string()));
@@ -1056,6 +1040,38 @@ pub fn is_cross_origin_isolated(policy: &DocumentPolicy) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_metadata_site_compares_the_full_origin_tuple() {
+        assert_eq!(
+            fetch_metadata_site(
+                "https://app.example.test:8443/chunk.js",
+                Some("https://app.example.test:8443")
+            ),
+            "same-origin"
+        );
+        assert_eq!(
+            fetch_metadata_site(
+                "https://app.example.test:9443/chunk.js",
+                Some("https://app.example.test:8443")
+            ),
+            "same-site"
+        );
+        assert_eq!(
+            fetch_metadata_site(
+                "https://cdn.example.test/chunk.js",
+                Some("https://app.example.test")
+            ),
+            "same-site"
+        );
+        assert_eq!(
+            fetch_metadata_site(
+                "https://static.example.net/chunk.js",
+                Some("https://app.example.test")
+            ),
+            "cross-site"
+        );
+    }
 
     #[test]
     fn accept_language_single() {

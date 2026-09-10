@@ -56,6 +56,7 @@ pub struct BrowserJsRuntime {
     worker_messages_pump_fn: Option<v8::Global<v8::Function>>,
     message_ports_pump_fn: Option<v8::Global<v8::Function>>,
     import_map_state: module_loader::ImportMapState,
+    module_request_state: module_loader::ModuleRequestState,
     /// Per-runtime navigation-pending signal. JS sets it via
     /// `op_set_pending_nav` (called from window_bootstrap.js whenever
     /// `__pendingNavigation` is assigned). The event loop polls it to
@@ -159,6 +160,7 @@ impl BrowserJsRuntime {
             worker_messages_pump_fn: internal_fns.pump_worker_messages,
             message_ports_pump_fn: internal_fns.pump_message_ports,
             import_map_state: internal_fns.import_map_state,
+            module_request_state: internal_fns.module_request_state,
         }
     }
 
@@ -745,8 +747,10 @@ impl BrowserJsRuntime {
         dom: Dom,
         stylesheets: Vec<String>,
         import_map: module_loader::ImportMap,
+        module_request_origin: Option<String>,
     ) {
         self.import_map_state.replace(import_map);
+        self.module_request_state.replace(module_request_origin);
         // The bootstrap (and thus __pumpFrameMessages) is re-installed here;
         // drop the cached handle so it is re-captured against the fresh function.
         self.frame_deliver_fn = None;

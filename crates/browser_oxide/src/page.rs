@@ -778,6 +778,10 @@ impl Page {
                 stealth_profile: Some(profile.clone()),
                 stylesheets,
                 import_map,
+                module_request_origin: {
+                    let origin = origin_of(url);
+                    (!origin.is_empty()).then_some(origin)
+                },
                 is_secure_context: is_secure_url(url),
                 ..Default::default()
             },
@@ -842,7 +846,10 @@ impl Page {
         // Swap DOM in existing runtime (no new V8 isolate needed)
         self.event_loop
             .runtime_mut()
-            .replace_dom(dom, stylesheets, import_map);
+            .replace_dom(dom, stylesheets, import_map, {
+                let origin = origin_of(url);
+                (!origin.is_empty()).then_some(origin)
+            });
 
         // Update URL (URL-state setup, not a real navigation).
         self.url = url.to_string();
@@ -924,6 +931,10 @@ impl Page {
                 stealth_profile: profile.clone(),
                 stylesheets,
                 import_map,
+                module_request_origin: {
+                    let origin = origin_of(url);
+                    (!origin.is_empty()).then_some(origin)
+                },
                 is_secure_context: is_secure_url(url),
                 ..Default::default()
             },
@@ -2624,21 +2635,24 @@ impl Page {
                 eprintln!("[navigate] script[{i}] PREFETCH {full_url}");
             }
             let client = client.clone();
-            let profile = profile.clone();
             let referer = resp_url.clone();
+            let request_origin = {
+                let origin = origin_of(&referer);
+                (!origin.is_empty()).then_some(origin)
+            };
+            let is_module = script.is_module;
             let handle = tokio::spawn(async move {
-                // Script fetches inherit the parent doc's
-                // regional accept-language (real Chrome sends one
-                // accept-language per session, not per-URL — keyed off
-                // the doc URL keeps sub-resource requests consistent).
-                let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, &referer, false);
-                hdrs.push(("referer".to_string(), referer));
-                hdrs.push(("accept".to_string(), "*/*".to_string()));
-                hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
-                hdrs.push(("sec-fetch-mode".to_string(), "no-cors".to_string()));
-                hdrs.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
                 let dbg = std::env::var("BROWSER_OXIDE_DEBUG_NAV").is_ok();
-                match client.get_follow_with_headers(&full_url, &hdrs, 5).await {
+                match client
+                    .get_script_resource(
+                        &full_url,
+                        &referer,
+                        request_origin.as_deref(),
+                        is_module,
+                        5,
+                    )
+                    .await
+                {
                     Ok(r) if r.ok() => {
                         let text = r.text();
                         if text.trim_start().starts_with("<!")
@@ -2699,7 +2713,10 @@ impl Page {
         // Swap DOM (also resets `TimerState` Rust-side).
         self.event_loop
             .runtime_mut()
-            .replace_dom(dom, stylesheets, import_map);
+            .replace_dom(dom, stylesheets, import_map, {
+                let origin = origin_of(&resp_url);
+                (!origin.is_empty()).then_some(origin)
+            });
         self.url = resp_url.clone();
         // A warm navigation reuses the JS realm, including the previous
         // document's readyState slot. Reset it before any new-page script runs;
@@ -4624,19 +4641,23 @@ impl Page {
                 }
             }
             let client = client.clone();
-            let profile = profile.clone();
             let referer = url.to_string();
+            let request_origin = {
+                let origin = origin_of(&referer);
+                (!origin.is_empty()).then_some(origin)
+            };
+            let is_module = script.is_module;
             let handle = tokio::spawn(async move {
-                // Script fetches inherit parent doc's
-                // regional accept-language (see lib.rs::get_with_headers).
-                let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, &referer, false);
-                hdrs.push(("referer".to_string(), referer));
-                hdrs.push(("accept".to_string(), "*/*".to_string()));
-                hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
-                hdrs.push(("sec-fetch-mode".to_string(), "no-cors".to_string()));
-                hdrs.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
-
-                match client.get_follow_with_headers(&full_url, &hdrs, 5).await {
+                match client
+                    .get_script_resource(
+                        &full_url,
+                        &referer,
+                        request_origin.as_deref(),
+                        is_module,
+                        5,
+                    )
+                    .await
+                {
                     Ok(resp) if resp.ok() => {
                         let text = resp.text();
                         if text.trim_start().starts_with("<!")
@@ -4686,6 +4707,10 @@ impl Page {
                 init_scripts: init_scripts.to_vec(),
                 storage,
                 import_map,
+                module_request_origin: {
+                    let origin = origin_of(url);
+                    (!origin.is_empty()).then_some(origin)
+                },
                 is_secure_context: is_secure_url(url),
                 cross_origin_isolated,
                 ..Default::default()

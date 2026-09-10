@@ -62,6 +62,53 @@ impl ImportMapState {
     }
 }
 
+/// Per-runtime module-fetch context. The owning document's Origin stays
+/// stable across a module graph even when an imported module has a different
+/// origin; warm navigation replaces this state together with the import map.
+#[derive(Debug, Default)]
+struct ModuleRequestContext {
+    origin: Option<String>,
+    resolved_referrers: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModuleRequestState(Rc<RefCell<ModuleRequestContext>>);
+
+impl ModuleRequestState {
+    pub fn new(origin: Option<String>) -> Self {
+        Self(Rc::new(RefCell::new(ModuleRequestContext {
+            origin,
+            resolved_referrers: HashMap::new(),
+        })))
+    }
+
+    pub fn replace(&self, origin: Option<String>) {
+        let mut state = self.0.borrow_mut();
+        state.origin = origin;
+        state.resolved_referrers.clear();
+    }
+
+    fn origin(&self) -> Option<String> {
+        self.0.borrow().origin.clone()
+    }
+
+    fn record_referrer(&self, resolved: &ModuleSpecifier, referrer: &str) {
+        self.0
+            .borrow_mut()
+            .resolved_referrers
+            .entry(resolved.to_string())
+            .or_insert_with(|| referrer.to_string());
+    }
+
+    fn referrer_for(&self, resolved: &ModuleSpecifier) -> Option<String> {
+        self.0
+            .borrow()
+            .resolved_referrers
+            .get(resolved.as_str())
+            .cloned()
+    }
+}
+
 impl ImportMap {
     /// Collect parser-inserted `<script type="importmap">` blocks in document
     /// order and merge them into the document's import map.
@@ -276,20 +323,24 @@ fn percent_decode(s: &str) -> String {
 
 /// Fetches ES-module sources through browser_oxide's shared HTTP session.
 pub struct BrowserModuleLoader {
-    profile: StealthProfile,
     /// Cached client on the shared session jar (cookie-consistent with the
     /// page nav). `None` only if the connector failed to build.
     client: Option<HttpClient>,
     import_map: ImportMapState,
+    request_state: ModuleRequestState,
 }
 
 impl BrowserModuleLoader {
-    pub fn new(profile: StealthProfile, import_map: ImportMapState) -> Self {
+    pub fn new(
+        profile: StealthProfile,
+        import_map: ImportMapState,
+        request_state: ModuleRequestState,
+    ) -> Self {
         let client = HttpClient::shared(&profile).ok();
         Self {
-            profile,
             client,
             import_map,
+            request_state,
         }
     }
 }
@@ -299,13 +350,19 @@ impl ModuleLoader for BrowserModuleLoader {
         &self,
         specifier: &str,
         referrer: &str,
-        _kind: ResolutionKind,
+        kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        if let Some(mapped) = self.import_map.resolve(specifier, referrer)? {
-            return Ok(mapped);
+        let resolved = if let Some(mapped) = self.import_map.resolve(specifier, referrer)? {
+            mapped
+        } else {
+            // Spec-compliant relative/absolute-specifier resolution against the referrer.
+            resolve_import(specifier, referrer)
+                .map_err(|e| ModuleLoaderError::generic(e.to_string()))?
+        };
+        if kind != ResolutionKind::MainModule {
+            self.request_state.record_referrer(&resolved, referrer);
         }
-        // Spec-compliant relative/absolute-specifier resolution against the referrer.
-        resolve_import(specifier, referrer).map_err(|e| ModuleLoaderError::generic(e.to_string()))
+        Ok(resolved)
     }
 
     fn load(
@@ -316,10 +373,11 @@ impl ModuleLoader for BrowserModuleLoader {
     ) -> ModuleLoadResponse {
         let spec = module_specifier.clone();
         let url = module_specifier.to_string();
-        let profile = self.profile.clone();
         let client = self.client.clone();
+        let request_origin = self.request_state.origin();
         let referer = maybe_referrer
             .map(|r| r.specifier.to_string())
+            .or_else(|| self.request_state.referrer_for(&spec))
             .unwrap_or_else(|| url.clone());
 
         // data: modules. deno_core 0.311 routes `import('data:…')` THROUGH the
@@ -379,14 +437,8 @@ impl ModuleLoader for BrowserModuleLoader {
             let client = client.ok_or_else(|| {
                 ModuleLoaderError::generic("module loader: shared HTTP client unavailable")
             })?;
-            let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, &referer, false);
-            hdrs.push(("referer".to_string(), referer));
-            hdrs.push(("accept".to_string(), "*/*".to_string()));
-            // ESM fetches: Chrome emits dest=script, mode=cors.
-            hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
-            hdrs.push(("sec-fetch-mode".to_string(), "cors".to_string()));
             let resp = client
-                .get_follow_with_headers(&url, &hdrs, 5)
+                .get_script_resource(&url, &referer, request_origin.as_deref(), true, 5)
                 .await
                 .map_err(|e| ModuleLoaderError::generic(format!("module fetch {url}: {e}")))?;
             if !resp.ok() {
@@ -404,5 +456,27 @@ impl ModuleLoader for BrowserModuleLoader {
             ))
         };
         ModuleLoadResponse::Async(Box::pin(fut))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_request_state_tracks_importer_and_clears_on_navigation() {
+        let state = ModuleRequestState::new(Some("https://first.example".to_string()));
+        let dep = ModuleSpecifier::parse("https://cdn.example/dep.js").unwrap();
+        state.record_referrer(&dep, "https://first.example/entry.js");
+
+        assert_eq!(state.origin().as_deref(), Some("https://first.example"));
+        assert_eq!(
+            state.referrer_for(&dep).as_deref(),
+            Some("https://first.example/entry.js")
+        );
+
+        state.replace(Some("https://second.example".to_string()));
+        assert_eq!(state.origin().as_deref(), Some("https://second.example"));
+        assert_eq!(state.referrer_for(&dep), None);
     }
 }

@@ -753,6 +753,49 @@ impl HttpClient {
         self.get_with_exact_headers(url, &hdrs).await
     }
 
+    /// Fetch an external classic/module script as a subresource rather than a
+    /// navigation. `request_origin` is the owning document's serialized origin;
+    /// `referrer` is the immediate document/module URL.
+    pub async fn get_script_resource(
+        &self,
+        url: &str,
+        referrer: &str,
+        request_origin: Option<&str>,
+        is_module: bool,
+        max_redirects: u8,
+    ) -> Result<Response, NetError> {
+        let hdrs = self.script_resource_headers(url, referrer, request_origin, is_module);
+        self.get_follow_exact_headers(url, &hdrs, max_redirects)
+            .await
+    }
+
+    fn script_resource_headers(
+        &self,
+        url: &str,
+        referrer: &str,
+        request_origin: Option<&str>,
+        is_module: bool,
+    ) -> Vec<(String, String)> {
+        let mut hdrs = headers::nav_headers_fetch(&self.profile, url, request_origin);
+        let extras = [
+            ("accept".to_string(), "*/*".to_string()),
+            ("sec-fetch-dest".to_string(), "script".to_string()),
+            (
+                "sec-fetch-mode".to_string(),
+                if is_module { "cors" } else { "no-cors" }.to_string(),
+            ),
+            ("referer".to_string(), referrer.to_string()),
+        ];
+        merge_headers(&mut hdrs, &extras);
+        if !is_module {
+            hdrs.retain(|(name, _)| !name.eq_ignore_ascii_case("origin"));
+        }
+        if self.profile.browser_name != "Firefox" && self.profile.browser_name != "Safari" {
+            order_chrome_fetch_headers(&mut hdrs, &extras);
+        }
+        hdrs
+    }
+
     /// Fetch-API-style GET: uses `chrome_headers_fetch` (accept: */*, no
     /// upgrade-insecure-requests, sec-fetch-dest: empty, etc.) as the base
     /// header set, with caller's extras merged in. `origin` is the page's
@@ -1919,6 +1962,69 @@ mod tests {
         let profile = crate::stealth::chrome_148_linux();
         let client = HttpClient::new(&profile);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn script_resource_headers_use_subresource_fetch_metadata() {
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let client = HttpClient::new(&profile).unwrap();
+
+        let classic = client.script_resource_headers(
+            "https://app.example.test/classic.js",
+            "https://app.example.test/page",
+            Some("https://app.example.test"),
+            false,
+        );
+        let classic: std::collections::HashMap<_, _> = classic.into_iter().collect();
+        assert_eq!(
+            classic.get("sec-fetch-site").map(String::as_str),
+            Some("same-origin")
+        );
+        assert_eq!(
+            classic.get("sec-fetch-mode").map(String::as_str),
+            Some("no-cors")
+        );
+        assert_eq!(
+            classic.get("sec-fetch-dest").map(String::as_str),
+            Some("script")
+        );
+        assert_eq!(
+            classic.get("referer").map(String::as_str),
+            Some("https://app.example.test/page")
+        );
+        assert!(!classic.contains_key("origin"));
+        assert!(!classic.contains_key("sec-fetch-user"));
+        assert!(!classic.contains_key("upgrade-insecure-requests"));
+
+        let module = client.script_resource_headers(
+            "https://cdn.example.net/module.js",
+            "https://app.example.test/entry.js",
+            Some("https://app.example.test"),
+            true,
+        );
+        let module: std::collections::HashMap<_, _> = module.into_iter().collect();
+        assert_eq!(
+            module.get("sec-fetch-site").map(String::as_str),
+            Some("cross-site")
+        );
+        assert_eq!(
+            module.get("sec-fetch-mode").map(String::as_str),
+            Some("cors")
+        );
+        assert_eq!(
+            module.get("sec-fetch-dest").map(String::as_str),
+            Some("script")
+        );
+        assert_eq!(
+            module.get("origin").map(String::as_str),
+            Some("https://app.example.test")
+        );
+        assert_eq!(
+            module.get("referer").map(String::as_str),
+            Some("https://app.example.test/entry.js")
+        );
+        assert!(!module.contains_key("sec-fetch-user"));
+        assert!(!module.contains_key("upgrade-insecure-requests"));
     }
 
     #[test]
