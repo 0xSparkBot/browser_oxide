@@ -437,6 +437,8 @@ pub fn create_runtime_with_signals(
             include_str!("js/window_reflection_spec.js"),
             "\n",
             include_str!("js/structured_clone.js"),
+            "\n",
+            include_str!("js/indexeddb_bootstrap.js"),
         );
 
         let _bt0 = std::time::Instant::now();
@@ -807,6 +809,10 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/structured_clone.js"))
         .expect("worker: structured_clone bootstrap failed");
+
+    runtime
+        .execute_script("<anonymous>", include_str!("js/indexeddb_bootstrap.js"))
+        .expect("worker: indexeddb bootstrap failed");
 
     runtime
         .execute_script("<anonymous>", include_str!("js/worker_bootstrap.js"))

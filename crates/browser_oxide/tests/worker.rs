@@ -1009,3 +1009,67 @@ fn chrome_148_worker_namespace_and_prototype_shape() {
         assert_eq!(v["requiredTypes"][name], "function", "{name}: {out}");
     }
 }
+
+#[test]
+fn worker_indexeddb_transaction_round_trip() {
+    let code = r#"
+        const src = `
+            const result = { seq: [] };
+            const open = indexedDB.open('worker-idb-regression', 1);
+            open.onupgradeneeded = () => {
+                result.seq.push('upgrade');
+                open.result.createObjectStore('items', { keyPath: 'id' })
+                    .put({ id: 1, value: 'worker' });
+            };
+            open.onsuccess = () => {
+                result.seq.push('open-success');
+                const tx = open.result.transaction('items', 'readwrite');
+                const store = tx.objectStore('items');
+                const put = store.put({ id: 2, value: 'round-trip' });
+                put.onsuccess = () => {
+                    result.seq.push('put-success');
+                    const get = store.get(2);
+                    get.onsuccess = () => {
+                        result.seq.push('get-success');
+                        result.value = get.result;
+                    };
+                };
+                tx.oncomplete = () => {
+                    result.seq.push('tx-complete');
+                    result.factoryTag = Object.prototype.toString.call(indexedDB);
+                    result.factoryOwn = Reflect.ownKeys(indexedDB).map(String);
+                    result.requestTag = Object.prototype.toString.call(put);
+                    result.requestOwn = Reflect.ownKeys(put).map(String);
+                    self.postMessage(JSON.stringify(result));
+                };
+            };
+            open.onerror = () => self.postMessage(JSON.stringify({ error: open.error && open.error.name }));
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = event => {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime(code, 2000);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["seq"],
+        serde_json::json!([
+            "upgrade",
+            "open-success",
+            "put-success",
+            "get-success",
+            "tx-complete"
+        ])
+    );
+    assert_eq!(
+        value["value"],
+        serde_json::json!({"id":2,"value":"round-trip"})
+    );
+    assert_eq!(value["factoryTag"], "[object IDBFactory]");
+    assert_eq!(value["factoryOwn"], serde_json::json!([]));
+    assert_eq!(value["requestTag"], "[object IDBRequest]");
+    assert_eq!(value["requestOwn"], serde_json::json!([]));
+    assert!(value.get("error").is_none());
+}

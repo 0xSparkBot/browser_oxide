@@ -192,6 +192,8 @@ pub fn get_snapshot() -> &'static [u8] {
             include_str!("js/window_reflection_spec.js"),
             "\n",
             include_str!("js/structured_clone.js"),
+            "\n",
+            include_str!("js/indexeddb_bootstrap.js"),
         );
 
         // Script name "<anonymous>" matches V8's eval-default so

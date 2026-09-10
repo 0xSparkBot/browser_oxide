@@ -1058,6 +1058,24 @@
         }
         if (bo) {
             bo._markTrustedEvent = _markTrusted;
+            // Some Web APIs have non-DOM EventTarget parent relationships.
+            // IndexedDB request errors, for example, bubble from IDBRequest to
+            // IDBTransaction while retaining the original Event identity and
+            // target. Keep that hop inside this module so the private Event
+            // WeakMap remains unforgeable and no page-visible event fields are
+            // introduced.
+            bo._dispatchEventToParentTarget = function(event, parentTarget) {
+                const state = _stateFor(_eventState, event);
+                if (!state.bubbles || state.stopped || !parentTarget) {
+                    return !state.defaultPrevented;
+                }
+                state.currentTarget = parentTarget;
+                state.eventPhase = 3;
+                _fireListeners(parentTarget, event, false);
+                state.currentTarget = null;
+                state.eventPhase = 0;
+                return !state.defaultPrevented;
+            };
             const _lifecycleState = function() {
                 const state = globalThis._browser_oxide;
                 const lifecycle = state
