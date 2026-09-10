@@ -6397,6 +6397,169 @@ async fn crypto_subtle_digest_actually_works() {
 }
 
 #[tokio::test]
+async fn crypto_subtle_hmac_matches_chrome_and_known_vector() {
+    use browser_oxide::Page;
+    use std::time::Duration;
+
+    let mut page = Page::with_profile(
+        "<!DOCTYPE html><html><head></head><body></body></html>",
+        "https://example.com/",
+        browser_oxide::stealth::presets::chrome_148_windows(),
+    )
+    .await
+    .unwrap();
+
+    let _ = page
+        .event_loop()
+        .execute_and_run(
+            r#"
+            (async function() {
+                const hex = (buffer) => Array.from(new Uint8Array(buffer))
+                    .map((b) => b.toString(16).padStart(2, '0')).join('');
+                const result = {};
+                try {
+                    try {
+                        new CryptoKey();
+                        result.cryptoKeyConstructor = 'ok';
+                    } catch (e) {
+                        result.cryptoKeyConstructor = `${e.name}:${e.message}`;
+                    }
+                    const algorithmDescriptor = Object.getOwnPropertyDescriptor(
+                        CryptoKey.prototype, 'algorithm'
+                    );
+                    result.cryptoKeySurface = {
+                        length: CryptoKey.length,
+                        native: Function.prototype.toString.call(CryptoKey).includes('[native code]'),
+                        algorithmEnumerable: algorithmDescriptor.enumerable,
+                        algorithmConfigurable: algorithmDescriptor.configurable,
+                        algorithmHasGetter: typeof algorithmDescriptor.get === 'function',
+                        algorithmHasSetter: typeof algorithmDescriptor.set === 'function',
+                    };
+                    const raw = new TextEncoder().encode('key');
+                    const data = new TextEncoder().encode('The quick brown fox jumps over the lazy dog');
+                    const key = await crypto.subtle.importKey(
+                        'raw', raw, { name: 'HMAC', hash: 'SHA-256' }, true, ['sign', 'verify']
+                    );
+                    const signature = await crypto.subtle.sign('HMAC', key, data);
+                    const badSignature = new Uint8Array(signature.slice(0));
+                    badSignature[0] ^= 1;
+                    result.key = {
+                        tag: Object.prototype.toString.call(key),
+                        own: Reflect.ownKeys(key).length,
+                        proto: Object.getOwnPropertyNames(CryptoKey.prototype),
+                        type: key.type,
+                        extractable: key.extractable,
+                        algorithm: key.algorithm,
+                        usages: key.usages,
+                        sameAlgorithmObject: key.algorithm === key.algorithm,
+                        sameUsagesArray: key.usages === key.usages,
+                    };
+                    result.signature = hex(signature);
+                    result.verify = await crypto.subtle.verify('HMAC', key, signature, data);
+                    result.verifyBad = await crypto.subtle.verify('HMAC', key, badSignature, data);
+                    result.exported = hex(await crypto.subtle.exportKey('raw', key));
+
+                    const generated = await crypto.subtle.generateKey(
+                        { name: 'HMAC', hash: 'SHA-256' }, true, ['sign']
+                    );
+                    result.generated = {
+                        type: generated.type,
+                        algorithm: generated.algorithm,
+                        usages: generated.usages,
+                        rawLength: (await crypto.subtle.exportKey('raw', generated)).byteLength,
+                    };
+
+                    try {
+                        await crypto.subtle.importKey(
+                            'raw', raw, { name: 'HMAC', hash: 'SHA-256' }, true, ['encrypt']
+                        );
+                        result.badUsage = 'ok';
+                    } catch (e) {
+                        result.badUsage = e.name;
+                    }
+
+                    const nonExtractable = await crypto.subtle.importKey(
+                        'raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+                    );
+                    try {
+                        await crypto.subtle.exportKey('raw', nonExtractable);
+                        result.nonExtractable = 'ok';
+                    } catch (e) {
+                        result.nonExtractable = e.name;
+                    }
+
+                    const verifyOnly = await crypto.subtle.importKey(
+                        'raw', raw, { name: 'HMAC', hash: 'SHA-256' }, true, ['verify']
+                    );
+                    try {
+                        await crypto.subtle.sign('HMAC', verifyOnly, data);
+                        result.wrongUsage = 'ok';
+                    } catch (e) {
+                        result.wrongUsage = e.name;
+                    }
+                } catch (e) {
+                    result.topError = `${e.name}:${e.message}`;
+                }
+                globalThis.__hmacResult = JSON.stringify(result);
+            })();
+            "#,
+            Duration::from_secs(5),
+        )
+        .await;
+
+    let raw = page
+        .event_loop()
+        .execute_script("globalThis.__hmacResult || '{}' ")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    assert_eq!(
+        value["cryptoKeyConstructor"],
+        "TypeError:Failed to construct 'CryptoKey': Illegal constructor"
+    );
+    assert_eq!(value["cryptoKeySurface"]["length"], 0);
+    assert_eq!(value["cryptoKeySurface"]["native"], true);
+    assert_eq!(value["cryptoKeySurface"]["algorithmEnumerable"], true);
+    assert_eq!(value["cryptoKeySurface"]["algorithmConfigurable"], true);
+    assert_eq!(value["cryptoKeySurface"]["algorithmHasGetter"], true);
+    assert_eq!(value["cryptoKeySurface"]["algorithmHasSetter"], false);
+    assert_eq!(value["key"]["tag"], "[object CryptoKey]");
+    assert_eq!(value["key"]["own"], 0);
+    assert_eq!(
+        value["key"]["proto"],
+        serde_json::json!(["type", "extractable", "algorithm", "usages", "constructor"])
+    );
+    assert_eq!(value["key"]["type"], "secret");
+    assert_eq!(value["key"]["extractable"], true);
+    assert_eq!(value["key"]["algorithm"]["name"], "HMAC");
+    assert_eq!(value["key"]["algorithm"]["hash"]["name"], "SHA-256");
+    assert_eq!(value["key"]["algorithm"]["length"], 24);
+    assert_eq!(
+        value["key"]["usages"],
+        serde_json::json!(["sign", "verify"])
+    );
+    assert_eq!(value["key"]["sameAlgorithmObject"], false);
+    assert_eq!(value["key"]["sameUsagesArray"], false);
+    assert_eq!(
+        value["signature"],
+        "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+    );
+    assert_eq!(value["verify"], true);
+    assert_eq!(value["verifyBad"], false);
+    assert_eq!(value["exported"], "6b6579");
+    assert_eq!(value["generated"]["type"], "secret");
+    assert_eq!(value["generated"]["algorithm"]["name"], "HMAC");
+    assert_eq!(value["generated"]["algorithm"]["hash"]["name"], "SHA-256");
+    assert_eq!(value["generated"]["algorithm"]["length"], 512);
+    assert_eq!(value["generated"]["usages"], serde_json::json!(["sign"]));
+    assert_eq!(value["generated"]["rawLength"], 64);
+    assert_eq!(value["badUsage"], "SyntaxError");
+    assert_eq!(value["nonExtractable"], "InvalidAccessError");
+    assert_eq!(value["wrongUsage"], "InvalidAccessError");
+    assert!(value.get("topError").is_none());
+}
+
+#[tokio::test]
 async fn performance_instanceof_performance() {
     assert_eq!(check("performance instanceof Performance").await, "true");
 }

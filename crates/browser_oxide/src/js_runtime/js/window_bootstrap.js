@@ -4924,6 +4924,53 @@
     const _SubtleProto = SubtleCrypto.prototype;
     const _subtleInstance = Object.create(_SubtleProto);
 
+    class CryptoKey {
+        constructor() {
+            throw new TypeError("Failed to construct 'CryptoKey': Illegal constructor");
+        }
+    }
+    globalThis.CryptoKey = CryptoKey;
+    const _CryptoKeyProto = CryptoKey.prototype;
+    const _cryptoKeyState = new WeakMap();
+    delete _CryptoKeyProto.constructor;
+
+    const _requireCryptoKey = (key) => {
+        const state = _cryptoKeyState.get(key);
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    };
+    const _copyKeyAlgorithm = (state) => ({
+        name: "HMAC",
+        hash: { name: state.hash },
+        length: state.length,
+    });
+    _defProtoGetter(_CryptoKeyProto, 'type', function type() {
+        return _requireCryptoKey(this).type;
+    });
+    _defProtoGetter(_CryptoKeyProto, 'extractable', function extractable() {
+        return _requireCryptoKey(this).extractable;
+    });
+    _defProtoGetter(_CryptoKeyProto, 'algorithm', function algorithm() {
+        return _copyKeyAlgorithm(_requireCryptoKey(this));
+    });
+    _defProtoGetter(_CryptoKeyProto, 'usages', function usages() {
+        return _requireCryptoKey(this).usages.slice();
+    });
+    Object.defineProperty(_CryptoKeyProto, 'constructor', {
+        value: CryptoKey,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+    Object.defineProperty(_CryptoKeyProto, Symbol.toStringTag, {
+        value: "CryptoKey",
+        configurable: true,
+    });
+    if (typeof globalThis._maskFunction === 'function') {
+        globalThis._maskFunction(CryptoKey, 'CryptoKey');
+    }
+    _maskAsNative(CryptoKey);
+
     // Coerce BufferSource → Uint8Array for op bridging.
     const _toBytes = (src) => {
         if (src == null) return new Uint8Array(0);
@@ -4944,13 +4991,123 @@
             return Promise.reject(e);
         }
     });
-    // Stubs for sign/verify/encrypt/decrypt/generateKey/importKey/exportKey/deriveKey/deriveBits/wrapKey/unwrapKey.
-    // Real implementations are expensive; most callers only use digest(),
-    // so we expose the methods as native-shaped no-ops that reject.
+
+    const _normalizeHashName = (hash) => {
+        const raw = typeof hash === 'string' ? hash : (hash && hash.name);
+        const name = String(raw || '').toUpperCase().replace(/^SHA(\d)/, 'SHA-$1');
+        if (name === 'SHA-1' || name === 'SHA-256' || name === 'SHA-384' || name === 'SHA-512') {
+            return name;
+        }
+        throw new DOMException("Unrecognized name.", "NotSupportedError");
+    };
+    const _normalizeHmacAlgorithm = (algorithm, requireHash) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'HMAC') {
+            throw new DOMException("Unrecognized name.", "NotSupportedError");
+        }
+        const result = { name: 'HMAC' };
+        if (requireHash) result.hash = _normalizeHashName(algorithm && algorithm.hash);
+        if (algorithm && typeof algorithm === 'object' && algorithm.length !== undefined) {
+            const length = Number(algorithm.length);
+            if (!Number.isFinite(length) || length <= 0) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            result.length = Math.floor(length);
+        }
+        return result;
+    };
+    const _normalizeHmacUsages = (keyUsages) => {
+        const usages = Array.from(keyUsages || [], String);
+        if (usages.length === 0 || usages.some((usage) => usage !== 'sign' && usage !== 'verify')) {
+            throw new DOMException("Cannot create a key using the specified key usages.", "SyntaxError");
+        }
+        return usages;
+    };
+    const _makeHmacKey = (bytes, hash, extractable, usages, length) => {
+        const key = Object.create(_CryptoKeyProto);
+        _cryptoKeyState.set(key, {
+            type: 'secret',
+            extractable: !!extractable,
+            hash,
+            length,
+            usages: usages.slice(),
+            bytes: new Uint8Array(bytes),
+        });
+        return key;
+    };
+    const _checkHmacOperation = (algorithm, key, usage) => {
+        _normalizeHmacAlgorithm(algorithm, false);
+        const state = _requireCryptoKey(key);
+        if (!state.usages.includes(usage)) {
+            throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+        }
+        return state;
+    };
+
+    _defProtoMethod(_SubtleProto, 'generateKey', function generateKey(algorithm, extractable, keyUsages) {
+        try {
+            const alg = _normalizeHmacAlgorithm(algorithm, true);
+            const usages = _normalizeHmacUsages(keyUsages);
+            const defaultLength = alg.hash === 'SHA-384' || alg.hash === 'SHA-512' ? 1024 : 512;
+            const length = alg.length === undefined ? defaultLength : alg.length;
+            const byteLength = Math.ceil(length / 8);
+            const bytes = new Uint8Array(byteLength);
+            ops.op_crypto_random_fill(bytes);
+            return Promise.resolve(_makeHmacKey(bytes, alg.hash, extractable, usages, length));
+        } catch (e) { return Promise.reject(e); }
+    });
+    _defProtoMethod(_SubtleProto, 'importKey', function importKey(format, keyData, algorithm, extractable, keyUsages) {
+        try {
+            if (String(format).toLowerCase() !== 'raw') {
+                throw new DOMException("The requested operation is not supported", "NotSupportedError");
+            }
+            const alg = _normalizeHmacAlgorithm(algorithm, true);
+            const usages = _normalizeHmacUsages(keyUsages);
+            if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+                throw new TypeError("keyData is not a BufferSource");
+            }
+            const bytes = _toBytes(keyData);
+            return Promise.resolve(_makeHmacKey(bytes, alg.hash, extractable, usages, bytes.byteLength * 8));
+        } catch (e) { return Promise.reject(e); }
+    });
+    _defProtoMethod(_SubtleProto, 'exportKey', function exportKey(format, key) {
+        try {
+            const state = _requireCryptoKey(key);
+            if (!state.extractable) {
+                throw new DOMException("Failed to execute 'exportKey' on 'SubtleCrypto': key is not extractable", "InvalidAccessError");
+            }
+            if (String(format).toLowerCase() !== 'raw') {
+                throw new DOMException("The requested operation is not supported", "NotSupportedError");
+            }
+            const copy = state.bytes.slice();
+            return Promise.resolve(copy.buffer);
+        } catch (e) { return Promise.reject(e); }
+    });
+    _defProtoMethod(_SubtleProto, 'sign', function sign(algorithm, key, data) {
+        try {
+            const state = _checkHmacOperation(algorithm, key, 'sign');
+            const out = ops.op_crypto_hmac_sign(state.hash, state.bytes, _toBytes(data));
+            return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+        } catch (e) { return Promise.reject(e); }
+    });
+    _defProtoMethod(_SubtleProto, 'verify', function verify(algorithm, key, signature, data) {
+        try {
+            const state = _checkHmacOperation(algorithm, key, 'verify');
+            const expected = ops.op_crypto_hmac_sign(state.hash, state.bytes, _toBytes(data));
+            const actual = _toBytes(signature);
+            if (actual.byteLength !== expected.byteLength) return Promise.resolve(false);
+            let diff = 0;
+            for (let i = 0; i < expected.byteLength; i++) diff |= expected[i] ^ actual[i];
+            return Promise.resolve(diff === 0);
+        } catch (e) { return Promise.reject(e); }
+    });
+
+    // AES/RSA/ECDH/PBKDF2 are still explicit NotSupportedError paths until
+    // their algorithm-specific key representations are implemented.
     const _subtleNotImplemented = (name) => function (...args) {
         return Promise.reject(new DOMException(`${name} not implemented`, "NotSupportedError"));
     };
-    for (const m of ['sign','verify','encrypt','decrypt','generateKey','importKey','exportKey','deriveKey','deriveBits','wrapKey','unwrapKey']) {
+    for (const m of ['encrypt','decrypt','deriveKey','deriveBits','wrapKey','unwrapKey']) {
         _defProtoMethod(_SubtleProto, m, _subtleNotImplemented(m));
     }
 

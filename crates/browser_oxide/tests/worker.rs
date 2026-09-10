@@ -100,6 +100,54 @@ fn worker_message_port_post_message_arity_matches_chrome() {
 }
 
 #[test]
+fn worker_crypto_subtle_hmac_round_trip() {
+    let code = r#"
+        const src = `
+            (async function() {
+                try {
+                    const raw = new TextEncoder().encode('key');
+                    const data = new TextEncoder().encode('The quick brown fox jumps over the lazy dog');
+                    const key = await crypto.subtle.importKey(
+                        'raw', raw, { name: 'HMAC', hash: 'SHA-256' }, true, ['sign', 'verify']
+                    );
+                    const signature = await crypto.subtle.sign('HMAC', key, data);
+                    const ok = await crypto.subtle.verify('HMAC', key, signature, data);
+                    const hex = Array.from(new Uint8Array(signature))
+                        .map((b) => b.toString(16).padStart(2, '0')).join('');
+                    self.postMessage(JSON.stringify({
+                        ok,
+                        hex,
+                        tag: Object.prototype.toString.call(key),
+                        own: Reflect.ownKeys(key).length,
+                        length: key.algorithm.length,
+                        usages: key.usages
+                    }));
+                } catch (e) {
+                    self.postMessage(JSON.stringify({ error: e.name + ':' + e.message }));
+                }
+            })();
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(
+        value["hex"],
+        "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+    );
+    assert_eq!(value["tag"], "[object CryptoKey]");
+    assert_eq!(value["own"], 0);
+    assert_eq!(value["length"], 24);
+    assert_eq!(value["usages"], serde_json::json!(["sign", "verify"]));
+    assert!(value.get("error").is_none());
+}
+
+#[test]
 fn worker_inherits_cross_origin_isolation_and_shared_array_buffer() {
     let code = r#"
         const src = `
