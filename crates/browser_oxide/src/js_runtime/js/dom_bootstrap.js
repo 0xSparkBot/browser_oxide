@@ -3106,22 +3106,19 @@
         queryCommandSupported(command) { return false; }
         queryCommandEnabled(command) { return false; }
         getSelection() { return globalThis.getSelection ? globalThis.getSelection() : null; }
-        // Point-based queries. Per spec, a point OUTSIDE the viewport
-        // (negative, or >= innerWidth/innerHeight) returns null / []. Real
-        // Chrome returns null for elementFromPoint(-1,-1) and (99999,99999);
-        // the previous unconditional `return this.body` differed from
-        // real Chrome's layout behaviour for out-of-bounds points.
-        // We lack full layout, so an in-viewport
-        // point still approximates the topmost element with body (falling back
-        // to documentElement) — but the viewport-bounds null result, which is
-        // the detectable behaviour, is now spec-correct.
+        // Point-based queries use the same Taffy boxes as
+        // getBoundingClientRect()/offset*. The Rust op returns participating
+        // element boxes in topmost-first DOM paint order; display:none nodes
+        // are absent from layout and therefore cannot be hit.
         elementFromPoint(x, y) {
             if (!_pointInViewport(x, y)) return null;
-            return this.body || this.documentElement || null;
+            const ids = ops.op_layout_elements_from_point(Number(x), Number(y));
+            return Array.isArray(ids) && ids.length ? _wrapNode(ids[0]) : null;
         }
         elementsFromPoint(x, y) {
             if (!_pointInViewport(x, y)) return [];
-            return this.body ? [this.body] : [];
+            const ids = ops.op_layout_elements_from_point(Number(x), Number(y));
+            return Array.isArray(ids) ? ids.map(_wrapNode).filter(Boolean) : [];
         }
         caretPositionFromPoint(x, y) { return null; }
         hasFocus() { return true; }  // Anti-bot: must return true

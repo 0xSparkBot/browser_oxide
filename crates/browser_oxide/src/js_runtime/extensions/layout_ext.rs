@@ -35,6 +35,19 @@ pub fn op_layout_get_bounding_rect(state: &mut OpState, #[smi] node_id: i32) -> 
     }
 }
 
+/// Hit-test viewport coordinates against the real Taffy layout tree.
+#[op2]
+#[serde]
+pub fn op_layout_elements_from_point(state: &mut OpState, x: f64, y: f64) -> Vec<i32> {
+    let state = state.borrow_mut::<DomState>();
+    state
+        .layout_engine
+        .elements_from_point(&state.dom, x, y)
+        .into_iter()
+        .map(|id| id.to_raw() as i32)
+        .collect()
+}
+
 #[op2(fast)]
 #[smi]
 pub fn op_layout_get_offset_width(state: &mut OpState, #[smi] node_id: i32) -> i32 {
@@ -117,6 +130,7 @@ deno_core::extension!(
     layout_extension,
     ops = [
         op_layout_get_bounding_rect,
+        op_layout_elements_from_point,
         op_layout_get_offset_width,
         op_layout_get_offset_height,
         op_layout_get_offset_top,

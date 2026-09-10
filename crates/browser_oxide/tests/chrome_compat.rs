@@ -2298,6 +2298,49 @@ async fn doc_element_from_point_out_of_viewport_is_null() {
         "OOB elementsFromPoint must be []: {r}"
     );
 }
+
+#[tokio::test]
+async fn doc_element_from_point_uses_layout_boxes_and_paint_order() {
+    let r = check(
+        r#"(function(){
+            const parent = document.createElement('div');
+            parent.id = 'hit-parent';
+            parent.style.cssText = 'width:120px;height:120px';
+            const child = document.createElement('span');
+            child.id = 'hit-child';
+            child.style.cssText = 'display:block;width:40px;height:40px';
+            parent.appendChild(child);
+            const hidden = document.createElement('div');
+            hidden.id = 'hit-hidden';
+            hidden.style.cssText = 'display:none;width:500px;height:500px';
+            document.body.append(parent, hidden);
+
+            const hit = document.elementFromPoint(20, 20);
+            const hits = document.elementsFromPoint(20, 20);
+            return JSON.stringify({
+                hitId: hit && hit.id,
+                sameWrapper: hit === document.getElementById('hit-child'),
+                ids: hits.map(el => el.id || el.tagName),
+                hiddenHit: hits.includes(hidden),
+                parentRect: parent.getBoundingClientRect().toJSON(),
+                childRect: child.getBoundingClientRect().toJSON(),
+                parentStyle: parent.getAttribute('style'),
+                childStyle: child.getAttribute('style'),
+            });
+        })()"#,
+    )
+    .await;
+
+    let value: serde_json::Value = serde_json::from_str(&r).expect("hit-test result JSON");
+    assert_eq!(value["hitId"], "hit-child", "{r}");
+    assert_eq!(value["sameWrapper"], true, "{r}");
+    assert_eq!(value["hiddenHit"], false, "{r}");
+    assert_eq!(
+        value["ids"],
+        serde_json::json!(["hit-child", "hit-parent", "BODY", "HTML"]),
+        "{r}"
+    );
+}
 #[tokio::test]
 async fn doc_write() {
     assert_eq!(check("typeof document.write").await, "function");

@@ -105,6 +105,56 @@ impl LayoutEngine {
         )
     }
 
+    /// Hit-test element layout boxes at a viewport coordinate.
+    ///
+    /// This follows the paint-order subset our Taffy-backed layout engine can
+    /// represent: descendants paint above ancestors and later DOM siblings
+    /// paint above earlier siblings. Elements excluded from layout (for
+    /// example `display:none`) cannot be hit. Full Blink stacking-context,
+    /// transform and clipping semantics remain a separate layout concern.
+    pub fn elements_from_point(&mut self, dom: &Dom, x: f64, y: f64) -> Vec<NodeId> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x >= self.viewport.width as f64
+            || y >= self.viewport.height as f64
+        {
+            return Vec::new();
+        }
+
+        self.ensure_computed(dom);
+
+        let mut document_order = Vec::new();
+        let mut stack = vec![NodeId::DOCUMENT];
+        while let Some(node_id) = stack.pop() {
+            if dom.get(node_id).is_some_and(|node| node.is_element())
+                && self.dom_to_taffy.contains_key(&node_id.to_raw())
+            {
+                document_order.push(node_id);
+            }
+
+            let children = dom.children(node_id);
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+
+        document_order
+            .into_iter()
+            .rev()
+            .filter(|node_id| {
+                let rect = self.get_bounding_rect(dom, *node_id);
+                rect.width > 0.0
+                    && rect.height > 0.0
+                    && x >= rect.left
+                    && x < rect.right
+                    && y >= rect.top
+                    && y < rect.bottom
+            })
+            .collect()
+    }
+
     /// Get offsetWidth (width including padding + border).
     pub fn get_offset_width(&mut self, dom: &Dom, node_id: NodeId) -> f64 {
         self.ensure_computed(dom);
@@ -423,5 +473,47 @@ mod tests {
         let layout = taffy::Layout::new();
         let rect = DOMRect::from_taffy_layout(&layout);
         assert_eq!(rect.width, 0.0);
+    }
+
+    #[test]
+    fn elements_from_point_prefers_descendant_and_skips_display_none() {
+        let mut dom = Dom::new();
+        let html = dom.create_element(QualName::new("html"), vec![]);
+        dom.append_child(NodeId::DOCUMENT, html);
+        let body = dom.create_element(QualName::new("body"), vec![]);
+        dom.append_child(html, body);
+
+        let parent = dom.create_element(
+            QualName::new("div"),
+            vec![Attribute {
+                name: QualName::new("style"),
+                value: "width: 120px; height: 120px".into(),
+            }],
+        );
+        dom.append_child(body, parent);
+        let child = dom.create_element(
+            QualName::new("span"),
+            vec![Attribute {
+                name: QualName::new("style"),
+                value: "width: 40px; height: 40px".into(),
+            }],
+        );
+        dom.append_child(parent, child);
+        let hidden = dom.create_element(
+            QualName::new("div"),
+            vec![Attribute {
+                name: QualName::new("style"),
+                value: "display: none; width: 500px; height: 500px".into(),
+            }],
+        );
+        dom.append_child(body, hidden);
+
+        let mut engine = LayoutEngine::new(Viewport::new(800.0, 600.0));
+        let hits = engine.elements_from_point(&dom, 10.0, 10.0);
+        assert_eq!(hits.first().copied(), Some(child));
+        assert!(hits.contains(&parent));
+        assert!(!hits.contains(&hidden));
+        assert!(engine.elements_from_point(&dom, -1.0, 10.0).is_empty());
+        assert!(engine.elements_from_point(&dom, 800.0, 10.0).is_empty());
     }
 }
