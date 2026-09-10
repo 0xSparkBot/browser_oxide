@@ -398,7 +398,11 @@ async fn handle_connection(
                 // avoids the 17ms cost of creating a new isolate.
                 if let Some(navigation) = session.pending_navigate.take() {
                     if let Some(client) = http_client.as_deref() {
-                        match client.get(&navigation.url).await {
+                        let extra_headers = session.navigation_extra_headers();
+                        match client
+                            .get_with_headers(&navigation.url, &extra_headers)
+                            .await
+                        {
                             Ok(resp) => {
                                 // Cache the raw response bytes before turning
                                 // them into DOM text, and emit the Network

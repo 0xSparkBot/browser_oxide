@@ -84,6 +84,13 @@ impl CdpSession {
         self.enabled_domains.insert(domain.to_string());
     }
 
+    pub(crate) fn navigation_extra_headers(&self) -> Vec<(String, String)> {
+        self.extra_headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
     fn cache_response_body(&mut self, request_id: &str, response: &crate::net::Response) {
         if let Some(previous) = self.response_bodies.remove(request_id) {
             self.response_body_bytes = self.response_body_bytes.saturating_sub(previous.body.len());
@@ -501,6 +508,10 @@ impl CdpSession {
                 Ok(serde_json::json!({}))
             }
             "Network.setExtraHTTPHeaders" => {
+                // CDP treats this as a setter for the complete extra-header
+                // map, not an incremental merge. Headers omitted from a later
+                // call must stop being sent on subsequent requests.
+                self.extra_headers.clear();
                 if let Some(headers) = req.params.get("headers").and_then(|h| h.as_object()) {
                     for (k, v) in headers {
                         if let Some(val) = v.as_str() {
