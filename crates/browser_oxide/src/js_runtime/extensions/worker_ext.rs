@@ -187,6 +187,16 @@ fn blob_registry() -> &'static Mutex<BlobRegistry> {
     })
 }
 
+/// Read JavaScript source stored behind a registered blob: URL. The module
+/// loader shares this browser-owned registry with fetch(), Worker(), and
+/// importScripts(), so Blob URL module imports observe the same lifetime.
+pub(crate) fn blob_module_source(url: &str) -> Option<String> {
+    let reg = blob_registry().lock().unwrap_or_else(|e| e.into_inner());
+    reg.blobs
+        .get(url)
+        .map(|entry| String::from_utf8_lossy(&entry.data).to_string())
+}
+
 /// Register a blob's bytes + MIME type under a blob: URL. Called from
 /// `URL.createObjectURL`. `content_type` comes from the `Blob.type`
 /// field; may be empty string for unspecified blobs.

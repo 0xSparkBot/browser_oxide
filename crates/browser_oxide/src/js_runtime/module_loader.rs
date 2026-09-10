@@ -350,16 +350,26 @@ impl ModuleLoader for BrowserModuleLoader {
             )));
         }
 
-        // Only http(s) modules are network-fetchable.
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            // Unknown scheme (blob:, about:, …): return an EMPTY module rather
-            // than an error, so an unhandled rejection can't abort the drain.
+        if url.starts_with("blob:") {
+            let Some(code) = crate::js_runtime::extensions::worker_ext::blob_module_source(&url)
+            else {
+                return ModuleLoadResponse::Sync(Err(ModuleLoaderError::generic(format!(
+                    "module fetch {url}: blob URL not found or revoked"
+                ))));
+            };
             return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
                 ModuleType::JavaScript,
-                ModuleSourceCode::String(String::new().into()),
+                ModuleSourceCode::String(code.into()),
                 &spec,
                 None,
             )));
+        }
+
+        // Only http(s) modules are network-fetchable.
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return ModuleLoadResponse::Sync(Err(ModuleLoaderError::generic(format!(
+                "unsupported module URL scheme: {url}"
+            ))));
         }
 
         let fut = async move {
