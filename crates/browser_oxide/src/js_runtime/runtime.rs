@@ -212,10 +212,15 @@ pub fn create_runtime_with_signals(
         None => FetchState::new(None),
     };
 
+    // A cross-origin isolated browsing context is necessarily a secure
+    // context. Keep the low-level runtime API from representing the
+    // impossible state `crossOriginIsolated === true` on an insecure page.
+    let is_secure_context = options.is_secure_context;
+    let cross_origin_isolated = options.cross_origin_isolated && is_secure_context;
     let stealth_state = StealthState::new_with_flags(
         options.stealth_profile,
-        options.cross_origin_isolated,
-        options.is_secure_context,
+        cross_origin_isolated,
+        is_secure_context,
     );
 
     // Match Chrome 147's renderer heap budget. V8's default ~1.5 GB OOMs
@@ -599,14 +604,14 @@ pub fn create_runtime_with_signals(
 /// DO get canvas (for `OffscreenCanvas`, which sites use inside
 /// workers per the WHATWG spec), console, crypto, timers, fetch,
 /// and the worker-side ops.
-/// `is_secure_context` is inherited from the spawning document: a Worker is a
-/// secure context iff its owner is (HTML spec §"secure context"). Without this,
-/// the worker realm defaulted to insecure and `cleanup_bootstrap.js` stripped
-/// `crypto.subtle` / `crypto.randomUUID` — which silently broke any worker doing
-/// SHA-256 proof-of-work (a common pattern in challenge scripts that run in workers).
+/// `is_secure_context` and `cross_origin_isolated` are inherited from the
+/// spawning document. Without the former, cleanup strips secure-context APIs;
+/// without the latter it also hides SharedArrayBuffer in an otherwise isolated
+/// worker realm.
 pub fn create_worker_runtime(
     profile: Option<StealthProfile>,
     is_secure_context: bool,
+    cross_origin_isolated: bool,
     storage_directory_allowed: bool,
 ) -> JsRuntime {
     // Same requirement as the page runtime — worker realms are built on their
@@ -671,7 +676,7 @@ pub fn create_worker_runtime(
         .borrow_mut()
         .put(StealthState::new_with_flags(
             profile,
-            false,
+            cross_origin_isolated && is_secure_context,
             is_secure_context,
         ));
 

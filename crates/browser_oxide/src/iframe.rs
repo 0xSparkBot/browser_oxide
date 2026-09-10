@@ -691,7 +691,11 @@ impl ChildIframe {
         let mut options = BrowserRuntimeOptions {
             stylesheets,
             navigation_timing: Some(resp.timings.clone()),
-            is_secure_context: crate::page::is_secure_url(url),
+            is_secure_context: crate::page::is_secure_url(&resp.url),
+            cross_origin_isolated: crate::page::response_is_cross_origin_isolated(
+                &resp.url,
+                &resp.headers,
+            ),
             ..Default::default()
         };
         if let Some(profile) = stealth_profile {

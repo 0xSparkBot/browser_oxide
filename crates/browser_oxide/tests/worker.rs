@@ -83,6 +83,51 @@ fn worker_echo_round_trip() {
     assert_eq!(out, "echo:hello", "worker should echo 'echo:hello'");
 }
 
+#[test]
+fn worker_inherits_cross_origin_isolation_and_shared_array_buffer() {
+    let code = r#"
+        const src = `
+            const sabType = typeof SharedArrayBuffer;
+            let bytes = -1;
+            let error = '';
+            try {
+                if (sabType === 'function') bytes = new SharedArrayBuffer(8).byteLength;
+            } catch (e) {
+                error = String(e && (e.stack || e.message) || e);
+            }
+            self.postMessage(JSON.stringify({
+                coi: self.crossOriginIsolated,
+                secure: self.isSecureContext,
+                subtle: typeof crypto !== 'undefined' && typeof crypto.subtle,
+                sab: sabType,
+                bytes,
+                error
+            }));
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime_with_options(
+        code,
+        2000,
+        browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
+            base_url: Some(url::Url::parse("https://example.com/").unwrap()),
+            is_secure_context: true,
+            cross_origin_isolated: true,
+            ..Default::default()
+        },
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["coi"], true);
+    assert_eq!(value["secure"], true);
+    assert_eq!(value["subtle"], "object");
+    assert_eq!(value["sab"], "function");
+    assert_eq!(value["bytes"], 8);
+}
+
 /// An idle Worker must not keep the page event loop pending forever. Chrome
 /// treats the receive side as background work; keeping our async receive op
 /// ref'ed makes every bounded page drain consume its full timeout and inflates

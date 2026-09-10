@@ -55,6 +55,28 @@ async fn spawn_server(requests: usize) -> String {
     format!("http://{addr}/echo?q=1")
 }
 
+async fn spawn_document_policy_server(coep: bool) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        let body = "<!doctype html><html><body>coi</body></html>";
+        let coep_header = if coep {
+            "Cross-Origin-Embedder-Policy: require-corp\r\n"
+        } else {
+            ""
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCross-Origin-Opener-Policy: same-origin\r\n{coep_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{addr}/")
+}
+
 #[tokio::test]
 async fn all_http_get_and_post_paths_use_cleartext_h1() {
     let url = spawn_server(5).await;
@@ -93,4 +115,35 @@ async fn all_http_get_and_post_paths_use_cleartext_h1() {
         .await
         .unwrap();
     assert!(exact.text().ends_with("|exact-post"));
+}
+
+#[tokio::test]
+async fn page_navigation_applies_cross_origin_isolation_response_headers() {
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+
+    let isolated_url = spawn_document_policy_server(true).await;
+    let mut isolated = browser_oxide::Page::navigate(&isolated_url, profile.clone(), 1)
+        .await
+        .unwrap();
+    let state = isolated
+        .evaluate(
+            "JSON.stringify({secure:isSecureContext,coi:crossOriginIsolated,sab:typeof SharedArrayBuffer,bytes:new SharedArrayBuffer(8).byteLength})",
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&state).unwrap();
+    assert_eq!(value["secure"], true);
+    assert_eq!(value["coi"], true);
+    assert_eq!(value["sab"], "function");
+    assert_eq!(value["bytes"], 8);
+
+    let non_isolated_url = spawn_document_policy_server(false).await;
+    let mut non_isolated = browser_oxide::Page::navigate(&non_isolated_url, profile, 1)
+        .await
+        .unwrap();
+    let state = non_isolated
+        .evaluate("JSON.stringify({coi:crossOriginIsolated,sab:typeof SharedArrayBuffer})")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&state).unwrap();
+    assert_eq!(value["coi"], false);
+    assert_eq!(value["sab"], "undefined");
 }

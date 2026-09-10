@@ -7150,6 +7150,8 @@ fn coi_check(cross_origin_isolated: bool, js: &str) -> String {
         dom,
         browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
             cross_origin_isolated,
+            // A valid cross-origin isolated document is necessarily secure.
+            is_secure_context: cross_origin_isolated,
             ..Default::default()
         },
     );
@@ -7194,13 +7196,11 @@ async fn sab_constructor_exists() {
 }
 
 #[tokio::test]
-#[ignore = "SAB only available with cross-origin isolation (COOP+COEP headers)"]
 async fn sab_constructible_with_byte_length() {
     assert_eq!(coi_check(true, "new SharedArrayBuffer(8).byteLength"), "8");
 }
 
 #[tokio::test]
-#[ignore = "SAB only available with cross-origin isolation (COOP+COEP headers)"]
 async fn sab_instance_is_shared_array_buffer() {
     assert_eq!(
         coi_check(
@@ -7223,7 +7223,6 @@ async fn atomics_wait_and_notify_exist() {
 }
 
 #[tokio::test]
-#[ignore = "SAB only available with cross-origin isolation (COOP+COEP headers)"]
 async fn atomics_wait_returns_timed_out_synchronously() {
     // Atomics.wait on a fresh SharedArrayBuffer with timeout=1ms must return
     // "timed-out" (or "ok"/"not-equal" on edge cases) — proves SAB+Atomics
@@ -7234,6 +7233,27 @@ async fn atomics_wait_returns_timed_out_synchronously() {
             "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1)"
         ),
         "timed-out"
+    );
+}
+
+#[tokio::test]
+async fn coi_requested_on_insecure_runtime_is_clamped_off() {
+    let dom = browser_oxide::html_parser::parse_html("<html><body></body></html>");
+    let mut rt = browser_oxide::js_runtime::BrowserJsRuntime::with_options(
+        dom,
+        browser_oxide::js_runtime::runtime::BrowserRuntimeOptions {
+            cross_origin_isolated: true,
+            is_secure_context: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        rt.execute_script("crossOriginIsolated", None).unwrap(),
+        "false"
+    );
+    assert_eq!(
+        rt.execute_script("typeof SharedArrayBuffer", None).unwrap(),
+        "undefined"
     );
 }
 

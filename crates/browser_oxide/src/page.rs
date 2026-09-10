@@ -31,6 +31,20 @@ pub(crate) fn is_secure_url(url: &str) -> bool {
     }
 }
 
+/// Compute the effective cross-origin-isolated state for a network document.
+/// COOP+COEP are necessary, but an insecure origin cannot become isolated
+/// even if it sends those response headers.
+pub(crate) fn response_is_cross_origin_isolated(
+    url: &str,
+    headers: &std::collections::HashMap<String, String>,
+) -> bool {
+    if !is_secure_url(url) {
+        return false;
+    }
+    let policy = crate::net::headers::parse_document_policy(headers);
+    crate::net::headers::is_cross_origin_isolated(&policy)
+}
+
 /// Serialized origin of a URL (`https://host[:port]`), empty if unparseable
 /// or opaque. Used to build a frame's `location.ancestorOrigins` chain.
 fn origin_of(url: &str) -> String {
@@ -2189,6 +2203,7 @@ impl Page {
             .filter(|(k, _)| k.eq_ignore_ascii_case("content-security-policy-report-only"))
             .map(|(_, v)| v.clone())
             .collect();
+        let cross_origin_isolated = response_is_cross_origin_isolated(&resp.url, &resp.headers);
         let html = resp.text();
         let resp_url = resp.url.clone();
         let timings = resp.timings.clone();
@@ -2204,6 +2219,7 @@ impl Page {
             csp_headers,
             csp_headers_ro,
             resp.accept_ch_upgrade,
+            cross_origin_isolated,
             solvers,
         )
         .await?;
@@ -2242,6 +2258,7 @@ impl Page {
             debug_nav,
             Vec::new(),
             Vec::new(),
+            false,
             false,
             Self::default_solvers(),
         )
@@ -2829,6 +2846,7 @@ impl Page {
         csp_headers: Vec<String>,
         csp_headers_ro: Vec<String>,
         accept_ch_upgrade: bool,
+        cross_origin_isolated: bool,
         solvers: std::sync::Arc<[std::sync::Arc<dyn crate::ChallengeSolver>]>,
     ) -> Result<Self, deno_core::error::AnyError> {
         // The challenge-solver dispatch below iterates over `solvers`.
@@ -2971,6 +2989,7 @@ impl Page {
             std::collections::HashMap<String, std::collections::HashMap<String, String>>,
         > = None;
         let mut last_accept_ch_upgrade = accept_ch_upgrade;
+        let mut current_cross_origin_isolated = cross_origin_isolated;
         let mut accept_ch_retry_done = false;
 
         // Wall-clock budget for this entire navigate_with_init call.
@@ -3104,6 +3123,7 @@ impl Page {
                 &client,
                 &init_scripts,
                 current_storage.take(),
+                current_cross_origin_isolated,
             )
             .await?;
 
@@ -4092,6 +4112,8 @@ impl Page {
                         .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?
                 }
             };
+            current_cross_origin_isolated =
+                response_is_cross_origin_isolated(&resp.url, &resp.headers);
             current_html = resp.text();
             current_url = resp.url.clone();
             last_accept_ch_upgrade = resp.accept_ch_upgrade;
@@ -4200,6 +4222,7 @@ impl Page {
             client,
             init_scripts,
             None,
+            false,
         )
         .await
     }
@@ -4213,6 +4236,7 @@ impl Page {
         storage: Option<
             std::collections::HashMap<String, std::collections::HashMap<String, String>>,
         >,
+        cross_origin_isolated: bool,
     ) -> Result<Self, deno_core::error::AnyError> {
         crate::js_runtime::readiness::reset();
         let bp_trace = std::env::var("BROWSER_OXIDE_BUILD_PROFILE").is_ok();
@@ -4407,6 +4431,7 @@ impl Page {
                 init_scripts: init_scripts.to_vec(),
                 storage,
                 is_secure_context: is_secure_url(url),
+                cross_origin_isolated,
                 ..Default::default()
             },
         );

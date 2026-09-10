@@ -825,6 +825,13 @@
             + 'isNaN name onmessage onmessageerror onrtctransform parseFloat parseInt postMessage '
             + 'requestAnimationFrame undefined unescape webkitRequestFileSystem webkitRequestFileSystemSync webkitResolveLocalFileSystemSyncURL webkitResolveLocalFileSystemURL'
         ).split(' '));
+        // The captured baseline above is a normal (non-COI) worker, where
+        // Chrome intentionally hides SharedArrayBuffer. In a secure
+        // cross-origin-isolated worker SAB is exposed and must survive the
+        // same namespace cleanup.
+        if (ops && ops.op_cross_origin_isolated && ops.op_cross_origin_isolated()) {
+            _chromeWorkerGlobals.add('SharedArrayBuffer');
+        }
         for (const k of Object.getOwnPropertyNames(globalThis)) {
             if (_chromeWorkerGlobals.has(k)) continue;
             try { delete globalThis[k]; } catch (_) {}

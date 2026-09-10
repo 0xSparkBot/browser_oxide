@@ -622,6 +622,10 @@ pub fn op_worker_spawn(
     // page — required by SHA-256 proof-of-work workers (a common pattern in
     // challenge scripts that run in workers).
     let is_secure_context = stealth.is_secure_context;
+    // Dedicated workers inherit the owner's cross-origin-isolated state too.
+    // This controls both self.crossOriginIsolated and SharedArrayBuffer
+    // exposure in the worker cleanup phase.
+    let cross_origin_isolated = stealth.cross_origin_isolated && is_secure_context;
     // Capture the page's fetch client (correct profile + shared cookie
     // jar) on the MAIN thread so the worker thread
     // can seed its own thread-local FETCH_CLIENT with it. Without this,
@@ -719,6 +723,7 @@ pub fn op_worker_spawn(
                 let mut runtime = crate::js_runtime::runtime::create_worker_runtime(
                     profile,
                     is_secure_context,
+                    cross_origin_isolated,
                     storage_directory_allowed,
                 );
 
