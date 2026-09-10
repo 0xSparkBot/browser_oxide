@@ -120,24 +120,31 @@ async fn event_global_symbol_forgery_is_blocked() {
 }
 
 #[tokio::test]
-async fn istrusted_is_a_prototype_accessor_not_own_data() {
-    // behavioral E1 — anti-bots read getOwnPropertyDescriptor; real browsers
-    // expose isTrusted as a getter on Event.prototype, never as an own data
-    // property on the instance.
-    let own =
-        evaluate("Object.getOwnPropertyDescriptor(new Event('x'), 'isTrusted') === undefined")
-            .await;
-    assert_eq!(own, "true", "isTrusted must NOT be an own property");
-    let proto = evaluate(
-        "typeof Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted').get === 'function'",
+async fn istrusted_matches_chrome_148_unforgeable_own_accessor() {
+    // Chrome 148 exposes isTrusted as a LegacyUnforgeable own accessor on
+    // each Event instance: enumerable, non-configurable, getter-only.  It is
+    // intentionally absent from Event.prototype.
+    let shape = evaluate(
+        r#"(() => {
+            const event = new Event('x');
+            const own = Object.getOwnPropertyDescriptor(event, 'isTrusted');
+            const proto = Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted');
+            return JSON.stringify({
+                own: !!own,
+                getter: typeof own?.get === 'function',
+                setter: own?.set === undefined,
+                enumerable: own?.enumerable,
+                configurable: own?.configurable,
+                protoAbsent: proto === undefined,
+                nativeMasked: own?.get?.toString().includes('[native code]') === true,
+            });
+        })()"#,
     )
     .await;
-    assert_eq!(proto, "true", "isTrusted must be a prototype getter");
-    let masked = evaluate(
-        "Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted').get.toString().includes('[native code]')",
-    )
-    .await;
-    assert_eq!(masked, "true", "isTrusted getter must be native-masked");
+    assert_eq!(
+        shape,
+        r#"{"own":true,"getter":true,"setter":true,"enumerable":true,"configurable":false,"protoAbsent":true,"nativeMasked":true}"#
+    );
 }
 
 // ================================================================
