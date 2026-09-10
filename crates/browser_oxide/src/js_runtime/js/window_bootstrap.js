@@ -5176,12 +5176,36 @@
         } catch (e) { return Promise.reject(e); }
     });
 
+    _defProtoMethod(_SubtleProto, 'deriveKey', function deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
+        try {
+            const alg = _normalizePbkdf2Algorithm(algorithm);
+            const state = _requireCryptoKey(baseKey);
+            if (state.name !== 'PBKDF2' || !state.usages.includes('deriveKey')) {
+                throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+            }
+            const derived = _normalizeHmacAlgorithm(derivedKeyType, true);
+            const usages = _normalizeHmacUsages(keyUsages);
+            const bitLength = derived.length === undefined
+                ? (derived.hash === 'SHA-384' || derived.hash === 'SHA-512' ? 1024 : 512)
+                : derived.length;
+            if (bitLength % 8 !== 0) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            const byteLength = bitLength / 8;
+            const out = ops.op_crypto_pbkdf2(alg.hash, state.bytes, alg.salt, alg.iterations, byteLength);
+            if (out.byteLength !== byteLength) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            return Promise.resolve(_makeHmacKey(out, derived.hash, extractable, usages, bitLength));
+        } catch (e) { return Promise.reject(e); }
+    });
+
     // AES/RSA/ECDH and key wrapping are still explicit NotSupportedError paths until
     // their algorithm-specific key representations are implemented.
     const _subtleNotImplemented = (name) => function (...args) {
         return Promise.reject(new DOMException(`${name} not implemented`, "NotSupportedError"));
     };
-    for (const m of ['encrypt','decrypt','deriveKey','wrapKey','unwrapKey']) {
+    for (const m of ['encrypt','decrypt','wrapKey','unwrapKey']) {
         _defProtoMethod(_SubtleProto, m, _subtleNotImplemented(m));
     }
 

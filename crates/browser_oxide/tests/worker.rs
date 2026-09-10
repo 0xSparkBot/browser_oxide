@@ -196,6 +196,60 @@ fn worker_crypto_subtle_pbkdf2_derive_bits() {
 }
 
 #[test]
+fn worker_crypto_subtle_pbkdf2_derive_hmac_key() {
+    let code = r#"
+        const src = `
+            (async function() {
+                try {
+                    const enc = new TextEncoder();
+                    const password = enc.encode('password');
+                    const salt = enc.encode('salt');
+                    const baseKey = await crypto.subtle.importKey(
+                        'raw', password, 'PBKDF2', false, ['deriveKey']
+                    );
+                    const key = await crypto.subtle.deriveKey(
+                        { name: 'PBKDF2', salt, iterations: 2, hash: 'SHA-256' },
+                        baseKey,
+                        { name: 'HMAC', hash: 'SHA-256', length: 256 },
+                        true,
+                        ['sign']
+                    );
+                    const raw = await crypto.subtle.exportKey('raw', key);
+                    const hex = Array.from(new Uint8Array(raw))
+                        .map((b) => b.toString(16).padStart(2, '0')).join('');
+                    self.postMessage(JSON.stringify({
+                        hex,
+                        algorithm: key.algorithm,
+                        extractable: key.extractable,
+                        usages: key.usages
+                    }));
+                } catch (e) {
+                    self.postMessage(JSON.stringify({ error: e.name + ':' + e.message }));
+                }
+            })();
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["hex"],
+        "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+    );
+    assert_eq!(
+        value["algorithm"],
+        serde_json::json!({"name":"HMAC","hash":{"name":"SHA-256"},"length":256})
+    );
+    assert_eq!(value["extractable"], true);
+    assert_eq!(value["usages"], serde_json::json!(["sign"]));
+    assert!(value.get("error").is_none());
+}
+
+#[test]
 fn worker_inherits_cross_origin_isolation_and_shared_array_buffer() {
     let code = r#"
         const src = `

@@ -6704,6 +6704,136 @@ async fn crypto_subtle_pbkdf2_matches_standard_vectors_and_key_semantics() {
 }
 
 #[tokio::test]
+async fn crypto_subtle_pbkdf2_derive_key_matches_hmac_semantics() {
+    use browser_oxide::Page;
+    use std::time::Duration;
+
+    let mut page = Page::with_profile(
+        "<!DOCTYPE html><html><head></head><body></body></html>",
+        "https://example.com/",
+        browser_oxide::stealth::presets::chrome_148_windows(),
+    )
+    .await
+    .unwrap();
+
+    let _ = page
+        .event_loop()
+        .execute_and_run(
+            r#"
+            (async function() {
+                const hex = (buffer) => Array.from(new Uint8Array(buffer))
+                    .map((b) => b.toString(16).padStart(2, '0')).join('');
+                const enc = new TextEncoder();
+                const password = enc.encode('password');
+                const salt = enc.encode('salt');
+                const result = {};
+                try {
+                    const baseKey = await crypto.subtle.importKey(
+                        'raw', password, 'PBKDF2', false, ['deriveKey']
+                    );
+                    const explicit = await crypto.subtle.deriveKey(
+                        { name: 'PBKDF2', salt, iterations: 2, hash: 'SHA-256' },
+                        baseKey,
+                        { name: 'HMAC', hash: 'SHA-256', length: 256 },
+                        true,
+                        ['sign', 'verify']
+                    );
+                    result.explicit = {
+                        algorithm: explicit.algorithm,
+                        type: explicit.type,
+                        extractable: explicit.extractable,
+                        usages: explicit.usages,
+                        raw: hex(await crypto.subtle.exportKey('raw', explicit)),
+                    };
+
+                    const defaultLength = await crypto.subtle.deriveKey(
+                        { name: 'PBKDF2', salt, iterations: 2, hash: 'SHA-256' },
+                        baseKey,
+                        { name: 'HMAC', hash: 'SHA-256' },
+                        true,
+                        ['sign']
+                    );
+                    result.defaultLength = {
+                        algorithm: defaultLength.algorithm,
+                        rawLength: (await crypto.subtle.exportKey('raw', defaultLength)).byteLength,
+                    };
+
+                    for (const [name, derivedType, usages] of [
+                        ['noUsage', { name: 'HMAC', hash: 'SHA-256', length: 256 }, []],
+                        ['badUsage', { name: 'HMAC', hash: 'SHA-256', length: 256 }, ['encrypt']],
+                        ['badDerivedAlgorithm', { name: 'UNKNOWN' }, ['sign']],
+                        ['badLength', { name: 'HMAC', hash: 'SHA-256', length: 7 }, ['sign']],
+                    ]) {
+                        try {
+                            await crypto.subtle.deriveKey(
+                                { name: 'PBKDF2', salt, iterations: 1, hash: 'SHA-256' },
+                                baseKey,
+                                derivedType,
+                                true,
+                                usages
+                            );
+                            result[name] = 'ok';
+                        } catch (e) {
+                            result[name] = e.name;
+                        }
+                    }
+
+                    const wrongUsageBase = await crypto.subtle.importKey(
+                        'raw', password, 'PBKDF2', false, ['deriveBits']
+                    );
+                    try {
+                        await crypto.subtle.deriveKey(
+                            { name: 'PBKDF2', salt, iterations: 1, hash: 'SHA-256' },
+                            wrongUsageBase,
+                            { name: 'HMAC', hash: 'SHA-256', length: 256 },
+                            true,
+                            ['sign']
+                        );
+                        result.baseWrongUsage = 'ok';
+                    } catch (e) {
+                        result.baseWrongUsage = e.name;
+                    }
+                } catch (e) {
+                    result.topError = `${e.name}:${e.message}`;
+                }
+                globalThis.__pbkdf2DeriveKeyResult = JSON.stringify(result);
+            })();
+            "#,
+            Duration::from_secs(5),
+        )
+        .await;
+
+    let raw = page
+        .event_loop()
+        .execute_script("globalThis.__pbkdf2DeriveKeyResult || '{}' ")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    assert_eq!(
+        value["explicit"]["algorithm"],
+        serde_json::json!({"name":"HMAC","hash":{"name":"SHA-256"},"length":256})
+    );
+    assert_eq!(value["explicit"]["type"], "secret");
+    assert_eq!(value["explicit"]["extractable"], true);
+    assert_eq!(
+        value["explicit"]["usages"],
+        serde_json::json!(["sign", "verify"])
+    );
+    assert_eq!(
+        value["explicit"]["raw"],
+        "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+    );
+    assert_eq!(value["defaultLength"]["algorithm"]["length"], 512);
+    assert_eq!(value["defaultLength"]["rawLength"], 64);
+    assert_eq!(value["noUsage"], "SyntaxError");
+    assert_eq!(value["badUsage"], "SyntaxError");
+    assert_eq!(value["badDerivedAlgorithm"], "NotSupportedError");
+    assert_eq!(value["badLength"], "OperationError");
+    assert_eq!(value["baseWrongUsage"], "InvalidAccessError");
+    assert!(value.get("topError").is_none());
+}
+
+#[tokio::test]
 async fn performance_instanceof_performance() {
     assert_eq!(check("performance instanceof Performance").await, "true");
 }
