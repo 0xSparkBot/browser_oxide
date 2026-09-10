@@ -10022,6 +10022,7 @@ async fn message_channel_webidl_shape_and_explicit_start_match_chrome() {
                     Object.getOwnPropertyDescriptor(MessageChannel.prototype,name).enumerable),
                 portEnumerable:['onmessage','onmessageerror','postMessage','start','close'].map(name =>
                     Object.getOwnPropertyDescriptor(MessagePort.prototype,name).enumerable),
+                postMessageLength:MessagePort.prototype.postMessage.length,
                 hasOwnAddEventListener:Object.prototype.hasOwnProperty.call(
                     MessagePort.prototype,'addEventListener'),
             };
@@ -10087,6 +10088,7 @@ async fn message_channel_webidl_shape_and_explicit_start_match_chrome() {
         value["before"]["portEnumerable"],
         serde_json::json!([true, true, true, true, true])
     );
+    assert_eq!(value["before"]["postMessageLength"], 1);
     assert_eq!(value["before"]["hasOwnAddEventListener"], false);
     assert_eq!(value["got"], serde_json::json!(["queued"]));
 }

@@ -3546,6 +3546,10 @@
                 // Delivery to the PAIRED port (spec semantics).
                 _deliver(paired, cloned);
         });
+        Object.defineProperty(MessagePort.prototype.postMessage, 'length', {
+            value: 1,
+            configurable: true,
+        });
         _defProtoMethod(MessagePort.prototype, 'start', function start() { _enable(this); });
         _defProtoMethod(MessagePort.prototype, 'close', function close() {
                 _PortClosed.set(this, true);

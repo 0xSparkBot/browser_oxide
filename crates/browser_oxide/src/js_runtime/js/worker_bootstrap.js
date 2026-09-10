@@ -493,6 +493,10 @@
         Object.defineProperty(MessagePort.prototype, Symbol.toStringTag, {
             value: 'MessagePort', configurable: true,
         });
+        Object.defineProperty(MessagePort.prototype.postMessage, 'length', {
+            value: 1,
+            configurable: true,
+        });
 
         class MessageChannel {
             constructor() {

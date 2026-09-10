@@ -84,6 +84,22 @@ fn worker_echo_round_trip() {
 }
 
 #[test]
+fn worker_message_port_post_message_arity_matches_chrome() {
+    let code = r#"
+        const src = `
+            self.postMessage(String(MessagePort.prototype.postMessage.length));
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime(code, 1000);
+    assert_eq!(out, "1");
+}
+
+#[test]
 fn worker_inherits_cross_origin_isolation_and_shared_array_buffer() {
     let code = r#"
         const src = `
