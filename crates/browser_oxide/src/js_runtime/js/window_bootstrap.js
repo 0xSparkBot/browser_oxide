@@ -9790,7 +9790,7 @@
         });
         globalThis.VirtualKeyboard = VirtualKeyboard;
         const _vk = new VirtualKeyboard();
-        _defNav('virtualKeyboard', () => _vk);
+        _defNav('virtualKeyboard', () => _secure() ? _vk : undefined);
     }
 
     {
@@ -9803,7 +9803,7 @@
         });
         globalThis.DevicePosture = DevicePosture;
         const _dp = new DevicePosture();
-        _defNav('devicePosture', () => _dp);
+        _defNav('devicePosture', () => _secure() ? _dp : undefined);
     }
 
     {

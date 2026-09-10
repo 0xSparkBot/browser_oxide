@@ -153,7 +153,6 @@ async fn parity_rect_height_0_5px() {
 // Iframe realm purity — exact bool match to Chrome 147
 // ================================================================
 #[tokio::test]
-#[ignore = "not yet implemented: per-realm constructor identity for iframe contexts"]
 async fn parity_iframe_navigator_distinct() {
     let r = evaluate(
         "(()=>{ const f = document.createElement('iframe'); document.body.appendChild(f); return f.contentWindow.Navigator !== Navigator; })()",

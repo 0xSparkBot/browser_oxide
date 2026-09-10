@@ -371,7 +371,6 @@ async fn phase7_d3_scroll_eventcounts_grease() {
 /// secure contexts (https:). Byte-exact match against
 /// `the reference captures/probe_mcp.json` (insecure).
 #[tokio::test]
-#[ignore = "not yet implemented: insecure-context stripping of optional Web API stubs"]
 async fn phase7_d2_secure_context_gating() {
     use browser_oxide::stealth::presets::chrome_148_macos;
     use browser_oxide::Page;
