@@ -4556,7 +4556,7 @@
     // throw where real Chrome succeeds, that differs from real Chrome.
     const _ILLEGAL_CONSTRUCTORS = new Set([
         "Navigator", "Window", "Document", "HTMLDocument",
-        "IdleDeadline", "MediaCapabilities",
+        "IdleDeadline", "MediaCapabilities", "BatteryManager",
         "Node", "Element", "HTMLElement",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
         "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
@@ -4748,8 +4748,7 @@
     // shape.
     const _CHILD_REALM_INTERFACES = [
         "Navigator", "EventTarget", "Event", "CustomEvent", "MessageEvent",
-        "IdleDeadline",
-        "MediaCapabilities",
+        "IdleDeadline", "MediaCapabilities", "BatteryManager",
         "Node", "Element", "HTMLElement", "Document", "HTMLDocument",
         "DocumentFragment", "CharacterData", "Text", "Comment", "ShadowRoot",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",

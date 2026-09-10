@@ -1547,9 +1547,17 @@
     // BatteryManager — must be a real class extending EventTarget so
     // `Object.getPrototypeOf(b).constructor.name === "BatteryManager"`
     // and `b instanceof EventTarget` both hold.
+    const _batteryInternalToken = {};
+    const _batteryBrand = new WeakSet();
+    const _batteryHandlers = new WeakMap();
     class BatteryManager extends EventTarget {
-        constructor() {
+        constructor(token = undefined) {
             super();
+            if (token !== _batteryInternalToken) {
+                throw new TypeError("Failed to construct 'BatteryManager': Illegal constructor");
+            }
+            _batteryBrand.add(this);
+            _batteryHandlers.set(this, Object.create(null));
         }
     }
     Object.defineProperty(BatteryManager.prototype, Symbol.toStringTag, {
@@ -1563,7 +1571,10 @@
     // 1. Instance has 0 own properties (parity).
     // 2. for..in on instance still finds them (parity).
     const _defBatGetter = (name, val) => {
-        const getter = function() { return val; };
+        const getter = function() {
+            if (!_batteryBrand.has(this)) throw new TypeError('Illegal invocation');
+            return val;
+        };
         Object.defineProperty(BatteryManager.prototype, name, {
             get: getter,
             enumerable: true,
@@ -1572,9 +1583,16 @@
         _maskFunction(getter, `get ${name}`);
     };
     const _defBatProp = (name) => {
-        let _val = null;
-        const getter = function() { return _val; };
-        const setter = function(v) { _val = v; };
+        const getter = function() {
+            const state = _batteryHandlers.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state[name] || null;
+        };
+        const setter = function(v) {
+            const state = _batteryHandlers.get(this);
+            if (!state) throw new TypeError('Illegal invocation');
+            state[name] = v;
+        };
         Object.defineProperty(BatteryManager.prototype, name, {
             get: getter,
             set: setter,
@@ -1618,7 +1636,7 @@
     _defBatProp('onlevelchange');
 
     globalThis.BatteryManager = BatteryManager;
-    const _batteryInstance = new BatteryManager();
+    const _batteryInstance = new BatteryManager(_batteryInternalToken);
     // getBattery is [SecureContext] — exists only on https/wss/file/
     // localhost. On data:/http:, real Chrome reports
     // `TypeError: navigator.getBattery is not a function`. Phase 7.
@@ -7337,6 +7355,11 @@
         }
     }
     const _abortSignalCreate = () => new AbortSignal(_abortSignalInternalToken);
+    const _requireAbortSignal = (signal) => {
+        const state = _abortSignalState.get(signal);
+        if (!state) throw new TypeError('Illegal invocation');
+        return state;
+    };
     const _abortSignalFire = (signal, reason) => {
         const state = _abortSignalState.get(signal);
         if (!state || state.aborted) return;
@@ -7347,26 +7370,25 @@
         signal.dispatchEvent(new Event("abort"));
     };
     _defProtoGetter(AbortSignal.prototype, 'aborted', function aborted() {
-        return !!_abortSignalState.get(this)?.aborted;
+        return _requireAbortSignal(this).aborted;
     });
     _defProtoGetter(AbortSignal.prototype, 'reason', function reason() {
-        return _abortSignalState.get(this)?.reason;
+        return _requireAbortSignal(this).reason;
     });
     _defProtoGetter(
         AbortSignal.prototype,
         'onabort',
         function onabort() {
-            return _abortSignalState.get(this)?.onabort || null;
+            return _requireAbortSignal(this).onabort || null;
         },
         function onabort(value) {
-            const state = _abortSignalState.get(this);
-            if (!state) return;
+            const state = _requireAbortSignal(this);
             state.onabort = typeof value === 'function' ? value : null;
         },
     );
     _defProtoMethod(AbortSignal.prototype, 'throwIfAborted', function throwIfAborted() {
-        const state = _abortSignalState.get(this);
-        if (state?.aborted) throw state.reason;
+        const state = _requireAbortSignal(this);
+        if (state.aborted) throw state.reason;
     });
     Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, {
         value: 'AbortSignal', configurable: true,
@@ -7400,11 +7422,16 @@
             _abortControllerState.set(this, _abortSignalCreate());
         }
     }
+    const _requireAbortController = (controller) => {
+        const signal = _abortControllerState.get(controller);
+        if (!signal) throw new TypeError('Illegal invocation');
+        return signal;
+    };
     _defProtoGetter(AbortController.prototype, 'signal', function signal() {
-        return _abortControllerState.get(this);
+        return _requireAbortController(this);
     });
     _defProtoMethod(AbortController.prototype, 'abort', function abort(reason = undefined) {
-        _abortSignalFire(_abortControllerState.get(this), reason);
+        _abortSignalFire(_requireAbortController(this), reason);
     });
     Object.defineProperty(AbortController.prototype, Symbol.toStringTag, {
         value: 'AbortController', configurable: true,
