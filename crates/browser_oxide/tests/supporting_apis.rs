@@ -460,6 +460,113 @@ async fn structured_clone_message_port_transfer_matches_chrome() {
     );
 }
 
+#[tokio::test]
+async fn structured_clone_blob_file_and_worker_wire_preserve_metadata() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            (async () => {
+                const parts = [];
+                const blob = new Blob(['hello'], { type: 'text/plain' });
+                const file = new File(
+                    ['abc'],
+                    'note.txt',
+                    { type: 'text/plain', lastModified: 123456 }
+                );
+
+                const blobClone = structuredClone(blob);
+                const fileClone = structuredClone(file);
+                parts.push(
+                    Object.prototype.toString.call(blobClone) === '[object Blob]'
+                    && blobClone.size === 5
+                    && blobClone.type === 'text/plain'
+                    && await blobClone.text() === 'hello'
+                );
+                parts.push(
+                    Object.prototype.toString.call(fileClone) === '[object File]'
+                    && fileClone.name === 'note.txt'
+                    && fileClone.size === 3
+                    && fileClone.type === 'text/plain'
+                    && fileClone.lastModified === 123456
+                    && await fileClone.text() === 'abc'
+                );
+
+                const src = `
+                    self.onmessage = async (e) => {
+                        if (e.data.kind === 'from-parent') {
+                            const b = e.data.blob;
+                            const f = e.data.file;
+                            self.postMessage({
+                                kind: 'parent-result',
+                                blob: [Object.prototype.toString.call(b), b.size, b.type, await b.text()],
+                                file: [Object.prototype.toString.call(f), f.name, f.size, f.type, f.lastModified, await f.text()],
+                            });
+                            return;
+                        }
+                        const b = new Blob(['worker'], { type: 'text/custom' });
+                        const f = new File(['xyz'], 'worker.txt', {
+                            type: 'text/worker',
+                            lastModified: 654321,
+                        });
+                        self.postMessage({ kind: 'from-worker', blob: b, file: f });
+                    };
+                `;
+                const worker = new Worker(URL.createObjectURL(new Blob([src])));
+                const seen = {};
+                worker.onmessage = async (e) => {
+                    if (e.data.kind === 'parent-result') {
+                        seen.parent =
+                            JSON.stringify(e.data.blob) === JSON.stringify(['[object Blob]', 5, 'text/plain', 'hello'])
+                            && JSON.stringify(e.data.file) === JSON.stringify(['[object File]', 'note.txt', 3, 'text/plain', 123456, 'abc']);
+                        worker.postMessage({ kind: 'send-worker-values' });
+                        return;
+                    }
+                    if (e.data.kind === 'from-worker') {
+                        const b = e.data.blob;
+                        const f = e.data.file;
+                        seen.worker =
+                            Object.prototype.toString.call(b) === '[object Blob]'
+                            && b.size === 6
+                            && b.type === 'text/custom'
+                            && await b.text() === 'worker'
+                            && Object.prototype.toString.call(f) === '[object File]'
+                            && f.name === 'worker.txt'
+                            && f.size === 3
+                            && f.type === 'text/worker'
+                            && f.lastModified === 654321
+                            && await f.text() === 'xyz';
+                        parts.push(seen.parent === true);
+                        parts.push(seen.worker === true);
+                        document.getElementById('out').textContent = parts.join(',');
+                        worker.terminate();
+                    }
+                };
+                worker.postMessage({ kind: 'from-parent', blob, file });
+            })();
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    for _ in 0..60 {
+        if page
+            .text_of("#out")
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        page.text_of("#out"),
+        Some("true,true,true,true".to_string())
+    );
+}
+
 // ============================================================================
 // A4 — Streams (ReadableStream / WritableStream / TransformStream)
 // ============================================================================

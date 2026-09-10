@@ -62,6 +62,18 @@
         return null;
     }
 
+    function _blobSnapshot(value) {
+        for (const bridge of _bridgeRefs) {
+            const snapshot = bridge && bridge.blobSnapshotForClone;
+            if (typeof snapshot !== "function") continue;
+            try {
+                const result = snapshot(value);
+                if (result) return result;
+            } catch (_) {}
+        }
+        return null;
+    }
+
     function _serializeForWire(value, seen, transferState) {
         if (value === null) return null;
         const t = typeof value;
@@ -94,6 +106,32 @@
         }
         if (value instanceof RegExp) {
             return { [TAG]: "RegExp", source: value.source, flags: value.flags };
+        }
+        if (typeof File !== "undefined" && value instanceof File) {
+            const snapshot = _blobSnapshot(value);
+            const bytes = snapshot && snapshot.bytes
+                ? snapshot.bytes
+                : new Uint8Array(0);
+            return {
+                [TAG]: "File",
+                b: _b64encodeBytes(bytes),
+                name: String(snapshot ? snapshot.name : value.name || ""),
+                type: String(snapshot ? snapshot.type : value.type || ""),
+                lastModified: Number(
+                    snapshot ? snapshot.lastModified : value.lastModified
+                ) || 0,
+            };
+        }
+        if (typeof Blob !== "undefined" && value instanceof Blob) {
+            const snapshot = _blobSnapshot(value);
+            const bytes = snapshot && snapshot.bytes
+                ? snapshot.bytes
+                : new Uint8Array(0);
+            return {
+                [TAG]: "Blob",
+                b: _b64encodeBytes(bytes),
+                type: String(snapshot ? snapshot.type : value.type || ""),
+            };
         }
         if (value instanceof ArrayBuffer) {
             const u8 = new Uint8Array(value);
@@ -159,6 +197,21 @@
                 case "bigint": return BigInt(value.v);
                 case "Date": return new Date(value.v);
                 case "RegExp": return new RegExp(value.source, value.flags);
+                case "Blob": {
+                    const u8 = _b64decodeToUint8(value.b);
+                    return new Blob([u8], { type: value.type || "" });
+                }
+                case "File": {
+                    const u8 = _b64decodeToUint8(value.b);
+                    return new File(
+                        [u8],
+                        value.name || "",
+                        {
+                            type: value.type || "",
+                            lastModified: Number(value.lastModified) || 0,
+                        },
+                    );
+                }
                 case "ArrayBuffer": {
                     const u8 = _b64decodeToUint8(value.b);
                     const ab = new ArrayBuffer(u8.byteLength);
@@ -567,6 +620,21 @@
                     c[i] = clone(value[i], seen, transferState);
                 }
             }
+            return c;
+        }
+        // File must be tested before Blob because File inherits from Blob.
+        // Structured clone preserves the File-specific name/lastModified
+        // metadata as well as the underlying bytes and MIME type.
+        if (typeof File !== "undefined" && value instanceof File) {
+            const c = new File(
+                [value],
+                value.name,
+                {
+                    type: value.type || "",
+                    lastModified: value.lastModified,
+                },
+            );
+            seen.set(value, c);
             return c;
         }
         // Blob — copy the underlying bytes + type. `new Blob([blob])`

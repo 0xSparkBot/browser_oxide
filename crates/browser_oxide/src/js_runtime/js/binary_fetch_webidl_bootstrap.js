@@ -174,6 +174,39 @@
     _tag(File.prototype, 'File');
     globalThis.File = File;
 
+    // Structured clone / Worker wire serialization needs synchronous access
+    // to the normalized Blob backing bytes. Keep that access on the private
+    // engine bridge rather than re-introducing a page-visible `_data` field.
+    const blobSnapshotForClone = (value) => {
+        const blob = blobState.get(value);
+        if (!blob) return null;
+        const file = fileState.get(value);
+        return {
+            bytes: blob.bytes,
+            type: blob.type,
+            isFile: !!file,
+            name: file ? file.name : '',
+            lastModified: file ? file.lastModified : 0,
+        };
+    };
+    // Worker runtimes execute this normalization layer before
+    // structured_clone.js creates its legacy private bridge. Ensure the bridge
+    // already exists here so the Blob snapshot hook is captured in both Window
+    // and DedicatedWorker realms; cleanup_bootstrap removes the global name
+    // before page-authored code can observe it.
+    if (!globalThis.__browser_oxide) globalThis.__browser_oxide = {};
+    for (const bridge of [globalThis._browser_oxide, globalThis.__browser_oxide]) {
+        if (!bridge) continue;
+        try {
+            Object.defineProperty(bridge, 'blobSnapshotForClone', {
+                value: blobSnapshotForClone,
+                configurable: true,
+                enumerable: false,
+                writable: false,
+            });
+        } catch (_) {}
+    }
+
     // Keep the native blob URL registry path, but read normalized Blob bytes
     // from the WeakMap instead of a page-visible `_data` property.
     if (globalThis.URL && typeof globalThis.URL.createObjectURL === 'function') {
