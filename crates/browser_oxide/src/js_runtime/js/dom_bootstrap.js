@@ -742,6 +742,10 @@
     globalThis.__onNodeInserted = _onNodeInserted;
 
     const _collectionIndex = (prop) => typeof prop === "string" && /^(0|[1-9]\d*)$/.test(prop);
+    const _collectionReflectOwnKeys = Reflect.ownKeys;
+    const _collectionReflectGet = Reflect.get;
+    const _collectionReflectHas = Reflect.has;
+    const _collectionReflectGetOwnPropertyDescriptor = Reflect.getOwnPropertyDescriptor;
     const _collectionState = new WeakMap();
 
     function _refreshCollection(collection, explicitData) {
@@ -787,12 +791,12 @@
             const proxy = new Proxy(this, {
                 get(target, prop, receiver) {
                     if (prop === "length" || _collectionIndex(prop)) _refreshCollection(target);
-                    return Reflect.get(target, prop, receiver);
+                    return _collectionReflectGet(target, prop, receiver);
                 },
-                ownKeys(target) { _refreshCollection(target); return Reflect.ownKeys(target); },
+                ownKeys(target) { _refreshCollection(target); return _collectionReflectOwnKeys(target); },
                 getOwnPropertyDescriptor(target, prop) {
                     if (_collectionIndex(prop)) _refreshCollection(target);
-                    return Reflect.getOwnPropertyDescriptor(target, prop);
+                    return _collectionReflectGetOwnPropertyDescriptor(target, prop);
                 },
             });
             _collectionState.set(proxy, state);
@@ -846,19 +850,19 @@
             const proxy = new Proxy(this, {
                 get(target, prop, receiver) {
                     if (prop === "length" || _collectionIndex(prop)) _refreshCollection(target);
-                    const ordinary = Reflect.get(target, prop, receiver);
+                    const ordinary = _collectionReflectGet(target, prop, receiver);
                     if (ordinary !== undefined || typeof prop !== "string" || _collectionIndex(prop)) return ordinary;
                     return _htmlCollectionNamedItem(target, prop) ?? undefined;
                 },
                 has(target, prop) {
-                    if (Reflect.has(target, prop)) return true;
+                    if (_collectionReflectHas(target, prop)) return true;
                     return typeof prop === "string" && !_collectionIndex(prop)
                         ? _htmlCollectionNamedItem(target, prop) !== null
                         : false;
                 },
                 ownKeys(target) {
                     _refreshCollection(target);
-                    const keys = Reflect.ownKeys(target);
+                    const keys = _collectionReflectOwnKeys(target);
                     for (const name of _htmlCollectionSupportedNames(target)) {
                         if (!keys.includes(name) && !Reflect.has(target, name)) keys.push(name);
                     }
@@ -866,9 +870,9 @@
                 },
                 getOwnPropertyDescriptor(target, prop) {
                     if (_collectionIndex(prop)) _refreshCollection(target);
-                    const ordinary = Reflect.getOwnPropertyDescriptor(target, prop);
+                    const ordinary = _collectionReflectGetOwnPropertyDescriptor(target, prop);
                     if (ordinary) return ordinary;
-                    if (typeof prop === "string" && !_collectionIndex(prop) && !Reflect.has(target, prop)) {
+                    if (typeof prop === "string" && !_collectionIndex(prop) && !_collectionReflectHas(target, prop)) {
                         const value = _htmlCollectionNamedItem(target, prop);
                         if (value !== null) {
                             return { value, writable: false, enumerable: false, configurable: true };
@@ -2865,13 +2869,6 @@
             // Capture initial base URL from ops or a global hint
             globalThis.__browser_oxide._baseUrl = ops.op_dom_get_base_url && ops.op_dom_get_base_url();
 
-            const all = new HTMLAllCollection(this);
-            // Hide 'all' from enumeration but keep it truthy
-            Object.defineProperty(this, 'all', {
-                get() { return all; },
-                enumerable: false,
-                configurable: true
-            });
         }
         get scripts() { return this.getElementsByTagName("script"); }
         get currentScript() { return _currentScript; }
@@ -2938,28 +2935,6 @@
         createElement(tag) {
             const el = _wrapNode(ops.op_dom_create_element(tag));
             _domPrivateTrace({ phase: "createElement", tag: String(tag || ""), node: _domPrivateMeta(el) });
-            if (tag.toLowerCase() === "script") {
-                let _src = "";
-                // Capture the real descriptor to avoid infinite recursion
-                const proto = Object.getPrototypeOf(el);
-                const origSrc = Object.getOwnPropertyDescriptor(proto, 'src');
-
-                Object.defineProperty(el, "src", {
-                    get: () => _src,
-                    set: (v) => {
-                        _src = v;
-                        if (v.includes("akam") || v.includes("ips.js") || v.includes("kpsdk")) {
-                            console.log(`[DOM] dynamic script: ${v}`);
-                        }
-                        if (origSrc && origSrc.set) {
-                            origSrc.set.call(el, v);
-                        } else {
-                            el.setAttribute("src", v);
-                        }
-                    },
-                    configurable: true,
-                });
-            }
             return el;
         }
         createElementNS(ns, tag) {
@@ -2973,9 +2948,7 @@
             return _wrapNode(ops.op_dom_create_document_fragment());
         }
         createComment(text) {
-            // Comment nodes have nodeType 8 in the DOM; use text node with special handling
-            const id = ops.op_dom_create_text_node(""); // TODO: proper comment op
-            return _wrapNode(id);
+            return _wrapNode(ops.op_dom_create_comment(String(text)));
         }
         createEvent(type) {
             // Legacy event factory
@@ -3285,7 +3258,12 @@
     _defineDocumentMethod('webkitExitFullscreen', function() { return this.exitFullscreen(); });
 
     _defineDocumentGetter('activeViewTransition', function() { return null; });
-    _defineDocumentGetter('all', function() { return this.querySelectorAll('*'); });
+    const _documentAllCollections = new WeakMap();
+    _defineDocumentGetter('all', function() {
+        let value = _documentAllCollections.get(this);
+        if (!value) { value = new HTMLAllCollection(this); _documentAllCollections.set(this, value); }
+        return value;
+    });
     _defineDocumentGetter('applets', function() { return this.querySelectorAll('applet'); });
     _defineDocumentGetter('children', function() { return this.documentElement ? [this.documentElement] : []; });
     _defineDocumentGetter('childElementCount', function() { return this.documentElement ? 1 : 0; });
@@ -3411,7 +3389,11 @@
     try {
         const _locationDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'location');
         if (_locationDescriptor) {
-            Object.defineProperty(_document, 'location', _locationDescriptor);
+            Object.defineProperty(_document, 'location', {
+                ..._locationDescriptor,
+                enumerable: true,
+                configurable: false,
+            });
             delete Document.prototype.location;
         }
     } catch (_) {}

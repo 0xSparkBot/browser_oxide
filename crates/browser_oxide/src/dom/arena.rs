@@ -300,6 +300,14 @@ impl Dom {
 
     /// Get text content of a subtree.
     pub fn text_content(&self, id: NodeId) -> String {
+        // CharacterData nodes expose their own payload through textContent.
+        // Descendant-text collection for elements/documents still excludes
+        // comments, matching the DOM descendant text content algorithm.
+        if let Some(node) = self.get(id) {
+            if let NodeData::Comment(text) = &node.data {
+                return text.clone();
+            }
+        }
         let mut result = String::new();
         self.collect_text(id, &mut result);
         result
@@ -852,6 +860,21 @@ mod tests {
     fn node_id_raw_roundtrip() {
         let id = NodeId::from_raw(42);
         assert_eq!(id.to_raw(), 42);
+    }
+
+    #[test]
+    fn comment_text_content_returns_own_data_but_parent_excludes_comment() {
+        let mut dom = Dom::new();
+        let parent = dom.create_element(QualName::new("div"), vec![]);
+        let text = dom.create_text("before".to_string());
+        let comment = dom.create_comment("hello".to_string());
+        let tail = dom.create_text("after".to_string());
+        dom.append_child(parent, text);
+        dom.append_child(parent, comment);
+        dom.append_child(parent, tail);
+
+        assert_eq!(dom.text_content(comment), "hello");
+        assert_eq!(dom.text_content(parent), "beforeafter");
     }
 
     #[test]

@@ -408,6 +408,10 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/binary_fetch_webidl_bootstrap.js"),
             "\n",
+            include_str!("js/instance_webidl_bootstrap.js"),
+            "\n",
+            include_str!("js/window_reflection_spec.js"),
+            "\n",
             include_str!("js/structured_clone.js"),
         );
 
@@ -466,6 +470,35 @@ pub fn create_runtime_with_signals(
         .expect("cleanup failed");
     if std::env::var_os("BROWSER_OXIDE_BOOTSTRAP_PROFILE").is_some() {
         eprintln!("[boot] cleanup exec: {:?}", _ct0.elapsed());
+    }
+
+    // Type the main realm's *inner* global as Window without touching V8's
+    // GlobalProxy.  This is the same primitive used by iframe child realms:
+    // GlobalProxy keeps forwarding semantics, while property lookup reaches
+    // Window.prototype and therefore exposes the correct constructor chain.
+    // Preserve the pre-existing inner-global prototype below Window.prototype
+    // so the runtime's event/global fallback behavior remains intact.
+    {
+        let __ctx = runtime.main_context();
+        v8::scope_with_context!(scope, runtime.v8_isolate(), __ctx);
+        let proxy = scope.get_current_context().global(scope);
+        let inner = proxy
+            .get_prototype(scope)
+            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok());
+        if let Some(inner) = inner {
+            let window_key = v8::String::new(scope, "Window");
+            let prototype_key = v8::String::new(scope, "prototype");
+            if let (Some(window_key), Some(prototype_key)) = (window_key, prototype_key) {
+                let window_proto = proxy
+                    .get(scope, window_key.into())
+                    .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                    .and_then(|ctor| ctor.get(scope, prototype_key.into()))
+                    .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok());
+                if let Some(window_proto) = window_proto {
+                    let _ = inner.set_prototype(scope, window_proto.into());
+                }
+            }
+        }
     }
 
     // Capture Symbol.for('__browser_oxide_native__') from the JS global registry
@@ -760,6 +793,13 @@ pub fn create_worker_runtime(
             include_str!("js/performance_webidl_bootstrap.js"),
         )
         .expect("worker: performance WebIDL bootstrap failed");
+
+    runtime
+        .execute_script(
+            "<anonymous>",
+            include_str!("js/instance_webidl_bootstrap.js"),
+        )
+        .expect("worker: instance WebIDL bootstrap failed");
 
     // Final cleanup in worker
     runtime

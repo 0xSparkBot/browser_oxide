@@ -6,23 +6,25 @@
  * preserving those existing fetch/WebSocket operations.
  */
 ((globalThis) => {
+    const _reflectOwnKeysRaw = Reflect.ownKeys;
+    const _reflectGetOwnPropertyDescriptorRaw = Reflect.getOwnPropertyDescriptor;
     const _rawInstances = new WeakMap();
     const _raw = value => _rawInstances.get(value) || value;
 
     const _hideImplementationSlots = (target, readonlyNames = []) => {
-        const hidden = new Set(Reflect.ownKeys(target));
+        const hidden = new Set(_reflectOwnKeysRaw(target));
         const readonly = new Set(readonlyNames);
         const eventMethodCache = new Map();
         const proxy = new Proxy(target, {
             ownKeys(obj) {
-                return Reflect.ownKeys(obj).filter(key => {
+                return _reflectOwnKeysRaw(obj).filter(key => {
                     if (!hidden.has(key)) return true;
-                    const descriptor = Reflect.getOwnPropertyDescriptor(obj, key);
+                    const descriptor = _reflectGetOwnPropertyDescriptorRaw(obj, key);
                     return descriptor && !descriptor.configurable;
                 });
             },
             getOwnPropertyDescriptor(obj, key) {
-                const descriptor = Reflect.getOwnPropertyDescriptor(obj, key);
+                const descriptor = _reflectGetOwnPropertyDescriptorRaw(obj, key);
                 if (hidden.has(key) && descriptor?.configurable) return undefined;
                 return descriptor;
             },

@@ -1875,27 +1875,13 @@
         enumerable: false,
     });
 
-    _defLoc('href', () => _locationData.href, (v) => {
-        _parseLocationUrl(v);
-        _browser_oxide.__pendingNavigation = { url: _locationData.href, kind: "assign" };
-        _signalNav();
-    });
-    _defLoc('origin', () => _locationData.origin);
-    _defLoc('protocol', () => _locationData.protocol, (v) => {
-        _setLocationPart('protocol', v);
-    });
-    _defLoc('host', () => _locationData.host, (v) => {
-        _setLocationPart('host', v);
-    });
-    _defLoc('hostname', () => _locationData.hostname, (v) => {
-        _setLocationPart('hostname', v);
-    });
-    _defLoc('port', () => _locationData.port, (v) => { _setLocationPart('port', v); });
-    _defLoc('pathname', () => _locationData.pathname, (v) => { _setLocationPart('pathname', v); });
-    _defLoc('search', () => _locationData.search, (v) => { _setLocationPart('search', v); });
-    _defLoc('hash', () => _locationData.hash, (v) => {
-        _locationData.hash = String(v).startsWith('#') ? v : '#' + v;
-        _locationData.href = _locationData.origin + _locationData.pathname + _locationData.search + _locationData.hash;
+    const _valueOf = ({ valueOf() { return this; } }).valueOf;
+    _maskFunction(_valueOf, 'valueOf');
+    Object.defineProperty(_locationInstance, 'valueOf', {
+        value: _valueOf,
+        writable: false,
+        enumerable: false,
+        configurable: false,
     });
     _defLoc('ancestorOrigins', () => {
         const arr = Array.isArray(globalThis.__frameAncestorOrigins) ? globalThis.__frameAncestorOrigins : [];
@@ -1908,29 +1894,39 @@
         _ao[Symbol.iterator] = function*() { for (let i = 0; i < arr.length; i++) yield arr[i]; };
         return _ao;
     });
-
+    _defLoc('href', () => _locationData.href, (v) => {
+        _parseLocationUrl(v);
+        _browser_oxide.__pendingNavigation = { url: _locationData.href, kind: "assign" };
+        _signalNav();
+    });
+    _defLoc('origin', () => _locationData.origin);
+    _defLoc('protocol', () => _locationData.protocol, (v) => { _setLocationPart('protocol', v); });
+    _defLoc('host', () => _locationData.host, (v) => { _setLocationPart('host', v); });
+    _defLoc('hostname', () => _locationData.hostname, (v) => { _setLocationPart('hostname', v); });
+    _defLoc('port', () => _locationData.port, (v) => { _setLocationPart('port', v); });
+    _defLoc('pathname', () => _locationData.pathname, (v) => { _setLocationPart('pathname', v); });
+    _defLoc('search', () => _locationData.search, (v) => { _setLocationPart('search', v); });
+    _defLoc('hash', () => _locationData.hash, (v) => {
+        _locationData.hash = String(v).startsWith('#') ? v : '#' + v;
+        _locationData.href = _locationData.origin + _locationData.pathname + _locationData.search + _locationData.hash;
+    });
     _defLocMethod('assign', (url) => {
         _parseLocationUrl(url);
-        _browser_oxide.__pendingNavigation = 
- { url: _locationData.href, kind: "assign" };
-        _signalNav();
-    }, 1);
-    _defLocMethod('replace', (url) => {
-        _parseLocationUrl(url);
-        _browser_oxide.__pendingNavigation = 
- { url: _locationData.href, kind: "replace" };
+        _browser_oxide.__pendingNavigation = { url: _locationData.href, kind: "assign" };
         _signalNav();
     }, 1);
     _defLocMethod('reload', () => {
-        _browser_oxide.__pendingNavigation = 
- { url: _locationData.href, kind: "reload" };
+        _browser_oxide.__pendingNavigation = { url: _locationData.href, kind: "reload" };
         _signalNav();
     }, 0);
+    _defLocMethod('replace', (url) => {
+        _parseLocationUrl(url);
+        _browser_oxide.__pendingNavigation = { url: _locationData.href, kind: "replace" };
+        _signalNav();
+    }, 1);
     _defLocMethod('toString', function() { return this.href; }, 0);
-    const _valueOf = ({ valueOf() { return this; } }).valueOf;
-    _maskFunction(_valueOf, 'valueOf');
-    Object.defineProperty(_locationInstance, 'valueOf', {
-        value: _valueOf,
+    Object.defineProperty(_locationInstance, Symbol.toPrimitive, {
+        value: undefined,
         writable: false,
         enumerable: false,
         configurable: false,
@@ -7696,8 +7692,7 @@
                 f.display = 'auto';
                 return f;
             });
-            Object.defineProperty(globalThis.document, 'fonts', {
-                value: {
+            const _fontFaceSet = {
                     check(font, text) {
                         // Parse font family from CSS font shorthand (e.g. "12px Arial", "bold 14px 'Times New Roman'")
                         // Strip size/weight prefix: everything before the last number+unit
@@ -7735,7 +7730,10 @@
                     clear() { _fontFaces.length = 0; },
                     addEventListener() {},
                     removeEventListener() {},
-                },
+                };
+            Object.defineProperty(globalThis.Document.prototype, 'fonts', {
+                get: function fonts() { return _fontFaceSet; },
+                enumerable: true,
                 configurable: true,
             });
         }
@@ -7828,31 +7826,19 @@
 
         // Removed redundant MediaSource definition here; it is defined further down.
 
-        // Patch HTMLMediaElement.canPlayType if document exists.
-        // The shim must be _maskFunction'd or its raw source leaks via
-        // `el.canPlayType + ""`, `el.canPlayType.toString()`, AND
-        // cross-realm `iframe.contentWindow.Function.prototype.toString.call(el.canPlayType)`.
-        if (globalThis.document) {
+        // HTMLMediaElement.canPlayType belongs on the prototype, not on each
+        // video/audio instance.  This also keeps Document.createElement as the
+        // single DOM creation path.
+        if (globalThis.HTMLMediaElement && globalThis.HTMLMediaElement.prototype) {
             const _canPlayTypeShim = function canPlayType(type) {
                 const parsed = _parseMediaType(type);
                 if (!_canPlayMediaType(type)) return "";
                 return parsed.codecs.length > 0 ? "probably" : "maybe";
             };
-            if (typeof _maskFunction === "function") {
-                _maskFunction(_canPlayTypeShim, "canPlayType");
-            }
-            const _origCreate = globalThis.document.createElement.bind(globalThis.document);
-            const _patchedCreate = function createElement(tag) {
-                const el = _origCreate(tag);
-                if (tag === 'video' || tag === 'audio') {
-                    el.canPlayType = _canPlayTypeShim;
-                }
-                return el;
-            };
-            if (typeof _maskFunction === "function") {
-                _maskFunction(_patchedCreate, "createElement");
-            }
-            globalThis.document.createElement = _patchedCreate;
+            if (typeof _maskFunction === "function") _maskFunction(_canPlayTypeShim, "canPlayType");
+            Object.defineProperty(globalThis.HTMLMediaElement.prototype, 'canPlayType', {
+                value: _canPlayTypeShim, writable: true, enumerable: true, configurable: true,
+            });
         }
 
         // MediaRecorder — Chrome ships this as a real constructor with
@@ -9016,16 +9002,6 @@
     }
     function _hasStorageAccess() {
         return Promise.resolve(_documentStorageAccessActive());
-    }
-
-    // Storage Access API
-    if (globalThis.document) {
-        if (!globalThis.document.hasStorageAccess) {
-            globalThis.document.hasStorageAccess = _hasStorageAccess;
-        }
-        if (!globalThis.document.requestStorageAccess) {
-            globalThis.document.requestStorageAccess = function() { return Promise.reject(new DOMException("Not allowed", "NotAllowedError")); };
-        }
     }
 
     // CSS.supports()

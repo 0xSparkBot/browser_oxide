@@ -1015,6 +1015,8 @@
     // make the current properties non-enumerable, and filter only the engine's
     // reserved names when page code enumerates the global object. Page-owned
     // names such as `__NEXT_DATA__` remain visible.
+    try { delete globalThis.XSLTProcessor; } catch (_) {}
+
     if (!globalThis.__browserOxideOwnKeysPatched) {
         const _hiddenExact = new Set([
             '_browser_oxide',
@@ -1063,56 +1065,229 @@
         }
 
         const _nativeMaskTag = globalThis._nativeTag;
+        const _windowSpec = globalThis.__browser_oxide?._windowReflectionSpec || null;
+        const _windowOrder = Array.isArray(_windowSpec?.order) ? _windowSpec.order.slice() : [];
+        const _windowOrderSet = new Set(_windowOrder);
+        const _windowOverrides = _windowSpec?.overrides || Object.create(null);
+        const _windowFrameShape = _windowSpec?.frameIndex || null;
+
+        const _objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
         const _objectGetOwnPropertyNames = Object.getOwnPropertyNames;
         const _objectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
         const _objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+        const _objectGetPrototypeOf = Object.getPrototypeOf;
         const _objectKeys = Object.keys;
+        const _reflectGetOwnPropertyDescriptor = Reflect.getOwnPropertyDescriptor;
+        const _reflectGetPrototypeOf = Reflect.getPrototypeOf;
         const _reflectOwnKeys = Reflect.ownKeys;
-        const _isHiddenOwnKey = (key) => _nativeMaskTag && key === _nativeMaskTag;
+        const _isHiddenOwnKey = (target, key) => {
+            if (_nativeMaskTag && key === _nativeMaskTag) return true;
+            if (!_isGlobalTarget(target) || typeof key !== 'symbol') return false;
+            const description = key.description || '';
+            return key === Symbol.toStringTag
+                || description.startsWith('__browser_oxide_')
+                || description.startsWith('browserOxide');
+        };
+        const _isFrameIndex = (key) => typeof key === 'string'
+            && /^(0|[1-9]\d*)$/.test(key)
+            && Number(key) < Number(globalThis.length || 0);
 
+        // WindowProxy is a host-exotic object in Chromium. V8/deno_core keeps
+        // the actual state on an inner global, so emulate the public
+        // [[OwnPropertyKeys]], [[GetOwnProperty]] and [[GetPrototypeOf]] traps
+        // while leaving storage/navigation/event state untouched.
+        const _windowOwnKeys = (target) => {
+            const raw = _reflectOwnKeys(target).filter((key) =>
+                !_isHiddenOwnKey(target, key)
+                && (typeof key !== 'string' || !_isHiddenGlobalName(key))
+            );
+            if (!_windowSpec) return raw;
+            const rawSet = new Set(raw);
+            const result = [];
+            const seen = new Set();
+            const frameCount = Math.max(0, Number(globalThis.length || 0) | 0);
+            for (let i = 0; i < frameCount; i++) {
+                const key = String(i);
+                // WindowProxy exposes one own numeric property per child frame.
+                if (rawSet.has(key) || target[key] !== undefined) {
+                    result.push(key);
+                    seen.add(key);
+                }
+            }
+            for (const key of _windowOrder) {
+                if (rawSet.has(key) && !seen.has(key)) {
+                    result.push(key);
+                    seen.add(key);
+                }
+            }
+            // Page-created own globals are appended after the browser baseline
+            // in their real creation order. Named DOM properties are not forced
+            // into this list; the underlying Window named-properties layer
+            // remains authoritative for those.
+            for (const key of raw) {
+                if (seen.has(key)) continue;
+                if (typeof key === 'string') {
+                    if (_windowOrderSet.has(key) || _isFrameIndex(key)) continue;
+                    result.push(key);
+                    seen.add(key);
+                }
+            }
+            for (const key of raw) {
+                if (typeof key === 'symbol' && !seen.has(key)) {
+                    result.push(key);
+                    seen.add(key);
+                }
+            }
+            return result;
+        };
+
+        const _windowShapeFor = (key) => {
+            if (!_windowSpec || typeof key !== 'string') return null;
+            if (_isFrameIndex(key)) return _windowFrameShape;
+            return Object.prototype.hasOwnProperty.call(_windowOverrides, key)
+                ? _windowOverrides[key]
+                : null;
+        };
+        const _virtualAccessorCache = new Map();
+        const _windowVirtualAccessors = (key, shape) => {
+            let pair = _virtualAccessorCache.get(key);
+            if (pair) return pair;
+            let get = undefined;
+            let set = undefined;
+            if (shape?.g) {
+                get = function() { return this[key]; };
+                try {
+                    Object.defineProperty(get, 'name', { value: `get ${key}`, configurable: true });
+                    Object.defineProperty(get, 'length', { value: 0, configurable: true });
+                    if (typeof globalThis._maskFunction === 'function') globalThis._maskFunction(get, `get ${key}`);
+                } catch (_e) {}
+            }
+            if (shape?.s) {
+                set = function(value) { this[key] = value; };
+                try {
+                    Object.defineProperty(set, 'name', { value: `set ${key}`, configurable: true });
+                    Object.defineProperty(set, 'length', { value: 1, configurable: true });
+                    if (typeof globalThis._maskFunction === 'function') globalThis._maskFunction(set, `set ${key}`);
+                } catch (_e) {}
+            }
+            pair = { get, set };
+            _virtualAccessorCache.set(key, pair);
+            return pair;
+        };
+        const _windowDescriptor = (target, key) => {
+            const raw = _reflectGetOwnPropertyDescriptor(target, key);
+            if (!_isGlobalTarget(target) || !_windowSpec) return raw;
+            const shape = _windowShapeFor(key);
+            if (!shape) return raw;
+            if (shape.kind === 'v') {
+                return {
+                    value: target[key],
+                    writable: !!shape.w,
+                    enumerable: !!shape.e,
+                    configurable: !!shape.c,
+                };
+            }
+            let get;
+            let set;
+            if (raw && !Object.prototype.hasOwnProperty.call(raw, 'value')) {
+                get = shape.g ? raw.get : undefined;
+                set = shape.s ? raw.set : undefined;
+            }
+            if ((shape.g && typeof get !== 'function') || (shape.s && typeof set !== 'function')) {
+                const virtual = _windowVirtualAccessors(key, shape);
+                if (shape.g && typeof get !== 'function') get = virtual.get;
+                if (shape.s && typeof set !== 'function') set = virtual.set;
+            }
+            return {
+                get: shape.g ? get : undefined,
+                set: shape.s ? set : undefined,
+                enumerable: !!shape.e,
+                configurable: !!shape.c,
+            };
+        };
+
+        const getOwnPropertyDescriptor = function getOwnPropertyDescriptor(target, key) {
+            if (_isGlobalTarget(target) && typeof key === 'string' && _isHiddenGlobalName(key)) return undefined;
+            if (_isHiddenOwnKey(target, key)) return undefined;
+            return _windowDescriptor(target, key);
+        };
+        const reflectGetOwnPropertyDescriptor = function getOwnPropertyDescriptor(target, key) {
+            return getOwnPropertyDescriptor(target, key);
+        };
         const getOwnPropertyNames = function getOwnPropertyNames(target) {
-            const names = _objectGetOwnPropertyNames(target);
-            return _isGlobalTarget(target)
-                ? names.filter((name) => !_isHiddenGlobalName(name))
-                : names;
+            const names = _isGlobalTarget(target) ? _windowOwnKeys(target) : _objectGetOwnPropertyNames(target);
+            return names.filter((name) => typeof name === 'string');
         };
         const getOwnPropertySymbols = function getOwnPropertySymbols(target) {
-            return _objectGetOwnPropertySymbols(target).filter((key) => !_isHiddenOwnKey(key));
+            const names = _isGlobalTarget(target) ? _windowOwnKeys(target) : _objectGetOwnPropertySymbols(target);
+            return names.filter((key) => typeof key === 'symbol' && !_isHiddenOwnKey(target, key));
         };
         const getOwnPropertyDescriptors = function getOwnPropertyDescriptors(target) {
-            const descriptors = _objectGetOwnPropertyDescriptors(target);
-            for (const key of _reflectOwnKeys(descriptors)) {
-                if (_isHiddenOwnKey(key)
-                    || (_isGlobalTarget(target) && typeof key === 'string' && _isHiddenGlobalName(key))) {
-                    try { delete descriptors[key]; } catch (_e) {}
+            if (!_isGlobalTarget(target)) {
+                const descriptors = _objectGetOwnPropertyDescriptors(target);
+                for (const key of _reflectOwnKeys(descriptors)) {
+                    if (_isHiddenOwnKey(target, key)) {
+                        try { delete descriptors[key]; } catch (_e) {}
+                    }
                 }
+                return descriptors;
+            }
+            const descriptors = {};
+            for (const key of _windowOwnKeys(target)) {
+                const descriptor = getOwnPropertyDescriptor(target, key);
+                if (!descriptor) continue;
+                try {
+                    Object.defineProperty(descriptors, key, {
+                        value: descriptor,
+                        writable: true,
+                        enumerable: true,
+                        configurable: true,
+                    });
+                } catch (_e) {}
             }
             return descriptors;
         };
         const keys = function keys(target) {
-            const names = _objectKeys(target);
-            return _isGlobalTarget(target)
-                ? names.filter((name) => !_isHiddenGlobalName(name))
-                : names;
+            if (!_isGlobalTarget(target)) return _objectKeys(target);
+            const result = [];
+            for (const key of _windowOwnKeys(target)) {
+                if (typeof key !== 'string') continue;
+                const descriptor = getOwnPropertyDescriptor(target, key);
+                if (descriptor?.enumerable) result.push(key);
+            }
+            return result;
         };
         const ownKeys = function ownKeys(target) {
-            const names = _reflectOwnKeys(target);
-            return names.filter((name) =>
-                !_isHiddenOwnKey(name)
-                && (!_isGlobalTarget(target) || typeof name !== 'string' || !_isHiddenGlobalName(name))
-            );
+            if (_isGlobalTarget(target)) return _windowOwnKeys(target);
+            return _reflectOwnKeys(target).filter((name) => !_isHiddenOwnKey(target, name));
+        };
+        const getPrototypeOf = function getPrototypeOf(target) {
+            if (_isGlobalTarget(target) && globalThis.Window?.prototype) return globalThis.Window.prototype;
+            return _objectGetPrototypeOf(target);
+        };
+        const reflectGetPrototypeOf = function getPrototypeOf(target) {
+            if (_isGlobalTarget(target) && globalThis.Window?.prototype) return globalThis.Window.prototype;
+            return _reflectGetPrototypeOf(target);
         };
 
+        Object.getOwnPropertyDescriptor = getOwnPropertyDescriptor;
         Object.getOwnPropertyNames = getOwnPropertyNames;
         Object.getOwnPropertySymbols = getOwnPropertySymbols;
         Object.getOwnPropertyDescriptors = getOwnPropertyDescriptors;
+        Object.getPrototypeOf = getPrototypeOf;
         Object.keys = keys;
+        Reflect.getOwnPropertyDescriptor = reflectGetOwnPropertyDescriptor;
+        Reflect.getPrototypeOf = reflectGetPrototypeOf;
         Reflect.ownKeys = ownKeys;
         if (typeof globalThis._maskFunction === 'function') {
+            globalThis._maskFunction(getOwnPropertyDescriptor, 'getOwnPropertyDescriptor');
             globalThis._maskFunction(getOwnPropertyNames, 'getOwnPropertyNames');
             globalThis._maskFunction(getOwnPropertySymbols, 'getOwnPropertySymbols');
             globalThis._maskFunction(getOwnPropertyDescriptors, 'getOwnPropertyDescriptors');
+            globalThis._maskFunction(getPrototypeOf, 'getPrototypeOf');
             globalThis._maskFunction(keys, 'keys');
+            globalThis._maskFunction(reflectGetOwnPropertyDescriptor, 'getOwnPropertyDescriptor');
+            globalThis._maskFunction(reflectGetPrototypeOf, 'getPrototypeOf');
             globalThis._maskFunction(ownKeys, 'ownKeys');
         }
         Object.defineProperty(globalThis, '__browserOxideOwnKeysPatched', {

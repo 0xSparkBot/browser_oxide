@@ -10942,3 +10942,327 @@ async fn dom_html_svg_constructor_chains_match_chrome() {
         "function HTMLQuoteElement() { [native code] }"
     );
 }
+
+#[tokio::test]
+async fn instance_shapes_and_window_proxy_reflection_match_chrome_148() {
+    let raw = check(
+        r#"(() => {
+            const windowKeysBeforeFrames = Reflect.ownKeys(window).map(k =>
+                typeof k === 'symbol' ? '@@' + (k.description || '') : String(k)
+            );
+            const windowDescriptor = name => {
+                const d = Object.getOwnPropertyDescriptor(window, name);
+                return d && {
+                    kind: 'value' in d ? 'value' : 'accessor',
+                    enumerable: d.enumerable,
+                    configurable: d.configurable,
+                    writable: 'value' in d ? d.writable : null,
+                    get: !!d.get,
+                    set: !!d.set,
+                };
+            };
+
+            const host = document.createElement('div');
+            document.body.appendChild(host);
+            const canvas = document.createElement('canvas');
+            host.appendChild(canvas);
+            const canvasOwnBefore = Reflect.ownKeys(canvas).map(String);
+            const ctx = canvas.getContext('2d');
+            const canvasOwnAfter = Reflect.ownKeys(canvas).map(String);
+
+            const comment = document.createComment('hello');
+            host.appendChild(comment);
+
+            const styleHost = document.createElement('div');
+            const style = styleHost.style;
+            const cssKeys = Reflect.ownKeys(style).map(String);
+            const accentDescriptor = Object.getOwnPropertyDescriptor(style, 'accentColor');
+            const epubDescriptor = Object.getOwnPropertyDescriptor(style, 'epubCaptionSide');
+            style.backgroundColor = 'red';
+
+            const docLocation = Object.getOwnPropertyDescriptor(document, 'location');
+            const locationPrimitive = Object.getOwnPropertyDescriptor(location, Symbol.toPrimitive);
+            const locationKeys = Reflect.ownKeys(location).map(k =>
+                typeof k === 'symbol' ? '@@' + (k.description || '') : String(k)
+            );
+
+            const decoder = new TextDecoder('utf-8', { fatal: true });
+            const decoderText = decoder.decode(new Uint8Array([0x68, 0x69]));
+            const resize = new ResizeObserver(() => {});
+            const xhr = new XMLHttpRequest();
+
+            const wp = Window.prototype;
+            const windowProperties = Object.getPrototypeOf(wp);
+            const eventProto = Object.getPrototypeOf(windowProperties);
+
+            return JSON.stringify({
+                window: {
+                    count: windowKeysBeforeFrames.length,
+                    first: windowKeysBeforeFrames.slice(0, 15),
+                    hidden: windowKeysBeforeFrames.filter(k =>
+                        k.includes('__browser_oxide') || k.includes('browserOxide')
+                    ),
+                    hasXSLT: typeof XSLTProcessor !== 'undefined',
+                    Window: windowDescriptor('Window'),
+                    navigation: windowDescriptor('navigation'),
+                    prototypeIsWindow: Object.getPrototypeOf(window) === Window.prototype,
+                    instanceOfWindow: window instanceof Window,
+                    windowProtoOwn: Reflect.ownKeys(wp).map(k =>
+                        typeof k === 'symbol' ? '@@' + (k.description || '') : String(k)
+                    ),
+                    windowPropertiesTag: Object.prototype.toString.call(windowProperties),
+                    windowPropertiesOwn: Reflect.ownKeys(windowProperties).map(k =>
+                        typeof k === 'symbol' ? '@@' + (k.description || '') : String(k)
+                    ),
+                    eventProtoIsExact: eventProto === EventTarget.prototype,
+                },
+                document: {
+                    own: Reflect.ownKeys(document).map(k =>
+                        typeof k === 'symbol' ? '@@' + (k.description || '') : String(k)
+                    ),
+                    location: docLocation && {
+                        enumerable: docLocation.enumerable,
+                        configurable: docLocation.configurable,
+                        get: !!docLocation.get,
+                        set: !!docLocation.set,
+                    },
+                },
+                location: {
+                    own: locationKeys,
+                    primitive: locationPrimitive && {
+                        valueType: typeof locationPrimitive.value,
+                        valueIsUndefined: locationPrimitive.value === undefined,
+                        writable: locationPrimitive.writable,
+                        enumerable: locationPrimitive.enumerable,
+                        configurable: locationPrimitive.configurable,
+                    },
+                    text: String(location),
+                },
+                canvas: {
+                    tag: Object.prototype.toString.call(canvas),
+                    instance: canvas instanceof HTMLCanvasElement,
+                    inTree: host.lastChild === comment && host.firstChild === canvas,
+                    childCount: host.childNodes.length,
+                    ownBefore: canvasOwnBefore,
+                    ownAfter: canvasOwnAfter,
+                    contextTag: Object.prototype.toString.call(ctx),
+                },
+                comment: {
+                    tag: Object.prototype.toString.call(comment),
+                    nodeType: comment.nodeType,
+                    nodeName: comment.nodeName,
+                    data: comment.data,
+                    html: host.innerHTML,
+                },
+                css: {
+                    count: cssKeys.length,
+                    first: cssKeys.slice(0, 12),
+                    last: cssKeys.slice(-12),
+                    accent: accentDescriptor && {
+                        value: accentDescriptor.value,
+                        writable: accentDescriptor.writable,
+                        enumerable: accentDescriptor.enumerable,
+                        configurable: accentDescriptor.configurable,
+                    },
+                    epubMissingDescriptor: epubDescriptor === undefined,
+                    background: style.backgroundColor,
+                    backgroundRaw: style.getPropertyValue('background-color'),
+                },
+                clean: {
+                    domParser: [Object.prototype.toString.call(new DOMParser()), Reflect.ownKeys(new DOMParser()).length],
+                    formData: [Object.prototype.toString.call(new FormData()), Reflect.ownKeys(new FormData()).length],
+                    params: [Object.prototype.toString.call(new URLSearchParams()), Reflect.ownKeys(new URLSearchParams()).length],
+                    encoder: [Object.prototype.toString.call(new TextEncoder()), Reflect.ownKeys(new TextEncoder()).length],
+                    decoder: [Object.prototype.toString.call(decoder), Reflect.ownKeys(decoder).length, decoder.encoding, decoder.fatal, decoder.ignoreBOM, decoderText],
+                    resize: [Object.prototype.toString.call(resize), Reflect.ownKeys(resize).length],
+                    xhr: [Object.prototype.toString.call(xhr), Reflect.ownKeys(xhr).length],
+                },
+            });
+        })()"#,
+    )
+    .await;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("json: {e}; raw={raw}"));
+
+    assert_eq!(
+        v["window"]["first"],
+        serde_json::json!([
+            "Object",
+            "Function",
+            "Array",
+            "Number",
+            "parseFloat",
+            "parseInt",
+            "Infinity",
+            "NaN",
+            "undefined",
+            "Boolean",
+            "String",
+            "Symbol",
+            "Date",
+            "Promise",
+            "RegExp"
+        ])
+    );
+    assert_eq!(v["window"]["hidden"], serde_json::json!([]));
+    assert_eq!(v["window"]["hasXSLT"], false);
+    assert_eq!(
+        v["window"]["Window"],
+        serde_json::json!({
+            "kind":"value","enumerable":false,"configurable":true,"writable":true,
+            "get":false,"set":false
+        })
+    );
+    assert_eq!(v["window"]["navigation"]["kind"], "accessor");
+    assert_eq!(v["window"]["navigation"]["enumerable"], true);
+    assert_eq!(v["window"]["navigation"]["configurable"], true);
+    assert_eq!(v["window"]["navigation"]["get"], true);
+    assert_eq!(v["window"]["navigation"]["set"], true);
+    assert_eq!(v["window"]["prototypeIsWindow"], true);
+    assert_eq!(v["window"]["instanceOfWindow"], true);
+    assert_eq!(
+        v["window"]["windowProtoOwn"],
+        serde_json::json!([
+            "TEMPORARY",
+            "PERSISTENT",
+            "constructor",
+            "@@Symbol.toStringTag"
+        ])
+    );
+    assert_eq!(
+        v["window"]["windowPropertiesTag"],
+        "[object WindowProperties]"
+    );
+    assert_eq!(
+        v["window"]["windowPropertiesOwn"],
+        serde_json::json!(["@@Symbol.toStringTag"])
+    );
+    assert_eq!(v["window"]["eventProtoIsExact"], true);
+
+    assert_eq!(v["document"]["own"], serde_json::json!(["location"]));
+    assert_eq!(
+        v["document"]["location"],
+        serde_json::json!({"enumerable":true,"configurable":false,"get":true,"set":true})
+    );
+    assert_eq!(
+        v["location"]["own"],
+        serde_json::json!([
+            "valueOf",
+            "ancestorOrigins",
+            "href",
+            "origin",
+            "protocol",
+            "host",
+            "hostname",
+            "port",
+            "pathname",
+            "search",
+            "hash",
+            "assign",
+            "reload",
+            "replace",
+            "toString",
+            "@@Symbol.toPrimitive"
+        ])
+    );
+    assert_eq!(
+        v["location"]["primitive"],
+        serde_json::json!({
+            "valueType":"undefined","valueIsUndefined":true,"writable":false,
+            "enumerable":false,"configurable":false
+        })
+    );
+    assert!(!v["location"]["text"].as_str().unwrap_or("").is_empty());
+
+    assert_eq!(v["canvas"]["tag"], "[object HTMLCanvasElement]");
+    assert_eq!(v["canvas"]["instance"], true);
+    assert_eq!(v["canvas"]["inTree"], true);
+    assert_eq!(v["canvas"]["childCount"], 2);
+    assert_eq!(v["canvas"]["ownBefore"], serde_json::json!([]));
+    assert_eq!(v["canvas"]["ownAfter"], serde_json::json!([]));
+    assert_eq!(
+        v["canvas"]["contextTag"],
+        "[object CanvasRenderingContext2D]"
+    );
+
+    assert_eq!(v["comment"]["tag"], "[object Comment]");
+    assert_eq!(v["comment"]["nodeType"], 8);
+    assert_eq!(v["comment"]["nodeName"], "#comment");
+    assert_eq!(v["comment"]["data"], "hello");
+    assert!(v["comment"]["html"]
+        .as_str()
+        .unwrap_or("")
+        .contains("<!--hello-->"));
+
+    assert_eq!(v["css"]["count"], 703);
+    assert_eq!(
+        v["css"]["first"],
+        serde_json::json!([
+            "accentColor",
+            "additiveSymbols",
+            "alignContent",
+            "alignItems",
+            "alignSelf",
+            "alignmentBaseline",
+            "all",
+            "anchorName",
+            "anchorScope",
+            "animation",
+            "animationComposition",
+            "animationDelay"
+        ])
+    );
+    assert_eq!(
+        v["css"]["last"],
+        serde_json::json!([
+            "whiteSpaceCollapse",
+            "widows",
+            "width",
+            "willChange",
+            "wordBreak",
+            "wordSpacing",
+            "wordWrap",
+            "writingMode",
+            "x",
+            "y",
+            "zIndex",
+            "zoom"
+        ])
+    );
+    assert_eq!(
+        v["css"]["accent"],
+        serde_json::json!({"value":"","writable":true,"enumerable":true,"configurable":true})
+    );
+    assert_eq!(v["css"]["epubMissingDescriptor"], true);
+    assert_eq!(v["css"]["background"], "red");
+    assert_eq!(v["css"]["backgroundRaw"], "red");
+
+    assert_eq!(
+        v["clean"]["domParser"],
+        serde_json::json!(["[object DOMParser]", 0])
+    );
+    assert_eq!(
+        v["clean"]["formData"],
+        serde_json::json!(["[object FormData]", 0])
+    );
+    assert_eq!(
+        v["clean"]["params"],
+        serde_json::json!(["[object URLSearchParams]", 0])
+    );
+    assert_eq!(
+        v["clean"]["encoder"],
+        serde_json::json!(["[object TextEncoder]", 0])
+    );
+    assert_eq!(
+        v["clean"]["decoder"],
+        serde_json::json!(["[object TextDecoder]", 0, "utf-8", true, false, "hi"])
+    );
+    assert_eq!(
+        v["clean"]["resize"],
+        serde_json::json!(["[object ResizeObserver]", 0])
+    );
+    assert_eq!(
+        v["clean"]["xhr"],
+        serde_json::json!(["[object XMLHttpRequest]", 0])
+    );
+}

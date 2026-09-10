@@ -79,6 +79,16 @@
         return bitmap;
     };
     globalThis.ImageBitmap = ImageBitmap;
+    // DOM canvas backing state must not leak as page-visible `_canvasId` own
+    // properties. Keep the native canvas id in a WeakMap; the legacy fallback
+    // remains only for internal standalone canvas objects created inside this
+    // bootstrap and is never used by document.createElement.
+    const _canvasElementIds = new WeakMap();
+    const _canvasBackingId = value => {
+        if (!value || (typeof value !== 'object' && typeof value !== 'function')) return undefined;
+        const hidden = _canvasElementIds.get(value);
+        return hidden !== undefined ? hidden : value._canvasId;
+    };
     globalThis.createImageBitmap = function createImageBitmap(image) {
         const sourceSnapshot = {
             tag: Object.prototype.toString.call(image),
@@ -88,9 +98,10 @@
         };
         const finish = () => {
             let bitmap;
-            if (image && image._canvasId !== undefined) {
+            const imageCanvasId = _canvasBackingId(image);
+            if (imageCanvasId !== undefined) {
                 bitmap = _makeImageBitmap({
-                    canvasId: image._canvasId,
+                    canvasId: imageCanvasId,
                     width: Number(image.width) || 0,
                     height: Number(image.height) || 0,
                 });
@@ -667,14 +678,15 @@
                 return;
             }
             // source can be another canvas element — get its internal ID
-            if (source && source._canvasId !== undefined) {
+            const sourceCanvasId = _canvasBackingId(source);
+            if (sourceCanvasId !== undefined) {
                 _debugCanvas({
                     op: 'drawCanvas', argc: arguments.length,
                     dx: dx || 0, dy: dy || 0,
                     width: Number(source.width) || 0,
                     height: Number(source.height) || 0,
                 });
-                ops.op_canvas_draw_image(this.#id, source._canvasId, dx || 0, dy || 0);
+                ops.op_canvas_draw_image(this.#id, sourceCanvasId, dx || 0, dy || 0);
                 return;
             }
             // HTMLImageElement pixels are retained privately by the DOM
@@ -1603,10 +1615,11 @@
     let _domCanvasProto = null;
     if (globalThis.HTMLCanvasElement) {
         _domCanvasProto = globalThis.HTMLCanvasElement.prototype;
-        Object.setPrototypeOf(HTMLCanvasElement.prototype, globalThis.HTMLCanvasElement.prototype);
+        // The standalone helper class is retained for internal legacy paths,
+        // but it is no longer published or returned from DOM creation.
+        Object.setPrototypeOf(HTMLCanvasElement.prototype, _domCanvasProto);
         Object.setPrototypeOf(HTMLCanvasElement, globalThis.HTMLCanvasElement);
     }
-    globalThis.HTMLCanvasElement = HTMLCanvasElement;
     globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
     globalThis.WebGLRenderingContext = WebGLRenderingContext;
     // Symbol.toStringTag — some scripts check
@@ -1662,16 +1675,6 @@
         });
     } catch {}
 
-    // Patch document.createElement to return HTMLCanvasElement for 'canvas'
-    const _origCreateElement = globalThis.document?.createElement?.bind(globalThis.document);
-    if (_origCreateElement) {
-        const _origFn = globalThis.document.createElement;
-        globalThis.document.createElement = function(tag) {
-            if (tag.toLowerCase() === "canvas") return new HTMLCanvasElement();
-            return _origFn.call(this, tag);
-        };
-    }
-
     // Install canvas-specific methods on `HTMLCanvasElement.prototype`
     // directly (NOT on Element.prototype). Real Chrome's DOM uses
     // WebIDL-generated bindings where `getContext` / `toDataURL` /
@@ -1708,18 +1711,21 @@
             }
         }
         function _lazyInitCanvas(self) {
-            if (!self._canvasId) {
+            let canvasId = _canvasElementIds.get(self);
+            if (canvasId === undefined) {
                 const w = parseInt(self.getAttribute && self.getAttribute("width")) || 300;
                 const h = parseInt(self.getAttribute && self.getAttribute("height")) || 150;
-                self._canvasId = ops.op_canvas_create(w, h, _getOsName(), _getCanvasSeed());
+                canvasId = ops.op_canvas_create(w, h, _getOsName(), _getCanvasSeed());
+                _canvasElementIds.set(self, canvasId);
             }
+            return canvasId;
         }
 
         Object.defineProperty(_HTMLCanvasProto, "getContext", {
             value: function getContext(type) {
                 _requireCanvas(this, "getContext");
-                _lazyInitCanvas(this);
-                if (type === "2d") return new CanvasRenderingContext2D(this._canvasId);
+                const canvasId = _lazyInitCanvas(this);
+                if (type === "2d") return new CanvasRenderingContext2D(canvasId);
                 if (
                     type === "webgl" ||
                     type === "webgl2" ||
@@ -1730,8 +1736,8 @@
                     // FIX-D2: distinct class + surface per requested version.
                     const isV2 = (type === "webgl2");
                     const gl = isV2
-                        ? new WebGL2RenderingContext(this._canvasId, w, h)
-                        : new WebGLRenderingContext(this._canvasId, w, h);
+                        ? new WebGL2RenderingContext(canvasId, w, h)
+                        : new WebGLRenderingContext(canvasId, w, h);
                     gl._isWebGL2 = isV2;
                     gl.canvas = this;
                     return gl;
@@ -1750,11 +1756,12 @@
                 // serializes any HTMLCanvasElement, even one whose 2D
                 // context was never requested. The result is a fully
                 // transparent PNG of the element's width × height.
-                if (!this._canvasId) {
-                    try { this.getContext("2d"); } catch (_e) {}
+                let canvasId = _canvasElementIds.get(this);
+                if (canvasId === undefined) {
+                    try { canvasId = _lazyInitCanvas(this); } catch (_e) {}
                 }
-                if (!this._canvasId) return "data:,";
-                return ops.op_canvas_to_data_url(this._canvasId);
+                if (canvasId === undefined) return "data:,";
+                return ops.op_canvas_to_data_url(canvasId);
             },
             writable: true,
             configurable: true,
@@ -1771,7 +1778,8 @@
                 }
                 // Match Chrome: the callback fires asynchronously on
                 // the next microtask, not synchronously.
-                const url = this._canvasId ? ops.op_canvas_to_data_url(this._canvasId) : "data:,";
+                const canvasId = _canvasElementIds.get(this);
+                const url = canvasId !== undefined ? ops.op_canvas_to_data_url(canvasId) : "data:,";
                 queueMicrotask(() => {
                     try {
                         cb(new Blob([url], { type: type || "image/png" }));
@@ -1954,6 +1962,7 @@
             'getContext', 'transferToImageBitmap', 'convertToBlob'
         );
 
+        const _offscreenTransferred = new WeakSet();
         // HTMLCanvasElement.prototype.transferControlToOffscreen — Chrome
         // 69+ method that returns a new OffscreenCanvas bound to this
         // element. Commonly probed as a real-Chrome
@@ -1966,14 +1975,14 @@
                     throw new TypeError(
                         "Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': Illegal invocation");
                 }
-                if (this._offscreenTransferred) {
+                if (_offscreenTransferred.has(this)) {
                     throw new DOMException(
                         "Cannot transfer control from a canvas for more than one time.",
                         "InvalidStateError");
                 }
                 const w = this.width || 300;
                 const h = this.height || 150;
-                this._offscreenTransferred = true;
+                _offscreenTransferred.add(this);
                 return new RealOffscreenCanvas(w, h);
             };
             Object.defineProperty(_HTMLCanvasProto, "transferControlToOffscreen", {
