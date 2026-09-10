@@ -3019,24 +3019,16 @@
                         }
                     }
                 } catch (_) {}
-                // Transferables: accepted as an array. Each entry (an
-                // ArrayBuffer or view) is reachable from the message
-                // and will be serialized with it. Real browsers
-                // detach the source after transfer — V8 detachment
-                // isn't exposed here, so the source stays readable.
-                // For fingerprint-shape probes this is acceptable.
-                const transferList = Array.isArray(transfer) ? transfer : [];
-                for (const t of transferList) {
-                    if (
-                        t !== null &&
-                        !(t instanceof ArrayBuffer) &&
-                        !(ArrayBuffer.isView && ArrayBuffer.isView(t))
-                    ) {
-                        throw new TypeError(
-                            "postMessage: transferable must be an ArrayBuffer or view"
-                        );
-                    }
-                }
+                // Validate the WebIDL transfer sequence before cloning the
+                // message. The shared structured-clone helper rejects views,
+                // duplicate buffers, and non-sequences with Chrome-compatible
+                // DataCloneError/TypeError semantics, while accepting generic
+                // iterables such as Set.
+                const _normalizeTransfers = _browser_oxide
+                    && _browser_oxide.normalizeTransferList;
+                const transferList = _normalizeTransfers
+                    ? _normalizeTransfers(transfer, 'postMessage', 'Worker')
+                    : (transfer === undefined ? [] : Array.from(transfer));
                 // Wire-serialize so ArrayBuffer/TypedArray/Map/Set/
                 // Date/RegExp survive the JSON hop to the worker.
                 let wire;
@@ -3052,6 +3044,13 @@
                     // error Chrome would throw.
                     throw e;
                 }
+                // Serialize first while the source backing stores are still
+                // readable, then detach synchronously before postMessage
+                // returns. The worker receives the serialized copy while the
+                // sender observes byteLength === 0, matching Chromium.
+                const _detachTransfers = _browser_oxide
+                    && _browser_oxide.detachTransferList;
+                if (_detachTransfers) _detachTransfers(transferList);
                 let payload;
                 try {
                     payload = JSON.stringify({ data: wire });

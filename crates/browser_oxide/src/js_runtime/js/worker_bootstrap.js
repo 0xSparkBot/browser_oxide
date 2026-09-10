@@ -492,19 +492,11 @@
 
     // --- postMessage: send a message to the parent thread ---
     self.postMessage = function (message, transfer) {
-        // Validate transferables (same shape as main thread).
-        const transferList = Array.isArray(transfer) ? transfer : [];
-        for (const t of transferList) {
-            if (
-                t !== null &&
-                !(t instanceof ArrayBuffer) &&
-                !(ArrayBuffer.isView && ArrayBuffer.isView(t))
-            ) {
-                throw new TypeError(
-                    "postMessage: transferable must be an ArrayBuffer or view"
-                );
-            }
-        }
+        const _normalizeTransfers = _browser_oxide
+            && _browser_oxide.normalizeTransferList;
+        const transferList = _normalizeTransfers
+            ? _normalizeTransfers(transfer, 'postMessage', 'DedicatedWorkerGlobalScope')
+            : (transfer === undefined ? [] : Array.from(transfer));
         let wire;
         try {
             wire =
@@ -516,6 +508,9 @@
             // DataCloneError — propagate.
             throw e;
         }
+        const _detachTransfers = _browser_oxide
+            && _browser_oxide.detachTransferList;
+        if (_detachTransfers) _detachTransfers(transferList);
         let payload;
         try {
             payload = JSON.stringify({ data: wire });
@@ -580,20 +575,36 @@
     }
 
     // --- Pump: event-driven parent→worker message delivery ---
-    // Parks on the worker's Notify via `op_worker_self_await_message`, which
-    // resolves with "" once the worker is terminated to end the loop.
-    (async function _workerPump() {
-        while (!_closed) {
-            let s;
-            try {
-                s = await ops.op_worker_self_await_message();
-            } catch (_e) {
-                break;
+    // The runtime bootstrap runs before the user's worker body. Starting the
+    // pump here would let an immediately-posted parent message dispatch before
+    // `self.onmessage = ...` / addEventListener calls in that body execute,
+    // losing a task that Chromium queues until worker-script initialization
+    // completes. Rust invokes this private symbol hook immediately after the
+    // initial classic/module script evaluation finishes.
+    let _workerPumpStarted = false;
+    function _startWorkerMessagePump() {
+        if (_workerPumpStarted || _closed) return;
+        _workerPumpStarted = true;
+        (async function _workerPump() {
+            while (!_closed) {
+                let s;
+                try {
+                    s = await ops.op_worker_self_await_message();
+                } catch (_e) {
+                    break;
+                }
+                if (!s) break; // "" ⇒ terminated
+                _dispatchWorkerMessage(s);
             }
-            if (!s) break; // "" ⇒ terminated
-            _dispatchWorkerMessage(s);
-        }
-    })();
+        })();
+    }
+    try {
+        Object.defineProperty(
+            globalThis,
+            Symbol.for('__browser_oxide_worker_start_pump__'),
+            { value: _startWorkerMessagePump, configurable: true, enumerable: false }
+        );
+    } catch (_) {}
 
     // --- importScripts: classic-worker synchronous script loader ---
     self.importScripts = function importScripts(...urls) {

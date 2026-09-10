@@ -328,6 +328,67 @@ async fn structured_clone_array_buffer_copy() {
     );
 }
 
+#[tokio::test]
+async fn structured_clone_array_buffer_transfer_matches_chrome() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            const parts = [];
+            const buf = new ArrayBuffer(8);
+            new Uint8Array(buf)[0] = 7;
+            const clone = structuredClone({ buf }, { transfer: [buf] });
+            parts.push(buf.byteLength === 0);
+            parts.push(clone.buf.byteLength === 8);
+            parts.push(new Uint8Array(clone.buf)[0] === 7);
+
+            const iterableBuf = new ArrayBuffer(4);
+            const iterableClone = structuredClone(
+                { iterableBuf },
+                { transfer: new Set([iterableBuf]) }
+            );
+            parts.push(iterableBuf.byteLength === 0);
+            parts.push(iterableClone.iterableBuf.byteLength === 4);
+
+            const unreachable = new ArrayBuffer(2);
+            structuredClone({ ok: true }, { transfer: [unreachable] });
+            parts.push(unreachable.byteLength === 0);
+
+            const shared = new ArrayBuffer(8);
+            const view = new Uint8Array(shared, 2, 3);
+            const sharedClone = structuredClone({ shared, view });
+            parts.push(sharedClone.view.buffer === sharedClone.shared);
+            parts.push(sharedClone.view.byteOffset === 2);
+            parts.push(sharedClone.view.length === 3);
+
+            let viewError = '';
+            try {
+                const b = new ArrayBuffer(8);
+                structuredClone({ b }, { transfer: [new Uint8Array(b)] });
+            } catch (e) {
+                viewError = e.name + ':' + e.message;
+            }
+            parts.push(viewError === "DataCloneError:Failed to execute 'structuredClone' on 'Window': Value at index 0 does not have a transferable type.");
+
+            let duplicateError = '';
+            try {
+                const b = new ArrayBuffer(8);
+                structuredClone({ b }, { transfer: [b, b] });
+            } catch (e) {
+                duplicateError = e.name + ':' + e.message;
+            }
+            parts.push(duplicateError === "DataCloneError:Failed to execute 'structuredClone' on 'Window': ArrayBuffer at index 1 is a duplicate of an earlier ArrayBuffer.");
+
+            document.getElementById('out').textContent = parts.join(',');
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page.text_of("#out"),
+        Some("true,true,true,true,true,true,true,true,true,true,true".to_string())
+    );
+}
+
 // ============================================================================
 // A4 — Streams (ReadableStream / WritableStream / TransformStream)
 // ============================================================================
@@ -858,23 +919,24 @@ async fn worker_post_message_map_set_date_survive() {
 
 #[tokio::test]
 async fn worker_post_message_transferable_list_accepted() {
-    // The transferables list must be accepted as an array of
-    // ArrayBuffers/views without throwing. (We don't actually detach
-    // the source — that requires V8 internals — but the shape check
-    // that fingerprint probes do for `postMessage(buf, [buf])` passes.)
+    // ArrayBuffer transfer is synchronous from the sender's perspective:
+    // the source is detached before postMessage returns while the worker sees
+    // the original bytes. Posting immediately after construction must also be
+    // queued until the worker's initial script has installed onmessage.
     let mut page = Page::from_html(
         r#"<html><body><div id="out"></div><script>
             (async () => {
                 const src = `
-                    self.onmessage = () => self.postMessage('received');
+                    self.onmessage = (e) => self.postMessage('received:' + e.data.buf.byteLength);
                 `;
                 const url = URL.createObjectURL(new Blob([src]));
                 const w = new Worker(url);
                 const buf = new ArrayBuffer(8);
                 try {
                     w.postMessage({ buf }, [buf]);
+                    const detached = buf.byteLength;
                     const ok = await new Promise((r) => { w.onmessage = e => r(e.data); });
-                    document.getElementById('out').textContent = 'ok:' + ok;
+                    document.getElementById('out').textContent = 'ok:' + ok + ':' + detached;
                 } catch (e) {
                     document.getElementById('out').textContent = 'threw:' + e.message;
                 }
@@ -885,7 +947,21 @@ async fn worker_post_message_transferable_list_accepted() {
     )
     .await
     .unwrap();
-    assert_eq!(page.text_of("#out"), Some("ok:received".to_string()));
+    for _ in 0..50 {
+        if page
+            .text_of("#out")
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(page.text_of("#out"), Some("ok:received:8:0".to_string()));
 }
 
 #[tokio::test]
@@ -909,7 +985,100 @@ async fn worker_post_message_rejects_non_transferable() {
     )
     .await
     .unwrap();
-    assert_eq!(page.text_of("#out"), Some("threw:TypeError".to_string()));
+    assert_eq!(
+        page.text_of("#out"),
+        Some("threw:DataCloneError".to_string())
+    );
+}
+
+#[tokio::test]
+async fn worker_post_message_transfer_boundaries_match_chrome() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            const src = `self.onmessage = () => {};`;
+            const url = URL.createObjectURL(new Blob([src]));
+            const w = new Worker(url);
+            const parts = [];
+
+            const iterable = new ArrayBuffer(4);
+            w.postMessage({ iterable }, new Set([iterable]));
+            parts.push(iterable.byteLength === 0);
+
+            let viewError = '';
+            try {
+                const b = new ArrayBuffer(8);
+                w.postMessage({ b }, [new Uint8Array(b)]);
+            } catch (e) {
+                viewError = e.name + ':' + e.message;
+            }
+            parts.push(viewError === "DataCloneError:Failed to execute 'postMessage' on 'Worker': Value at index 0 does not have a transferable type.");
+
+            let duplicateError = '';
+            try {
+                const b = new ArrayBuffer(8);
+                w.postMessage({ b }, [b, b]);
+            } catch (e) {
+                duplicateError = e.name + ':' + e.message;
+            }
+            parts.push(duplicateError === "DataCloneError:Failed to execute 'postMessage' on 'Worker': ArrayBuffer at index 1 is a duplicate of an earlier ArrayBuffer.");
+
+            document.getElementById('out').textContent = parts.join(',');
+            w.terminate();
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.text_of("#out"), Some("true,true,true".to_string()));
+}
+
+#[tokio::test]
+async fn worker_to_parent_array_buffer_transfer_detaches_sender() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            (async () => {
+                const src = `
+                    self.onmessage = () => {
+                        const buf = new ArrayBuffer(6);
+                        new Uint8Array(buf)[0] = 9;
+                        self.postMessage({ kind: 'buffer', buf }, [buf]);
+                        self.postMessage({ kind: 'detached', length: buf.byteLength });
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src]));
+                const w = new Worker(url);
+                const seen = {};
+                w.onmessage = e => {
+                    if (e.data.kind === 'buffer') {
+                        seen.buffer = e.data.buf instanceof ArrayBuffer
+                            && e.data.buf.byteLength === 6
+                            && new Uint8Array(e.data.buf)[0] === 9;
+                    } else if (e.data.kind === 'detached') {
+                        seen.detached = e.data.length === 0;
+                    }
+                    if (seen.buffer === true && seen.detached === true) {
+                        document.getElementById('out').textContent = 'ok';
+                        w.terminate();
+                    }
+                };
+                w.postMessage('go');
+            })();
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    for _ in 0..50 {
+        if page.text_of("#out").as_deref() == Some("ok") {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(page.text_of("#out"), Some("ok".to_string()));
 }
 
 // ============================================================================

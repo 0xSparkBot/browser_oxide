@@ -623,6 +623,12 @@ pub fn create_worker_runtime(
             stealth_extension::init(),
             perf_extension::init(),
         ],
+        // Dedicated workers support the same ArrayBuffer transfer semantics
+        // as the owning window. deno_core's V8 serializer only detaches and
+        // re-homes transferred backing stores when this store is present;
+        // without it worker structuredClone/postMessage silently degenerate
+        // into copy-only behavior and leave the sender buffer readable.
+        shared_array_buffer_store: Some(SharedArrayBufferStore::default()),
         ..Default::default()
     });
 

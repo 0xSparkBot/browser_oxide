@@ -12,8 +12,7 @@
 
 use crate::js_runtime::extensions::stealth_ext::StealthState;
 use crate::js_runtime::state::DomState;
-use deno_core::op2;
-use deno_core::OpState;
+use deno_core::{op2, v8, OpState};
 use futures_util::task::AtomicWaker;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -518,6 +517,26 @@ pub fn op_worker_spawn(
                     storage_directory_allowed,
                 );
 
+                // Capture-and-delete the privileged message-pump starter
+                // before page-authored worker code runs. worker_bootstrap has
+                // to register the closure during runtime construction, but it
+                // must not remain reachable through Symbol.for() once the
+                // user's worker body starts executing.
+                let worker_pump_start = {
+                    let context = runtime.main_context();
+                    v8::scope_with_context!(scope, runtime.v8_isolate(), context);
+                    let global = scope.get_current_context().global(scope);
+                    let key = v8::String::new(scope, "__browser_oxide_worker_start_pump__")
+                        .expect("worker pump symbol key");
+                    let symbol = v8::Symbol::for_key(scope, key);
+                    let value = global.get(scope, symbol.into());
+                    let function = value
+                        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                        .map(|function| v8::Global::new(scope, function));
+                    let _ = global.delete(scope, symbol.into());
+                    function
+                };
+
                 // Execute the worker script inside the worker's isolate.
                 // Module workers go through `load_main_es_module_from_code`
                 // so top-level `import.meta` and module-scoped evaluation
@@ -557,6 +576,18 @@ pub fn op_worker_spawn(
                     tracing::warn!(worker_id = worker_id, error = %e, "worker script error");
                 } else {
                     worker_diag_note("eval-ok".to_string());
+                }
+
+                // Browser worker message tasks do not run until the initial
+                // worker script has evaluated. Invoke the closure captured
+                // above only now, after the user's onmessage/listener setup is
+                // complete, without re-exposing an internal hook to page JS.
+                if let Some(worker_pump_start) = worker_pump_start {
+                    let context = runtime.main_context();
+                    v8::scope_with_context!(scope, runtime.v8_isolate(), context);
+                    let function = v8::Local::new(scope, &worker_pump_start);
+                    let receiver = v8::undefined(scope).into();
+                    let _ = function.call(scope, receiver, &[]);
                 }
 
                 // Release the owner's initially-ref'ed receive after the

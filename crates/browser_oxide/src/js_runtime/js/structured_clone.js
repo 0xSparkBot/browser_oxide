@@ -174,11 +174,6 @@
         globalThis._browser_oxide.deserializeFromWire = _deserializeFromWire;
     }
 
-    // structuredClone polyfill — only install if V8 doesn't provide it natively.
-    if (typeof globalThis.structuredClone === "function") {
-        return;
-    }
-
     // Lazy lookup of the DOMException constructor. window_bootstrap.js
     // installs it, so by the time structuredClone runs at page load
     // it exists; but during bootstrap execution order it may not.
@@ -190,6 +185,111 @@
             err.name = "DataCloneError";
             return err;
         }
+    }
+
+    // V8's serializer owns the only correct ArrayBuffer-detach primitive in
+    // this runtime. Capture it before cleanup hides Deno from page code. We do
+    // NOT use it to clone the whole value because BrowserOxide has JS-backed
+    // host objects (Blob/File/etc.) whose state is intentionally not exposed as
+    // own properties. Instead, the normal clone runs first and V8 is used only
+    // to detach the explicitly transferred backing stores.
+    const _core = globalThis.Deno && globalThis.Deno.core;
+    const _coreSerialize = _core && typeof _core.serialize === "function"
+        ? (value, options) => _core.serialize(value, options)
+        : null;
+    const _coreDeserialize = _core && typeof _core.deserialize === "function"
+        ? (value, options) => _core.deserialize(value, options)
+        : null;
+    const _coreIsArrayBuffer = _core && typeof _core.isArrayBuffer === "function"
+        ? (value) => _core.isArrayBuffer(value)
+        : (value) => Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+
+    function _transferSequenceTypeError(method, iface) {
+        if (method === "structuredClone" && iface === "Window") {
+            return new TypeError(
+                "Failed to execute 'structuredClone' on 'Window': Failed to read the 'transfer' property from 'StructuredSerializeOptions': The provided value cannot be converted to a sequence."
+            );
+        }
+        return new TypeError(
+            `Failed to execute '${method}' on '${iface}': The provided value cannot be converted to a sequence.`
+        );
+    }
+
+    function _normalizeTransferList(input, method, iface) {
+        if (input === undefined) return [];
+        let iterator;
+        try { iterator = input != null ? input[Symbol.iterator] : undefined; }
+        catch (e) { throw e; }
+        if (typeof iterator !== "function") {
+            throw _transferSequenceTypeError(method, iface);
+        }
+        const out = [];
+        const seen = new Set();
+        let index = 0;
+        for (const value of input) {
+            if (!_coreIsArrayBuffer(value)) {
+                throw _dataCloneError(
+                    `Failed to execute '${method}' on '${iface}': Value at index ${index} does not have a transferable type.`
+                );
+            }
+            if (seen.has(value)) {
+                throw _dataCloneError(
+                    `Failed to execute '${method}' on '${iface}': ArrayBuffer at index ${index} is a duplicate of an earlier ArrayBuffer.`
+                );
+            }
+            seen.add(value);
+            out.push(value);
+            index++;
+        }
+        return out;
+    }
+
+    function _detachTransferList(list) {
+        if (!list || list.length === 0) return;
+        if (!_coreSerialize || !_coreDeserialize) {
+            throw _dataCloneError("ArrayBuffer transfer is not available in this runtime.");
+        }
+        // op_serialize mutates transferredArrayBuffers entries into backing-
+        // store ids. Use a private copy so the caller's sequence is untouched;
+        // immediately deserialize to consume those ids from the shared store.
+        const slots = list.slice();
+        const wire = _coreSerialize(slots, { transferredArrayBuffers: slots });
+        _coreDeserialize(wire, { transferredArrayBuffers: slots });
+    }
+
+    function _transferArrayBuffers(input, method, iface) {
+        const list = _normalizeTransferList(input, method, iface);
+        _detachTransferList(list);
+        return list;
+    }
+
+    for (const bridge of [globalThis.__browser_oxide, globalThis._browser_oxide]) {
+        if (!bridge) continue;
+        try {
+            Object.defineProperty(bridge, "normalizeTransferList", {
+                value: _normalizeTransferList,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+            Object.defineProperty(bridge, "detachTransferList", {
+                value: _detachTransferList,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+            Object.defineProperty(bridge, "transferArrayBuffers", {
+                value: _transferArrayBuffers,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+        } catch (_) {}
+    }
+
+    // structuredClone polyfill — only install if V8 doesn't provide it natively.
+    if (typeof globalThis.structuredClone === "function") {
+        return;
     }
 
     function _isTypedArray(v) {
@@ -234,19 +334,17 @@
         // DataView — clone the underlying buffer and construct a new view
         // over the same byte range.
         if (value instanceof DataView) {
-            const bufCopy = value.buffer.slice(
-                value.byteOffset,
-                value.byteOffset + value.byteLength
-            );
-            const c = new DataView(bufCopy);
+            const bufCopy = clone(value.buffer, seen);
+            const c = new DataView(bufCopy, value.byteOffset, value.byteLength);
             seen.set(value, c);
             return c;
         }
-        // TypedArray — `new value.constructor(value)` copies elements.
-        // For Uint8Array.from a typed array, this produces a fresh
-        // backing ArrayBuffer matching Chrome's structuredClone.
+        // TypedArray — clone the backing buffer through `seen` so sibling
+        // views and an explicitly cloned `.buffer` preserve their shared
+        // backing-store identity, as the structured clone algorithm requires.
         if (_isTypedArray(value)) {
-            const c = new value.constructor(value);
+            const bufCopy = clone(value.buffer, seen);
+            const c = new value.constructor(bufCopy, value.byteOffset, value.length);
             seen.set(value, c);
             return c;
         }
@@ -347,15 +445,15 @@
     }
 
     globalThis.structuredClone = function structuredClone(value, options) {
-        const _transfer = (options && options.transfer) || [];
-        // Transferables are not yet implemented — cloning them just
-        // copies their contents. This matches what the existing
-        // Worker.postMessage path already does, so no regression.
-        // TODO(A6 / B2): neuter transferred buffers after clone.
-        if (!Array.isArray(_transfer)) {
-            throw new TypeError("structuredClone: transfer must be an array");
-        }
-        return clone(value, new WeakMap());
+        const transferInput = options == null ? undefined : options.transfer;
+        const transferList = _normalizeTransferList(
+            transferInput,
+            "structuredClone",
+            "Window"
+        );
+        const result = clone(value, new WeakMap());
+        _detachTransferList(transferList);
+        return result;
     };
     // Mask as native — some scripts inspect the toString() of built-ins
     // for raw JS bodies of polyfills. Without this, `structuredClone
