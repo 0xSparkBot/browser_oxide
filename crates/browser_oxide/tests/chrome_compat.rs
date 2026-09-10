@@ -9550,13 +9550,11 @@ async fn location_legacy_unforgeable_shape_matches_chrome() {
 // from Function.prototype.toString — 11 of 12 anti-bot vendors fingerprint
 // this. Fix 1 closes WebGL[2]RenderingContext.prototype. Fix 3 widens
 // STRICT_INTERFACES (JS-side) to the remaining prototypes.
-// Marked #[ignore]; per-fix validation command:
-//   cargo test -p browser --test chrome_compat native_code_mask_audit \
-//       -- --ignored --test-threads=1 --nocapture
+// Kept in the default suite so any future JS-source leakage from a patched
+// WebIDL method is caught immediately.
 // ================================================================
 
 #[tokio::test]
-#[ignore]
 async fn native_code_mask_audit() {
     // Enumerates every constructor on globalThis that has a .prototype,
     // walks each prototype's own-function descriptors, asserts
