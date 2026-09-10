@@ -171,6 +171,7 @@ pub struct RuntimeInternalFns {
     pub set_current_script: Option<v8::Global<v8::Function>>,
     pub complete_document_lifecycle: Option<v8::Global<v8::Function>>,
     pub pump_worker_messages: Option<v8::Global<v8::Function>>,
+    pub pump_message_ports: Option<v8::Global<v8::Function>>,
 }
 
 /// Create a runtime AND return its NavSignal so the event-loop driver
@@ -444,6 +445,7 @@ pub fn create_runtime_with_signals(
                     &mut captured.complete_document_lifecycle,
                 ),
                 ("_pumpWorkerMessages", &mut captured.pump_worker_messages),
+                ("_pumpMessagePorts", &mut captured.pump_message_ports),
             ] {
                 let Some(key) = v8::String::new(scope, name) else {
                     continue;

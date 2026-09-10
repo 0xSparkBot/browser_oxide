@@ -45,7 +45,24 @@
         return out;
     }
 
-    function _serializeForWire(value, seen) {
+    // Keep direct references to the engine bridge objects. cleanup_bootstrap
+    // intentionally removes their global names from page-observable scope,
+    // but structured-clone/Worker deserialization still needs the hooks that
+    // realm-specific MessagePort bootstrap code installs onto those objects.
+    let _bridgeRefs = [];
+
+    function _messagePortHooks() {
+        for (const bridge of _bridgeRefs) {
+            if (bridge && bridge.messagePortHooks) return bridge.messagePortHooks;
+        }
+        const live = [globalThis._browser_oxide, globalThis.__browser_oxide];
+        for (const bridge of live) {
+            if (bridge && bridge.messagePortHooks) return bridge.messagePortHooks;
+        }
+        return null;
+    }
+
+    function _serializeForWire(value, seen, transferState) {
         if (value === null) return null;
         const t = typeof value;
         if (t === "undefined") return { [TAG]: "undefined" };
@@ -58,6 +75,20 @@
         }
         seen = seen || new WeakMap();
         if (seen.has(value)) return null;
+        const portHooks = _messagePortHooks();
+        if (portHooks && portHooks.isMessagePort(value)) {
+            const endpointId = transferState && transferState.portIds
+                ? transferState.portIds.get(value)
+                : 0;
+            if (!endpointId) {
+                const method = transferState?.method || "postMessage";
+                const iface = transferState?.iface || "Worker";
+                throw _dataCloneError(
+                    `Failed to execute '${method}' on '${iface}': A MessagePort could not be cloned because it was not transferred.`
+                );
+            }
+            return { [TAG]: "MessagePort", id: endpointId };
+        }
         if (value instanceof Date) {
             return { [TAG]: "Date", v: value.getTime() };
         }
@@ -80,36 +111,45 @@
             seen.set(value, true);
             const entries = [];
             for (const [k, v] of value) {
-                entries.push([_serializeForWire(k, seen), _serializeForWire(v, seen)]);
+                entries.push([
+                    _serializeForWire(k, seen, transferState),
+                    _serializeForWire(v, seen, transferState),
+                ]);
             }
             return { [TAG]: "Map", entries };
         }
         if (value instanceof Set) {
             seen.set(value, true);
             const items = [];
-            for (const v of value) items.push(_serializeForWire(v, seen));
+            for (const v of value) items.push(_serializeForWire(v, seen, transferState));
             return { [TAG]: "Set", items };
         }
         if (Array.isArray(value)) {
             seen.set(value, true);
             const out = new Array(value.length);
-            for (let i = 0; i < value.length; i++) out[i] = _serializeForWire(value[i], seen);
+            for (let i = 0; i < value.length; i++) {
+                out[i] = _serializeForWire(value[i], seen, transferState);
+            }
             return out;
         }
         seen.set(value, true);
         const out = {};
-        for (const key of Object.keys(value)) out[key] = _serializeForWire(value[key], seen);
+        for (const key of Object.keys(value)) {
+            out[key] = _serializeForWire(value[key], seen, transferState);
+        }
         return out;
     }
 
-    function _deserializeFromWire(value) {
+    function _deserializeFromWire(value, portCache) {
         if (value === null) return null;
         const t = typeof value;
         if (t === "number" || t === "string" || t === "boolean") return value;
         if (t !== "object") return value;
         if (Array.isArray(value)) {
             const out = new Array(value.length);
-            for (let i = 0; i < value.length; i++) out[i] = _deserializeFromWire(value[i]);
+            for (let i = 0; i < value.length; i++) {
+                out[i] = _deserializeFromWire(value[i], portCache);
+            }
             return out;
         }
         const tag = value[TAG];
@@ -138,21 +178,39 @@
                     new Uint8Array(ab).set(u8);
                     return new DataView(ab);
                 }
+                case "MessagePort": {
+                    const endpointId = Number(value.id) || 0;
+                    if (!endpointId) return null;
+                    portCache = portCache || new Map();
+                    if (portCache.has(endpointId)) return portCache.get(endpointId);
+                    const hooks = _messagePortHooks();
+                    if (!hooks || typeof hooks.adopt !== "function") return null;
+                    const port = hooks.adopt(endpointId);
+                    portCache.set(endpointId, port);
+                    return port;
+                }
                 case "Map": {
                     const m = new Map();
-                    for (const [k, v] of value.entries) m.set(_deserializeFromWire(k), _deserializeFromWire(v));
+                    for (const [k, v] of value.entries) {
+                        m.set(
+                            _deserializeFromWire(k, portCache),
+                            _deserializeFromWire(v, portCache),
+                        );
+                    }
                     return m;
                 }
                 case "Set": {
                     const s = new Set();
-                    for (const v of value.items) s.add(_deserializeFromWire(v));
+                    for (const v of value.items) s.add(_deserializeFromWire(v, portCache));
                     return s;
                 }
                 default: break;
             }
         }
         const out = {};
-        for (const key of Object.keys(value)) out[key] = _deserializeFromWire(value[key]);
+        for (const key of Object.keys(value)) {
+            out[key] = _deserializeFromWire(value[key], portCache);
+        }
         return out;
     }
 
@@ -167,6 +225,8 @@
     // captured a reference to it before cleanup runs (e.g.
     // worker_bootstrap.js's `const _browser_oxide = globalThis.__browser_oxide;`).
     if (!globalThis.__browser_oxide) globalThis.__browser_oxide = {};
+    _bridgeRefs = [globalThis._browser_oxide, globalThis.__browser_oxide]
+        .filter(Boolean);
     globalThis.__browser_oxide.serializeForWire = _serializeForWire;
     globalThis.__browser_oxide.deserializeFromWire = _deserializeFromWire;
     if (globalThis._browser_oxide) {
@@ -225,16 +285,26 @@
         }
         const out = [];
         const seen = new Set();
+        const portHooks = _messagePortHooks();
         let index = 0;
         for (const value of input) {
-            if (!_coreIsArrayBuffer(value)) {
+            const isArrayBuffer = _coreIsArrayBuffer(value);
+            const isMessagePort = !!(
+                portHooks
+                && typeof portHooks.isMessagePort === "function"
+                && portHooks.isMessagePort(value)
+            );
+            if (!isArrayBuffer && !isMessagePort) {
                 throw _dataCloneError(
                     `Failed to execute '${method}' on '${iface}': Value at index ${index} does not have a transferable type.`
                 );
             }
             if (seen.has(value)) {
+                const detail = isMessagePort
+                    ? `Message port at index ${index} is a duplicate of an earlier port.`
+                    : `ArrayBuffer at index ${index} is a duplicate of an earlier ArrayBuffer.`;
                 throw _dataCloneError(
-                    `Failed to execute '${method}' on '${iface}': ArrayBuffer at index ${index} is a duplicate of an earlier ArrayBuffer.`
+                    `Failed to execute '${method}' on '${iface}': ${detail}`
                 );
             }
             seen.add(value);
@@ -246,15 +316,97 @@
 
     function _detachTransferList(list) {
         if (!list || list.length === 0) return;
+        const buffers = list.filter((value) => _coreIsArrayBuffer(value));
+        if (buffers.length === 0) return;
         if (!_coreSerialize || !_coreDeserialize) {
             throw _dataCloneError("ArrayBuffer transfer is not available in this runtime.");
         }
         // op_serialize mutates transferredArrayBuffers entries into backing-
         // store ids. Use a private copy so the caller's sequence is untouched;
         // immediately deserialize to consume those ids from the shared store.
-        const slots = list.slice();
+        const slots = buffers.slice();
         const wire = _coreSerialize(slots, { transferredArrayBuffers: slots });
         _coreDeserialize(wire, { transferredArrayBuffers: slots });
+    }
+
+    function _prepareTransferState(input, method, iface) {
+        const list = _normalizeTransferList(input, method, iface);
+        const portHooks = _messagePortHooks();
+        const portIds = new WeakMap();
+        const portRecords = [];
+        for (const value of list) {
+            if (_coreIsArrayBuffer(value)) continue;
+            if (!portHooks || typeof portHooks.prepareTransfer !== "function") {
+                throw _dataCloneError(
+                    `Failed to execute '${method}' on '${iface}': Value does not have a transferable type.`
+                );
+            }
+            const endpointId = portHooks.prepareTransfer(value);
+            if (!endpointId) {
+                throw _dataCloneError(
+                    `Failed to execute '${method}' on '${iface}': MessagePort could not be transferred.`
+                );
+            }
+            portIds.set(value, endpointId);
+            portRecords.push({ port: value, id: endpointId });
+        }
+        return {
+            list,
+            method,
+            iface,
+            portIds,
+            portRecords,
+            placeholders: [],
+            committed: false,
+        };
+    }
+
+    function _commitPreparedTransfers(state) {
+        if (!state || state.committed) return;
+        _detachTransferList(state.list);
+        const portHooks = _messagePortHooks();
+        for (const record of state.portRecords) {
+            if (!portHooks || typeof portHooks.commitTransfer !== "function"
+                || !portHooks.commitTransfer(record.port)) {
+                throw _dataCloneError(
+                    `Failed to execute '${state.method}' on '${state.iface}': MessagePort could not be transferred.`
+                );
+            }
+        }
+        state.committed = true;
+        if (portHooks && typeof portHooks.finalizePlaceholder === "function") {
+            for (const placeholder of state.placeholders) {
+                portHooks.finalizePlaceholder(placeholder);
+            }
+        }
+    }
+
+    function _prepareWireMessage(value, transfer, method, iface) {
+        const transferState = _prepareTransferState(transfer, method, iface);
+        const data = _serializeForWire(value, new WeakMap(), transferState);
+        return {
+            data,
+            ports: transferState.portRecords.map((record) => record.id),
+            transferState,
+        };
+    }
+
+    function _adoptTransferredPorts(endpointIds, cache) {
+        const hooks = _messagePortHooks();
+        if (!hooks || typeof hooks.adopt !== "function") return [];
+        const portCache = cache || new Map();
+        const out = [];
+        for (const rawId of endpointIds || []) {
+            const endpointId = Number(rawId) || 0;
+            if (!endpointId) continue;
+            let port = portCache.get(endpointId);
+            if (!port) {
+                port = hooks.adopt(endpointId);
+                portCache.set(endpointId, port);
+            }
+            out.push(port);
+        }
+        return out;
     }
 
     function _transferArrayBuffers(input, method, iface) {
@@ -284,6 +436,24 @@
                 enumerable: false,
                 configurable: true,
             });
+            Object.defineProperty(bridge, "prepareWireMessage", {
+                value: _prepareWireMessage,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+            Object.defineProperty(bridge, "commitPreparedTransfers", {
+                value: _commitPreparedTransfers,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+            Object.defineProperty(bridge, "adoptTransferredPorts", {
+                value: _adoptTransferredPorts,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
         } catch (_) {}
     }
 
@@ -296,7 +466,7 @@
         return ArrayBuffer.isView(v) && !(v instanceof DataView);
     }
 
-    function clone(value, seen) {
+    function clone(value, seen, transferState) {
         // Primitives + null + undefined — return as-is.
         if (value === null) return null;
         const t = typeof value;
@@ -311,6 +481,24 @@
         // From here on, `value` is an object.
         if (seen.has(value)) {
             return seen.get(value);
+        }
+
+        const portHooks = _messagePortHooks();
+        if (portHooks && portHooks.isMessagePort(value)) {
+            const endpointId = transferState && transferState.portIds
+                ? transferState.portIds.get(value)
+                : 0;
+            if (!endpointId) {
+                const method = transferState?.method || "structuredClone";
+                const iface = transferState?.iface || "Window";
+                throw _dataCloneError(
+                    `Failed to execute '${method}' on '${iface}': A MessagePort could not be cloned because it was not transferred.`
+                );
+            }
+            const placeholder = portHooks.createPlaceholder(endpointId);
+            seen.set(value, placeholder);
+            transferState.placeholders.push(placeholder);
+            return placeholder;
         }
 
         // Date — clone with same time value.
@@ -334,7 +522,7 @@
         // DataView — clone the underlying buffer and construct a new view
         // over the same byte range.
         if (value instanceof DataView) {
-            const bufCopy = clone(value.buffer, seen);
+            const bufCopy = clone(value.buffer, seen, transferState);
             const c = new DataView(bufCopy, value.byteOffset, value.byteLength);
             seen.set(value, c);
             return c;
@@ -343,7 +531,7 @@
         // views and an explicitly cloned `.buffer` preserve their shared
         // backing-store identity, as the structured clone algorithm requires.
         if (_isTypedArray(value)) {
-            const bufCopy = clone(value.buffer, seen);
+            const bufCopy = clone(value.buffer, seen, transferState);
             const c = new value.constructor(bufCopy, value.byteOffset, value.length);
             seen.set(value, c);
             return c;
@@ -353,7 +541,10 @@
             const c = new Map();
             seen.set(value, c);
             for (const [k, v] of value) {
-                c.set(clone(k, seen), clone(v, seen));
+                c.set(
+                    clone(k, seen, transferState),
+                    clone(v, seen, transferState),
+                );
             }
             return c;
         }
@@ -362,7 +553,7 @@
             const c = new Set();
             seen.set(value, c);
             for (const v of value) {
-                c.add(clone(v, seen));
+                c.add(clone(v, seen, transferState));
             }
             return c;
         }
@@ -373,7 +564,7 @@
             seen.set(value, c);
             for (let i = 0; i < value.length; i++) {
                 if (i in value) {
-                    c[i] = clone(value[i], seen);
+                    c[i] = clone(value[i], seen, transferState);
                 }
             }
             return c;
@@ -439,20 +630,20 @@
         const c = {};
         seen.set(value, c);
         for (const key of Object.keys(value)) {
-            c[key] = clone(value[key], seen);
+            c[key] = clone(value[key], seen, transferState);
         }
         return c;
     }
 
     globalThis.structuredClone = function structuredClone(value, options) {
         const transferInput = options == null ? undefined : options.transfer;
-        const transferList = _normalizeTransferList(
+        const transferState = _prepareTransferState(
             transferInput,
             "structuredClone",
             "Window"
         );
-        const result = clone(value, new WeakMap());
-        _detachTransferList(transferList);
+        const result = clone(value, new WeakMap(), transferState);
+        _commitPreparedTransfers(transferState);
         return result;
     };
     // Mask as native — some scripts inspect the toString() of built-ins

@@ -51,6 +51,7 @@ pub struct BrowserJsRuntime {
     set_current_script_fn: Option<v8::Global<v8::Function>>,
     complete_lifecycle_fn: Option<v8::Global<v8::Function>>,
     worker_messages_pump_fn: Option<v8::Global<v8::Function>>,
+    message_ports_pump_fn: Option<v8::Global<v8::Function>>,
     /// Per-runtime navigation-pending signal. JS sets it via
     /// `op_set_pending_nav` (called from window_bootstrap.js whenever
     /// `__pendingNavigation` is assigned). The event loop polls it to
@@ -149,6 +150,7 @@ impl BrowserJsRuntime {
             set_current_script_fn: internal_fns.set_current_script,
             complete_lifecycle_fn: internal_fns.complete_document_lifecycle,
             worker_messages_pump_fn: internal_fns.pump_worker_messages,
+            message_ports_pump_fn: internal_fns.pump_message_ports,
         }
     }
 
@@ -216,6 +218,22 @@ impl BrowserJsRuntime {
     /// unsolicited worker message is not stranded behind an unpolled op.
     fn pump_worker_messages(&mut self) {
         let Some(function) = self.worker_messages_pump_fn.clone() else {
+            return;
+        };
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let function = v8::Local::new(scope, &function);
+        let receiver = v8::undefined(scope).into();
+        let _ = function.call(scope, receiver, &[]);
+    }
+
+    /// Flush messages queued on transferred MessagePort endpoints. The Rust
+    /// registry wakes `worker_owner_wake` when a peer posts; draining here is
+    /// synchronous and never pins the runtime waiting for an idle port.
+    fn pump_message_ports(&mut self) {
+        let Some(function) = self.message_ports_pump_fn.clone() else {
             return;
         };
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
@@ -505,6 +523,7 @@ impl BrowserJsRuntime {
     pub async fn run_event_loop(&mut self) -> Result<(), deno_core::error::AnyError> {
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
         self.pump_worker_messages();
+        self.pump_message_ports();
         // v8-149: re-enter this runtime's own isolate so driving the event
         // loop (which runs JS, microtasks, and ops that build scopes) targets
         // the correct thread-current isolate even when a child-iframe runtime
@@ -518,6 +537,7 @@ impl BrowserJsRuntime {
             .await
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()));
         self.pump_worker_messages();
+        self.pump_message_ports();
         result
     }
 
@@ -530,6 +550,7 @@ impl BrowserJsRuntime {
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
         self.worker_owner_wake.register(cx.waker());
         self.pump_worker_messages();
+        self.pump_message_ports();
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
         self.inner
             .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())

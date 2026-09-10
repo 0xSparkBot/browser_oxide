@@ -15,7 +15,7 @@ use crate::js_runtime::state::DomState;
 use deno_core::{op2, v8, OpState};
 use futures_util::task::AtomicWaker;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -354,6 +354,205 @@ fn worker_registry() -> &'static Mutex<HashMap<u32, WorkerSlot>> {
 static NEXT_WORKER_ID: AtomicU32 = AtomicU32::new(1);
 
 // ============================================================================
+// MessagePort registry — process-global entangled endpoints.
+//
+// Normal same-realm MessageChannel traffic stays on the JS fast path. A pair
+// is promoted into this registry only when one of its ports is transferred,
+// at which point the peer may live in another V8 isolate / OS thread.
+// ============================================================================
+
+#[derive(serde::Serialize)]
+struct JsMessagePortHandle {
+    id: u32,
+    generation: u32,
+}
+
+struct MessagePortEndpoint {
+    peer: u32,
+    queue: VecDeque<String>,
+    owner_wake: Option<WorkerOwnerWake>,
+    worker_notify: Option<Arc<Notify>>,
+    generation: u32,
+    closed: bool,
+}
+
+fn message_port_registry() -> &'static Mutex<HashMap<u32, MessagePortEndpoint>> {
+    static INST: OnceLock<Mutex<HashMap<u32, MessagePortEndpoint>>> = OnceLock::new();
+    INST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static NEXT_MESSAGE_PORT_ID: AtomicU32 = AtomicU32::new(1);
+
+fn runtime_owner_wake(op_state: &OpState) -> WorkerOwnerWake {
+    op_state
+        .try_borrow::<WorkerOwnerWake>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[op2]
+#[serde]
+pub fn op_message_port_create_pair(op_state: &mut OpState) -> Vec<JsMessagePortHandle> {
+    let first = NEXT_MESSAGE_PORT_ID.fetch_add(2, Ordering::Relaxed);
+    let second = first.saturating_add(1);
+    let owner_wake = runtime_owner_wake(op_state);
+    let worker_notify = WORKER_SELF.with(|worker| {
+        worker
+            .borrow()
+            .as_ref()
+            .map(|worker| worker.notify_message_port.clone())
+    });
+    let mut registry = message_port_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.insert(
+        first,
+        MessagePortEndpoint {
+            peer: second,
+            queue: VecDeque::new(),
+            owner_wake: Some(owner_wake.clone()),
+            worker_notify: worker_notify.clone(),
+            generation: 1,
+            closed: false,
+        },
+    );
+    registry.insert(
+        second,
+        MessagePortEndpoint {
+            peer: first,
+            queue: VecDeque::new(),
+            owner_wake: Some(owner_wake),
+            worker_notify,
+            generation: 1,
+            closed: false,
+        },
+    );
+    vec![
+        JsMessagePortHandle {
+            id: first,
+            generation: 1,
+        },
+        JsMessagePortHandle {
+            id: second,
+            generation: 1,
+        },
+    ]
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_message_port_adopt(op_state: &mut OpState, #[smi] endpoint_id: i32) -> i32 {
+    let owner_wake = runtime_owner_wake(op_state);
+    let worker_notify = WORKER_SELF.with(|worker| {
+        worker
+            .borrow()
+            .as_ref()
+            .map(|worker| worker.notify_message_port.clone())
+    });
+    let mut registry = message_port_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(endpoint) = registry.get_mut(&(endpoint_id as u32)) else {
+        return 0;
+    };
+    if endpoint.closed {
+        return 0;
+    }
+    endpoint.owner_wake = Some(owner_wake);
+    endpoint.worker_notify = worker_notify;
+    endpoint.generation as i32
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_message_port_transfer_out(#[smi] endpoint_id: i32, #[smi] generation: i32) -> i32 {
+    let mut registry = message_port_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(endpoint) = registry.get_mut(&(endpoint_id as u32)) else {
+        return 0;
+    };
+    if endpoint.closed || endpoint.generation != generation as u32 {
+        return 0;
+    }
+    endpoint.generation = endpoint.generation.wrapping_add(1).max(1);
+    endpoint.owner_wake = None;
+    endpoint.worker_notify = None;
+    endpoint.generation as i32
+}
+
+#[op2(fast)]
+pub fn op_message_port_post(
+    #[smi] endpoint_id: i32,
+    #[smi] generation: i32,
+    #[string] data: String,
+) {
+    let wake = {
+        let mut registry = message_port_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(sender) = registry.get(&(endpoint_id as u32)) else {
+            return;
+        };
+        if sender.closed || sender.generation != generation as u32 {
+            return;
+        }
+        let peer_id = sender.peer;
+        let Some(peer) = registry.get_mut(&peer_id) else {
+            return;
+        };
+        if peer.closed {
+            return;
+        }
+        peer.queue.push_back(data);
+        let owner_wake = peer.owner_wake.clone();
+        let worker_notify = peer.worker_notify.clone();
+        (owner_wake, worker_notify)
+    };
+    if let Some(wake) = wake.0 {
+        wake.wake();
+    }
+    if let Some(notify) = wake.1 {
+        notify.notify_one();
+    }
+}
+
+#[op2]
+#[string]
+pub fn op_message_port_try_recv(#[smi] endpoint_id: i32, #[smi] generation: i32) -> String {
+    let endpoint_id = endpoint_id as u32;
+    let generation = generation as u32;
+    let message = {
+        let mut registry = message_port_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match registry.get_mut(&endpoint_id) {
+            Some(endpoint) if !endpoint.closed && endpoint.generation == generation => {
+                endpoint.queue.pop_front()
+            }
+            _ => None,
+        }
+    };
+    message.unwrap_or_default()
+}
+
+#[op2(fast)]
+pub fn op_message_port_close(#[smi] endpoint_id: i32, #[smi] generation: i32) {
+    let mut registry = message_port_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(endpoint) = registry.get_mut(&(endpoint_id as u32)) else {
+        return;
+    };
+    if endpoint.generation != generation as u32 {
+        return;
+    }
+    endpoint.closed = true;
+    endpoint.owner_wake = None;
+    endpoint.worker_notify = None;
+}
+
+// ============================================================================
 // Per-thread worker "self" state — populated when a worker thread starts.
 // ============================================================================
 
@@ -367,6 +566,10 @@ struct WorkerSelf {
     /// Same Arc as the parent's `WorkerSlot.notify_worker`; the worker's
     /// `op_worker_self_await_message` parks on it, the parent signals on post/terminate.
     notify_worker: Arc<Notify>,
+    /// Dedicated wake for transferred MessagePort endpoints owned by this
+    /// worker realm. It resolves the same ref'ed receive op with an internal
+    /// sentinel so JS can synchronously drain the endpoint registry.
+    notify_message_port: Arc<Notify>,
     /// Out-of-band wake for the browser runtime that owns this worker.
     owner_wake: WorkerOwnerWake,
     /// Same Arc as the parent's `WorkerSlot.terminate`. Lets the worker's
@@ -474,12 +677,14 @@ pub fn op_worker_spawn(
         .stack_size(crate::js_runtime::V8_THREAD_STACK)
         .spawn(move || {
             // Install per-thread worker state BEFORE any ops run.
+            let notify_message_port = Arc::new(Notify::new());
             WORKER_SELF.with(|w| {
                 *w.borrow_mut() = Some(WorkerSelf {
                     to_parent: to_parent_tx,
                     from_parent: to_worker_rx,
                     notify_parent: notify_parent.clone(),
                     notify_worker: notify_worker.clone(),
+                    notify_message_port: notify_message_port.clone(),
                     owner_wake: owner_wake.clone(),
                     terminate: terminate.clone(),
                     url,
@@ -536,7 +741,6 @@ pub fn op_worker_spawn(
                     let _ = global.delete(scope, symbol.into());
                     function
                 };
-
                 // Execute the worker script inside the worker's isolate.
                 // Module workers go through `load_main_es_module_from_code`
                 // so top-level `import.meta` and module-scoped evaluation
@@ -813,18 +1017,20 @@ pub fn op_worker_self_recv() -> String {
 pub async fn op_worker_self_await_message() -> String {
     // Clone the Notify + terminate flag and try a fast drain, dropping the
     // WORKER_SELF borrow before any await.
-    let (notify, terminate, fast) = WORKER_SELF.with(|w| match w.borrow().as_ref() {
+    let (notify, port_notify, terminate, fast) = WORKER_SELF.with(|w| match w.borrow().as_ref() {
         Some(s) => (
             Some(s.notify_worker.clone()),
+            Some(s.notify_message_port.clone()),
             Some(s.terminate.clone()),
             s.from_parent.try_recv().ok(),
         ),
-        None => (None, None, None),
+        None => (None, None, None, None),
     });
     if let Some(msg) = fast {
         return msg;
     }
-    let (Some(notify), Some(terminate)) = (notify, terminate) else {
+    let (Some(notify), Some(port_notify), Some(terminate)) = (notify, port_notify, terminate)
+    else {
         return String::new();
     };
     // Notified is edge-triggered, so re-check the queue after each wake.
@@ -832,14 +1038,20 @@ pub async fn op_worker_self_await_message() -> String {
         if terminate.load(Ordering::Acquire) {
             return String::new();
         }
-        notify.notified().await;
-        let msg = WORKER_SELF.with(|w| {
-            w.borrow()
-                .as_ref()
-                .and_then(|s| s.from_parent.try_recv().ok())
-        });
-        if let Some(msg) = msg {
-            return msg;
+        tokio::select! {
+            _ = notify.notified() => {
+                let msg = WORKER_SELF.with(|w| {
+                    w.borrow()
+                        .as_ref()
+                        .and_then(|s| s.from_parent.try_recv().ok())
+                });
+                if let Some(msg) = msg {
+                    return msg;
+                }
+            }
+            _ = port_notify.notified() => {
+                return "__browser_oxide_message_port_wake__".to_string();
+            }
         }
     }
 }
@@ -894,5 +1106,11 @@ deno_core::extension!(
         op_worker_last_spawn,
         op_worker_diag_note,
         op_worker_diag_read,
+        op_message_port_create_pair,
+        op_message_port_adopt,
+        op_message_port_transfer_out,
+        op_message_port_post,
+        op_message_port_try_recv,
+        op_message_port_close,
     ],
 );

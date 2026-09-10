@@ -389,6 +389,77 @@ async fn structured_clone_array_buffer_transfer_matches_chrome() {
     );
 }
 
+#[tokio::test]
+async fn structured_clone_message_port_transfer_matches_chrome() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            (async () => {
+                const parts = [];
+
+                let noTransferError = '';
+                try {
+                    const p = new MessageChannel().port1;
+                    structuredClone({ p });
+                } catch (e) {
+                    noTransferError = e.name + ':' + e.message;
+                }
+                parts.push(noTransferError === "DataCloneError:Failed to execute 'structuredClone' on 'Window': A MessagePort could not be cloned because it was not transferred.");
+
+                let duplicateError = '';
+                try {
+                    const p = new MessageChannel().port1;
+                    structuredClone({ p }, { transfer: [p, p] });
+                } catch (e) {
+                    duplicateError = e.name + ':' + e.message;
+                }
+                parts.push(duplicateError === "DataCloneError:Failed to execute 'structuredClone' on 'Window': Message port at index 1 is a duplicate of an earlier port.");
+
+                const channel = new MessageChannel();
+                const source = channel.port1;
+                const moved = structuredClone({ p: source }, { transfer: [source] }).p;
+                parts.push(Object.prototype.toString.call(moved) === '[object MessagePort]');
+                parts.push(moved !== source);
+
+                const received = await new Promise((resolve) => {
+                    channel.port2.onmessage = (e) => resolve(e.data);
+                    moved.postMessage('same-realm-ok');
+                    setTimeout(() => resolve('timeout'), 150);
+                });
+                parts.push(received === 'same-realm-ok');
+
+                let sourceDelivered = false;
+                channel.port2.onmessage = () => { sourceDelivered = true; };
+                source.postMessage('must-not-arrive');
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                parts.push(sourceDelivered === false);
+
+                document.getElementById('out').textContent = parts.join(',');
+            })();
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    for _ in 0..50 {
+        if page
+            .text_of("#out")
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        page.text_of("#out"),
+        Some("true,true,true,true,true,true".to_string())
+    );
+}
+
 // ============================================================================
 // A4 — Streams (ReadableStream / WritableStream / TransformStream)
 // ============================================================================
@@ -1022,6 +1093,24 @@ async fn worker_post_message_transfer_boundaries_match_chrome() {
             }
             parts.push(duplicateError === "DataCloneError:Failed to execute 'postMessage' on 'Worker': ArrayBuffer at index 1 is a duplicate of an earlier ArrayBuffer.");
 
+            let missingPortError = '';
+            try {
+                const p = new MessageChannel().port1;
+                w.postMessage({ p });
+            } catch (e) {
+                missingPortError = e.name + ':' + e.message;
+            }
+            parts.push(missingPortError === "DataCloneError:Failed to execute 'postMessage' on 'Worker': A MessagePort could not be cloned because it was not transferred.");
+
+            let duplicatePortError = '';
+            try {
+                const p = new MessageChannel().port1;
+                w.postMessage({ p }, [p, p]);
+            } catch (e) {
+                duplicatePortError = e.name + ':' + e.message;
+            }
+            parts.push(duplicatePortError === "DataCloneError:Failed to execute 'postMessage' on 'Worker': Message port at index 1 is a duplicate of an earlier port.");
+
             document.getElementById('out').textContent = parts.join(',');
             w.terminate();
         </script></body></html>"#,
@@ -1029,7 +1118,10 @@ async fn worker_post_message_transfer_boundaries_match_chrome() {
     )
     .await
     .unwrap();
-    assert_eq!(page.text_of("#out"), Some("true,true,true".to_string()));
+    assert_eq!(
+        page.text_of("#out"),
+        Some("true,true,true,true,true".to_string())
+    );
 }
 
 #[tokio::test]
@@ -1069,6 +1161,112 @@ async fn worker_to_parent_array_buffer_transfer_detaches_sender() {
     .await
     .unwrap();
     for _ in 0..50 {
+        if page.text_of("#out").as_deref() == Some("ok") {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(page.text_of("#out"), Some("ok".to_string()));
+}
+
+#[tokio::test]
+async fn worker_message_port_transfer_round_trip() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    self.onmessage = (e) => {
+                        const port = e.ports[0];
+                        const same = e.data.port === port;
+                        port.onmessage = (ev) => {
+                            port.postMessage({ echo: ev.data, same });
+                        };
+                        self.postMessage({
+                            kind: 'ready',
+                            tag: Object.prototype.toString.call(port),
+                            count: e.ports.length,
+                            same,
+                        });
+                    };
+                `;
+                const worker = new Worker(URL.createObjectURL(new Blob([src])));
+                const channel = new MessageChannel();
+                const seen = {};
+                worker.onmessage = (e) => {
+                    if (e.data.kind === 'ready') {
+                        seen.ready = e.data.tag === '[object MessagePort]'
+                            && e.data.count === 1
+                            && e.data.same === true;
+                        channel.port2.postMessage('cross-ok');
+                    }
+                };
+                channel.port2.onmessage = (e) => {
+                    seen.echo = e.data.echo === 'cross-ok' && e.data.same === true;
+                    if (seen.ready === true && seen.echo === true) {
+                        document.getElementById('out').textContent = 'ok';
+                        worker.terminate();
+                    }
+                };
+                worker.postMessage({ port: channel.port1 }, [channel.port1]);
+            })();
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    for _ in 0..60 {
+        if page.text_of("#out").as_deref() == Some("ok") {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(page.text_of("#out"), Some("ok".to_string()));
+}
+
+#[tokio::test]
+async fn worker_to_parent_message_port_transfer_round_trip() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    self.onmessage = () => {
+                        const channel = new MessageChannel();
+                        channel.port2.onmessage = (e) => {
+                            channel.port2.postMessage('worker:' + e.data);
+                        };
+                        self.postMessage({ kind: 'port', port: channel.port1 }, [channel.port1]);
+                    };
+                `;
+                const worker = new Worker(URL.createObjectURL(new Blob([src])));
+                worker.onmessage = (e) => {
+                    if (e.data.kind !== 'port') return;
+                    const port = e.ports[0];
+                    const identity = e.data.port === port;
+                    const shape = Object.prototype.toString.call(port) === '[object MessagePort]';
+                    port.onmessage = (ev) => {
+                        if (identity && shape && ev.data === 'worker:parent') {
+                            document.getElementById('out').textContent = 'ok';
+                            worker.terminate();
+                        }
+                    };
+                    port.postMessage('parent');
+                };
+                worker.postMessage('go');
+            })();
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    for _ in 0..60 {
         if page.text_of("#out").as_deref() == Some("ok") {
             break;
         }

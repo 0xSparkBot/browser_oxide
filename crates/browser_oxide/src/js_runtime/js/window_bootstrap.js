@@ -2708,9 +2708,16 @@
             let payload = null;
             try { payload = JSON.parse(raw); }
             catch (_) { return false; }
+            const portCache = new Map();
             const data = deserializer
-                ? deserializer(payload && payload.data)
+                ? deserializer(payload && payload.data, portCache)
                 : payload && payload.data;
+            const ports = _browser_oxide && _browser_oxide.adoptTransferredPorts
+                ? _browser_oxide.adoptTransferredPorts(
+                    (payload && payload.ports) || [],
+                    portCache,
+                )
+                : [];
             // Mirror dedicated-worker eval-source captures into the
             // top-window sink (worker isolates die with the page's
             // interest in them; this survives for end-of-run dumps).
@@ -2737,7 +2744,7 @@
                 origin: '',
                 lastEventId: '',
                 source: null,
-                ports: [],
+                ports,
             }));
             if (_diagnosticsEnabled) {
                 try {
@@ -3019,41 +3026,23 @@
                         }
                     }
                 } catch (_) {}
-                // Validate the WebIDL transfer sequence before cloning the
-                // message. The shared structured-clone helper rejects views,
-                // duplicate buffers, and non-sequences with Chrome-compatible
-                // DataCloneError/TypeError semantics, while accepting generic
-                // iterables such as Set.
-                const _normalizeTransfers = _browser_oxide
-                    && _browser_oxide.normalizeTransferList;
-                const transferList = _normalizeTransfers
-                    ? _normalizeTransfers(transfer, 'postMessage', 'Worker')
-                    : (transfer === undefined ? [] : Array.from(transfer));
-                // Wire-serialize so ArrayBuffer/TypedArray/Map/Set/
-                // Date/RegExp survive the JSON hop to the worker.
-                let wire;
-                try {
-                    wire =
-                        (_browser_oxide &&
-                            _browser_oxide.serializeForWire &&
-                            _browser_oxide.serializeForWire(message)) ||
-                        message;
-                } catch (e) {
-                    // DataCloneError (e.g. function inside message).
-                    // Propagate to the caller so they see the same
-                    // error Chrome would throw.
-                    throw e;
+                const prepared = _browser_oxide && _browser_oxide.prepareWireMessage
+                    ? _browser_oxide.prepareWireMessage(
+                        message,
+                        transfer,
+                        'postMessage',
+                        'Worker',
+                    )
+                    : { data: message, ports: [], transferState: null };
+                if (_browser_oxide && _browser_oxide.commitPreparedTransfers) {
+                    _browser_oxide.commitPreparedTransfers(prepared.transferState);
                 }
-                // Serialize first while the source backing stores are still
-                // readable, then detach synchronously before postMessage
-                // returns. The worker receives the serialized copy while the
-                // sender observes byteLength === 0, matching Chromium.
-                const _detachTransfers = _browser_oxide
-                    && _browser_oxide.detachTransferList;
-                if (_detachTransfers) _detachTransfers(transferList);
                 let payload;
                 try {
-                    payload = JSON.stringify({ data: wire });
+                    payload = JSON.stringify({
+                        data: prepared.data,
+                        ports: prepared.ports,
+                    });
                 } catch (_e) {
                     payload = JSON.stringify({ data: null });
                 }
@@ -3388,6 +3377,9 @@
         const _PortEnabled = new WeakMap();  // port → bool (start gate)
         const _PortClosed = new WeakMap();   // port → bool
         const _PortHandlers = new WeakMap(); // port → {onmessage,onmessageerror}
+        const _PortRemote = new WeakMap();   // port → {id,generation,pending}
+        const _PortTransferred = new WeakSet();
+        const _PortRemoteActive = new Set();
         const _PortInternalToken = {};
 
         const _clone = (data) => {
@@ -3403,22 +3395,37 @@
             if (_PortEnabled.get(port)) return;
             _PortEnabled.set(port, true);
             const q = _PortQueue.get(port);
-            if (!q || !q.length) return;
-            _PortQueue.set(port, []);
-            // Drain synchronously. HTML spec routes via the event loop;
-            // we drain inline so that `port.onmessage = fn; port.start()`
-            // sees its queued messages before control returns to the
-            // caller (deno_core's microtask drain across `execute_script`
-            // boundaries isn't reliable for this).
-            for (const msg of q) _deliver(port, msg);
+            if (q && q.length) {
+                _PortQueue.set(port, []);
+                // Drain synchronously. HTML spec routes via the event loop;
+                // we drain inline so that `port.onmessage = fn; port.start()`
+                // sees its queued messages before control returns to the
+                // caller (deno_core's microtask drain across `execute_script`
+                // boundaries isn't reliable for this).
+                for (const msg of q) _deliver(port, msg.data, msg.ports);
+            }
+            if (_PortRemote.has(port)) _PortRemoteActive.add(port);
         };
 
-        const _deliver = (port, data) => {
+        const _dispatchPortEvent = (port, data, ports = []) => {
+            if (_PortClosed.get(port)) return;
+            try {
+                const ev = new MessageEvent('message', {
+                    data,
+                    ports,
+                    bubbles: false,
+                    cancelable: false,
+                });
+                port.dispatchEvent(ev);
+            } catch (_e) {}
+        };
+
+        const _deliver = (port, data, ports = []) => {
             if (_PortClosed.get(port)) return;
             if (!_PortEnabled.get(port)) {
                 let q = _PortQueue.get(port);
                 if (!q) { q = []; _PortQueue.set(port, q); }
-                q.push(data);
+                q.push({ data, ports });
                 return;
             }
             // Deliver as a MACROTASK, not synchronously. React 18's concurrent
@@ -3433,20 +3440,48 @@
             // event loop drives this timer during the nav drain, so React's
             // render chain now runs to completion.
             const _fire = () => {
-                if (_PortClosed.get(port)) return;
-                try {
-                    const ev = new MessageEvent('message', { data, bubbles: false, cancelable: false });
-                    // dispatchEvent fires both addEventListener handlers AND the
-                    // on-property (deno_core's EventTarget auto-promotes
-                    // `onmessage`). Calling the on-property explicitly too would
-                    // double-fire it.
-                    port.dispatchEvent(ev);
-                } catch (_e) {}
+                _dispatchPortEvent(port, data, ports);
             };
             // Use a refed setTimeout so the loop stays alive to deliver the
             // queued port message; React 18's scheduler waits on it to run.
             try { globalThis.setTimeout(_fire, 0); } catch (_e) { _fire(); }
         };
+
+        function _pumpRemotePorts() {
+            for (const port of Array.from(_PortRemoteActive)) {
+                if (_PortTransferred.has(port)
+                    || _PortClosed.get(port)
+                    || !_PortEnabled.get(port)) {
+                    _PortRemoteActive.delete(port);
+                    continue;
+                }
+                const state = _PortRemote.get(port);
+                if (!state || state.pending || !state.generation) continue;
+                for (;;) {
+                    let raw = '';
+                    try {
+                        raw = ops.op_message_port_try_recv(state.id, state.generation);
+                    } catch (_) {
+                        break;
+                    }
+                    if (!raw) break;
+                    let payload;
+                    try { payload = JSON.parse(raw); }
+                    catch (_) { continue; }
+                    const cache = new Map();
+                    const data = _browser_oxide.deserializeFromWire
+                        ? _browser_oxide.deserializeFromWire(payload && payload.data, cache)
+                        : payload && payload.data;
+                    const ports = _browser_oxide.adoptTransferredPorts
+                        ? _browser_oxide.adoptTransferredPorts(
+                            (payload && payload.ports) || [],
+                            cache,
+                        )
+                        : [];
+                    _dispatchPortEvent(port, data, ports);
+                }
+            }
+        }
 
         class MessagePort extends EventTarget {
             constructor(token = undefined) {
@@ -3483,17 +3518,42 @@
                 if (state) state.onmessageerror = typeof value === 'function' ? value : null;
             },
         );
-        _defProtoMethod(MessagePort.prototype, 'postMessage', function postMessage(data) {
+        _defProtoMethod(MessagePort.prototype, 'postMessage', function postMessage(data, transfer) {
                 if (_PortClosed.get(this)) return;
+                if (_PortTransferred.has(this)) return;
+                const remote = _PortRemote.get(this);
+                if (remote && !remote.pending && remote.generation
+                    && _browser_oxide.prepareWireMessage) {
+                    const prepared = _browser_oxide.prepareWireMessage(
+                        data,
+                        transfer,
+                        'postMessage',
+                        'MessagePort',
+                    );
+                    const payload = JSON.stringify({
+                        data: prepared.data,
+                        ports: prepared.ports,
+                    });
+                    _browser_oxide.commitPreparedTransfers(prepared.transferState);
+                    ops.op_message_port_post(remote.id, remote.generation, payload);
+                    return;
+                }
                 const paired = _PortPaired.get(this);
                 if (!paired) return;
-                const cloned = _clone(data);
+                const cloned = transfer === undefined
+                    ? _clone(data)
+                    : globalThis.structuredClone(data, { transfer });
                 // Delivery to the PAIRED port (spec semantics).
                 _deliver(paired, cloned);
         });
         _defProtoMethod(MessagePort.prototype, 'start', function start() { _enable(this); });
         _defProtoMethod(MessagePort.prototype, 'close', function close() {
                 _PortClosed.set(this, true);
+                _PortRemoteActive.delete(this);
+                const remote = _PortRemote.get(this);
+                if (remote && !remote.pending && remote.generation) {
+                    try { ops.op_message_port_close(remote.id, remote.generation); } catch (_) {}
+                }
                 // Detach from pair so the other side stops being able
                 // to deliver to us. Pair is preserved on the other
                 // port's side so its close() still works.
@@ -3505,6 +3565,103 @@
         });
         _maskFunction(MessagePort, 'MessagePort');
         globalThis.MessagePort = MessagePort;
+
+        function _ensureRemotePair(port) {
+            const existing = _PortRemote.get(port);
+            if (existing) return existing;
+            const paired = _PortPaired.get(port);
+            if (!paired) return null;
+            const handles = ops.op_message_port_create_pair();
+            if (!Array.isArray(handles) || handles.length !== 2) return null;
+            const first = {
+                id: handles[0].id,
+                generation: handles[0].generation,
+                pending: false,
+            };
+            const second = {
+                id: handles[1].id,
+                generation: handles[1].generation,
+                pending: false,
+            };
+            _PortRemote.set(port, first);
+            _PortRemote.set(paired, second);
+            if (_PortEnabled.get(port)) _PortRemoteActive.add(port);
+            if (_PortEnabled.get(paired)) _PortRemoteActive.add(paired);
+            return first;
+        }
+
+        const _messagePortHooks = {
+            isMessagePort(value) {
+                return !!value && _PortQueue.has(value);
+            },
+            prepareTransfer(port) {
+                if (!this.isMessagePort(port)
+                    || _PortClosed.get(port)
+                    || _PortTransferred.has(port)) {
+                    return 0;
+                }
+                const state = _ensureRemotePair(port);
+                return state ? state.id : 0;
+            },
+            commitTransfer(port) {
+                const state = _PortRemote.get(port);
+                if (!state || state.pending || !state.generation) return false;
+                const nextGeneration = ops.op_message_port_transfer_out(
+                    state.id,
+                    state.generation,
+                );
+                if (!nextGeneration) return false;
+                state.generation = nextGeneration;
+                _PortTransferred.add(port);
+                _PortRemoteActive.delete(port);
+                return true;
+            },
+            createPlaceholder(endpointId) {
+                const port = _createPort();
+                _PortRemote.set(port, {
+                    id: endpointId,
+                    generation: 0,
+                    pending: true,
+                });
+                return port;
+            },
+            finalizePlaceholder(port) {
+                const state = _PortRemote.get(port);
+                if (!state || !state.pending) return port;
+                const generation = ops.op_message_port_adopt(state.id);
+                if (!generation) return port;
+                state.generation = generation;
+                state.pending = false;
+                if (_PortEnabled.get(port)) _PortRemoteActive.add(port);
+                return port;
+            },
+            adopt(endpointId) {
+                const port = this.createPlaceholder(endpointId);
+                return this.finalizePlaceholder(port);
+            },
+        };
+        Object.defineProperty(_browser_oxide, 'messagePortHooks', {
+            value: _messagePortHooks,
+            configurable: true,
+            enumerable: false,
+            writable: false,
+        });
+        Object.defineProperty(_browser_oxide, '_pumpMessagePorts', {
+            value: _pumpRemotePorts,
+            configurable: true,
+            enumerable: false,
+            writable: false,
+        });
+        try {
+            if (globalThis.__browser_oxide) {
+                Object.defineProperty(globalThis.__browser_oxide, '_pumpMessagePorts', {
+                    value: _pumpRemotePorts,
+                    configurable: true,
+                    enumerable: false,
+                    writable: false,
+                });
+            }
+        } catch (_) {}
 
         // Re-tag the constructor + prototype methods so the universal
         // mask sweep (cleanup_bootstrap) tags them with the right name;

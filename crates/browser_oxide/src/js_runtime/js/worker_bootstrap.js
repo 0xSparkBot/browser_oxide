@@ -349,28 +349,36 @@
         const _queuedMessages = new WeakMap();
         const _enabledPorts = new WeakMap();
         const _closedPorts = new WeakMap();
+        const _remotePorts = new WeakMap();
+        const _transferredPorts = new WeakSet();
+        const _remoteActivePorts = new Set();
 
         const _cloneMessage = (data) => {
             if (typeof globalThis.structuredClone !== 'function') return data;
             return globalThis.structuredClone(data);
         };
 
-        const _deliverMessage = (port, data) => {
+        const _dispatchPortEvent = (port, data, ports = []) => {
             if (_closedPorts.get(port)) return;
-            if (!_enabledPorts.get(port)) {
-                const queue = _queuedMessages.get(port) || [];
-                queue.push(data);
-                _queuedMessages.set(port, queue);
-                return;
-            }
-            const fire = () => {
-                if (_closedPorts.get(port)) return;
+            try {
                 port.dispatchEvent(new MessageEvent('message', {
                     data,
+                    ports,
                     bubbles: false,
                     cancelable: false,
                 }));
-            };
+            } catch (_) {}
+        };
+
+        const _deliverMessage = (port, data, ports = []) => {
+            if (_closedPorts.get(port)) return;
+            if (!_enabledPorts.get(port)) {
+                const queue = _queuedMessages.get(port) || [];
+                queue.push({ data, ports });
+                _queuedMessages.set(port, queue);
+                return;
+            }
+            const fire = () => _dispatchPortEvent(port, data, ports);
             // Message ports enqueue a task. A timer preserves that ordering and
             // avoids synchronous re-entry in schedulers built on a channel.
             try { globalThis.setTimeout(fire, 0); } catch (_e) { fire(); }
@@ -381,29 +389,99 @@
             _enabledPorts.set(port, true);
             const queue = _queuedMessages.get(port) || [];
             _queuedMessages.set(port, []);
-            for (const message of queue) _deliverMessage(port, message);
+            for (const message of queue) {
+                _deliverMessage(port, message.data, message.ports || []);
+            }
+            if (_remotePorts.has(port)) _remoteActivePorts.add(port);
         };
+
+        function _pumpRemotePorts() {
+            for (const port of Array.from(_remoteActivePorts)) {
+                if (_transferredPorts.has(port)
+                    || _closedPorts.get(port)
+                    || !_enabledPorts.get(port)) {
+                    _remoteActivePorts.delete(port);
+                    continue;
+                }
+                const state = _remotePorts.get(port);
+                if (!state || state.pending || !state.generation) continue;
+                for (;;) {
+                    let raw = '';
+                    try {
+                        raw = ops.op_message_port_try_recv(state.id, state.generation);
+                    } catch (_) {
+                        break;
+                    }
+                    if (!raw) break;
+                    let payload;
+                    try { payload = JSON.parse(raw); }
+                    catch (_) { continue; }
+                    const cache = new Map();
+                    const data = _browser_oxide && _browser_oxide.deserializeFromWire
+                        ? _browser_oxide.deserializeFromWire(payload && payload.data, cache)
+                        : payload && payload.data;
+                    const ports = _browser_oxide && _browser_oxide.adoptTransferredPorts
+                        ? _browser_oxide.adoptTransferredPorts(
+                            (payload && payload.ports) || [],
+                            cache,
+                        )
+                        : [];
+                    _dispatchPortEvent(port, data, ports);
+                }
+            }
+        }
 
         class MessagePort extends EventTarget {
             constructor() {
                 super();
                 this._onmessage = null;
                 this.onmessageerror = null;
+                _queuedMessages.set(this, []);
+                _enabledPorts.set(this, false);
+                _closedPorts.set(this, false);
             }
             get onmessage() { return this._onmessage; }
             set onmessage(listener) {
                 this._onmessage = typeof listener === 'function' ? listener : null;
                 if (this._onmessage) _enablePort(this);
             }
-            postMessage(data /*, transfer */) {
+            postMessage(data, transfer) {
                 if (_closedPorts.get(this)) return;
+                if (_transferredPorts.has(this)) return;
+                const remote = _remotePorts.get(this);
+                if (remote && !remote.pending && remote.generation
+                    && _browser_oxide && _browser_oxide.prepareWireMessage) {
+                    const prepared = _browser_oxide.prepareWireMessage(
+                        data,
+                        transfer,
+                        'postMessage',
+                        'MessagePort',
+                    );
+                    const payload = JSON.stringify({
+                        data: prepared.data,
+                        ports: prepared.ports,
+                    });
+                    _browser_oxide.commitPreparedTransfers(prepared.transferState);
+                    ops.op_message_port_post(remote.id, remote.generation, payload);
+                    return;
+                }
                 const paired = _pairedPorts.get(this);
                 if (!paired) return;
-                _deliverMessage(paired, _cloneMessage(data));
+                _deliverMessage(
+                    paired,
+                    transfer === undefined
+                        ? _cloneMessage(data)
+                        : structuredClone(data, { transfer }),
+                );
             }
             start() { _enablePort(this); }
             close() {
                 _closedPorts.set(this, true);
+                _remoteActivePorts.delete(this);
+                const remote = _remotePorts.get(this);
+                if (remote && !remote.pending && remote.generation) {
+                    try { ops.op_message_port_close(remote.id, remote.generation); } catch (_) {}
+                }
                 _pairedPorts.delete(this);
                 _queuedMessages.set(this, []);
             }
@@ -430,6 +508,89 @@
 
         globalThis.MessagePort = MessagePort;
         globalThis.MessageChannel = MessageChannel;
+
+        function _ensureRemotePair(port) {
+            const existing = _remotePorts.get(port);
+            if (existing) return existing;
+            const paired = _pairedPorts.get(port);
+            if (!paired) return null;
+            const handles = ops.op_message_port_create_pair();
+            if (!Array.isArray(handles) || handles.length !== 2) return null;
+            const first = {
+                id: handles[0].id,
+                generation: handles[0].generation,
+                pending: false,
+            };
+            const second = {
+                id: handles[1].id,
+                generation: handles[1].generation,
+                pending: false,
+            };
+            _remotePorts.set(port, first);
+            _remotePorts.set(paired, second);
+            if (_enabledPorts.get(port)) _remoteActivePorts.add(port);
+            if (_enabledPorts.get(paired)) _remoteActivePorts.add(paired);
+            return first;
+        }
+
+        const _messagePortHooks = {
+            isMessagePort(value) {
+                return !!value && _queuedMessages.has(value);
+            },
+            prepareTransfer(port) {
+                if (!this.isMessagePort(port)
+                    || _closedPorts.get(port)
+                    || _transferredPorts.has(port)) {
+                    return 0;
+                }
+                const state = _ensureRemotePair(port);
+                return state ? state.id : 0;
+            },
+            commitTransfer(port) {
+                const state = _remotePorts.get(port);
+                if (!state || state.pending || !state.generation) return false;
+                const nextGeneration = ops.op_message_port_transfer_out(
+                    state.id,
+                    state.generation,
+                );
+                if (!nextGeneration) return false;
+                state.generation = nextGeneration;
+                _transferredPorts.add(port);
+                _remoteActivePorts.delete(port);
+                return true;
+            },
+            createPlaceholder(endpointId) {
+                const port = new MessagePort();
+                _remotePorts.set(port, {
+                    id: endpointId,
+                    generation: 0,
+                    pending: true,
+                });
+                return port;
+            },
+            finalizePlaceholder(port) {
+                const state = _remotePorts.get(port);
+                if (!state || !state.pending) return port;
+                const generation = ops.op_message_port_adopt(state.id);
+                if (!generation) return port;
+                state.generation = generation;
+                state.pending = false;
+                if (_enabledPorts.get(port)) _remoteActivePorts.add(port);
+                return port;
+            },
+            adopt(endpointId) {
+                const port = this.createPlaceholder(endpointId);
+                return this.finalizePlaceholder(port);
+            },
+        };
+        if (_browser_oxide) {
+            Object.defineProperty(_browser_oxide, 'messagePortHooks', {
+                value: _messagePortHooks,
+                configurable: true,
+                enumerable: false,
+                writable: false,
+            });
+        }
         if (typeof _maskAsNative === 'function') {
             _maskAsNative(MessagePort.prototype,
                 'postMessage', 'start', 'close', 'addEventListener', 'onmessage');
@@ -492,28 +653,23 @@
 
     // --- postMessage: send a message to the parent thread ---
     self.postMessage = function (message, transfer) {
-        const _normalizeTransfers = _browser_oxide
-            && _browser_oxide.normalizeTransferList;
-        const transferList = _normalizeTransfers
-            ? _normalizeTransfers(transfer, 'postMessage', 'DedicatedWorkerGlobalScope')
-            : (transfer === undefined ? [] : Array.from(transfer));
-        let wire;
-        try {
-            wire =
-                (_browser_oxide &&
-                    _browser_oxide.serializeForWire &&
-                    _browser_oxide.serializeForWire(message)) ||
-                message;
-        } catch (e) {
-            // DataCloneError — propagate.
-            throw e;
+        const prepared = _browser_oxide && _browser_oxide.prepareWireMessage
+            ? _browser_oxide.prepareWireMessage(
+                message,
+                transfer,
+                'postMessage',
+                'DedicatedWorkerGlobalScope',
+            )
+            : { data: message, ports: [], transferState: null };
+        if (_browser_oxide && _browser_oxide.commitPreparedTransfers) {
+            _browser_oxide.commitPreparedTransfers(prepared.transferState);
         }
-        const _detachTransfers = _browser_oxide
-            && _browser_oxide.detachTransferList;
-        if (_detachTransfers) _detachTransfers(transferList);
         let payload;
         try {
-            payload = JSON.stringify({ data: wire });
+            payload = JSON.stringify({
+                data: prepared.data,
+                ports: prepared.ports,
+            });
         } catch (_e) {
             payload = JSON.stringify({ data: null });
         }
@@ -544,9 +700,16 @@
         }
         const deserializer =
             _browser_oxide && _browser_oxide.deserializeFromWire;
+        const portCache = new Map();
         const data = deserializer
-            ? deserializer(payload && payload.data)
+            ? deserializer(payload && payload.data, portCache)
             : payload && payload.data;
+        const ports = _browser_oxide && _browser_oxide.adoptTransferredPorts
+            ? _browser_oxide.adoptTransferredPorts(
+                (payload && payload.ports) || [],
+                portCache,
+            )
+            : [];
         let shape = typeof data;
         try {
             if (data && typeof data === "object") {
@@ -570,7 +733,7 @@
             data,
             origin: "",
             source: null,
-            ports: [],
+            ports,
         })));
     }
 
@@ -594,6 +757,10 @@
                     break;
                 }
                 if (!s) break; // "" ⇒ terminated
+                if (s === '__browser_oxide_message_port_wake__') {
+                    _pumpRemotePorts();
+                    continue;
+                }
                 _dispatchWorkerMessage(s);
             }
         })();
