@@ -57,6 +57,38 @@ fn origin_of(url: &str) -> String {
     }
 }
 
+/// Effective document base URL for resolving document-owned relative URLs.
+/// HTML uses the first `<base href>` in tree order; otherwise the document
+/// URL itself remains the fallback base.
+pub(crate) fn document_base_url(dom: &Dom, document_url: &str) -> String {
+    let Ok(fallback) = url::Url::parse(document_url) else {
+        return document_url.to_string();
+    };
+
+    for base_id in dom.get_elements_by_tag_name(NodeId::DOCUMENT, "base") {
+        let Some(node) = dom.get(base_id) else {
+            continue;
+        };
+        let crate::dom::node::NodeData::Element(element) = &node.data else {
+            continue;
+        };
+        let Some(href) = element
+            .attrs
+            .iter()
+            .find(|attr| attr.name.local.eq_ignore_ascii_case("href"))
+            .map(|attr| attr.value.as_str())
+        else {
+            continue;
+        };
+        return fallback
+            .join(href)
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| fallback.to_string());
+    }
+
+    fallback.to_string()
+}
+
 /// `document.referrer` + `location.ancestorOrigins` for a frame. Cross-origin
 /// downgrades the referrer to the parent origin (default referrer policy).
 #[cfg(test)]
@@ -736,12 +768,16 @@ impl Page {
         let scripts = script_runner::find_scripts(&dom);
         let stylesheet_entries = stylesheet_collector::find_stylesheets(&dom);
         let stylesheets = stylesheet_collector::resolve_inline_only(&stylesheet_entries);
+        let document_base = document_base_url(&dom, url);
+        let import_map =
+            crate::js_runtime::module_loader::ImportMap::from_dom(&dom, &document_base);
 
         let runtime = BrowserJsRuntime::with_options(
             dom,
             BrowserRuntimeOptions {
                 stealth_profile: Some(profile.clone()),
                 stylesheets,
+                import_map,
                 is_secure_context: is_secure_url(url),
                 ..Default::default()
             },
@@ -799,9 +835,14 @@ impl Page {
         let scripts = script_runner::find_scripts(&dom);
         let stylesheet_entries = stylesheet_collector::find_stylesheets(&dom);
         let stylesheets = stylesheet_collector::resolve_inline_only(&stylesheet_entries);
+        let document_base = document_base_url(&dom, url);
+        let import_map =
+            crate::js_runtime::module_loader::ImportMap::from_dom(&dom, &document_base);
 
         // Swap DOM in existing runtime (no new V8 isolate needed)
-        self.event_loop.runtime_mut().replace_dom(dom, stylesheets);
+        self.event_loop
+            .runtime_mut()
+            .replace_dom(dom, stylesheets, import_map);
 
         // Update URL (URL-state setup, not a real navigation).
         self.url = url.to_string();
@@ -873,12 +914,16 @@ impl Page {
         let scripts = script_runner::find_scripts(&dom);
         let stylesheet_entries = stylesheet_collector::find_stylesheets(&dom);
         let stylesheets = stylesheet_collector::resolve_inline_only(&stylesheet_entries);
+        let document_base = document_base_url(&dom, url);
+        let import_map =
+            crate::js_runtime::module_loader::ImportMap::from_dom(&dom, &document_base);
 
         let runtime = BrowserJsRuntime::with_options(
             dom,
             BrowserRuntimeOptions {
                 stealth_profile: profile.clone(),
                 stylesheets,
+                import_map,
                 is_secure_context: is_secure_url(url),
                 ..Default::default()
             },
@@ -2642,6 +2687,9 @@ impl Page {
             stylesheets.push(r.0);
             all_timings.push(r.1);
         }
+        let document_base = document_base_url(&dom, &resp_url);
+        let import_map =
+            crate::js_runtime::module_loader::ImportMap::from_dom(&dom, &document_base);
         // Cancel all in-flight timers from the previous page and clear
         // cross-nav JS buffers BEFORE swapping the DOM, so any straggler
         // callbacks that try to fire don't see a half-installed state.
@@ -2649,7 +2697,9 @@ impl Page {
         wmark!("reset_for_reuse");
 
         // Swap DOM (also resets `TimerState` Rust-side).
-        self.event_loop.runtime_mut().replace_dom(dom, stylesheets);
+        self.event_loop
+            .runtime_mut()
+            .replace_dom(dom, stylesheets, import_map);
         self.url = resp_url.clone();
         // A warm navigation reuses the JS realm, including the previous
         // document's readyState slot. Reset it before any new-page script runs;
@@ -4624,6 +4674,9 @@ impl Page {
             stylesheets.push(css);
             all_timings.push(timings);
         }
+        let document_base = document_base_url(&dom, url);
+        let import_map =
+            crate::js_runtime::module_loader::ImportMap::from_dom(&dom, &document_base);
 
         let runtime = BrowserJsRuntime::with_options(
             dom,
@@ -4632,6 +4685,7 @@ impl Page {
                 stylesheets,
                 init_scripts: init_scripts.to_vec(),
                 storage,
+                import_map,
                 is_secure_context: is_secure_url(url),
                 cross_origin_isolated,
                 ..Default::default()

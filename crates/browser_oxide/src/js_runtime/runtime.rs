@@ -63,6 +63,9 @@ pub struct BrowserRuntimeOptions {
     /// Start the V8 inspector so a Chrome DevTools Protocol frontend can attach
     /// for breakpoint/step debugging. Off by default. See `js_runtime::inspector`.
     pub inspector: bool,
+    /// Parsed import map for this document. The module loader keeps a
+    /// per-runtime shared handle so warm-reuse can replace it on navigation.
+    pub import_map: crate::js_runtime::module_loader::ImportMap,
 }
 
 /// Create a deno_core JsRuntime configured with browser extensions.
@@ -175,6 +178,7 @@ pub struct RuntimeInternalFns {
     pub complete_document_lifecycle: Option<v8::Global<v8::Function>>,
     pub pump_worker_messages: Option<v8::Global<v8::Function>>,
     pub pump_message_ports: Option<v8::Global<v8::Function>>,
+    pub import_map_state: crate::js_runtime::module_loader::ImportMapState,
 }
 
 /// Create a runtime AND return its NavSignal so the event-loop driver
@@ -199,10 +203,13 @@ pub fn create_runtime_with_signals(
     // session (cookie/profile-consistent with the nav). Built before
     // `stealth_profile` is moved into StealthState below. Without it, module
     // SPA bundles throw SyntaxError and are dropped (the thin-render gap).
+    let import_map_state =
+        crate::js_runtime::module_loader::ImportMapState::new(options.import_map);
     let module_loader: Option<std::rc::Rc<dyn deno_core::ModuleLoader>> =
         options.stealth_profile.as_ref().map(|p| {
             std::rc::Rc::new(crate::js_runtime::module_loader::BrowserModuleLoader::new(
                 p.clone(),
+                import_map_state.clone(),
             )) as std::rc::Rc<dyn deno_core::ModuleLoader>
         });
 
@@ -444,7 +451,10 @@ pub fn create_runtime_with_signals(
             .and_then(|key| global.get(scope, key.into()))
             .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok());
 
-        let mut captured = RuntimeInternalFns::default();
+        let mut captured = RuntimeInternalFns {
+            import_map_state: import_map_state.clone(),
+            ..Default::default()
+        };
         if let Some(bridge) = bridge {
             for (name, slot) in [
                 ("_setCurrentScriptById", &mut captured.set_current_script),

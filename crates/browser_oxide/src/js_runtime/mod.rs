@@ -55,6 +55,7 @@ pub struct BrowserJsRuntime {
     complete_lifecycle_fn: Option<v8::Global<v8::Function>>,
     worker_messages_pump_fn: Option<v8::Global<v8::Function>>,
     message_ports_pump_fn: Option<v8::Global<v8::Function>>,
+    import_map_state: module_loader::ImportMapState,
     /// Per-runtime navigation-pending signal. JS sets it via
     /// `op_set_pending_nav` (called from window_bootstrap.js whenever
     /// `__pendingNavigation` is assigned). The event loop polls it to
@@ -157,6 +158,7 @@ impl BrowserJsRuntime {
             complete_lifecycle_fn: internal_fns.complete_document_lifecycle,
             worker_messages_pump_fn: internal_fns.pump_worker_messages,
             message_ports_pump_fn: internal_fns.pump_message_ports,
+            import_map_state: internal_fns.import_map_state,
         }
     }
 
@@ -738,7 +740,13 @@ impl BrowserJsRuntime {
 
     /// Replace the DOM in this runtime with a new one.
     /// Used for CDP Page.navigate to avoid recreating the V8 isolate.
-    pub fn replace_dom(&mut self, dom: Dom, stylesheets: Vec<String>) {
+    pub fn replace_dom(
+        &mut self,
+        dom: Dom,
+        stylesheets: Vec<String>,
+        import_map: module_loader::ImportMap,
+    ) {
+        self.import_map_state.replace(import_map);
         // The bootstrap (and thus __pumpFrameMessages) is re-installed here;
         // drop the cached handle so it is re-captured against the fresh function.
         self.frame_deliver_fn = None;

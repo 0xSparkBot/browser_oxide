@@ -651,6 +651,9 @@ impl ChildIframe {
         let dom = crate::html_parser::parse_html(&html);
         let scripts = crate::script_runner::find_scripts(&dom);
         let stylesheet_entries = crate::stylesheet_collector::find_stylesheets(&dom);
+        let document_base = crate::page::document_base_url(&dom, &resp.url);
+        let import_map =
+            crate::js_runtime::module_loader::ImportMap::from_dom(&dom, &document_base);
 
         // Fetch external stylesheets
         let mut stylesheets = Vec::new();
@@ -691,6 +694,7 @@ impl ChildIframe {
         let mut options = BrowserRuntimeOptions {
             stylesheets,
             navigation_timing: Some(resp.timings.clone()),
+            import_map,
             is_secure_context: crate::page::is_secure_url(&resp.url),
             cross_origin_isolated: crate::page::response_is_cross_origin_isolated(
                 &resp.url,
