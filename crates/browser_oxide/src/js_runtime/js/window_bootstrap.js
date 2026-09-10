@@ -4939,11 +4939,13 @@
         if (!state) throw new TypeError("Illegal invocation");
         return state;
     };
-    const _copyKeyAlgorithm = (state) => ({
-        name: "HMAC",
-        hash: { name: state.hash },
-        length: state.length,
-    });
+    const _copyKeyAlgorithm = (state) => state.name === 'PBKDF2'
+        ? { name: 'PBKDF2' }
+        : {
+            name: "HMAC",
+            hash: { name: state.hash },
+            length: state.length,
+        };
     _defProtoGetter(_CryptoKeyProto, 'type', function type() {
         return _requireCryptoKey(this).type;
     });
@@ -5026,6 +5028,7 @@
     const _makeHmacKey = (bytes, hash, extractable, usages, length) => {
         const key = Object.create(_CryptoKeyProto);
         _cryptoKeyState.set(key, {
+            name: 'HMAC',
             type: 'secret',
             extractable: !!extractable,
             hash,
@@ -5034,6 +5037,43 @@
             bytes: new Uint8Array(bytes),
         });
         return key;
+    };
+    const _normalizePbkdf2Usages = (keyUsages) => {
+        const usages = Array.from(keyUsages || [], String);
+        if (usages.length === 0 || usages.some((usage) => usage !== 'deriveBits' && usage !== 'deriveKey')) {
+            throw new DOMException("Cannot create a key using the specified key usages.", "SyntaxError");
+        }
+        return usages;
+    };
+    const _makePbkdf2Key = (bytes, usages) => {
+        const key = Object.create(_CryptoKeyProto);
+        _cryptoKeyState.set(key, {
+            name: 'PBKDF2',
+            type: 'secret',
+            extractable: false,
+            usages: usages.slice(),
+            bytes: new Uint8Array(bytes),
+        });
+        return key;
+    };
+    const _normalizePbkdf2Algorithm = (algorithm) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'PBKDF2') {
+            throw new DOMException("Unrecognized name.", "NotSupportedError");
+        }
+        if (!algorithm || typeof algorithm !== 'object' || algorithm.salt === undefined) {
+            throw new TypeError("PBKDF2 salt is required");
+        }
+        const iterations = Number(algorithm.iterations);
+        if (!Number.isFinite(iterations) || !Number.isInteger(iterations) || iterations <= 0 || iterations > 0xffffffff) {
+            throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+        }
+        return {
+            name: 'PBKDF2',
+            hash: _normalizeHashName(algorithm.hash),
+            salt: _toBytes(algorithm.salt).slice(),
+            iterations,
+        };
     };
     const _checkHmacOperation = (algorithm, key, usage) => {
         _normalizeHmacAlgorithm(algorithm, false);
@@ -5060,6 +5100,17 @@
         try {
             if (String(format).toLowerCase() !== 'raw') {
                 throw new DOMException("The requested operation is not supported", "NotSupportedError");
+            }
+            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'PBKDF2') {
+                if (extractable) {
+                    throw new DOMException("PBKDF2 keys are not extractable", "SyntaxError");
+                }
+                const usages = _normalizePbkdf2Usages(keyUsages);
+                if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+                    throw new TypeError("keyData is not a BufferSource");
+                }
+                return Promise.resolve(_makePbkdf2Key(_toBytes(keyData), usages));
             }
             const alg = _normalizeHmacAlgorithm(algorithm, true);
             const usages = _normalizeHmacUsages(keyUsages);
@@ -5102,12 +5153,35 @@
         } catch (e) { return Promise.reject(e); }
     });
 
-    // AES/RSA/ECDH/PBKDF2 are still explicit NotSupportedError paths until
+    _defProtoMethod(_SubtleProto, 'deriveBits', function deriveBits(algorithm, baseKey, length) {
+        try {
+            const alg = _normalizePbkdf2Algorithm(algorithm);
+            const state = _requireCryptoKey(baseKey);
+            if (state.name !== 'PBKDF2' || !state.usages.includes('deriveBits')) {
+                throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+            }
+            const bitLength = Number(length);
+            if (!Number.isFinite(bitLength) || !Number.isInteger(bitLength) || bitLength < 0 || bitLength % 8 !== 0) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            const byteLength = bitLength / 8;
+            if (byteLength > 0xffffffff) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            const out = ops.op_crypto_pbkdf2(alg.hash, state.bytes, alg.salt, alg.iterations, byteLength);
+            if (out.byteLength !== byteLength) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+        } catch (e) { return Promise.reject(e); }
+    });
+
+    // AES/RSA/ECDH and key wrapping are still explicit NotSupportedError paths until
     // their algorithm-specific key representations are implemented.
     const _subtleNotImplemented = (name) => function (...args) {
         return Promise.reject(new DOMException(`${name} not implemented`, "NotSupportedError"));
     };
-    for (const m of ['encrypt','decrypt','deriveKey','deriveBits','wrapKey','unwrapKey']) {
+    for (const m of ['encrypt','decrypt','deriveKey','wrapKey','unwrapKey']) {
         _defProtoMethod(_SubtleProto, m, _subtleNotImplemented(m));
     }
 

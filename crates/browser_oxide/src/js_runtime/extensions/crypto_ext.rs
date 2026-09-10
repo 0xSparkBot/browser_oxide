@@ -1,4 +1,4 @@
-//! Web Crypto API ops — digest, random bytes, HMAC. Backs the JS-side
+//! Web Crypto API ops — digest, random bytes, HMAC, PBKDF2. Backs the JS-side
 //! `crypto.subtle` stub so scripts that hash payloads via
 //! `crypto.subtle.digest("SHA-256", ...)` see a real result.
 
@@ -61,6 +61,46 @@ fn hmac_bytes(algorithm: &str, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     digest_bytes(&alg, &outer)
 }
 
+fn pbkdf2_bytes(
+    algorithm: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    byte_length: usize,
+) -> Option<Vec<u8>> {
+    if iterations == 0 {
+        return None;
+    }
+    if byte_length == 0 {
+        return Some(Vec::new());
+    }
+
+    let digest_len = digest_bytes(algorithm, &[])?.len();
+    let block_count = byte_length.div_ceil(digest_len);
+    if block_count > u32::MAX as usize {
+        return None;
+    }
+
+    let mut derived = Vec::with_capacity(block_count * digest_len);
+    for block_index in 1..=block_count {
+        let mut initial = Vec::with_capacity(salt.len() + 4);
+        initial.extend_from_slice(salt);
+        initial.extend_from_slice(&(block_index as u32).to_be_bytes());
+
+        let mut u = hmac_bytes(algorithm, password, &initial)?;
+        let mut block = u.clone();
+        for _ in 1..iterations {
+            u = hmac_bytes(algorithm, password, &u)?;
+            for (acc, byte) in block.iter_mut().zip(&u) {
+                *acc ^= *byte;
+            }
+        }
+        derived.extend_from_slice(&block);
+    }
+    derived.truncate(byte_length);
+    Some(derived)
+}
+
 #[op2]
 #[buffer]
 pub fn op_crypto_digest(#[string] algorithm: String, #[buffer] data: &[u8]) -> Vec<u8> {
@@ -77,6 +117,18 @@ pub fn op_crypto_hmac_sign(
     hmac_bytes(&algorithm, key, data).unwrap_or_default()
 }
 
+#[op2]
+#[buffer]
+pub fn op_crypto_pbkdf2(
+    #[string] algorithm: String,
+    #[buffer] password: &[u8],
+    #[buffer] salt: &[u8],
+    iterations: u32,
+    byte_length: u32,
+) -> Vec<u8> {
+    pbkdf2_bytes(&algorithm, password, salt, iterations, byte_length as usize).unwrap_or_default()
+}
+
 #[op2(fast)]
 pub fn op_crypto_random_fill(#[buffer] out: &mut [u8]) {
     use rand::Rng;
@@ -85,12 +137,17 @@ pub fn op_crypto_random_fill(#[buffer] out: &mut [u8]) {
 
 deno_core::extension!(
     crypto_extension,
-    ops = [op_crypto_digest, op_crypto_hmac_sign, op_crypto_random_fill],
+    ops = [
+        op_crypto_digest,
+        op_crypto_hmac_sign,
+        op_crypto_pbkdf2,
+        op_crypto_random_fill
+    ],
 );
 
 #[cfg(test)]
 mod tests {
-    use super::hmac_bytes;
+    use super::{hmac_bytes, pbkdf2_bytes};
 
     #[test]
     fn hmac_sha256_matches_rfc_style_vector() {
@@ -126,6 +183,42 @@ mod tests {
             ),
         ] {
             assert_eq!(hex::encode(hmac_bytes(algorithm, &key, data).unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn pbkdf2_sha1_matches_rfc6070_vectors() {
+        for (iterations, expected) in [
+            (1, "0c60c80f961f0e71f3a9b524af6012062fe037a6"),
+            (2, "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"),
+        ] {
+            assert_eq!(
+                hex::encode(pbkdf2_bytes("SHA-1", b"password", b"salt", iterations, 20).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pbkdf2_sha256_matches_standard_vectors() {
+        for (iterations, expected) in [
+            (
+                1,
+                "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+            ),
+            (
+                2,
+                "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
+            ),
+            (
+                4096,
+                "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+            ),
+        ] {
+            assert_eq!(
+                hex::encode(pbkdf2_bytes("SHA-256", b"password", b"salt", iterations, 32).unwrap()),
+                expected
+            );
         }
     }
 }

@@ -6560,6 +6560,150 @@ async fn crypto_subtle_hmac_matches_chrome_and_known_vector() {
 }
 
 #[tokio::test]
+async fn crypto_subtle_pbkdf2_matches_standard_vectors_and_key_semantics() {
+    use browser_oxide::Page;
+    use std::time::Duration;
+
+    let mut page = Page::with_profile(
+        "<!DOCTYPE html><html><head></head><body></body></html>",
+        "https://example.com/",
+        browser_oxide::stealth::presets::chrome_148_windows(),
+    )
+    .await
+    .unwrap();
+
+    let _ = page
+        .event_loop()
+        .execute_and_run(
+            r#"
+            (async function() {
+                const hex = (buffer) => Array.from(new Uint8Array(buffer))
+                    .map((b) => b.toString(16).padStart(2, '0')).join('');
+                const enc = new TextEncoder();
+                const password = enc.encode('password');
+                const salt = enc.encode('salt');
+                const result = {};
+                try {
+                    const key = await crypto.subtle.importKey(
+                        'raw', password, 'PBKDF2', false, ['deriveBits']
+                    );
+                    result.key = {
+                        tag: Object.prototype.toString.call(key),
+                        own: Reflect.ownKeys(key).length,
+                        type: key.type,
+                        extractable: key.extractable,
+                        algorithm: key.algorithm,
+                        usages: key.usages,
+                        sameAlgorithmObject: key.algorithm === key.algorithm,
+                        sameUsagesArray: key.usages === key.usages,
+                    };
+                    result.sha256One = hex(await crypto.subtle.deriveBits(
+                        { name: 'PBKDF2', salt, iterations: 1, hash: 'SHA-256' },
+                        key,
+                        256
+                    ));
+                    result.sha2564096 = hex(await crypto.subtle.deriveBits(
+                        { name: 'PBKDF2', salt, iterations: 4096, hash: 'SHA-256' },
+                        key,
+                        256
+                    ));
+                    result.zeroLength = (await crypto.subtle.deriveBits(
+                        { name: 'PBKDF2', salt, iterations: 1, hash: 'SHA-256' },
+                        key,
+                        0
+                    )).byteLength;
+
+                    try {
+                        await crypto.subtle.importKey(
+                            'raw', password, 'PBKDF2', true, ['deriveBits']
+                        );
+                        result.extractable = 'ok';
+                    } catch (e) {
+                        result.extractable = e.name;
+                    }
+                    try {
+                        await crypto.subtle.importKey(
+                            'raw', password, 'PBKDF2', false, ['sign']
+                        );
+                        result.badUsage = 'ok';
+                    } catch (e) {
+                        result.badUsage = e.name;
+                    }
+                    try {
+                        await crypto.subtle.deriveBits(
+                            { name: 'PBKDF2', salt, iterations: 0, hash: 'SHA-256' },
+                            key,
+                            256
+                        );
+                        result.zeroIterations = 'ok';
+                    } catch (e) {
+                        result.zeroIterations = e.name;
+                    }
+                    try {
+                        await crypto.subtle.deriveBits(
+                            { name: 'PBKDF2', salt, iterations: 1, hash: 'SHA-256' },
+                            key,
+                            7
+                        );
+                        result.badLength = 'ok';
+                    } catch (e) {
+                        result.badLength = e.name;
+                    }
+                    try {
+                        await crypto.subtle.deriveBits(
+                            { name: 'PBKDF2', salt, iterations: 1, hash: 'MD5' },
+                            key,
+                            256
+                        );
+                        result.badHash = 'ok';
+                    } catch (e) {
+                        result.badHash = e.name;
+                    }
+                } catch (e) {
+                    result.topError = `${e.name}:${e.message}`;
+                }
+                globalThis.__pbkdf2Result = JSON.stringify(result);
+            })();
+            "#,
+            Duration::from_secs(5),
+        )
+        .await;
+
+    let raw = page
+        .event_loop()
+        .execute_script("globalThis.__pbkdf2Result || '{}' ")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    assert_eq!(value["key"]["tag"], "[object CryptoKey]");
+    assert_eq!(value["key"]["own"], 0);
+    assert_eq!(value["key"]["type"], "secret");
+    assert_eq!(value["key"]["extractable"], false);
+    assert_eq!(
+        value["key"]["algorithm"],
+        serde_json::json!({"name": "PBKDF2"})
+    );
+    assert_eq!(value["key"]["usages"], serde_json::json!(["deriveBits"]));
+    assert_eq!(value["key"]["sameAlgorithmObject"], false);
+    assert_eq!(value["key"]["sameUsagesArray"], false);
+    assert_eq!(
+        value["sha256One"],
+        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+    );
+    assert_eq!(
+        value["sha2564096"],
+        "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+    );
+    assert_eq!(value["zeroLength"], 0);
+    assert_eq!(value["extractable"], "SyntaxError");
+    assert_eq!(value["badUsage"], "SyntaxError");
+    assert_eq!(value["zeroIterations"], "OperationError");
+    assert_eq!(value["badLength"], "OperationError");
+    assert_eq!(value["badHash"], "NotSupportedError");
+    assert!(value.get("topError").is_none());
+}
+
+#[tokio::test]
 async fn performance_instanceof_performance() {
     assert_eq!(check("performance instanceof Performance").await, "true");
 }
