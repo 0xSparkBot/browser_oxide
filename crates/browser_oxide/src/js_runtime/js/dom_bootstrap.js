@@ -1114,10 +1114,13 @@
                 }
                 return child;
             }
+            // Legacy insertion APIs perform a remove+insert when moving an
+            // already-connected node. For iframe descendants that destroys
+            // the current child navigable. Avoid doing so only for the true
+            // append no-op (already the last child of this parent).
             try {
-                if (child && child.isConnected && !this.isConnected && this.nodeType !== 9) {
-                    _ceDisconnected(child);
-                }
+                const noOp = child && child.parentNode === this && child.nextSibling === null;
+                if (child && child.isConnected && !noOp) _ceDisconnected(child);
             } catch (_) {}
             ops.op_dom_append_child(_getNodeId(this), _getNodeId(child));
             _onNodeInserted(child);
@@ -1129,6 +1132,7 @@
             return child;
         }
         replaceChild(newChild, oldChild) {
+            if (newChild === oldChild) return oldChild;
             if (newChild && newChild.nodeType === 11) {
                 if (newChild !== this) {
                     while (newChild.firstChild) {
@@ -1143,9 +1147,7 @@
             const newId = _getNodeId(newChild);
             _ceDisconnected(oldChild);
             try {
-                if (newChild && newChild.isConnected && !this.isConnected && this.nodeType !== 9) {
-                    _ceDisconnected(newChild);
-                }
+                if (newChild && newChild.isConnected) _ceDisconnected(newChild);
             } catch (_) {}
             ops.op_dom_insert_before(parent, newId, oldId);
             ops.op_dom_remove_child(parent, oldId);
@@ -1154,6 +1156,7 @@
         }
         insertBefore(newChild, refChild) {
             if (refChild === null || refChild === undefined) return this.appendChild(newChild);
+            if (newChild === refChild) return newChild;
             if (newChild && newChild.nodeType === 11) {
                 if (newChild === this) return newChild;
                 while (newChild.firstChild) {
@@ -1162,9 +1165,8 @@
                 return newChild;
             }
             try {
-                if (newChild && newChild.isConnected && !this.isConnected && this.nodeType !== 9) {
-                    _ceDisconnected(newChild);
-                }
+                const noOp = newChild && newChild.parentNode === this && newChild.nextSibling === refChild;
+                if (newChild && newChild.isConnected && !noOp) _ceDisconnected(newChild);
             } catch (_) {}
             ops.op_dom_insert_before(_getNodeId(this), _getNodeId(newChild), _getNodeId(refChild));
             _onNodeInserted(newChild);
@@ -3848,8 +3850,33 @@
     // methods are installed before iframe state is initialized, but execute only
     // after bootstrap has completed.
     let _disposeIframeRealm = function() {};
+    // Legacy DOM insertion APIs destroy an iframe's current child navigable
+    // when a connected iframe is moved.  The DOM node id itself is reused, so
+    // registry reconciliation needs an explicit generation tombstone to avoid
+    // mistaking the freshly-created browsing context for the old one.
+    const _destroyedTopFrameNodes = new Set();
+    const _destroyedRealmFrameNodes = new Map();
+    function _markFrameGenerationDestroyed(frame) {
+        if (!frame) return;
+        let nodeId = null;
+        try { nodeId = _getNodeId(frame); } catch (_) {}
+        if (nodeId === null || nodeId === undefined) return;
+        const parentRealmId = typeof frame.__oxParentRealm === "number"
+            ? frame.__oxParentRealm : null;
+        if (parentRealmId === null) {
+            _destroyedTopFrameNodes.add(nodeId);
+            return;
+        }
+        let set = _destroyedRealmFrameNodes.get(parentRealmId);
+        if (!set) {
+            set = new Set();
+            _destroyedRealmFrameNodes.set(parentRealmId, set);
+        }
+        set.add(nodeId);
+    }
     function _teardownIframeElement(frame) {
         if (!frame) return;
+        _markFrameGenerationDestroyed(frame);
         try {
             if (globalThis.__oxUnregisterChildFrame) {
                 globalThis.__oxUnregisterChildFrame(_getNodeId(frame));
@@ -3890,6 +3917,11 @@
     // window[0] is undefined → TypeError "Cannot read properties of undefined
     // (reading 'webdriver')".
     const _appendedIframes = [];
+    // Browsing-context names are captured when a child navigable is created.
+    // Mutating iframe.name afterwards changes the element attribute but does
+    // not rename the already-existing Window (Chrome keeps the original name
+    // until that navigable is destroyed and a fresh one is created).
+    const _topFrameBrowsingNames = new Map(); // NodeId -> initial name
     const _windowNamedSlots = new Set();
     // deno_core's host global prototype is stable and must not be replaced or
     // re-parented (doing so can break host-op lookup). Use that existing
@@ -3907,20 +3939,59 @@
         let frames = [];
         try { frames = document.querySelectorAll("iframe") || []; } catch (_) { frames = []; }
         const previousCount = _appendedIframes.length;
-        const nextFrameNamed = new Map();
-        _appendedIframes.length = 0;
+        const scannedByNode = new Map();
         for (let i = 0; i < frames.length; i++) {
             const frame = frames[i];
+            const nodeId = _iframeNodeId(frame);
+            if (nodeId === null) continue;
             // This sync walks the top document, so any stale same-isolate
             // ownership marker left by adoption/reinsertion must be cleared.
             try { delete frame.__oxParentRealm; } catch (_) {}
-            _appendedIframes.push(frame);
-            try {
-                const name = String((frame.getAttribute && frame.getAttribute("name")) || frame.name || "");
-                if (name && !/^(0|[1-9]\d*)$/.test(name) && !nextFrameNamed.has(name)) {
-                    nextFrameNamed.set(name, frame);
-                }
-            } catch (_) {}
+            scannedByNode.set(nodeId, frame);
+        }
+
+        // Window's indexed child navigables follow active browsing-context
+        // creation order, not current DOM order. Preserve surviving contexts
+        // in their previous slots; append newly-created contexts afterwards.
+        // This matters when the same iframe element is removed then reinserted:
+        // the old navigable is destroyed and its replacement is a new last slot.
+        const nextOrder = [];
+        const activeNodeIds = new Set();
+        for (const oldFrame of _appendedIframes) {
+            const nodeId = _iframeNodeId(oldFrame);
+            if (nodeId === null || !scannedByNode.has(nodeId) || _destroyedTopFrameNodes.has(nodeId)) {
+                if (nodeId !== null) _topFrameBrowsingNames.delete(nodeId);
+                continue;
+            }
+            const liveFrame = scannedByNode.get(nodeId);
+            nextOrder.push(liveFrame);
+            activeNodeIds.add(nodeId);
+        }
+        for (const [nodeId, frame] of scannedByNode) {
+            if (activeNodeIds.has(nodeId)) continue;
+            nextOrder.push(frame);
+            activeNodeIds.add(nodeId);
+            let name = "";
+            try { name = String((frame.getAttribute && frame.getAttribute("name")) || frame.name || ""); } catch (_) {}
+            _topFrameBrowsingNames.set(nodeId, name);
+        }
+        _destroyedTopFrameNodes.clear();
+
+        _appendedIframes.length = 0;
+        _appendedIframes.push(...nextOrder);
+        const nextFrameNamed = new Map();
+        for (let i = 0; i < _appendedIframes.length; i++) {
+            const frame = _appendedIframes[i];
+            const nodeId = _iframeNodeId(frame);
+            if (nodeId !== null && !_topFrameBrowsingNames.has(nodeId)) {
+                let initialName = "";
+                try { initialName = String((frame.getAttribute && frame.getAttribute("name")) || frame.name || ""); } catch (_) {}
+                _topFrameBrowsingNames.set(nodeId, initialName);
+            }
+            const name = nodeId === null ? "" : (_topFrameBrowsingNames.get(nodeId) || "");
+            if (name && !/^(0|[1-9]\d*)$/.test(name) && !nextFrameNamed.has(name)) {
+                nextFrameNamed.set(name, frame);
+            }
             try {
                 Object.defineProperty(globalThis, String(i), {
                     get: function() { return _frameWindowFor(_appendedIframes[i]); },
@@ -3929,12 +4000,12 @@
                 });
             } catch (_) {}
         }
-        for (let i = frames.length; i < previousCount; i++) {
+        for (let i = _appendedIframes.length; i < previousCount; i++) {
             try { delete globalThis[String(i)]; } catch (_) {}
         }
         try {
             Object.defineProperty(globalThis, "length", {
-                value: frames.length,
+                value: _appendedIframes.length,
                 configurable: true,
                 writable: true,
             });
@@ -4016,7 +4087,7 @@
                 } catch (_) {}
             }
         }
-        try { globalThis.__ifAppendCount = frames.length; } catch (_) {}
+        try { globalThis.__ifAppendCount = _appendedIframes.length; } catch (_) {}
     }
 
     // Wrap DOM mutation methods to fire MO notifications
@@ -4169,6 +4240,7 @@
     const _realmFrameHosts = new Map();
     const _realmFrameSlotCount = new Map();
     const _realmFrameNamedSlots = new Map();
+    const _realmFrameBrowsingNames = new Map();
     const _realmRegistrySyncing = new Set();
     function _iframeNodeId(el) {
         try {
@@ -4240,6 +4312,8 @@
             _realmFrameHosts.delete(state._realmId);
             _realmFrameSlotCount.delete(state._realmId);
             _realmFrameNamedSlots.delete(state._realmId);
+            _realmFrameBrowsingNames.delete(state._realmId);
+            _destroyedRealmFrameNodes.delete(state._realmId);
         }
         _deleteIframeState(el);
     };
@@ -4921,9 +4995,11 @@
             try { frames = doc.querySelectorAll("iframe") || []; } catch (_) { frames = []; }
             const previousHosts = _realmFrameHosts.get(realmId) || new Map();
             const previousNamed = _realmFrameNamedSlots.get(realmId) || new Set();
+            const browsingNames = _realmFrameBrowsingNames.get(realmId) || new Map();
+            const destroyedNodes = _destroyedRealmFrameNodes.get(realmId) || new Set();
+            const scannedHosts = new Map();
             const currentHosts = new Map();
             const nextNamed = new Map();
-            let slot = 0;
 
             for (let i = 0; i < frames.length; i++) {
                 const frame = frames[i];
@@ -4933,13 +5009,36 @@
                 // through Document.createElement(), so stamp their owning realm
                 // here before contentWindow materialization/registration.
                 try { frame.__oxParentRealm = realmId; } catch (_) {}
+                scannedHosts.set(nodeId, frame);
+            }
+
+            // Preserve existing child navigables in creation order. Removed
+            // hosts lose their generation; newly-seen hosts are appended after
+            // all surviving contexts, even if their DOM position is earlier.
+            for (const [nodeId, oldFrame] of previousHosts) {
+                const liveFrame = scannedHosts.get(nodeId);
+                if (!liveFrame || destroyedNodes.has(nodeId)) {
+                    try { _disposeIframeRealm(oldFrame, false); } catch (_) {}
+                    browsingNames.delete(nodeId);
+                    continue;
+                }
+                currentHosts.set(nodeId, liveFrame);
+            }
+            for (const [nodeId, frame] of scannedHosts) {
+                if (currentHosts.has(nodeId)) continue;
                 currentHosts.set(nodeId, frame);
-                try {
-                    const name = String((frame.getAttribute && frame.getAttribute("name")) || frame.name || "");
-                    if (name && !/^(0|[1-9]\d*)$/.test(name) && !nextNamed.has(name)) {
-                        nextNamed.set(name, frame);
-                    }
-                } catch (_) {}
+                let name = "";
+                try { name = String((frame.getAttribute && frame.getAttribute("name")) || frame.name || ""); } catch (_) {}
+                browsingNames.set(nodeId, name);
+            }
+
+            let slot = 0;
+            for (const [nodeId, frame] of currentHosts) {
+                if (!browsingNames.has(nodeId)) {
+                    let name = "";
+                    try { name = String((frame.getAttribute && frame.getAttribute("name")) || frame.name || ""); } catch (_) {}
+                    browsingNames.set(nodeId, name);
+                }
                 let publicWindow = null;
                 try {
                     const backend = _getIframeWindow(frame);
@@ -4948,13 +5047,12 @@
                 if (!publicWindow) continue;
                 try { ops.op_set_child_realm_prop(realmId, String(slot), publicWindow); } catch (_) {}
                 slot++;
+                const name = browsingNames.get(nodeId) || "";
+                if (name && !/^(0|[1-9]\d*)$/.test(name) && !nextNamed.has(name)) {
+                    nextNamed.set(name, frame);
+                }
             }
 
-            // Removed nested frames lose their browsing contexts and numeric slots.
-            for (const [nodeId, oldFrame] of previousHosts) {
-                if (currentHosts.has(nodeId)) continue;
-                try { _disposeIframeRealm(oldFrame, false); } catch (_) {}
-            }
             const previousCount = _realmFrameSlotCount.get(realmId) || 0;
             for (let i = slot; i < previousCount; i++) {
                 try { ops.op_delete_child_realm_prop(realmId, String(i)); } catch (_) {}
@@ -4984,6 +5082,8 @@
             _realmFrameHosts.set(realmId, currentHosts);
             _realmFrameSlotCount.set(realmId, slot);
             _realmFrameNamedSlots.set(realmId, installedNames);
+            _realmFrameBrowsingNames.set(realmId, browsingNames);
+            _destroyedRealmFrameNodes.delete(realmId);
         } finally {
             _realmRegistrySyncing.delete(realmId);
         }
@@ -4996,10 +5096,42 @@
         else _syncTopFrameRegistry();
     }
 
-    // Register contentWindow cw at frame index _fi in the main window.
-    // Pass the iframe element el so we can find its DOM position and also
-    // handle cases where the iframe was inserted via a non-tracked method
-    // (insertBefore, innerHTML, insertAdjacentHTML, etc.).
+    // DOM moveBefore() is explicitly state-preserving, unlike legacy
+    // appendChild()/insertBefore()/replaceChild() moves. Expose a private
+    // low-level path for the later WebIDL layer so iframe navigables, media
+    // state and other connected state survive the move while the DOM order is
+    // updated. The frame registry deliberately keeps its existing slots.
+    Object.defineProperty(globalThis.__browser_oxide, 'domMoveBeforePreservingState', {
+        value: function(parent, movedNode, referenceNode) {
+            if (!parent || !movedNode) return movedNode;
+            if (movedNode === referenceNode) return movedNode;
+            try {
+                if (referenceNode == null) {
+                    if (movedNode.parentNode === parent && movedNode.nextSibling === null) return movedNode;
+                    ops.op_dom_append_child(_getNodeId(parent), _getNodeId(movedNode));
+                } else {
+                    if (movedNode.parentNode === parent && movedNode.nextSibling === referenceNode) return movedNode;
+                    ops.op_dom_insert_before(
+                        _getNodeId(parent),
+                        _getNodeId(movedNode),
+                        _getNodeId(referenceNode),
+                    );
+                }
+                _syncOwningFrameRegistry(movedNode);
+            } catch (_) {
+                // Preserve the existing exception/fallback behavior for
+                // malformed input through the public wrapper.
+                throw _;
+            }
+            return movedNode;
+        },
+        configurable: true,
+        enumerable: false,
+    });
+
+    // Register contentWindow cw in the main Window's child-navigable order.
+    // The order is maintained by _syncTopFrameRegistry: surviving browsing
+    // contexts keep their slots and newly-created contexts append after them.
     function _registerFrame(cw, el) {
         const parentRealmId = (el && typeof el.__oxParentRealm === "number")
             ? el.__oxParentRealm : null;
@@ -5016,56 +5148,54 @@
                 return;
             }
         } catch (_) {}
-        // Try to find the iframe's true DOM position
+
+        // Reconcile removals/reinsertions before locating this generation.
+        // In particular, a removed then reinserted element is a fresh child
+        // navigable and therefore appears after all still-live contexts.
+        _syncTopFrameRegistry();
         var _fi = -1;
-        // First: check if el is already tracked in _appendedIframes
-        if (el) {
-            for (var _ai = 0; _ai < _appendedIframes.length; _ai++) {
-                if (_appendedIframes[_ai] === el) { _fi = _ai; break; }
+        const nodeId = _iframeNodeId(el);
+        if (nodeId !== null) {
+            for (let i = 0; i < _appendedIframes.length; i++) {
+                if (_iframeNodeId(_appendedIframes[i]) === nodeId) {
+                    _fi = i;
+                    break;
+                }
             }
         }
-        // Second: if not tracked, query the DOM for its position
+        // A connected frame should already have been discovered by the sync,
+        // but append defensively if a custom DOM wrapper hid it from the query.
         if (_fi < 0) {
-            try {
-                var _all = document.getElementsByTagName && document.getElementsByTagName('iframe');
-                if (_all) {
-                    for (var _di = 0; _di < _all.length; _di++) {
-                        if (_all[_di] === el) { _fi = _di; break; }
-                    }
-                }
-            } catch (_) {}
-        }
-        // Fallback: use sequential registry length
-        if (_fi < 0) {
-            _fi = _frameRegistry.length;
+            _fi = _appendedIframes.length;
+            _appendedIframes.push(el);
+            if (nodeId !== null) {
+                let name = "";
+                try { name = String((el.getAttribute && el.getAttribute("name")) || el.name || ""); } catch (_) {}
+                _topFrameBrowsingNames.set(nodeId, name);
+            }
         }
         // Track in registry
         while (_frameRegistry.length <= _fi) _frameRegistry.push(null);
         _frameRegistry[_fi] = cw;
-        // Register in _appendedIframes if not already there (for lazy getter)
-        if (el && _fi >= _appendedIframes.length) {
-            while (_appendedIframes.length < _fi) _appendedIframes.push(null);
-            _appendedIframes.push(el);
-            try { globalThis.__ifAppendCount = _appendedIframes.length; } catch (_) {}
-        }
         // Install as window[N] — replace lazy getter (if any) with actual value
         try {
             Object.defineProperty(globalThis, String(_fi), {
                 value: cw, writable: true, enumerable: true, configurable: true,
             });
         } catch (_) {}
-        // Update window.length
-        var _newLen = _fi + 1;
+        // window.length is the number of active child navigables, independent
+        // of their current DOM ordering.
         try {
             const _ld = Object.getOwnPropertyDescriptor(globalThis, 'length');
             if (_ld && _ld.writable) {
-                if (globalThis.length < _newLen) globalThis.length = _newLen;
+                globalThis.length = _appendedIframes.length;
             } else {
                 Object.defineProperty(globalThis, 'length', {
-                    value: _newLen, writable: true, configurable: true, enumerable: true,
+                    value: _appendedIframes.length, writable: true, configurable: true, enumerable: true,
                 });
             }
         } catch (_) {}
+        try { globalThis.__ifAppendCount = _appendedIframes.length; } catch (_) {}
     }
 
     // Extract scheme+host+port from a URL without using new URL().
@@ -6291,6 +6421,19 @@
         // active record and WeakMap is only a fast path.
         const _iframeWindowProxyCache = new WeakMap(); // wrapper -> record
         const _iframeWindowProxyByNode = new Map();    // NodeId -> active record
+        // Capture raw Reflect intrinsics before cleanup installs the public
+        // WindowProxy reflection facade. Internal WindowProxy forwarding and
+        // detach snapshots must never recurse through or be reshaped by the
+        // page-visible wrappers.
+        const _iframeReflectGet = Reflect.get;
+        const _iframeReflectSet = Reflect.set;
+        const _iframeReflectHas = Reflect.has;
+        const _iframeReflectOwnKeys = Reflect.ownKeys;
+        const _iframeReflectGetOwnPropertyDescriptor = Reflect.getOwnPropertyDescriptor;
+        const _iframeReflectDefineProperty = Reflect.defineProperty;
+        const _iframeReflectDeleteProperty = Reflect.deleteProperty;
+        const _iframeReflectGetPrototypeOf = Reflect.getPrototypeOf;
+        const _iframeReflectSetPrototypeOf = Reflect.setPrototypeOf;
         function _iframeBackend(el) {
             try {
                 // A disconnected iframe has no child navigable. Never recreate
@@ -6398,7 +6541,7 @@
                             if (live && live.document) return live.document;
                         } catch (_) {}
                     }
-                    try { return Reflect.get(backend, prop, backend); } catch (_) { return undefined; }
+                    try { return _iframeReflectGet(backend, prop, backend); } catch (_) { return undefined; }
                 },
                 set(_target, prop, value) {
                     const realmId = activeRealmId();
@@ -6407,7 +6550,7 @@
                     }
                     const backend = currentBackend();
                     if (!backend) return false;
-                    try { return Reflect.set(backend, prop, value, backend); } catch (_) { return false; }
+                    try { return _iframeReflectSet(backend, prop, value, backend); } catch (_) { return false; }
                 },
                 has(_target, prop) {
                     if (prop === "window" || prop === "self" || prop === "globalThis" || prop === "frames") return true;
@@ -6417,7 +6560,7 @@
                         try { return !!ops.op_child_realm_has_property(realmId, prop); } catch (_) { return false; }
                     }
                     const backend = currentBackend();
-                    try { return !!backend && Reflect.has(backend, prop); } catch (_) { return false; }
+                    try { return !!backend && _iframeReflectHas(backend, prop); } catch (_) { return false; }
                 },
                 ownKeys() {
                     const realmId = activeRealmId();
@@ -6428,7 +6571,7 @@
                         } catch (_) {}
                     }
                     const backend = currentBackend();
-                    try { return backend ? Reflect.ownKeys(backend) : []; } catch (_) { return []; }
+                    try { return backend ? _iframeReflectOwnKeys(backend) : []; } catch (_) { return []; }
                 },
                 getOwnPropertyDescriptor(_target, prop) {
                     if (prop === "window" || prop === "self" || prop === "globalThis" || prop === "frames") {
@@ -6446,7 +6589,7 @@
                     }
                     const backend = currentBackend();
                     try {
-                        const desc = backend && Reflect.getOwnPropertyDescriptor(backend, prop);
+                        const desc = backend && _iframeReflectGetOwnPropertyDescriptor(backend, prop);
                         if (!desc) return undefined;
                         const copy = Object.assign({}, desc);
                         copy.configurable = true;
@@ -6464,7 +6607,7 @@
                         try { return !!ops.op_child_realm_define_property(realmId, prop, desc); } catch (_) { return false; }
                     }
                     const backend = currentBackend();
-                    try { return !!backend && Reflect.defineProperty(backend, prop, desc); } catch (_) { return false; }
+                    try { return !!backend && _iframeReflectDefineProperty(backend, prop, desc); } catch (_) { return false; }
                 },
                 deleteProperty(_target, prop) {
                     const realmId = activeRealmId();
@@ -6472,7 +6615,7 @@
                         try { return !!ops.op_child_realm_delete_property(realmId, prop); } catch (_) { return false; }
                     }
                     const backend = currentBackend();
-                    try { return !!backend && Reflect.deleteProperty(backend, prop); } catch (_) { return false; }
+                    try { return !!backend && _iframeReflectDeleteProperty(backend, prop); } catch (_) { return false; }
                 },
                 getPrototypeOf() {
                     const realmId = activeRealmId();
@@ -6483,11 +6626,11 @@
                         } catch (_) {}
                     }
                     const backend = currentBackend();
-                    try { return backend ? Reflect.getPrototypeOf(backend) : Object.prototype; } catch (_) { return Object.prototype; }
+                    try { return backend ? _iframeReflectGetPrototypeOf(backend) : Object.prototype; } catch (_) { return Object.prototype; }
                 },
                 setPrototypeOf(_target, proto) {
                     const backend = currentBackend();
-                    try { return !!backend && Reflect.setPrototypeOf(backend, proto); } catch (_) { return false; }
+                    try { return !!backend && _iframeReflectSetPrototypeOf(backend, proto); } catch (_) { return false; }
                 },
                 isExtensible() {
                     return true;
@@ -6522,14 +6665,14 @@
             let detachedSnapshot = null;
             try {
                 detachedSnapshot = Object.create(null);
-                for (const key of Reflect.ownKeys(record.proxy)) {
-                    const desc = Reflect.getOwnPropertyDescriptor(record.proxy, key);
+                for (const key of _iframeReflectOwnKeys(record.proxy)) {
+                    const desc = _iframeReflectGetOwnPropertyDescriptor(record.proxy, key);
                     if (!desc) continue;
                     const copy = Object.assign({}, desc);
                     copy.configurable = true;
                     try { Object.defineProperty(detachedSnapshot, key, copy); } catch (_) {}
                 }
-                try { Object.setPrototypeOf(detachedSnapshot, Reflect.getPrototypeOf(record.proxy)); } catch (_) {}
+                try { Object.setPrototypeOf(detachedSnapshot, _iframeReflectGetPrototypeOf(record.proxy)); } catch (_) {}
             } catch (_) {
                 detachedSnapshot = null;
             }

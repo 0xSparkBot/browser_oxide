@@ -2,6 +2,9 @@
 // subclasses. The DOM backend remains unchanged; this layer relocates members
 // to their Chrome prototype owners and fills standards-shaped reflection/state.
 ((globalThis) => {
+    // Internal bridges are removed from the public global by cleanup. Capture
+    // the state-preserving DOM move helper now; never resolve it per call.
+    const preserveDomMoveBefore = globalThis.__browser_oxide?.domMoveBeforePreservingState;
     const mask = (fn, name) => {
         if (typeof fn !== 'function') return fn;
         try {
@@ -283,7 +286,10 @@
         pointerCapture.get(this)?.delete(Number(pointerId));
     }, 1);
     method(ep, 'moveBefore', function moveBefore(movedNode, referenceNode) {
-        this.insertBefore(movedNode, referenceNode == null ? null : referenceNode);
+        if (typeof preserveDomMoveBefore === 'function') {
+            return preserveDomMoveBefore(this, movedNode, referenceNode == null ? null : referenceNode);
+        }
+        return this.insertBefore(movedNode, referenceNode == null ? null : referenceNode);
     }, 2);
     method(ep, 'requestFullscreen', function requestFullscreen() { return Promise.resolve(); }, 0);
     method(ep, 'requestPointerLock', function requestPointerLock() { return Promise.resolve(); }, 0);

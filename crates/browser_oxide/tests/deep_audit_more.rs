@@ -334,7 +334,7 @@ async fn removed_iframe_window_proxy_stays_detached_across_reinsert() {
 }
 
 #[tokio::test]
-async fn top_frame_registry_tracks_dom_order_and_removal() {
+async fn top_frame_registry_tracks_active_navigable_order_and_removal() {
     let mut page = empty_page().await;
     let state = page
         .evaluate(
@@ -363,6 +363,8 @@ async fn top_frame_registry_tracks_dom_order_and_removal() {
                 const aw2=a.contentWindow;
                 const reinserted={
                     length:window.length,
+                    b0:window[0]===bw,
+                    a1:window[1]===aw2,
                     a0:window[0]===aw2,
                     b1:window[1]===bw,
                     fresh:aw2!==aw,
@@ -375,7 +377,7 @@ async fn top_frame_registry_tracks_dom_order_and_removal() {
 
     assert_eq!(
         state,
-        r#"{"initial":{"length":2,"a0":true,"b1":true},"removed":{"length":1,"b0":true,"slot1":"undefined","oldClosed":true},"reinserted":{"length":2,"a0":true,"b1":true,"fresh":true,"oldClosed":true}}"#
+        r#"{"initial":{"length":2,"a0":true,"b1":true},"removed":{"length":1,"b0":true,"slot1":"undefined","oldClosed":true},"reinserted":{"length":2,"b0":true,"a1":true,"a0":false,"b1":false,"fresh":true,"oldClosed":true}}"#
     );
 }
 
@@ -534,6 +536,8 @@ async fn named_frame_registry_respects_existing_globals_and_renames() {
                 f.name='freeFrameName';
                 const renamed={
                     oldValue:window.keepMe,
+                    oldNameStillFrame:window.frames.keepMe===cw,
+                    newType:typeof window.freeFrameName,
                     newIsFrame:window.freeFrameName===cw,
                 };
                 f.remove();
@@ -547,7 +551,7 @@ async fn named_frame_registry_respects_existing_globals_and_renames() {
         .unwrap();
     assert_eq!(
         top,
-        r#"{"collision":{"value":17,"isFrame":false},"renamed":{"oldValue":17,"newIsFrame":true},"removedType":"undefined"}"#
+        r#"{"collision":{"value":17,"isFrame":false},"renamed":{"oldValue":17,"oldNameStillFrame":false,"newType":"undefined","newIsFrame":false},"removedType":"undefined"}"#
     );
 
     page.evaluate(
@@ -567,7 +571,12 @@ async fn named_frame_registry_respects_existing_globals_and_renames() {
                     const cw=f.contentWindow;
                     const collision={value:keepNested,isFrame:keepNested===cw};
                     f.name='freeNestedName';
-                    const renamed={oldValue:keepNested,newIsFrame:freeNestedName===cw};
+                    const renamed={
+                        oldValue:keepNested,
+                        oldNameStillFrame:frames.keepNested===cw,
+                        newType:typeof freeNestedName,
+                        newIsFrame:globalThis.freeNestedName===cw,
+                    };
                     f.remove();
                     return JSON.stringify({collision,renamed,removedType:typeof freeNestedName});
                 })()"#,
@@ -576,7 +585,7 @@ async fn named_frame_registry_respects_existing_globals_and_renames() {
     };
     assert_eq!(
         nested,
-        r#"{"collision":{"value":23,"isFrame":false},"renamed":{"oldValue":23,"newIsFrame":true},"removedType":"undefined"}"#
+        r#"{"collision":{"value":23,"isFrame":false},"renamed":{"oldValue":23,"oldNameStillFrame":false,"newType":"undefined","newIsFrame":false},"removedType":"undefined"}"#
     );
 }
 
@@ -1056,7 +1065,7 @@ async fn parser_nested_iframe_is_registered_in_parent_realm() {
 }
 
 #[tokio::test]
-async fn top_frame_registry_reorders_without_recreating_windows() {
+async fn legacy_dom_move_recreates_moved_iframe_browsing_context() {
     let mut page = browser_oxide::Page::from_html_with_url(
         r#"<!doctype html><body></body>"#,
         "https://example.com/reorder",
@@ -1074,19 +1083,60 @@ async fn top_frame_registry_reorders_without_recreating_windows() {
                 document.body.append(a,b);
                 const aw=a.contentWindow, bw=b.contentWindow;
                 document.body.insertBefore(b,a);
+                const bw2=b.contentWindow;
                 return JSON.stringify({
                     length:window.length,
-                    b0:window[0]===bw,
-                    a1:window[1]===aw,
+                    a0:window[0]===aw,
+                    b1:window[1]===bw2,
+                    b0:window[0]===bw2,
                     stableA:a.contentWindow===aw,
-                    stableB:b.contentWindow===bw,
+                    freshB:bw2!==bw,
+                    oldBClosed:bw.closed,
                 });
             })()"#,
         )
         .unwrap();
     assert_eq!(
         state,
-        r#"{"length":2,"b0":true,"a1":true,"stableA":true,"stableB":true}"#
+        r#"{"length":2,"a0":true,"b1":true,"b0":false,"stableA":true,"freshB":true,"oldBClosed":true}"#
+    );
+}
+
+#[tokio::test]
+async fn move_before_preserves_iframe_browsing_context_and_index_order() {
+    let mut page = browser_oxide::Page::from_html_with_url(
+        r#"<!doctype html><body></body>"#,
+        "https://example.com/move-before",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let state = page
+        .evaluate(
+            r#"(() => {
+                const a=document.createElement('iframe');
+                const b=document.createElement('iframe');
+                a.srcdoc='<p>a</p>'; b.srcdoc='<p>b</p>';
+                document.body.append(a,b);
+                const aw=a.contentWindow, bw=b.contentWindow;
+                document.body.moveBefore(b,a);
+                return JSON.stringify({
+                    length:window.length,
+                    a0:window[0]===aw,
+                    b1:window[1]===bw,
+                    b0:window[0]===bw,
+                    stableA:a.contentWindow===aw,
+                    stableB:b.contentWindow===bw,
+                    oldBClosed:bw.closed,
+                    dom:[...document.querySelectorAll('iframe')].map(x=>x===a?'a':'b'),
+                });
+            })()"#,
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        r#"{"length":2,"a0":true,"b1":true,"b0":false,"stableA":true,"stableB":true,"oldBClosed":false,"dom":["b","a"]}"#
     );
 }
 
