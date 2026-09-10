@@ -2079,7 +2079,7 @@ mod tests {
         let resp = client.get("https://httpbin.org/headers").await.unwrap();
         let body = resp.text();
         assert!(
-            body.contains("Chrome/130"),
+            body.contains("Chrome/148"),
             "Response should show our UA: {}",
             body
         );

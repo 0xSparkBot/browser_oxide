@@ -5726,8 +5726,11 @@ mod tests {
         println!("[stealth] userAgent: {ua}");
         assert!(ua.contains("Chrome"), "UA should contain Chrome");
 
-        let webdriver = page.evaluate("typeof navigator.webdriver").unwrap();
-        assert_eq!(webdriver, "undefined", "webdriver must be undefined");
+        let webdriver = page.evaluate("navigator.webdriver").unwrap();
+        assert_eq!(
+            webdriver, "false",
+            "webdriver must be false in normal browsing"
+        );
 
         let langs = page
             .evaluate("JSON.stringify(navigator.languages)")
