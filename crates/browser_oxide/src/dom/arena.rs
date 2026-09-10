@@ -520,12 +520,40 @@ impl Dom {
                             }
                         }
                         NodeData::Text(text) => {
-                            out.push_str(
-                                &text
-                                    .replace('&', "&amp;")
-                                    .replace('<', "&lt;")
-                                    .replace('>', "&gt;"),
-                            );
+                            // HTML fragment serialization does not escape text
+                            // whose parent is a raw-text element. This matters
+                            // for script/template payloads that intentionally
+                            // contain literal character-reference text such as
+                            // `&#34;`: escaping `&` here would turn it into
+                            // `&amp;#34;` and change what `element.innerHTML`
+                            // returns compared with Chrome.
+                            let raw_text_parent = node
+                                .parent
+                                .and_then(|parent| self.get(parent))
+                                .and_then(Node::as_element)
+                                .is_some_and(|parent| {
+                                    parent.name.ns.is_none()
+                                        && matches!(
+                                            parent.name.local.as_str(),
+                                            "script"
+                                                | "style"
+                                                | "xmp"
+                                                | "iframe"
+                                                | "noembed"
+                                                | "noframes"
+                                                | "plaintext"
+                                        )
+                                });
+                            if raw_text_parent {
+                                out.push_str(text);
+                            } else {
+                                out.push_str(
+                                    &text
+                                        .replace('&', "&amp;")
+                                        .replace('<', "&lt;")
+                                        .replace('>', "&gt;"),
+                                );
+                            }
                         }
                         NodeData::Comment(text) => {
                             out.push_str("<!--");
@@ -994,6 +1022,28 @@ mod tests {
         dom.append_child(span, text);
 
         assert_eq!(dom.serialize_inner_html(div), "<span>hi</span>");
+    }
+
+    #[test]
+    fn serialize_inner_html_preserves_raw_text_element_contents() {
+        let dom = crate::html_parser::parse_html(
+            r#"<html><body>
+                <script id="s" type="text/template">{&#34;a&#34;:1}</script>
+                <style id="st">a>b{content:"&x"}</style>
+                <div id="d">&amp;&lt;&gt;</div>
+            </body></html>"#,
+        );
+
+        let script = dom.get_element_by_id("s").unwrap();
+        let style = dom.get_element_by_id("st").unwrap();
+        let div = dom.get_element_by_id("d").unwrap();
+
+        // Chrome 148 keeps raw-text contents byte-for-byte for innerHTML.
+        assert_eq!(dom.serialize_inner_html(script), r#"{&#34;a&#34;:1}"#);
+        assert_eq!(dom.serialize_inner_html(style), r#"a>b{content:"&x"}"#);
+
+        // Ordinary element text continues to use HTML escaping.
+        assert_eq!(dom.serialize_inner_html(div), "&amp;&lt;&gt;");
     }
 
     #[test]
