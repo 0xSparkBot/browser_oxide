@@ -1314,11 +1314,21 @@ async fn e2e_websocket_tls_connects() {
             r#"
         <script>
             globalThis.wsResult = 'pending';
+            globalThis.wsMessages = [];
             globalThis.wsError = '';
             try {
-                const ws = new WebSocket('wss://echo.websocket.events');
+                const ws = new WebSocket('wss://echo.websocket.org');
                 ws.onopen = () => { ws.send('hello'); };
-                ws.onmessage = (e) => { globalThis.wsResult = 'received:' + e.data; ws.close(); };
+                ws.onmessage = (e) => {
+                    const data = String(e.data);
+                    globalThis.wsMessages.push(data);
+                    // echo.websocket.org sends a short greeting first; keep
+                    // listening until the payload we sent is echoed back.
+                    if (data === 'hello') {
+                        globalThis.wsResult = 'received:hello';
+                        ws.close();
+                    }
+                };
                 ws.onerror = () => { globalThis.wsResult = 'error'; };
             } catch (e) {
                 globalThis.wsError = e.toString();
@@ -1337,6 +1347,13 @@ async fn e2e_websocket_tls_connects() {
         .ok();
     let err = page.evaluate("wsError").unwrap();
     assert!(err.is_empty(), "wss:// should not throw: {}", err);
+    let result = page.evaluate("wsResult").unwrap();
+    assert_eq!(
+        result,
+        "received:hello",
+        "wss:// must complete TLS handshake, send, and receive an echo; messages={}",
+        page.evaluate("JSON.stringify(wsMessages)").unwrap()
+    );
 }
 
 // ================================================================
