@@ -457,6 +457,18 @@ impl BrowserEventLoop {
         self.runtime.complete_document_lifecycle();
     }
 
+    pub fn mark_document_interactive(&mut self) {
+        self.runtime.mark_document_interactive();
+    }
+
+    pub fn dispatch_dom_content_loaded(&mut self) {
+        self.runtime.dispatch_dom_content_loaded();
+    }
+
+    pub fn dispatch_load(&mut self) {
+        self.runtime.dispatch_load();
+    }
+
     /// Flush the microtask queue. See [`BrowserJsRuntime::drain_microtasks`].
     pub fn drain_microtasks(&mut self) {
         self.runtime.drain_microtasks();

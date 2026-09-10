@@ -169,6 +169,9 @@ pub fn create_runtime(dom: Dom, options: BrowserRuntimeOptions) -> JsRuntime {
 #[derive(Default)]
 pub struct RuntimeInternalFns {
     pub set_current_script: Option<v8::Global<v8::Function>>,
+    pub mark_document_interactive: Option<v8::Global<v8::Function>>,
+    pub dispatch_dom_content_loaded: Option<v8::Global<v8::Function>>,
+    pub dispatch_load: Option<v8::Global<v8::Function>>,
     pub complete_document_lifecycle: Option<v8::Global<v8::Function>>,
     pub pump_worker_messages: Option<v8::Global<v8::Function>>,
     pub pump_message_ports: Option<v8::Global<v8::Function>>,
@@ -445,6 +448,15 @@ pub fn create_runtime_with_signals(
         if let Some(bridge) = bridge {
             for (name, slot) in [
                 ("_setCurrentScriptById", &mut captured.set_current_script),
+                (
+                    "_markDocumentInteractive",
+                    &mut captured.mark_document_interactive,
+                ),
+                (
+                    "_dispatchDOMContentLoaded",
+                    &mut captured.dispatch_dom_content_loaded,
+                ),
+                ("_dispatchLoad", &mut captured.dispatch_load),
                 (
                     "_completeDocumentLifecycle",
                     &mut captured.complete_document_lifecycle,

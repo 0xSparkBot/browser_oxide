@@ -4,7 +4,10 @@ use crate::iframe;
 use crate::js_runtime::{runtime::BrowserRuntimeOptions, BrowserJsRuntime};
 use crate::script_runner;
 use crate::stylesheet_collector;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+type DocumentScriptFetchResult = Option<(String, crate::net::TimingStats, Instant)>;
+type DocumentScriptFetchHandle = tokio::task::JoinHandle<DocumentScriptFetchResult>;
 
 /// Whether a URL is a "secure context" per WICG/secure-contexts §3.2.
 /// Secure: https, wss, file, plus http://localhost / http://127.0.0.1 /
@@ -895,84 +898,66 @@ impl Page {
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
         crate::js_runtime::extensions::fetch_ext::set_fetch_client(client.clone());
 
-        // Execute scripts in document order. Document module scripts are
-        // independent ES-module entry points (not classic scripts, and not a
-        // single runtime "main" module); route them through the same side-
-        // module path as real navigation.
-        for (i, script) in scripts.iter().enumerate() {
-            if let Some(n) = &script.src {
-                if let Some(full_url) = Self::resolve_url(url, n) {
-                    // CSP gate — same enforcement point as the parallel
-                    // pre-fetch path in `build_page_with_scripts_init_and_storage`.
-                    if let Ok(parsed_url) = url::Url::parse(&full_url) {
-                        if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_csp(
-                            crate::net::csp::Directive::ScriptSrcElem,
-                            &parsed_url,
-                            script.nonce.as_deref(),
-                            true,
-                        ) {
-                            eprintln!(
-                                "[csp] Refused to load the script '{}' because it violates the following Content Security Policy directive: \"{}\".",
-                                full_url, violated
-                            );
-                            continue;
-                        }
-                    }
-                    match client.get_follow(&full_url, 10).await {
-                        Ok(resp) => {
-                            let code = resp.text();
-                            event_loop.note_executed_script(&full_url, &code);
-                            if script.is_module {
-                                if let Err(e) = event_loop.eval_module_code(&full_url, code).await {
-                                    tracing::warn!(script_src = %n, error = %e, "Module script error in external script");
-                                }
-                            } else {
-                                // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                                event_loop.set_current_script(Some(script.node_id));
-                                if let Err(e) =
-                                    event_loop.execute_script_with_name(&code, &full_url)
-                                {
-                                    tracing::warn!(script_src = %n, error = %e, "Script error in external script");
-                                }
-                                event_loop.set_current_script(None);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(script_src = %n, error = %e, "Failed to fetch script")
-                        }
-                    }
-                }
-            } else if !script.code.is_empty() {
-                event_loop.note_executed_script(url, &script.code);
-                if script.is_module {
-                    let spec = format!("{url}#oxide-mod-{i}");
-                    if let Err(e) = event_loop
-                        .eval_module_code(&spec, script.code.clone())
-                        .await
-                    {
-                        tracing::warn!(script_index = i, error = %e, "Module script error in inline script");
-                    }
-                } else {
-                    // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                    event_loop.set_current_script(Some(script.node_id));
-                    if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
-                        tracing::warn!(script_index = i, error = %e, "Script error in inline script");
-                    }
-                    event_loop.set_current_script(None);
+        let mut script_fetches: std::collections::HashMap<usize, DocumentScriptFetchHandle> =
+            std::collections::HashMap::new();
+        for (index, script) in scripts.iter().enumerate() {
+            let Some(src) = script.src.as_ref() else {
+                continue;
+            };
+            let Some(full_url) = Self::resolve_url(url, src) else {
+                continue;
+            };
+            if let Ok(parsed_url) = url::Url::parse(&full_url) {
+                if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_csp(
+                    crate::net::csp::Directive::ScriptSrcElem,
+                    &parsed_url,
+                    script.nonce.as_deref(),
+                    true,
+                ) {
+                    eprintln!(
+                        "[csp] Refused to load the script '{}' because it violates the following Content Security Policy directive: \"{}\".",
+                        full_url, violated
+                    );
+                    continue;
                 }
             }
+            let fetch_client = client.clone();
+            let handle = tokio::spawn(async move {
+                match fetch_client.get_follow(&full_url, 10).await {
+                    Ok(response) => {
+                        Some((response.text(), response.timings.clone(), Instant::now()))
+                    }
+                    Err(error) => {
+                        tracing::warn!(script_src = %full_url, error = %error, "failed to fetch script");
+                        None
+                    }
+                }
+            });
+            script_fetches.insert(index, handle);
         }
 
-        // Set document.readyState = loading
-        // Non-enumerable own property so it doesn't leak into
-        // Object.keys(window) — defined here so subsequent
-        // `globalThis.__browser_oxide.__documentReadyState = ...` assignments preserve
-        // enumerable=false (writable=true, descriptor inherited).
+        // The document is `loading` while parser-blocking classic scripts run.
+        // The shared scheduler advances it to `interactive`, executes deferred
+        // and module scripts, dispatches DOMContentLoaded, then waits only the
+        // remaining async scripts before `load`.
         event_loop
             .execute_script("globalThis._browser_oxide.__documentReadyState = 'loading';")
             .ok();
-
-        event_loop.complete_document_lifecycle();
+        let pending_async = Self::execute_document_script_parse_and_deferred(
+            &mut event_loop,
+            &scripts,
+            url,
+            &mut script_fetches,
+        )
+        .await;
+        Self::finish_document_script_schedule(
+            &mut event_loop,
+            &scripts,
+            url,
+            &mut script_fetches,
+            pending_async,
+        )
+        .await;
         // Top realm initial load settled: release deferred frame-message
         // delivery gated in `__pumpFrameMessages`.
         event_loop
@@ -2565,85 +2550,91 @@ impl Page {
                 }
             })
             .collect();
-        let script_futures: Vec<_> = scripts_meta
-            .iter()
-            .enumerate()
-            .filter_map(|(i, script)| {
-                let src = script.src.as_ref()?;
-                let full_url = Self::resolve_url(&resp_url, src)?;
+        let mut script_fetches: std::collections::HashMap<usize, DocumentScriptFetchHandle> =
+            std::collections::HashMap::new();
+        for (i, script) in scripts_meta.iter().enumerate() {
+            let Some(src) = script.src.as_ref() else {
+                continue;
+            };
+            let Some(full_url) = Self::resolve_url(&resp_url, src) else {
+                continue;
+            };
+            let dbg = std::env::var("BROWSER_OXIDE_DEBUG_NAV").is_ok();
+            if let Ok(parsed_url) = url::Url::parse(&full_url) {
+                if crate::js_runtime::extensions::fetch_ext::check_csp(
+                    crate::net::csp::Directive::ScriptSrcElem,
+                    &parsed_url,
+                    script.nonce.as_deref(),
+                    true,
+                )
+                .is_err()
+                {
+                    if dbg {
+                        eprintln!("[navigate] script[{i}] CSP-SKIP {full_url}");
+                    }
+                    continue;
+                }
+            }
+            if dbg {
+                eprintln!("[navigate] script[{i}] PREFETCH {full_url}");
+            }
+            let client = client.clone();
+            let profile = profile.clone();
+            let referer = resp_url.clone();
+            let handle = tokio::spawn(async move {
+                // Script fetches inherit the parent doc's
+                // regional accept-language (real Chrome sends one
+                // accept-language per session, not per-URL — keyed off
+                // the doc URL keeps sub-resource requests consistent).
+                let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, &referer, false);
+                hdrs.push(("referer".to_string(), referer));
+                hdrs.push(("accept".to_string(), "*/*".to_string()));
+                hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
+                hdrs.push(("sec-fetch-mode".to_string(), "no-cors".to_string()));
+                hdrs.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
                 let dbg = std::env::var("BROWSER_OXIDE_DEBUG_NAV").is_ok();
-                if let Ok(parsed_url) = url::Url::parse(&full_url) {
-                    if crate::js_runtime::extensions::fetch_ext::check_csp(
-                        crate::net::csp::Directive::ScriptSrcElem,
-                        &parsed_url,
-                        script.nonce.as_deref(),
-                        true,
-                    )
-                    .is_err()
-                    {
+                match client.get_follow_with_headers(&full_url, &hdrs, 5).await {
+                    Ok(r) if r.ok() => {
+                        let text = r.text();
+                        if text.trim_start().starts_with("<!")
+                            || text.trim_start().starts_with("<html")
+                        {
+                            if dbg {
+                                eprintln!("[navigate] script[{i}] FETCHED-BUT-HTML-FILTERED {} ({} bytes)", full_url, text.len());
+                            }
+                            None
+                        } else {
+                            if dbg {
+                                eprintln!(
+                                    "[navigate] script[{i}] FETCHED-OK {} ({} bytes)",
+                                    full_url,
+                                    text.len()
+                                );
+                            }
+                            Some((text, r.timings.clone(), Instant::now()))
+                        }
+                    }
+                    Ok(r) => {
                         if dbg {
-                            eprintln!("[navigate] script[{i}] CSP-SKIP {full_url}");
+                            eprintln!(
+                                "[navigate] script[{i}] FETCH-NOT-OK status={} {}",
+                                r.status, full_url
+                            );
                         }
-                        return None;
+                        None
+                    }
+                    Err(e) => {
+                        if dbg {
+                            eprintln!("[navigate] script[{i}] FETCH-ERR {e} {full_url}");
+                        }
+                        None
                     }
                 }
-                if dbg {
-                    eprintln!("[navigate] script[{i}] PREFETCH {full_url}");
-                }
-                let client = client.clone();
-                let profile = profile.clone();
-                let referer = resp_url.clone();
-                Some(async move {
-                    // Script fetches inherit the parent doc's
-                    // regional accept-language (real Chrome sends one
-                    // accept-language per session, not per-URL — keyed off
-                    // the doc URL keeps sub-resource requests consistent).
-                    let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, &referer, false);
-                    hdrs.push(("referer".to_string(), referer));
-                    hdrs.push(("accept".to_string(), "*/*".to_string()));
-                    hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
-                    hdrs.push(("sec-fetch-mode".to_string(), "no-cors".to_string()));
-                    hdrs.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
-                    let dbg = std::env::var("BROWSER_OXIDE_DEBUG_NAV").is_ok();
-                    match client.get_follow_with_headers(&full_url, &hdrs, 5).await {
-                        Ok(r) if r.ok() => {
-                            let text = r.text();
-                            if text.trim_start().starts_with("<!")
-                                || text.trim_start().starts_with("<html")
-                            {
-                                if dbg {
-                                    eprintln!("[navigate] script[{i}] FETCHED-BUT-HTML-FILTERED {} ({} bytes)", full_url, text.len());
-                                }
-                                None
-                            } else {
-                                if dbg {
-                                    eprintln!("[navigate] script[{i}] FETCHED-OK {} ({} bytes)", full_url, text.len());
-                                }
-                                Some((i, text, r.timings.clone()))
-                            }
-                        }
-                        Ok(r) => {
-                            if dbg {
-                                eprintln!("[navigate] script[{i}] FETCH-NOT-OK status={} {}", r.status, full_url);
-                            }
-                            None
-                        }
-                        Err(e) => {
-                            if dbg {
-                                eprintln!("[navigate] script[{i}] FETCH-ERR {e} {full_url}");
-                            }
-                            None
-                        }
-                    }
-                })
-            })
-            .collect();
-        let (fetched_css, fetched_scripts) = futures_util::future::join(
-            futures_util::future::join_all(css_futures),
-            futures_util::future::join_all(script_futures),
-        )
-        .await;
-        wmark!("subresources fetched");
+            });
+            script_fetches.insert(i, handle);
+        }
+        let fetched_css = futures_util::future::join_all(css_futures).await;
+        wmark!("stylesheets fetched (script fetches remain in flight)");
 
         let mut all_timings = vec![timings];
         let mut stylesheets = inline_css;
@@ -2651,13 +2642,6 @@ impl Page {
             stylesheets.push(r.0);
             all_timings.push(r.1);
         }
-        let mut prefetched: std::collections::HashMap<usize, String> =
-            std::collections::HashMap::new();
-        for r in fetched_scripts.into_iter().flatten() {
-            prefetched.insert(r.0, r.1);
-            all_timings.push(r.2);
-        }
-
         // Cancel all in-flight timers from the previous page and clear
         // cross-nav JS buffers BEFORE swapping the DOM, so any straggler
         // callbacks that try to fire don't see a half-installed state.
@@ -2718,76 +2702,14 @@ impl Page {
             }
         }
 
-        // Run inline + external scripts in document order, draining
-        // between each so microtasks land before the next script reads
-        // them. Mirrors the cold path's script loop.
-        for (i, script) in scripts_meta.iter().enumerate() {
-            let code = if script.src.is_some() {
-                match prefetched.get(&i) {
-                    Some(c) => c.clone(),
-                    None => continue,
-                }
-            } else {
-                script.code.clone()
-            };
-            if code.trim().is_empty() {
-                continue;
-            }
-            let name = script.src.clone().unwrap_or_else(|| resp_url.clone());
-            self.event_loop.note_executed_script(&name, &code);
-            if script.is_module {
-                // Mirror the cold path (navigate_loop_internal): route
-                // `<script type="module">` through the ES-module loader instead
-                // of classic `execute_script`, which throws `SyntaxError: Cannot
-                // use import statement outside a module` and drops the whole
-                // bundle. Without this the warm/PagePool path serves only the
-                // server shell for every modern Vite/React/Vue SPA — reddit's
-                // 16 module scripts rendered 8 KB warm vs 676 KB cold (the
-                // dominant warm-pool thin-render artifact; the gate runs pooled).
-                // Bounded at 10s/module so a stalled import graph can't hang the
-                // nav; on timeout we log and continue with what rendered.
-                let eval_fut = async {
-                    if let Some(src) = &script.src {
-                        let module_url = url::Url::parse(&resp_url)
-                            .ok()
-                            .and_then(|base| base.join(src).ok())
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|| src.clone());
-                        self.event_loop
-                            .eval_module_code(&module_url, code.clone())
-                            .await
-                    } else {
-                        let spec = format!("{resp_url}#oxide-mod-{i}");
-                        self.event_loop.eval_module_code(&spec, code.clone()).await
-                    }
-                };
-                match tokio::time::timeout(Duration::from_secs(10), eval_fut).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        // Surface the same diagnostics a real browser prints to
-                        // its Console for a failed module eval; without this the
-                        // error is invisible whenever no `tracing` subscriber is
-                        // installed (default for the example binaries).
-                        eprintln!("[module] {name}: {e}");
-                        tracing::warn!(script = %name, error = %e, "warm ES module eval error")
-                    }
-                    Err(_) => {
-                        tracing::warn!(script = %name, "warm ES module eval timed out (10s) — continuing")
-                    }
-                }
-            } else {
-                self.event_loop.note_executed_script(&name, &code);
-                self.event_loop.set_current_script(Some(script.node_id));
-                if let Err(e) = self.event_loop.execute_script_with_name(&code, &name) {
-                    tracing::warn!(script = %name, error = %e, "warm script error");
-                }
-                self.event_loop.set_current_script(None);
-            }
-            // Flush this script's microtasks before the next runs (browser script
-            // ordering); its async ops advance in the final drain.
-            self.event_loop.drain_microtasks();
-        }
-        wmark!("scripts executed");
+        let pending_async = Self::execute_document_script_parse_and_deferred(
+            &mut self.event_loop,
+            &scripts_meta,
+            &resp_url,
+            &mut script_fetches,
+        )
+        .await;
+        wmark!("document parser + deferred script schedule");
 
         // Re-install `humanize.js` on the fresh DOM. The previous page's
         // humanize closure captured the old `document.body`; its setInterval
@@ -2796,7 +2718,15 @@ impl Page {
             .event_loop
             .execute_script(include_str!("js/humanize.js"));
 
-        self.event_loop.complete_document_lifecycle();
+        Self::finish_document_script_schedule(
+            &mut self.event_loop,
+            &scripts_meta,
+            &resp_url,
+            &mut script_fetches,
+            pending_async,
+        )
+        .await;
+        wmark!("DOMContentLoaded + async scripts + load");
         // Top realm initial load settled (main navigation path).
         {
             let _ = self
@@ -4248,6 +4178,308 @@ impl Page {
         .await
     }
 
+    async fn take_document_script_fetch(
+        event_loop: &mut BrowserEventLoop,
+        fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
+        index: usize,
+    ) -> Option<(String, Instant)> {
+        let handle = fetches.remove(&index)?;
+        match handle.await {
+            Ok(Some((code, timing, completed_at))) => {
+                event_loop.runtime_mut().record_resource_timing(timing);
+                Some((code, completed_at))
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(script_index = index, error = %error, "script fetch task failed");
+                None
+            }
+        }
+    }
+
+    async fn execute_prepared_document_script(
+        event_loop: &mut BrowserEventLoop,
+        script: &script_runner::ScriptInfo,
+        index: usize,
+        code: String,
+        document_url: &str,
+    ) {
+        if code.trim().is_empty() {
+            return;
+        }
+        let name = script
+            .src
+            .as_deref()
+            .and_then(|src| Self::resolve_url(document_url, src))
+            .unwrap_or_else(|| document_url.to_string());
+        event_loop.note_executed_script(&name, &code);
+
+        if script.is_module {
+            // HTML module scripts never become document.currentScript.  This is
+            // observable both for inline and external module entries.
+            event_loop.set_current_script(None);
+            let specifier = if script.src.is_some() {
+                name.clone()
+            } else {
+                format!("{document_url}#oxide-mod-{index}")
+            };
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                event_loop.eval_module_code(&specifier, code),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(script = %name, error = %error, "ES module eval error");
+                    eprintln!("[module] {name}: {error}");
+                }
+                Err(_) => {
+                    tracing::warn!(script = %name, "ES module eval timed out (10s) — continuing");
+                    eprintln!("[module-timeout] {name}");
+                }
+            }
+        } else {
+            event_loop.set_current_script(Some(script.node_id));
+            if let Err(error) = event_loop.execute_script_with_name(&code, &name) {
+                tracing::warn!(script = %name, error = %error, "script execution error");
+                eprintln!("[script-error] {name}: {error}");
+            }
+            event_loop.set_current_script(None);
+        }
+
+        // Preserve the previous per-script console drain so a large page does
+        // not accumulate bootstrap logs until the end of the document.
+        let logs = {
+            let runtime = event_loop.runtime_mut().inner();
+            let state = runtime.op_state();
+            let mut state = state.borrow_mut();
+            let dom_state = state.borrow_mut::<crate::js_runtime::state::DomState>();
+            std::mem::take(&mut dom_state.console_output)
+        };
+        for log in logs {
+            let prefix = match log.level {
+                crate::js_runtime::state::ConsoleLevel::Log => "[JS LOG]",
+                crate::js_runtime::state::ConsoleLevel::Warn => "[JS WARN]",
+                crate::js_runtime::state::ConsoleLevel::Error => "[JS ERROR]",
+                _ => "[JS INFO]",
+            };
+            tracing::debug!(level = prefix, message = %log.args.join(" "), "JS console output");
+        }
+        event_loop.drain_microtasks();
+    }
+
+    async fn drain_ready_async_document_scripts(
+        event_loop: &mut BrowserEventLoop,
+        scripts: &[script_runner::ScriptInfo],
+        document_url: &str,
+        fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
+        pending_async: &mut Vec<usize>,
+    ) {
+        let mut ready = Vec::new();
+        let mut keep = Vec::new();
+        for index in pending_async.drain(..) {
+            let script = &scripts[index];
+            if script.src.is_none() {
+                ready.push((index, script.code.clone(), Instant::now()));
+            } else if fetches
+                .get(&index)
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                if let Some((code, completed_at)) =
+                    Self::take_document_script_fetch(event_loop, fetches, index).await
+                {
+                    ready.push((index, code, completed_at));
+                }
+            } else {
+                keep.push(index);
+            }
+        }
+        *pending_async = keep;
+        ready.sort_by_key(|(_, _, completed_at)| *completed_at);
+        for (index, code, _) in ready {
+            Self::execute_prepared_document_script(
+                event_loop,
+                &scripts[index],
+                index,
+                code,
+                document_url,
+            )
+            .await;
+        }
+    }
+
+    async fn finish_async_document_scripts(
+        event_loop: &mut BrowserEventLoop,
+        scripts: &[script_runner::ScriptInfo],
+        document_url: &str,
+        fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
+        pending_async: &mut Vec<usize>,
+    ) {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        // Inline async modules are already executable at discovery time, but
+        // keep this fallback for completeness.
+        let mut inline = Vec::new();
+        let mut external = FuturesUnordered::new();
+        for index in pending_async.drain(..) {
+            if scripts[index].src.is_none() {
+                inline.push(index);
+            } else if let Some(handle) = fetches.remove(&index) {
+                external.push(async move { (index, handle.await) });
+            }
+        }
+        for index in inline {
+            Self::execute_prepared_document_script(
+                event_loop,
+                &scripts[index],
+                index,
+                scripts[index].code.clone(),
+                document_url,
+            )
+            .await;
+        }
+        while let Some((index, result)) = external.next().await {
+            match result {
+                Ok(Some((code, timing, _))) => {
+                    event_loop.runtime_mut().record_resource_timing(timing);
+                    Self::execute_prepared_document_script(
+                        event_loop,
+                        &scripts[index],
+                        index,
+                        code,
+                        document_url,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(script_index = index, error = %error, "async script fetch task failed");
+                }
+            }
+        }
+    }
+
+    async fn execute_document_script_parse_and_deferred(
+        event_loop: &mut BrowserEventLoop,
+        scripts: &[script_runner::ScriptInfo],
+        document_url: &str,
+        fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
+    ) -> Vec<usize> {
+        use script_runner::ScriptScheduling;
+
+        let mut deferred = Vec::new();
+        let mut pending_async = Vec::new();
+
+        // Simulated parser pass. External fetches are already in flight, but an
+        // async script is not eligible to execute until its tag is discovered.
+        for (index, script) in scripts.iter().enumerate() {
+            match script.scheduling() {
+                ScriptScheduling::ParserBlocking => {
+                    let code = if script.src.is_some() {
+                        Self::take_document_script_fetch(event_loop, fetches, index)
+                            .await
+                            .map(|(code, _)| code)
+                    } else {
+                        Some(script.code.clone())
+                    };
+                    if let Some(code) = code {
+                        Self::execute_prepared_document_script(
+                            event_loop,
+                            script,
+                            index,
+                            code,
+                            document_url,
+                        )
+                        .await;
+                    }
+                }
+                ScriptScheduling::Deferred => deferred.push(index),
+                ScriptScheduling::Async => pending_async.push(index),
+            }
+            Self::drain_ready_async_document_scripts(
+                event_loop,
+                scripts,
+                document_url,
+                fetches,
+                &mut pending_async,
+            )
+            .await;
+        }
+
+        event_loop.mark_document_interactive();
+
+        // Defer-classic and non-async module scripts run after parsing, in
+        // document order. Ready async scripts may interleave between them.
+        for index in deferred {
+            Self::drain_ready_async_document_scripts(
+                event_loop,
+                scripts,
+                document_url,
+                fetches,
+                &mut pending_async,
+            )
+            .await;
+            let script = &scripts[index];
+            let code = if script.src.is_some() {
+                Self::take_document_script_fetch(event_loop, fetches, index)
+                    .await
+                    .map(|(code, _)| code)
+            } else {
+                Some(script.code.clone())
+            };
+            if let Some(code) = code {
+                Self::execute_prepared_document_script(
+                    event_loop,
+                    script,
+                    index,
+                    code,
+                    document_url,
+                )
+                .await;
+            }
+            Self::drain_ready_async_document_scripts(
+                event_loop,
+                scripts,
+                document_url,
+                fetches,
+                &mut pending_async,
+            )
+            .await;
+        }
+
+        pending_async
+    }
+
+    async fn finish_document_script_schedule(
+        event_loop: &mut BrowserEventLoop,
+        scripts: &[script_runner::ScriptInfo],
+        document_url: &str,
+        fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
+        mut pending_async: Vec<usize>,
+    ) {
+        // Any async entry whose resource became ready while the caller did its
+        // post-script internal cleanup still runs before DOMContentLoaded.
+        Self::drain_ready_async_document_scripts(
+            event_loop,
+            scripts,
+            document_url,
+            fetches,
+            &mut pending_async,
+        )
+        .await;
+        event_loop.dispatch_dom_content_loaded();
+        Self::finish_async_document_scripts(
+            event_loop,
+            scripts,
+            document_url,
+            fetches,
+            &mut pending_async,
+        )
+        .await;
+        event_loop.dispatch_load();
+    }
+
     async fn build_page_with_scripts_init_and_storage(
         html: &str,
         url: &str,
@@ -4306,127 +4538,83 @@ impl Page {
             })
             .collect();
 
-        // Pre-fetch ALL external scripts in parallel (execute later in document order)
-        let script_futures: Vec<_> = scripts
-            .iter()
-            .enumerate()
-            .filter_map(|(i, script)| {
-                let src = script.src.as_ref()?;
-                let full_url = Self::resolve_url(url, src)?;
-                // CSP `script-src-elem` enforcement. Parser-inserted scripts
-                // (everything `find_scripts` produces from the initial HTML
-                // parse) need a matching nonce to load under
-                // `'strict-dynamic'`. Without this gate, browser_oxide
-                // would fetch a `/akam/13/<hash>` bootstrap that real
-                // Chrome blocks under CSP — a fidelity divergence.
-                if let Ok(parsed_url) = url::Url::parse(&full_url) {
-                    if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_csp(
-                        crate::net::csp::Directive::ScriptSrcElem,
-                        &parsed_url,
-                        script.nonce.as_deref(),
-                        true, // parser_inserted: came from HTML parse
-                    ) {
-                        eprintln!(
+        // Start all external script fetches immediately, but keep each fetch as
+        // an independent task. Parser-blocking scripts await their own handle;
+        // defer/module entries wait for the parser-complete phase; async entries
+        // can execute as soon as their handle becomes ready. A single join_all
+        // here would erase that readiness information and force every async
+        // script to behave like a parser-blocking script.
+        let mut script_fetches: std::collections::HashMap<usize, DocumentScriptFetchHandle> =
+            std::collections::HashMap::new();
+        for (i, script) in scripts.iter().enumerate() {
+            let Some(src) = script.src.as_ref() else {
+                continue;
+            };
+            let Some(full_url) = Self::resolve_url(url, src) else {
+                continue;
+            };
+            // CSP `script-src-elem` enforcement. Parser-inserted scripts
+            // (everything `find_scripts` produces from the initial HTML
+            // parse) need a matching nonce to load under
+            // `'strict-dynamic'`. Without this gate, browser_oxide
+            // would fetch a `/akam/13/<hash>` bootstrap that real
+            // Chrome blocks under CSP — a fidelity divergence.
+            if let Ok(parsed_url) = url::Url::parse(&full_url) {
+                if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_csp(
+                    crate::net::csp::Directive::ScriptSrcElem,
+                    &parsed_url,
+                    script.nonce.as_deref(),
+                    true, // parser_inserted: came from HTML parse
+                ) {
+                    eprintln!(
                             "[csp] Refused to load the script '{}' because it violates the following Content Security Policy directive: \"{}\".",
                             full_url, violated
                         );
-                        return None;
+                    continue;
+                }
+            }
+            let client = client.clone();
+            let profile = profile.clone();
+            let referer = url.to_string();
+            let handle = tokio::spawn(async move {
+                // Script fetches inherit parent doc's
+                // regional accept-language (see lib.rs::get_with_headers).
+                let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, &referer, false);
+                hdrs.push(("referer".to_string(), referer));
+                hdrs.push(("accept".to_string(), "*/*".to_string()));
+                hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
+                hdrs.push(("sec-fetch-mode".to_string(), "no-cors".to_string()));
+                hdrs.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
+
+                match client.get_follow_with_headers(&full_url, &hdrs, 5).await {
+                    Ok(resp) if resp.ok() => {
+                        let text = resp.text();
+                        if text.trim_start().starts_with("<!")
+                            || text.trim_start().starts_with("<html")
+                        {
+                            tracing::debug!(script_index = i, url = %full_url, "Script fetch returned HTML, skipping");
+                            None
+                        } else {
+                            Some((text, resp.timings.clone(), Instant::now()))
+                        }
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(script_index = i, url = %full_url, status = resp.status, "Script fetch returned non-OK status");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(script_index = i, url = %full_url, error = ?e, "Script fetch failed");
+                        None
                     }
                 }
-                let client = client.clone();
-                let profile = profile.clone();
-                Some(async move {
-                    // Script fetches inherit parent doc's
-                    // regional accept-language (see lib.rs::get_with_headers).
-                    let mut hdrs = crate::net::headers::nav_headers_for_url(&profile, url, false);
-                    hdrs.push(("referer".to_string(), url.to_string()));
-                    hdrs.push(("accept".to_string(), "*/*".to_string()));
-                    hdrs.push(("sec-fetch-dest".to_string(), "script".to_string()));
-                    hdrs.push(("sec-fetch-mode".to_string(), "no-cors".to_string()));
-                    hdrs.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
+            });
+            script_fetches.insert(i, handle);
+        }
 
-                    // Instrumentation: trace the i.js
-                    // external-script fetch to get hard evidence of
-                    // whether the bundle even loads + its size. Env-gated,
-                    // default off ⇒ zero behavioral/perf/log change.
-                    let dd_trace = full_url.contains("captcha-delivery.com")
-                        && std::env::var("BROWSER_OXIDE_CHALLENGE_TRACE").is_ok();
-                    // Trace EVERY external-script fetch when
-                    // BROWSER_OXIDE_SECCPT_TRACE is set, so we can see whether
-                    // the obfuscated `/Wjv3…` sec-cpt bundle is actually
-                    // fetched + its size/status. Env-gated, default off ⇒
-                    // zero impact.
-                    let sc_trace = std::env::var("BROWSER_OXIDE_SECCPT_TRACE").is_ok();
-                    match client.get_follow_with_headers(&full_url, &hdrs, 5).await {
-                        Ok(resp) if resp.ok() => {
-                            let text = resp.text();
-                            if dd_trace {
-                                eprintln!(
-                                    "[challenge-trace] i.js fetch OK {} status={} bytes={}",
-                                    full_url,
-                                    resp.status,
-                                    text.len()
-                                );
-                            }
-                            if sc_trace {
-                                eprintln!(
-                                    "[seccpt-trace] script fetch OK {} status={} bytes={}",
-                                    full_url,
-                                    resp.status,
-                                    text.len()
-                                );
-                            }
-                            if full_url.contains("qauth") || full_url.contains("ips.js") || full_url.contains("antibot") {
-                                let safe_name = full_url.replace("/", "_").replace(":", "_").replace("?", "_");
-                                let _ = std::fs::write(format!("oxide_dump/{}", safe_name), &text);
-                            }
-                            if text.trim_start().starts_with("<!")
-                                || text.trim_start().starts_with("<html")
-                            {
-                                tracing::debug!(script_index = i, url = %full_url, "Script fetch returned HTML, skipping");
-                                None
-                            } else {
-                                Some((i, text, resp.timings.clone()))
-                            }
-                        }
-                        Ok(resp) => {
-                            if dd_trace {
-                                eprintln!(
-                                    "[challenge-trace] i.js fetch NON-OK {} status={}",
-                                    full_url, resp.status
-                                );
-                            }
-                            if sc_trace {
-                                eprintln!(
-                                    "[seccpt-trace] script fetch NON-OK {} status={}",
-                                    full_url, resp.status
-                                );
-                            }
-                            tracing::warn!(script_index = i, url = %full_url, status = resp.status, "Script fetch returned non-OK status");
-                            None
-                        }
-                        Err(e) => {
-                            if dd_trace {
-                                eprintln!(
-                                    "[challenge-trace] i.js fetch ERR {} err={:?}",
-                                    full_url, e
-                                );
-                            }
-                            tracing::warn!(script_index = i, url = %full_url, error = ?e, "Script fetch failed");
-                            None
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        // Await all fetches in parallel
-        let (fetched_css_results, fetched_scripts_results) = futures_util::future::join(
-            futures_util::future::join_all(css_futures),
-            futures_util::future::join_all(script_futures),
-        )
-        .await;
-        mark!("subresource fetch join (css + scripts)");
+        // Stylesheets are render-blocking for the initial document. Script
+        // tasks continue running while CSS resolves and while V8 boots.
+        let fetched_css_results = futures_util::future::join_all(css_futures).await;
+        mark!("stylesheet fetch join (script fetches remain in flight)");
 
         let mut all_timings = Vec::new();
 
@@ -4434,13 +4622,6 @@ impl Page {
         let mut stylesheets = inline_css;
         for (css, timings) in fetched_css_results.into_iter().flatten() {
             stylesheets.push(css);
-            all_timings.push(timings);
-        }
-
-        // Build pre-fetched script map
-        let mut prefetched = std::collections::HashMap::new();
-        for (i, text, timings) in fetched_scripts_results.into_iter().flatten() {
-            prefetched.insert(i, text);
             all_timings.push(timings);
         }
 
@@ -4746,133 +4927,14 @@ impl Page {
             );
         }
 
-        // Execute scripts in document order using pre-fetched code.
-        // Interleave with event loop ticks to allow for microtasks and
-        // macrotasks scheduled by one script to run before the next.
-        for (i, script) in scripts.iter().enumerate() {
-            let code = if script.src.is_some() {
-                match prefetched.get(&i) {
-                    Some(code) => code.clone(),
-                    None => {
-                        tracing::warn!(
-                            script_index = i,
-                            "Script not prefetched (fetch failed), skipping"
-                        );
-                        let src = script.src.clone().unwrap_or_default();
-                        eprintln!("[script-miss] #{i} {src}");
-                        continue;
-                    }
-                }
-            } else {
-                script.code.clone()
-            };
-
-            if code.trim().is_empty() {
-                continue;
-            }
-
-            let name = if let Some(src) = &script.src {
-                src.clone()
-            } else {
-                // Real Chrome inline <script> stack frames report the
-                // document URL, not a synthetic <script_N> tag. The
-                // latter would leak the index/wrapper layer to a
-                // challenge vendor's sensor.
-                url.to_string()
-            };
-
-            if script.is_module {
-                // P2 — `<script type="module">`: execute via the ES-module
-                // loader (resolves + fetches the import graph) instead of
-                // classic `v8::Script::compile`, which throws
-                // `SyntaxError: Cannot use import statement outside a module`
-                // and drops modern Vite/React/Vue bundles (the thin-render gap).
-                // BOUND the module eval: a module whose import graph stalls (a
-                // dep that never resolves) or whose top-level work never idles
-                // must NOT hang the whole navigation. 10s/module is generous;
-                // on timeout we log and continue so the page renders what it has.
-                // Modules see `document.currentScript == null` per spec, but
-                // the *initial* evaluation of a module script exposes the
-                // element (HTML#the-strongcurrentscript-strong-says-so is the
-                // de-facto Chrome behavior for the top-level module run, and
-                // Next's getAssetPrefix() relies on it during app bootstrap —
-                // a null here throws InvariantError and kills hydration).
-                event_loop.set_current_script(Some(script.node_id));
-                let eval_fut = async {
-                    if let Some(src) = &script.src {
-                        // External module: resolve src to an absolute specifier;
-                        // reuse the prefetched entry, loader fetches the imports.
-                        let module_url = url::Url::parse(url)
-                            .ok()
-                            .and_then(|base| base.join(src).ok())
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|| src.clone());
-                        event_loop.eval_module_code(&module_url, code.clone()).await
-                    } else {
-                        // Inline module: unique specifier whose path is the doc
-                        // URL so its relative imports resolve against the document.
-                        let spec = format!("{url}#oxide-mod-{i}");
-                        event_loop.eval_module_code(&spec, code.clone()).await
-                    }
-                };
-                let eval_res = match tokio::time::timeout(Duration::from_secs(10), eval_fut).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => {
-                        tracing::warn!(script = %name, error = %e, "ES module eval error");
-                        eprintln!("[module] {name}: {e}");
-                        Err(())
-                    }
-                    Err(_) => {
-                        tracing::warn!(script = %name, "ES module eval timed out (10s) — continuing");
-                        eprintln!("[module-timeout] {name}");
-                        Err(())
-                    }
-                };
-                event_loop.set_current_script(None);
-                let _ = eval_res;
-            } else {
-                // Classic script. Set document.currentScript to THIS <script>
-                // element's wrapper for the duration of execution (the web-API
-                // contract: currentScript is the running classic script, null
-                // for modules and outside execution). Scripts that locate their
-                // own <script> via document.currentScript (to read a data-*
-                // attribute or resolve a relative path) get null otherwise and
-                // silently stall. The _wrapNode/_setCurrentScript hooks already
-                // exist + are exported; this is the missing call site.
-                event_loop.set_current_script(Some(script.node_id));
-                if let Err(e) = event_loop.execute_script_with_name(&code, &name) {
-                    tracing::warn!(script = %name, error = %e, "Script execution error");
-                    eprintln!("[script-error] {name}: {e}");
-                }
-                event_loop.set_current_script(None);
-            }
-
-            // Flush logs for this script
-            {
-                let _ = &script.src;
-                let logs = {
-                    let runtime = event_loop.runtime_mut().inner();
-                    let state = runtime.op_state();
-                    let mut state = state.borrow_mut();
-                    let dom_state = state.borrow_mut::<crate::js_runtime::state::DomState>();
-                    std::mem::take(&mut dom_state.console_output)
-                };
-                for log in logs {
-                    let prefix = match log.level {
-                        crate::js_runtime::state::ConsoleLevel::Log => "[JS LOG]",
-                        crate::js_runtime::state::ConsoleLevel::Warn => "[JS WARN]",
-                        crate::js_runtime::state::ConsoleLevel::Error => "[JS ERROR]",
-                        _ => "[JS INFO]",
-                    };
-                    tracing::debug!(level = prefix, message = %log.args.join(" "), "JS console output");
-                }
-            }
-
-            // Flush this script's microtasks before the next runs (browser script
-            // ordering); its async ops advance in the final drain.
-            event_loop.drain_microtasks();
-        }
-        mark!("inline scripts + interleaved drains");
+        let pending_async = Self::execute_document_script_parse_and_deferred(
+            &mut event_loop,
+            &scripts,
+            url,
+            &mut script_fetches,
+        )
+        .await;
+        mark!("document parser + deferred script schedule");
 
         // Final cleanup — hides Deno and internal globals from user JS.
         event_loop
@@ -4880,13 +4942,21 @@ impl Page {
             .ok();
         mark!("cleanup_bootstrap.js");
 
-        event_loop.complete_document_lifecycle();
+        Self::finish_document_script_schedule(
+            &mut event_loop,
+            &scripts,
+            url,
+            &mut script_fetches,
+            pending_async,
+        )
+        .await;
+
         // Top realm initial load settled (page-builder path): release the
         // deferred frame-message delivery gate in `__pumpFrameMessages`.
         event_loop
             .execute_script("try{globalThis.__oxFrameReady=1}catch(_){}")
             .ok();
-        mark!("DOMContentLoaded/load dispatch");
+        mark!("DOMContentLoaded + async scripts + load");
 
         // Scan for <meta http-equiv="refresh" content="N;url=..."> and
         // schedule a pending navigation. Generic navigation primitive —

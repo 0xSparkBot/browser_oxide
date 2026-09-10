@@ -49,6 +49,9 @@ pub struct BrowserJsRuntime {
     /// Privileged bootstrap closures retained after cleanup removes the
     /// temporary page-visible bridge.
     set_current_script_fn: Option<v8::Global<v8::Function>>,
+    mark_document_interactive_fn: Option<v8::Global<v8::Function>>,
+    dispatch_dom_content_loaded_fn: Option<v8::Global<v8::Function>>,
+    dispatch_load_fn: Option<v8::Global<v8::Function>>,
     complete_lifecycle_fn: Option<v8::Global<v8::Function>>,
     worker_messages_pump_fn: Option<v8::Global<v8::Function>>,
     message_ports_pump_fn: Option<v8::Global<v8::Function>>,
@@ -148,6 +151,9 @@ impl BrowserJsRuntime {
             worker_owner_wake,
             frame_deliver_fn: None,
             set_current_script_fn: internal_fns.set_current_script,
+            mark_document_interactive_fn: internal_fns.mark_document_interactive,
+            dispatch_dom_content_loaded_fn: internal_fns.dispatch_dom_content_loaded,
+            dispatch_load_fn: internal_fns.dispatch_load,
             complete_lifecycle_fn: internal_fns.complete_document_lifecycle,
             worker_messages_pump_fn: internal_fns.pump_worker_messages,
             message_ports_pump_fn: internal_fns.pump_message_ports,
@@ -200,6 +206,49 @@ impl BrowserJsRuntime {
     /// Advance the document through the trusted browser lifecycle sequence.
     pub fn complete_document_lifecycle(&mut self) {
         let Some(function) = self.complete_lifecycle_fn.clone() else {
+            return;
+        };
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let function = v8::Local::new(scope, &function);
+        let receiver = v8::undefined(scope).into();
+        let _ = function.call(scope, receiver, &[]);
+    }
+
+    /// Mark the parser-complete boundary: readyState becomes `interactive`
+    /// before deferred and non-async module scripts execute.
+    pub fn mark_document_interactive(&mut self) {
+        let Some(function) = self.mark_document_interactive_fn.clone() else {
+            return;
+        };
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let function = v8::Local::new(scope, &function);
+        let receiver = v8::undefined(scope).into();
+        let _ = function.call(scope, receiver, &[]);
+    }
+
+    /// Dispatch the parser-complete lifecycle boundary without firing `load`.
+    pub fn dispatch_dom_content_loaded(&mut self) {
+        let Some(function) = self.dispatch_dom_content_loaded_fn.clone() else {
+            return;
+        };
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let function = v8::Local::new(scope, &function);
+        let receiver = v8::undefined(scope).into();
+        let _ = function.call(scope, receiver, &[]);
+    }
+
+    /// Dispatch the resource-complete boundary after load-blocking async work.
+    pub fn dispatch_load(&mut self) {
+        let Some(function) = self.dispatch_load_fn.clone() else {
             return;
         };
         let _tokio_guard = tokio_fallback::ensure_tokio_context();

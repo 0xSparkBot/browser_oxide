@@ -17,6 +17,12 @@ pub struct ScriptInfo {
     /// which throws `SyntaxError: Cannot use import statement outside a module`
     /// and silently drops modern Vite/React/Vue bundles. (P2 / thin-render fix.)
     pub is_module: bool,
+    /// HTML `async` attribute. It changes scheduling for external classic
+    /// scripts and module scripts; inline classic scripts still block parsing.
+    pub is_async: bool,
+    /// HTML `defer` attribute. It changes scheduling only for external classic
+    /// scripts. Module scripts are deferred by default.
+    pub is_defer: bool,
     /// Raw `NodeId` of the `<script>` element in the arena DOM. Used to set
     /// `document.currentScript` to this element's wrapper for the duration of
     /// the script's execution (the standard web-API contract). Scripts that
@@ -24,6 +30,38 @@ pub struct ScriptInfo {
     /// to read a `data-*` attribute or resolve a relative path) depend on it;
     /// without it set, `currentScript` is `null` and such scripts stall.
     pub node_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptScheduling {
+    ParserBlocking,
+    Deferred,
+    Async,
+}
+
+impl ScriptInfo {
+    pub fn scheduling(&self) -> ScriptScheduling {
+        if self.is_module {
+            return if self.is_async {
+                ScriptScheduling::Async
+            } else {
+                ScriptScheduling::Deferred
+            };
+        }
+        if self.src.is_some() {
+            if self.is_async {
+                ScriptScheduling::Async
+            } else if self.is_defer {
+                ScriptScheduling::Deferred
+            } else {
+                ScriptScheduling::ParserBlocking
+            }
+        } else {
+            // `async` / `defer` have no scheduling effect on inline classic
+            // scripts.
+            ScriptScheduling::ParserBlocking
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +183,15 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
                         .map(|a| a.value.to_string())
                         .filter(|n| !n.is_empty());
 
+                    let is_async = elem
+                        .attrs
+                        .iter()
+                        .any(|a| a.name.local.eq_ignore_ascii_case("async"));
+                    let is_defer = elem
+                        .attrs
+                        .iter()
+                        .any(|a| a.name.local.eq_ignore_ascii_case("defer"));
+
                     let is_module = script_kind == ScriptKind::Module;
 
                     if src.is_some() {
@@ -154,6 +201,8 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
                             src,
                             nonce,
                             is_module,
+                            is_async,
+                            is_defer,
                             node_id: child_id.to_raw(),
                         });
                     } else {
@@ -165,6 +214,8 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
                                 src: None,
                                 nonce,
                                 is_module,
+                                is_async,
+                                is_defer,
                                 node_id: child_id.to_raw(),
                             });
                         }
@@ -186,7 +237,7 @@ fn decode_html_entities(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_script_type, find_scripts, ScriptKind};
+    use super::{classify_script_type, find_scripts, ScriptInfo, ScriptKind, ScriptScheduling};
 
     #[test]
     fn script_type_classification_matches_browser_execution_rules() {
@@ -242,5 +293,38 @@ mod tests {
         assert!(scripts[1].code.contains("globalThis.b"));
         assert!(scripts[2].is_module);
         assert!(scripts[2].code.contains("globalThis.c"));
+    }
+
+    #[test]
+    fn script_scheduling_matches_parser_inserted_html_rules() {
+        let dom = crate::html_parser::parse_html(
+            r#"<html><body>
+                <script async>inlineClassic()</script>
+                <script defer>inlineClassicDefer()</script>
+                <script src="/blocking.js"></script>
+                <script async src="/async.js"></script>
+                <script defer src="/defer.js"></script>
+                <script type="module">inlineModule()</script>
+                <script type="module" async>inlineAsyncModule()</script>
+                <script type="module" src="/module.js"></script>
+                <script type="module" async src="/async-module.js"></script>
+            </body></html>"#,
+        );
+        let scripts = find_scripts(&dom);
+        let modes: Vec<_> = scripts.iter().map(ScriptInfo::scheduling).collect();
+        assert_eq!(
+            modes,
+            vec![
+                ScriptScheduling::ParserBlocking,
+                ScriptScheduling::ParserBlocking,
+                ScriptScheduling::ParserBlocking,
+                ScriptScheduling::Async,
+                ScriptScheduling::Deferred,
+                ScriptScheduling::Deferred,
+                ScriptScheduling::Async,
+                ScriptScheduling::Deferred,
+                ScriptScheduling::Async,
+            ]
+        );
     }
 }

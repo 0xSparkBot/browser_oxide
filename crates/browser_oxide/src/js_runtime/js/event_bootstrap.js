@@ -1058,19 +1058,8 @@
         }
         if (bo) {
             bo._markTrustedEvent = _markTrusted;
-            bo._completeDocumentLifecycle = function() {
+            const _lifecycleState = function() {
                 const state = globalThis._browser_oxide;
-                const trusted = (type, options) => _markTrusted(new Event(type, options));
-                // Navigation lifecycle timestamps must be measured at the
-                // actual browser-generated transitions.  The old
-                // PerformanceNavigationTiming implementation kept fixed
-                // 320.5/328.7/515.9ms constants even for network-backed
-                // documents, which made every real navigation expose the same
-                // DOMContentLoaded/load fingerprint.  PerfState's clock is
-                // already anchored to the HTTP navigation time origin, so
-                // performance.now() here is the correct navigation-relative
-                // coordinate (including response download, parsing and script
-                // execution that happened before this lifecycle dispatch).
                 const lifecycle = state
                     ? (state.__navigationLifecycleTiming ||
                         (state.__navigationLifecycleTiming = {}))
@@ -1079,16 +1068,31 @@
                     if (!lifecycle) return;
                     try { lifecycle[name] = performance.now(); } catch (_) {}
                 };
+                return { state, stamp };
+            };
+
+            bo._markDocumentInteractive = function() {
+                const { state, stamp } = _lifecycleState();
+                const trusted = (type, options) => _markTrusted(new Event(type, options));
 
                 stamp('domInteractive');
                 if (state) state.__documentReadyState = 'interactive';
                 document.dispatchEvent(trusted('readystatechange'));
+            };
+
+            bo._dispatchDOMContentLoaded = function() {
+                const { stamp } = _lifecycleState();
+                const trusted = (type, options) => _markTrusted(new Event(type, options));
                 // DOM standard: bubbles:true so the event propagates to the
                 // window (window-level DOMContentLoaded listeners).
                 stamp('domContentLoadedEventStart');
                 document.dispatchEvent(trusted('DOMContentLoaded', { bubbles: true }));
                 stamp('domContentLoadedEventEnd');
+            };
 
+            bo._dispatchLoad = function() {
+                const { state, stamp } = _lifecycleState();
+                const trusted = (type, options) => _markTrusted(new Event(type, options));
                 stamp('domComplete');
                 if (state) state.__documentReadyState = 'complete';
                 document.dispatchEvent(trusted('readystatechange'));
@@ -1096,6 +1100,12 @@
                 window.dispatchEvent(trusted('load'));
                 stamp('loadEventEnd');
                 try { globalThis[Symbol.for('__browser_oxide_mark_load__')](); } catch (_) {}
+            };
+
+            bo._completeDocumentLifecycle = function() {
+                bo._markDocumentInteractive();
+                bo._dispatchDOMContentLoaded();
+                bo._dispatchLoad();
             };
         }
     } catch (_) { /* ignore */ }
