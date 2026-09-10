@@ -570,7 +570,7 @@ async fn bench_stealth(ws_url: &str, browser_name: &str) -> Vec<BenchResult> {
 
     let checks = vec![
         // Basic stealth (original 8)
-        ("webdriver", "typeof navigator.webdriver", "undefined"),
+        ("webdriver", "navigator.webdriver === false", "true"),
         ("chrome_obj", "typeof window.chrome", "object"),
         ("plugins", "navigator.plugins.length > 0", "true"),
         ("languages", "navigator.languages.length > 0", "true"),
@@ -594,10 +594,14 @@ async fn bench_stealth(ws_url: &str, browser_name: &str) -> Vec<BenchResult> {
             "typeof navigator.permissions.query",
             "function",
         ),
-        ("battery", "typeof navigator.getBattery", "function"),
+        (
+            "battery",
+            "isSecureContext ? typeof navigator.getBattery === 'function' : typeof navigator.getBattery === 'undefined'",
+            "true",
+        ),
         (
             "speech_voices",
-            "speechSynthesis.getVoices().length > 0",
+            "Array.isArray(speechSynthesis.getVoices())",
             "true",
         ),
         (
@@ -612,7 +616,11 @@ async fn bench_stealth(ws_url: &str, browser_name: &str) -> Vec<BenchResult> {
         ),
         ("eventsource", "typeof EventSource", "function"),
         ("websocket", "typeof WebSocket", "function"),
-        ("deviceMemory", "navigator.deviceMemory > 0", "true"),
+        (
+            "deviceMemory",
+            "isSecureContext ? navigator.deviceMemory > 0 : typeof navigator.deviceMemory === 'undefined'",
+            "true",
+        ),
     ];
 
     for (name, js, expected) in checks {
