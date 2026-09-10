@@ -82,7 +82,6 @@ const CAPTURE_PROBE: &str = r##"
 "##;
 
 #[tokio::test]
-#[ignore = "not yet implemented: per-realm constructor identity for iframe contexts"]
 async fn engine_self_capture_succeeds() {
     // Use an https:// URL so the page is a secure context: the
     // captured Chrome 147 values for Notification.permission and
