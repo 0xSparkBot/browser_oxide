@@ -524,6 +524,334 @@ fn complete_document_lifecycle(event_loop: &mut BrowserEventLoop) {
     event_loop.complete_document_lifecycle();
 }
 
+type FrameScriptFetchResult = Option<(String, crate::net::TimingStats, std::time::Instant, String)>;
+type FrameScriptFetchHandle = tokio::task::JoinHandle<FrameScriptFetchResult>;
+
+fn resolve_frame_subresource_url(base: &str, reference: &str) -> Option<String> {
+    let base = url::Url::parse(base).ok()?;
+    let joined = base.join(reference).ok()?;
+    match joined.scheme() {
+        "http" | "https" => Some(joined.to_string()),
+        _ => None,
+    }
+}
+
+fn frame_document_origin(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let origin = parsed.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+async fn take_frame_script_fetch(
+    event_loop: &mut BrowserEventLoop,
+    fetches: &mut std::collections::HashMap<usize, FrameScriptFetchHandle>,
+    index: usize,
+) -> Option<(String, std::time::Instant, String)> {
+    let handle = fetches.remove(&index)?;
+    match handle.await {
+        Ok(Some((code, timing, completed_at, resolved_url))) => {
+            event_loop.runtime_mut().record_resource_timing(timing);
+            Some((code, completed_at, resolved_url))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(script_index = index, error = %error, "iframe script fetch task failed");
+            None
+        }
+    }
+}
+
+async fn execute_prepared_frame_script(
+    event_loop: &mut BrowserEventLoop,
+    script: &crate::script_runner::ScriptInfo,
+    index: usize,
+    code: String,
+    document_base: &str,
+    source_url: Option<String>,
+) {
+    if code.trim().is_empty() {
+        return;
+    }
+    let code = if std::env::var_os("BROWSER_OXIDE_VM_CALL_TRACE").is_some() {
+        instrument_vm_handler_calls(&code)
+    } else {
+        code
+    };
+    let name = source_url.unwrap_or_else(|| document_base.to_string());
+    event_loop.note_executed_script(&name, &code);
+
+    if script.is_module {
+        // HTML module scripts are deferred by default and never become
+        // document.currentScript. Each entry is an independent side module.
+        event_loop.set_current_script(None);
+        let specifier = if script.src.is_some() {
+            name.clone()
+        } else {
+            format!("{document_base}#oxide-frame-mod-{index}")
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            event_loop.eval_module_code(&specifier, code),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(script = %name, error = %error, "iframe ES module eval error");
+            }
+            Err(_) => {
+                tracing::warn!(script = %name, "iframe ES module eval timed out");
+            }
+        }
+    } else {
+        event_loop.set_current_script(Some(script.node_id));
+        if let Err(error) = event_loop.execute_script_with_name(&code, &name) {
+            tracing::warn!(script = %name, error = %error, "iframe script execution error");
+        }
+        event_loop.set_current_script(None);
+    }
+    event_loop.drain_microtasks();
+}
+
+async fn drain_ready_async_frame_scripts(
+    event_loop: &mut BrowserEventLoop,
+    scripts: &[crate::script_runner::ScriptInfo],
+    document_base: &str,
+    fetches: &mut std::collections::HashMap<usize, FrameScriptFetchHandle>,
+    pending_async: &mut Vec<usize>,
+) {
+    let mut ready = Vec::new();
+    let mut keep = Vec::new();
+    for index in pending_async.drain(..) {
+        let script = &scripts[index];
+        if script.src.is_none() {
+            ready.push((index, script.code.clone(), std::time::Instant::now(), None));
+        } else if fetches
+            .get(&index)
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            if let Some((code, completed_at, resolved_url)) =
+                take_frame_script_fetch(event_loop, fetches, index).await
+            {
+                ready.push((index, code, completed_at, Some(resolved_url)));
+            }
+        } else {
+            keep.push(index);
+        }
+    }
+    *pending_async = keep;
+    ready.sort_by_key(|(_, _, completed_at, _)| *completed_at);
+    for (index, code, _, resolved_url) in ready {
+        execute_prepared_frame_script(
+            event_loop,
+            &scripts[index],
+            index,
+            code,
+            document_base,
+            resolved_url,
+        )
+        .await;
+    }
+}
+
+async fn finish_async_frame_scripts(
+    event_loop: &mut BrowserEventLoop,
+    scripts: &[crate::script_runner::ScriptInfo],
+    document_base: &str,
+    fetches: &mut std::collections::HashMap<usize, FrameScriptFetchHandle>,
+    pending_async: &mut Vec<usize>,
+) {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut inline = Vec::new();
+    let mut external = FuturesUnordered::new();
+    for index in pending_async.drain(..) {
+        if scripts[index].src.is_none() {
+            inline.push(index);
+        } else if let Some(handle) = fetches.remove(&index) {
+            external.push(async move { (index, handle.await) });
+        }
+    }
+    for index in inline {
+        execute_prepared_frame_script(
+            event_loop,
+            &scripts[index],
+            index,
+            scripts[index].code.clone(),
+            document_base,
+            None,
+        )
+        .await;
+    }
+    while let Some((index, result)) = external.next().await {
+        match result {
+            Ok(Some((code, timing, _, resolved_url))) => {
+                event_loop.runtime_mut().record_resource_timing(timing);
+                execute_prepared_frame_script(
+                    event_loop,
+                    &scripts[index],
+                    index,
+                    code,
+                    document_base,
+                    Some(resolved_url),
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(script_index = index, error = %error, "iframe async script fetch task failed");
+            }
+        }
+    }
+}
+
+async fn run_frame_script_schedule(
+    event_loop: &mut BrowserEventLoop,
+    scripts: &[crate::script_runner::ScriptInfo],
+    document_url: &str,
+    document_base: &str,
+    client: &crate::net::HttpClient,
+) {
+    use crate::script_runner::ScriptScheduling;
+
+    let request_origin = frame_document_origin(document_url);
+    let mut fetches: std::collections::HashMap<usize, FrameScriptFetchHandle> =
+        std::collections::HashMap::new();
+    for (index, script) in scripts.iter().enumerate() {
+        let Some(src) = script.src.as_deref() else {
+            continue;
+        };
+        let Some(resolved_url) = resolve_frame_subresource_url(document_base, src) else {
+            continue;
+        };
+        let client = client.clone();
+        let referer = document_url.to_string();
+        let origin = request_origin.clone();
+        let is_module = script.is_module;
+        fetches.insert(
+            index,
+            tokio::spawn(async move {
+                match client
+                    .get_script_resource(&resolved_url, &referer, origin.as_deref(), is_module, 5)
+                    .await
+                {
+                    Ok(response) if response.ok() => {
+                        let text = response.text();
+                        if text.trim_start().starts_with("<!")
+                            || text.trim_start().starts_with("<html")
+                        {
+                            None
+                        } else {
+                            Some((
+                                text,
+                                response.timings.clone(),
+                                std::time::Instant::now(),
+                                resolved_url,
+                            ))
+                        }
+                    }
+                    Ok(_) | Err(_) => None,
+                }
+            }),
+        );
+    }
+
+    let mut deferred = Vec::new();
+    let mut pending_async = Vec::new();
+    for (index, script) in scripts.iter().enumerate() {
+        match script.scheduling() {
+            ScriptScheduling::ParserBlocking => {
+                let prepared = if script.src.is_some() {
+                    take_frame_script_fetch(event_loop, &mut fetches, index)
+                        .await
+                        .map(|(code, _, resolved_url)| (code, Some(resolved_url)))
+                } else {
+                    Some((script.code.clone(), None))
+                };
+                if let Some((code, resolved_url)) = prepared {
+                    execute_prepared_frame_script(
+                        event_loop,
+                        script,
+                        index,
+                        code,
+                        document_base,
+                        resolved_url,
+                    )
+                    .await;
+                }
+            }
+            ScriptScheduling::Deferred => deferred.push(index),
+            ScriptScheduling::Async => pending_async.push(index),
+        }
+        drain_ready_async_frame_scripts(
+            event_loop,
+            scripts,
+            document_base,
+            &mut fetches,
+            &mut pending_async,
+        )
+        .await;
+    }
+
+    event_loop.mark_document_interactive();
+    for index in deferred {
+        drain_ready_async_frame_scripts(
+            event_loop,
+            scripts,
+            document_base,
+            &mut fetches,
+            &mut pending_async,
+        )
+        .await;
+        let script = &scripts[index];
+        let prepared = if script.src.is_some() {
+            take_frame_script_fetch(event_loop, &mut fetches, index)
+                .await
+                .map(|(code, _, resolved_url)| (code, Some(resolved_url)))
+        } else {
+            Some((script.code.clone(), None))
+        };
+        if let Some((code, resolved_url)) = prepared {
+            execute_prepared_frame_script(
+                event_loop,
+                script,
+                index,
+                code,
+                document_base,
+                resolved_url,
+            )
+            .await;
+        }
+        drain_ready_async_frame_scripts(
+            event_loop,
+            scripts,
+            document_base,
+            &mut fetches,
+            &mut pending_async,
+        )
+        .await;
+    }
+
+    drain_ready_async_frame_scripts(
+        event_loop,
+        scripts,
+        document_base,
+        &mut fetches,
+        &mut pending_async,
+    )
+    .await;
+    event_loop.dispatch_dom_content_loaded();
+    finish_async_frame_scripts(
+        event_loop,
+        scripts,
+        document_base,
+        &mut fetches,
+        &mut pending_async,
+    )
+    .await;
+    event_loop.dispatch_load();
+}
+
 impl ChildIframe {
     /// Build isolated HTML for the internal frame-tree backend. Browser-visible
     /// srcdoc frames never use this path.
@@ -663,20 +991,7 @@ impl ChildIframe {
                     stylesheets.push(css.clone());
                 }
                 crate::stylesheet_collector::StylesheetEntry::External(href) => {
-                    let full_url = if href.starts_with("http") {
-                        href.clone()
-                    } else if href.starts_with('/') {
-                        if let Ok(base) = url::Url::parse(url) {
-                            format!(
-                                "{}://{}{}",
-                                base.scheme(),
-                                base.host_str().unwrap_or(""),
-                                href
-                            )
-                        } else {
-                            continue;
-                        }
-                    } else {
+                    let Some(full_url) = resolve_frame_subresource_url(&document_base, href) else {
                         continue;
                     };
                     if let Ok(resp) = client.get(&full_url).await {
@@ -700,6 +1015,7 @@ impl ChildIframe {
                 &resp.url,
                 &resp.headers,
             ),
+            module_request_origin: frame_document_origin(&resp.url),
             ..Default::default()
         };
         if let Some(profile) = stealth_profile {
@@ -947,60 +1263,15 @@ if (typeof globalThis.Worker === 'function') {
             ))
             .ok();
 
-        // Execute scripts, fetching external ones
-        for (i, script) in scripts.iter().enumerate() {
-            let mut code = if let Some(src) = &script.src {
-                let full_url = if src.starts_with("http") {
-                    src.clone()
-                } else if src.starts_with('/') {
-                    if let Ok(base) = url::Url::parse(url) {
-                        format!(
-                            "{}://{}{}",
-                            base.scheme(),
-                            base.host_str().unwrap_or(""),
-                            src
-                        )
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                };
-                match client.get(&full_url).await {
-                    Ok(resp) if resp.ok() => {
-                        let text = resp.text();
-                        if text.trim_start().starts_with("<!") {
-                            continue;
-                        }
-                        text
-                    }
-                    _ => continue,
-                }
-            } else {
-                script.code.clone()
-            };
+        // Execute child-document scripts with the same browser scheduling
+        // model as top-level documents: parser-blocking classic scripts run
+        // during parsing, defer and non-async module entries wait until the
+        // parser completes, and async entries run as soon as their fetch is
+        // ready. External resources resolve against <base>/document URL with
+        // URL::join so ports and ordinary relative paths are preserved.
+        run_frame_script_schedule(&mut event_loop, &scripts, &resp.url, &document_base, client)
+            .await;
 
-            if code.trim().is_empty() {
-                continue;
-            }
-            if std::env::var_os("BROWSER_OXIDE_VM_CALL_TRACE").is_some() {
-                code = instrument_vm_handler_calls(&code);
-            }
-            // W2.7 — name scripts by their actual URL (external src or
-            // the iframe document URL for inline). Chrome stack frames
-            // are URL-tagged, not anonymous.
-            let name = if let Some(src) = &script.src {
-                src.clone()
-            } else {
-                url.to_string()
-            };
-            event_loop.note_executed_script(&name, &code);
-            if let Err(e) = event_loop.execute_script_with_name(&code, &name) {
-                tracing::warn!(script_index = i, error = %e, "iframe script error");
-            }
-        }
-
-        complete_document_lifecycle(&mut event_loop);
         // See from_isolated_html: gate parent->child postMessage delivery on
         // completed initial load.
         event_loop
