@@ -5734,10 +5734,134 @@
         disconnect() { this._elements.clear(); }
     };
 
-    // requestIdleCallback stub
+    // requestIdleCallback / IdleDeadline.  A deadline is a real WebIDL object
+    // with no own implementation fields; its mutable timing state lives here.
+    // Chrome's idle budget is scheduling-dependent and capped at 50 ms.  We do
+    // not fake a fixed fingerprint value: the budget is measured against the
+    // same monotonic performance clock while the callback is running.
+    const _IdleDeadline = globalThis.IdleDeadline;
+    const _idleDeadlineState = new WeakMap();
+    const _idleNow = () => (
+        globalThis.performance && typeof globalThis.performance.now === "function"
+            ? globalThis.performance.now()
+            : Date.now()
+    );
+
+    if (typeof _IdleDeadline === "function" && _IdleDeadline.prototype) {
+        const _idleProto = _IdleDeadline.prototype;
+        // interfaces_bootstrap creates the constructor/tag first. Recreate the
+        // prototype in Blink's observable property order:
+        // didTimeout, timeRemaining, constructor, @@toStringTag.
+        try { delete _idleProto.constructor; } catch (_) {}
+        try { delete _idleProto[Symbol.toStringTag]; } catch (_) {}
+
+        const _idleDidTimeoutGet = Object.getOwnPropertyDescriptor({
+            get didTimeout() {
+                const state = _idleDeadlineState.get(this);
+                if (!state) throw new TypeError("Illegal invocation");
+                return state.didTimeout;
+            }
+        }, "didTimeout").get;
+        const _idleTimeRemaining = ({
+            timeRemaining() {
+                const state = _idleDeadlineState.get(this);
+                if (!state) throw new TypeError("Illegal invocation");
+                if (state.didTimeout) return 0;
+                return Math.max(0, Math.min(50, state.deadline - _idleNow()));
+            }
+        }).timeRemaining;
+        _maskFunction(_idleDidTimeoutGet, "get didTimeout");
+        _maskFunction(_idleTimeRemaining, "timeRemaining");
+        Object.defineProperty(_idleProto, "didTimeout", {
+            get: _idleDidTimeoutGet,
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(_idleProto, "timeRemaining", {
+            value: _idleTimeRemaining,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(_idleProto, "constructor", {
+            value: _IdleDeadline,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(_idleProto, Symbol.toStringTag, {
+            value: "IdleDeadline",
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        });
+        // Blink exposes WebIDL interface constructor .prototype as read-only.
+        try { Object.defineProperty(_IdleDeadline, "prototype", { writable: false }); } catch (_) {}
+    }
+
+    function _idleCallbackRealm(callback, host) {
+        // Same-origin iframe host wrappers invoke the parent implementation
+        // with the child Window as `this`. Chrome creates IdleDeadline in the
+        // callback's realm: a parent callback passed to cw.requestIdleCallback
+        // gets a parent deadline, while a callback created by cw.Function gets
+        // a child deadline.
+        try {
+            if (host && host !== globalThis
+                && typeof host.Function === "function"
+                && callback instanceof host.Function) {
+                return host;
+            }
+        } catch (_) {}
+        return globalThis;
+    }
+
+    function _makeIdleDeadline(callback, host, didTimeout) {
+        const realm = _idleCallbackRealm(callback, host);
+        let ctor = _IdleDeadline;
+        try {
+            if (realm && typeof realm.IdleDeadline === "function") ctor = realm.IdleDeadline;
+        } catch (_) {}
+        let deadline;
+        try {
+            const realmObject = realm && realm.Object;
+            deadline = realmObject && typeof realmObject.create === "function"
+                ? realmObject.create(ctor.prototype)
+                : Object.create(ctor.prototype);
+        } catch (_) {
+            deadline = Object.create(_IdleDeadline.prototype);
+        }
+        _idleDeadlineState.set(deadline, {
+            didTimeout,
+            deadline: _idleNow() + (didTimeout ? 0 : 50),
+        });
+        return deadline;
+    }
+
     globalThis.requestIdleCallback = ({
-        requestIdleCallback(cb) {
-            return setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 1);
+        requestIdleCallback(callback, options) {
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to execute 'requestIdleCallback' on 'Window': 1 argument required, but only 0 present.");
+            }
+            if (typeof callback !== "function") {
+                throw new TypeError("Failed to execute 'requestIdleCallback' on 'Window': parameter 1 is not of type 'Function'.");
+            }
+            const host = this && (typeof this === "object" || typeof this === "function")
+                ? this : globalThis;
+            let timeout = Infinity;
+            if (options !== null && options !== undefined) {
+                try {
+                    const value = Number(options.timeout);
+                    if (Number.isFinite(value)) timeout = Math.max(0, value);
+                } catch (_) {}
+            }
+            const requestedAt = _idleNow();
+            return setTimeout(() => {
+                const elapsed = _idleNow() - requestedAt;
+                // In Blink timeout:0 can still enter a normal idle period
+                // first; only a positive expired timeout forces didTimeout.
+                const didTimeout = timeout > 0 && Number.isFinite(timeout) && elapsed >= timeout;
+                callback(_makeIdleDeadline(callback, host, didTimeout));
+            }, 1);
         }
     }).requestIdleCallback;
     _maskFunction(globalThis.requestIdleCallback, 'requestIdleCallback');

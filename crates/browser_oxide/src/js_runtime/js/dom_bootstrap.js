@@ -4495,7 +4495,7 @@
     // throw where real Chrome succeeds, that differs from real Chrome.
     const _ILLEGAL_CONSTRUCTORS = new Set([
         "Navigator", "Window", "Document", "HTMLDocument",
-        "MediaCapabilities",
+        "IdleDeadline", "MediaCapabilities",
         "Node", "Element", "HTMLElement",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
         "SVGSVGElement", "SVGGElement", "SVGAElement", "SVGDefsElement",
@@ -4687,6 +4687,7 @@
     // shape.
     const _CHILD_REALM_INTERFACES = [
         "Navigator", "EventTarget", "Event", "CustomEvent", "MessageEvent",
+        "IdleDeadline",
         "MediaCapabilities",
         "Node", "Element", "HTMLElement", "Document", "HTMLDocument",
         "DocumentFragment", "CharacterData", "Text", "Comment", "ShadowRoot",
@@ -4831,15 +4832,36 @@
                     const parentProto=parentName&&built[parentName]
                         ? built[parentName].prototype : Object.prototype;
                     const proto=Object.create(parentProto);
+                    let copiedConstructor=false;
                     try{
                         for(const key of Reflect.ownKeys(source.prototype||{})){
-                            if(key==='constructor')continue;
                             const desc=Object.getOwnPropertyDescriptor(source.prototype,key);
-                            if(desc)Object.defineProperty(proto,key,copyDescriptor(desc,key));
+                            if(!desc)continue;
+                            if(key==='constructor'){
+                                Object.defineProperty(proto,'constructor',{
+                                    value:fresh,
+                                    writable:'writable' in desc?desc.writable:true,
+                                    enumerable:!!desc.enumerable,
+                                    configurable:desc.configurable!==false
+                                });
+                                copiedConstructor=true;
+                            }else{
+                                Object.defineProperty(proto,key,copyDescriptor(desc,key));
+                            }
                         }
                     }catch(_){}
-                    try{Object.defineProperty(proto,'constructor',{value:fresh,writable:true,configurable:true});}catch(_){}
+                    if(!copiedConstructor){
+                        try{Object.defineProperty(proto,'constructor',{value:fresh,writable:true,configurable:true});}catch(_){}
+                    }
                     try{fresh.prototype=proto;}catch(_){}
+                    // Preserve a read-only WebIDL .prototype descriptor
+                    // after assigning the child-local prototype object.
+                    try{
+                        const sourceProtoDesc=Object.getOwnPropertyDescriptor(source,'prototype');
+                        if(sourceProtoDesc&&sourceProtoDesc.writable===false){
+                            Object.defineProperty(fresh,'prototype',{writable:false});
+                        }
+                    }catch(_){}
                     try{
                         if(parentName&&built[parentName])Object.setPrototypeOf(fresh,built[parentName]);
                     }catch(_){}
