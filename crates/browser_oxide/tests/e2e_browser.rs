@@ -1352,16 +1352,24 @@ async fn e2e_linked_stylesheet_fetched() {
     match Page::navigate("https://news.ycombinator.com", profile, 0).await {
         Ok(mut page) => {
             // HN uses <link rel="stylesheet" href="news.css">
-            // The CSS sets body font, link colors, etc.
+            // The CSS sets body font, size, and color.  Assert those concrete
+            // values instead of merely printing backgroundColor (HN's body
+            // background is transparent, so that old smoke could pass even if
+            // the linked stylesheet was never applied).
             let title = page.title();
             assert_eq!(title, "Hacker News");
-            // If external CSS was fetched, getComputedStyle should return non-default values
-            // for properties set by news.css (like font-family, background-color)
-            let bg = page
-                .evaluate("getComputedStyle(document.body).backgroundColor")
+            let font_family = page
+                .evaluate("getComputedStyle(document.body).fontFamily")
                 .unwrap();
-            println!("[linked CSS] body bg: {bg}");
-            // HN sets body background to #f6f6ef — if stylesheet was fetched, this won't be default
+            let font_size = page
+                .evaluate("getComputedStyle(document.body).fontSize")
+                .unwrap();
+            let color = page
+                .evaluate("getComputedStyle(document.body).color")
+                .unwrap();
+            assert_eq!(font_family, "Verdana, Geneva, sans-serif");
+            assert_eq!(font_size, "10pt");
+            assert_eq!(color, "#828282");
         }
         Err(e) => eprintln!("navigate failed: {e}"),
     }
