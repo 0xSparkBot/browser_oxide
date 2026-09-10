@@ -119,6 +119,19 @@ fn collect_scripts(dom: &Dom, node_id: NodeId, scripts: &mut Vec<ScriptInfo>) {
                         continue;
                     }
 
+                    // `nomodule` suppresses classic scripts in browsers that
+                    // support ES modules. BrowserOxide has a module loader, so
+                    // executing this legacy fallback would double-run app
+                    // bootstraps on modern pages.
+                    let no_module = elem
+                        .attrs
+                        .iter()
+                        .any(|a| a.name.local.eq_ignore_ascii_case("nomodule"));
+                    if script_kind == ScriptKind::Classic && no_module {
+                        collect_scripts(dom, child_id, scripts);
+                        continue;
+                    }
+
                     let src = elem
                         .attrs
                         .iter()
@@ -214,6 +227,7 @@ mod tests {
                 <script type="a-state">{"not":"javascript"}</script>
                 <script type="application/x-custom-data">value: still-data</script>
                 <script type="text/javascript; charset=utf-8">globalThis.b = 2;</script>
+                <script nomodule>globalThis.legacy = true;</script>
                 <script type="module">globalThis.c = 3;</script>
                 <script type="importmap">{"imports":{}}</script>
                 <script type="speculationrules">{"prefetch":[]}</script>
