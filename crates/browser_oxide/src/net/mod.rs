@@ -698,6 +698,24 @@ impl HttpClient {
             .ok_or_else(|| NetError::Http(format!("unsupported URL scheme: {}", parsed.scheme())))
     }
 
+    fn h1_host_header(parsed: &Url, host: &str, port: u16) -> String {
+        let rendered_host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let default_port = match parsed.scheme() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        };
+        if default_port == Some(port) {
+            rendered_host
+        } else {
+            format!("{rendered_host}:{port}")
+        }
+    }
+
     async fn send_h1_get_for_url(
         &self,
         parsed: &Url,
@@ -707,12 +725,13 @@ impl HttpClient {
         headers: &[(String, String)],
     ) -> Result<h1_client::RawResponse, NetError> {
         let mut tcp_stream = self.connect_tcp(host, port).await?;
+        let authority = Self::h1_host_header(parsed, host, port);
         match parsed.scheme() {
-            "http" => h1_client::send_get(&mut tcp_stream, host, path, headers).await,
+            "http" => h1_client::send_get(&mut tcp_stream, &authority, path, headers).await,
             "https" => {
                 let mut tls_stream =
                     tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
-                h1_client::send_get(&mut tls_stream, host, path, headers).await
+                h1_client::send_get(&mut tls_stream, &authority, path, headers).await
             }
             scheme => Err(NetError::Http(format!("unsupported URL scheme: {scheme}"))),
         }
@@ -728,12 +747,13 @@ impl HttpClient {
         body: &[u8],
     ) -> Result<h1_client::RawResponse, NetError> {
         let mut tcp_stream = self.connect_tcp(host, port).await?;
+        let authority = Self::h1_host_header(parsed, host, port);
         match parsed.scheme() {
-            "http" => h1_client::send_post(&mut tcp_stream, host, path, headers, body).await,
+            "http" => h1_client::send_post(&mut tcp_stream, &authority, path, headers, body).await,
             "https" => {
                 let mut tls_stream =
                     tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
-                h1_client::send_post(&mut tls_stream, host, path, headers, body).await
+                h1_client::send_post(&mut tls_stream, &authority, path, headers, body).await
             }
             scheme => Err(NetError::Http(format!("unsupported URL scheme: {scheme}"))),
         }
@@ -2021,6 +2041,36 @@ mod tests {
         let profile = crate::stealth::chrome_148_linux();
         let client = HttpClient::new(&profile);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn h1_host_header_preserves_only_non_default_ports_and_ipv6_brackets() {
+        let cases = [
+            (
+                "http://example.test/path",
+                "example.test",
+                80,
+                "example.test",
+            ),
+            (
+                "https://example.test/path",
+                "example.test",
+                443,
+                "example.test",
+            ),
+            (
+                "http://example.test:8080/path",
+                "example.test",
+                8080,
+                "example.test:8080",
+            ),
+            ("http://[::1]:8080/path", "::1", 8080, "[::1]:8080"),
+            ("https://[::1]/path", "::1", 443, "[::1]"),
+        ];
+        for (url, host, port, expected) in cases {
+            let parsed = Url::parse(url).unwrap();
+            assert_eq!(HttpClient::h1_host_header(&parsed, host, port), expected);
+        }
     }
 
     #[test]

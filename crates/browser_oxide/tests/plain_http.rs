@@ -38,11 +38,15 @@ async fn spawn_server(requests: usize) -> String {
             let request = read_request(&mut socket).await;
             let text = String::from_utf8_lossy(&request);
             let first_line = text.lines().next().unwrap_or("");
+            let host = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Host: "))
+                .unwrap_or("");
             let body = text
                 .split_once("\r\n\r\n")
                 .map(|(_, body)| body)
                 .unwrap_or("");
-            let response_body = format!("{first_line}|{body}");
+            let response_body = format!("{first_line}|host={host}|{body}");
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_body.len(),
@@ -82,18 +86,25 @@ async fn all_http_get_and_post_paths_use_cleartext_h1() {
     let url = spawn_server(5).await;
     let profile = browser_oxide::stealth::presets::chrome_148_macos();
     let client = HttpClient::shared(&profile).unwrap();
+    let parsed = url::Url::parse(&url).unwrap();
+    let expected_host = format!("127.0.0.1:{}", parsed.port().unwrap());
 
     let get = client.get(&url).await.unwrap();
     assert_eq!(get.status, 200);
     assert!(get.text().starts_with("GET /echo?q=1 HTTP/1.1|"));
+    assert!(get.text().contains(&format!("|host={expected_host}|")));
 
     let exact_get = client
         .get_with_exact_headers(&url, &[("accept".into(), "text/plain".into())])
         .await
         .unwrap();
     assert!(exact_get.text().starts_with("GET /echo?q=1 HTTP/1.1|"));
+    assert!(exact_get
+        .text()
+        .contains(&format!("|host={expected_host}|")));
 
     let post = client.post(&url, "normal-post").await.unwrap();
+    assert!(post.text().contains(&format!("|host={expected_host}|")));
     assert!(post.text().ends_with("|normal-post"));
 
     let direct = client
@@ -104,6 +115,7 @@ async fn all_http_get_and_post_paths_use_cleartext_h1() {
         )
         .await
         .unwrap();
+    assert!(direct.text().contains(&format!("|host={expected_host}|")));
     assert!(direct.text().ends_with("|direct-post"));
 
     let exact = client
@@ -114,6 +126,7 @@ async fn all_http_get_and_post_paths_use_cleartext_h1() {
         )
         .await
         .unwrap();
+    assert!(exact.text().contains(&format!("|host={expected_host}|")));
     assert!(exact.text().ends_with("|exact-post"));
 }
 

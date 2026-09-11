@@ -19,20 +19,20 @@ pub struct RawResponse {
 /// Send an HTTP/1.1 GET request over a stream.
 pub async fn send_get<S>(
     stream: &mut S,
-    host: &str,
+    authority: &str,
     path: &str,
     headers: &[(String, String)],
 ) -> Result<RawResponse, NetError>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    send_request(stream, "GET", host, path, headers, None).await
+    send_request(stream, "GET", authority, path, headers, None).await
 }
 
 /// Send an HTTP/1.1 POST request over a stream.
 pub async fn send_post<S>(
     stream: &mut S,
-    host: &str,
+    authority: &str,
     path: &str,
     headers: &[(String, String)],
     body: &[u8],
@@ -40,13 +40,13 @@ pub async fn send_post<S>(
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    send_request(stream, "POST", host, path, headers, Some(body)).await
+    send_request(stream, "POST", authority, path, headers, Some(body)).await
 }
 
 async fn send_request<S>(
     stream: &mut S,
     method: &str,
-    host: &str,
+    authority: &str,
     path: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
@@ -57,7 +57,7 @@ where
     // Build the request using Title-Case names and specific order for H1.
     // Real Chrome H1 order: Host, Connection, (Content-Length), then others.
     let mut request = format!("{method} {path} HTTP/1.1\r\n");
-    request.push_str(&format!("Host: {host}\r\n"));
+    request.push_str(&format!("Host: {authority}\r\n"));
     request.push_str("Connection: keep-alive\r\n");
 
     if let Some(body) = body {
