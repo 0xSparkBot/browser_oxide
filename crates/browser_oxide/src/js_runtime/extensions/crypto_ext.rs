@@ -155,6 +155,41 @@ fn pbkdf2_bytes(
     Some(derived)
 }
 
+fn hkdf_bytes(
+    algorithm: &str,
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
+    byte_length: usize,
+) -> Option<Vec<u8>> {
+    if byte_length == 0 {
+        return Some(Vec::new());
+    }
+
+    let digest_len = digest_bytes(algorithm, &[])?.len();
+    if byte_length > 255usize.checked_mul(digest_len)? {
+        return None;
+    }
+
+    // RFC 5869: PRK = HMAC-Hash(salt, IKM), then expand T(1..N).
+    // An empty salt is equivalent to HashLen zero bytes; HMAC key
+    // normalization makes the empty slice equivalent to that zero key.
+    let prk = hmac_bytes(algorithm, salt, ikm)?;
+    let block_count = byte_length.div_ceil(digest_len);
+    let mut okm = Vec::with_capacity(block_count * digest_len);
+    let mut previous = Vec::new();
+    for block_index in 1..=block_count {
+        let mut input = Vec::with_capacity(previous.len() + info.len() + 1);
+        input.extend_from_slice(&previous);
+        input.extend_from_slice(info);
+        input.push(block_index as u8);
+        previous = hmac_bytes(algorithm, &prk, &input)?;
+        okm.extend_from_slice(&previous);
+    }
+    okm.truncate(byte_length);
+    Some(okm)
+}
+
 #[op2]
 #[buffer]
 pub fn op_crypto_digest(#[string] algorithm: String, #[buffer] data: &[u8]) -> Vec<u8> {
@@ -181,6 +216,18 @@ pub fn op_crypto_pbkdf2(
     byte_length: u32,
 ) -> Vec<u8> {
     pbkdf2_bytes(&algorithm, password, salt, iterations, byte_length as usize).unwrap_or_default()
+}
+
+#[op2]
+#[buffer]
+pub fn op_crypto_hkdf(
+    #[string] algorithm: String,
+    #[buffer] ikm: &[u8],
+    #[buffer] salt: &[u8],
+    #[buffer] info: &[u8],
+    byte_length: u32,
+) -> Vec<u8> {
+    hkdf_bytes(&algorithm, ikm, salt, info, byte_length as usize).unwrap_or_default()
 }
 
 #[op2]
@@ -231,6 +278,7 @@ deno_core::extension!(
         op_crypto_digest,
         op_crypto_hmac_sign,
         op_crypto_pbkdf2,
+        op_crypto_hkdf,
         op_crypto_aes_gcm_encrypt,
         op_crypto_aes_gcm_decrypt,
         op_crypto_random_fill
@@ -239,7 +287,9 @@ deno_core::extension!(
 
 #[cfg(test)]
 mod tests {
-    use super::{aes_gcm_decrypt_bytes, aes_gcm_encrypt_bytes, hmac_bytes, pbkdf2_bytes};
+    use super::{
+        aes_gcm_decrypt_bytes, aes_gcm_encrypt_bytes, hkdf_bytes, hmac_bytes, pbkdf2_bytes,
+    };
 
     #[test]
     fn hmac_sha256_matches_rfc_style_vector() {
@@ -312,6 +362,23 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn hkdf_sha256_matches_rfc5869_case_1() {
+        let ikm = [0x0b; 22];
+        let salt: Vec<u8> = (0x00..=0x0c).collect();
+        let info: Vec<u8> = (0xf0..=0xf9).collect();
+        let okm = hkdf_bytes("SHA-256", &ikm, &salt, &info, 42).unwrap();
+        assert_eq!(
+            hex::encode(okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+        assert_eq!(
+            hkdf_bytes("SHA-256", &ikm, &salt, &info, 0),
+            Some(Vec::new())
+        );
+        assert!(hkdf_bytes("SHA-256", &ikm, &salt, &info, 255 * 32 + 1).is_none());
     }
 
     #[test]

@@ -117,8 +117,8 @@
         if (!state) throw new TypeError("Illegal invocation");
         return state;
     };
-    const _copyKeyAlgorithm = (state) => state.name === 'PBKDF2'
-        ? { name: 'PBKDF2' }
+    const _copyKeyAlgorithm = (state) => (state.name === 'PBKDF2' || state.name === 'HKDF')
+        ? { name: state.name }
         : state.name === 'AES-GCM'
             ? { name: 'AES-GCM', length: state.length }
             : {
@@ -251,6 +251,73 @@
             iterations,
         };
     };
+    const _normalizeHkdfUsages = (keyUsages) => {
+        const requested = Array.from(keyUsages || [], String);
+        const allowed = new Set(['deriveKey', 'deriveBits']);
+        if (requested.length === 0) {
+            throw new DOMException("Usages cannot be empty when creating a key.", "SyntaxError");
+        }
+        if (requested.some((usage) => !allowed.has(usage))) {
+            throw new DOMException("Cannot create a key using the specified key usages.", "SyntaxError");
+        }
+        // Chrome exposes KDF usages in canonical WebCrypto order, not caller order.
+        return ['deriveKey', 'deriveBits'].filter((usage) => requested.includes(usage));
+    };
+    const _makeHkdfKey = (bytes, usages) => {
+        const key = Object.create(_CryptoKeyProto);
+        _cryptoKeyState.set(key, {
+            name: 'HKDF',
+            type: 'secret',
+            extractable: false,
+            usages: usages.slice(),
+            bytes: new Uint8Array(bytes),
+        });
+        return key;
+    };
+    const _normalizeHkdfAlgorithm = (algorithm, operationName) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'HKDF') {
+            throw new DOMException("Unrecognized name.", "NotSupportedError");
+        }
+        if (!algorithm || typeof algorithm !== 'object' || algorithm.salt === undefined) {
+            throw new TypeError(`Failed to execute '${operationName}' on 'SubtleCrypto': HkdfParams: salt: Missing required property`);
+        }
+        if (algorithm.info === undefined) {
+            throw new TypeError(`Failed to execute '${operationName}' on 'SubtleCrypto': HkdfParams: info: Missing required property`);
+        }
+        if (!(algorithm.salt instanceof ArrayBuffer) && !ArrayBuffer.isView(algorithm.salt)) {
+            throw new TypeError("HkdfParams: salt is not a BufferSource");
+        }
+        if (!(algorithm.info instanceof ArrayBuffer) && !ArrayBuffer.isView(algorithm.info)) {
+            throw new TypeError("HkdfParams: info is not a BufferSource");
+        }
+        return {
+            name: 'HKDF',
+            hash: _normalizeHashName(algorithm.hash),
+            salt: _toBytes(algorithm.salt).slice(),
+            info: _toBytes(algorithm.info).slice(),
+        };
+    };
+    const _hkdfDigestBytes = (hash) => hash === 'SHA-1' ? 20
+        : hash === 'SHA-256' ? 32
+            : hash === 'SHA-384' ? 48 : 64;
+    const _deriveHkdfBytes = (alg, state, bitLength) => {
+        if (!Number.isFinite(bitLength) || !Number.isInteger(bitLength) || bitLength < 0) {
+            throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+        }
+        if (bitLength % 8 !== 0) {
+            throw new DOMException("The length provided for HKDF is not a multiple of 8 bits.", "OperationError");
+        }
+        const byteLength = bitLength / 8;
+        if (byteLength > 255 * _hkdfDigestBytes(alg.hash)) {
+            throw new DOMException("The length provided for HKDF is too large.", "OperationError");
+        }
+        const out = ops.op_crypto_hkdf(alg.hash, state.bytes, alg.salt, alg.info, byteLength);
+        if (out.byteLength !== byteLength) {
+            throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+        }
+        return out;
+    };
     const _normalizeAesGcmKeyAlgorithm = (algorithm, requireLength) => {
         const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
         if (String(rawName || '').toUpperCase() !== 'AES-GCM') {
@@ -360,6 +427,16 @@
                 throw new DOMException("The requested operation is not supported", "NotSupportedError");
             }
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'HKDF') {
+                if (extractable) {
+                    throw new DOMException("KDF keys must set extractable=false", "SyntaxError");
+                }
+                const usages = _normalizeHkdfUsages(keyUsages);
+                if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+                    throw new TypeError("keyData is not a BufferSource");
+                }
+                return Promise.resolve(_makeHkdfKey(_toBytes(keyData), usages));
+            }
             if (String(rawName || '').toUpperCase() === 'PBKDF2') {
                 if (extractable) {
                     throw new DOMException("PBKDF2 keys are not extractable", "SyntaxError");
@@ -421,6 +498,16 @@
 
     _defProtoMethod(_SubtleProto, 'deriveBits', function deriveBits(algorithm, baseKey, length) {
         try {
+            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'HKDF') {
+                const alg = _normalizeHkdfAlgorithm(algorithm, 'deriveBits');
+                const state = _requireCryptoKey(baseKey);
+                if (state.name !== 'HKDF' || !state.usages.includes('deriveBits')) {
+                    throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+                }
+                const out = _deriveHkdfBytes(alg, state, Number(length));
+                return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+            }
             const alg = _normalizePbkdf2Algorithm(algorithm);
             const state = _requireCryptoKey(baseKey);
             if (state.name !== 'PBKDF2' || !state.usages.includes('deriveBits')) {
@@ -444,6 +531,30 @@
 
     _defProtoMethod(_SubtleProto, 'deriveKey', function deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
         try {
+            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'HKDF') {
+                const alg = _normalizeHkdfAlgorithm(algorithm, 'deriveKey');
+                const state = _requireCryptoKey(baseKey);
+                if (state.name !== 'HKDF' || !state.usages.includes('deriveKey')) {
+                    throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+                }
+                const derivedName = typeof derivedKeyType === 'string'
+                    ? derivedKeyType
+                    : (derivedKeyType && derivedKeyType.name);
+                if (String(derivedName || '').toUpperCase() === 'AES-GCM') {
+                    const derived = _normalizeAesGcmKeyAlgorithm(derivedKeyType, true);
+                    const usages = _normalizeAesGcmUsages(keyUsages);
+                    const out = _deriveHkdfBytes(alg, state, derived.length);
+                    return Promise.resolve(_makeAesGcmKey(out, extractable, usages));
+                }
+                const derived = _normalizeHmacAlgorithm(derivedKeyType, true);
+                const usages = _normalizeHmacUsages(keyUsages);
+                const bitLength = derived.length === undefined
+                    ? (derived.hash === 'SHA-384' || derived.hash === 'SHA-512' ? 1024 : 512)
+                    : derived.length;
+                const out = _deriveHkdfBytes(alg, state, bitLength);
+                return Promise.resolve(_makeHmacKey(out, derived.hash, extractable, usages, bitLength));
+            }
             const alg = _normalizePbkdf2Algorithm(algorithm);
             const state = _requireCryptoKey(baseKey);
             if (state.name !== 'PBKDF2' || !state.usages.includes('deriveKey')) {
