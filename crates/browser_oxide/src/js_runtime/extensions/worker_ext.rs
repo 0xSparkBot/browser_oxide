@@ -574,6 +574,111 @@ pub fn op_message_port_close(#[smi] endpoint_id: i32, #[smi] generation: i32) {
 }
 
 // ============================================================================
+// BroadcastChannel registry — process-global same-origin named channels.
+//
+// Unlike MessagePort, BroadcastChannel fan-outs to every other live endpoint
+// with the same (origin, name) storage key. Endpoints retain the owning
+// runtime's wake handle so cross-thread sends wake an otherwise-idle Window;
+// worker endpoints additionally retain the worker's existing message-port
+// Notify so the worker-side parked receive wakes without polling.
+// ============================================================================
+
+struct BroadcastChannelEndpoint {
+    origin: String,
+    name: String,
+    queue: VecDeque<String>,
+    owner_wake: WorkerOwnerWake,
+    worker_notify: Option<Arc<Notify>>,
+}
+
+fn broadcast_channel_registry() -> &'static Mutex<HashMap<u32, BroadcastChannelEndpoint>> {
+    static INST: OnceLock<Mutex<HashMap<u32, BroadcastChannelEndpoint>>> = OnceLock::new();
+    INST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static NEXT_BROADCAST_CHANNEL_ID: AtomicU32 = AtomicU32::new(1);
+
+#[op2(fast)]
+#[smi]
+pub fn op_broadcast_channel_register(
+    op_state: &mut OpState,
+    #[string] origin: String,
+    #[string] name: String,
+) -> i32 {
+    let id = NEXT_BROADCAST_CHANNEL_ID.fetch_add(1, Ordering::Relaxed);
+    let owner_wake = runtime_owner_wake(op_state);
+    let worker_notify = WORKER_SELF.with(|worker| {
+        worker
+            .borrow()
+            .as_ref()
+            .map(|worker| worker.notify_message_port.clone())
+    });
+    broadcast_channel_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            id,
+            BroadcastChannelEndpoint {
+                origin,
+                name,
+                queue: VecDeque::new(),
+                owner_wake,
+                worker_notify,
+            },
+        );
+    id as i32
+}
+
+#[op2(fast)]
+pub fn op_broadcast_channel_post(#[smi] endpoint_id: i32, #[string] data: String) {
+    let endpoint_id = endpoint_id as u32;
+    let wakes = {
+        let mut registry = broadcast_channel_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(sender) = registry.get(&endpoint_id) else {
+            return;
+        };
+        let origin = sender.origin.clone();
+        let name = sender.name.clone();
+        let mut wakes = Vec::new();
+        for (peer_id, peer) in registry.iter_mut() {
+            if *peer_id == endpoint_id || peer.origin != origin || peer.name != name {
+                continue;
+            }
+            peer.queue.push_back(data.clone());
+            wakes.push((peer.owner_wake.clone(), peer.worker_notify.clone()));
+        }
+        wakes
+    };
+    for (owner_wake, worker_notify) in wakes {
+        owner_wake.wake();
+        if let Some(notify) = worker_notify {
+            notify.notify_one();
+        }
+    }
+}
+
+#[op2]
+#[string]
+pub fn op_broadcast_channel_try_recv(#[smi] endpoint_id: i32) -> String {
+    broadcast_channel_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&(endpoint_id as u32))
+        .and_then(|endpoint| endpoint.queue.pop_front())
+        .unwrap_or_default()
+}
+
+#[op2(fast)]
+pub fn op_broadcast_channel_close(#[smi] endpoint_id: i32) {
+    broadcast_channel_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(endpoint_id as u32));
+}
+
+// ============================================================================
 // Per-thread worker "self" state — populated when a worker thread starts.
 // ============================================================================
 
@@ -1138,5 +1243,9 @@ deno_core::extension!(
         op_message_port_post,
         op_message_port_try_recv,
         op_message_port_close,
+        op_broadcast_channel_register,
+        op_broadcast_channel_post,
+        op_broadcast_channel_try_recv,
+        op_broadcast_channel_close,
     ],
 );

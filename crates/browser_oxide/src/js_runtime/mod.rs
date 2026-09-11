@@ -81,6 +81,7 @@ pub struct BrowserJsRuntime {
     complete_lifecycle_fn: Option<v8::Global<v8::Function>>,
     worker_messages_pump_fn: Option<v8::Global<v8::Function>>,
     message_ports_pump_fn: Option<v8::Global<v8::Function>>,
+    broadcast_channels_pump_fn: Option<v8::Global<v8::Function>>,
     import_map_state: module_loader::ImportMapState,
     module_request_state: module_loader::ModuleRequestState,
     /// Per-runtime navigation-pending signal. JS sets it via
@@ -185,6 +186,7 @@ impl BrowserJsRuntime {
             complete_lifecycle_fn: internal_fns.complete_document_lifecycle,
             worker_messages_pump_fn: internal_fns.pump_worker_messages,
             message_ports_pump_fn: internal_fns.pump_message_ports,
+            broadcast_channels_pump_fn: internal_fns.pump_broadcast_channels,
             import_map_state: internal_fns.import_map_state,
             module_request_state: internal_fns.module_request_state,
         }
@@ -323,6 +325,26 @@ impl BrowserJsRuntime {
     /// synchronous and never pins the runtime waiting for an idle port.
     fn pump_message_ports(&mut self) -> u32 {
         let Some(function) = self.message_ports_pump_fn.clone() else {
+            return 0;
+        };
+        let _tokio_guard = tokio_fallback::ensure_tokio_context();
+        let __ctx = self.inner.main_context();
+        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+        v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
+        let function = v8::Local::new(scope, &function);
+        let receiver = v8::undefined(scope).into();
+        function
+            .call(scope, receiver, &[])
+            .and_then(|value| value.uint32_value(scope))
+            .unwrap_or(0)
+    }
+
+    /// Flush messages queued on cross-context BroadcastChannel endpoints.
+    /// The process-global registry uses the same WorkerOwnerWake/worker Notify
+    /// paths as remote MessagePorts, so this drain stays synchronous and never
+    /// adds a polling timer to an otherwise-idle page.
+    fn pump_broadcast_channels(&mut self) -> u32 {
+        let Some(function) = self.broadcast_channels_pump_fn.clone() else {
             return 0;
         };
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
@@ -638,7 +660,9 @@ impl BrowserJsRuntime {
             // idle. If delivery ran JS handlers, loop once more so any resulting
             // microtasks/timers are also driven. This closes the idle-vs-owner-
             // wake race without adding a polling cadence or artificial delay.
-            let delivered = self.pump_worker_messages() + self.pump_message_ports();
+            let delivered = self.pump_worker_messages()
+                + self.pump_message_ports()
+                + self.pump_broadcast_channels();
             if delivered == 0 {
                 return Ok(());
             }
@@ -655,6 +679,7 @@ impl BrowserJsRuntime {
         self.worker_owner_wake.register(cx.waker());
         self.pump_worker_messages();
         self.pump_message_ports();
+        self.pump_broadcast_channels();
         let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
         self.inner
             .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())

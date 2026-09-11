@@ -763,6 +763,10 @@
                 if (!s) break; // "" ⇒ terminated
                 if (s === '__browser_oxide_message_port_wake__') {
                     _pumpRemotePorts();
+                    try {
+                        const pumpBroadcasts = _browser_oxide && _browser_oxide._pumpBroadcastChannels;
+                        if (typeof pumpBroadcasts === 'function') pumpBroadcasts();
+                    } catch (_) {}
                     continue;
                 }
                 _dispatchWorkerMessage(s);

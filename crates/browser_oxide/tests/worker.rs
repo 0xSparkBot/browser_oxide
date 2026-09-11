@@ -1410,3 +1410,107 @@ fn worker_eventsource_receives_trusted_sse_events() {
     assert_eq!(value["custom"]["tag"], "[object MessageEvent]");
     assert_eq!(value["custom"]["data"], "done");
 }
+
+#[test]
+fn broadcast_channel_crosses_window_worker_boundary() {
+    let code = r#"
+        const seen = [];
+        const parentChannel = new BroadcastChannel('cross-context-room');
+        parentChannel.onmessage = event => {
+            seen.push('parent:' + event.data);
+            if (seen.length === 2) {
+                document.querySelector('#out').textContent = JSON.stringify(seen.sort());
+            }
+        };
+
+        const src = `
+            const workerChannel = new BroadcastChannel('cross-context-room');
+            workerChannel.onmessage = event => {
+                self.postMessage('worker:' + event.data);
+            };
+            self.postMessage('ready');
+            setTimeout(() => workerChannel.postMessage('from-worker'), 10);
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = event => {
+            if (event.data === 'ready') {
+                parentChannel.postMessage('from-parent');
+                return;
+            }
+            seen.push(event.data);
+            if (seen.length === 2) {
+                document.querySelector('#out').textContent = JSON.stringify(seen.sort());
+                parentChannel.close();
+                worker.terminate();
+            }
+        };
+    "#;
+
+    let out = drive_runtime(code, 1500);
+    assert_eq!(
+        out, r#"["parent:from-worker","worker:from-parent"]"#,
+        "same-origin BroadcastChannel traffic must cross the Window/DedicatedWorker boundary"
+    );
+}
+
+#[test]
+fn broadcast_channel_crosses_worker_worker_with_structured_clone() {
+    let code = r#"
+        let ready = 0;
+        const receiverSrc = `
+            const channel = new BroadcastChannel('worker-worker-room');
+            channel.onmessage = event => {
+                const value = event.data;
+                self.postMessage(JSON.stringify({
+                    mapTag: Object.prototype.toString.call(value.map),
+                    mapValue: value.map.get('answer'),
+                    bytesTag: Object.prototype.toString.call(value.bytes),
+                    bytes: Array.from(value.bytes),
+                    trusted: event.isTrusted,
+                    eventTag: Object.prototype.toString.call(event),
+                }));
+            };
+            self.postMessage('ready');
+        `;
+        const senderSrc = `
+            const channel = new BroadcastChannel('worker-worker-room');
+            self.onmessage = event => {
+                if (event.data !== 'go') return;
+                channel.postMessage({
+                    map: new Map([['answer', 42]]),
+                    bytes: new Uint8Array([3, 1, 4, 1, 5]),
+                });
+            };
+            self.postMessage('ready');
+        `;
+        const receiver = new Worker(URL.createObjectURL(new Blob([receiverSrc], { type: 'text/javascript' })));
+        const sender = new Worker(URL.createObjectURL(new Blob([senderSrc], { type: 'text/javascript' })));
+        const onReady = () => {
+            ready += 1;
+            if (ready === 2) sender.postMessage('go');
+        };
+        receiver.onmessage = event => {
+            if (event.data === 'ready') {
+                onReady();
+                return;
+            }
+            document.querySelector('#out').textContent = event.data;
+            receiver.terminate();
+            sender.terminate();
+        };
+        sender.onmessage = event => {
+            if (event.data === 'ready') onReady();
+        };
+    "#;
+
+    let out = drive_runtime(code, 2000);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("invalid worker-worker BroadcastChannel JSON: {error}; raw={out}")
+    });
+    assert_eq!(value["mapTag"], "[object Map]", "{out}");
+    assert_eq!(value["mapValue"], 42, "{out}");
+    assert_eq!(value["bytesTag"], "[object Uint8Array]", "{out}");
+    assert_eq!(value["bytes"], serde_json::json!([3, 1, 4, 1, 5]), "{out}");
+    assert_eq!(value["trusted"], true, "{out}");
+    assert_eq!(value["eventTag"], "[object MessageEvent]", "{out}");
+}

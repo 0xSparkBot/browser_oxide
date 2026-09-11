@@ -183,6 +183,7 @@ pub struct RuntimeInternalFns {
     pub complete_document_lifecycle: Option<v8::Global<v8::Function>>,
     pub pump_worker_messages: Option<v8::Global<v8::Function>>,
     pub pump_message_ports: Option<v8::Global<v8::Function>>,
+    pub pump_broadcast_channels: Option<v8::Global<v8::Function>>,
     pub import_map_state: crate::js_runtime::module_loader::ImportMapState,
     pub module_request_state: crate::js_runtime::module_loader::ModuleRequestState,
 }
@@ -452,6 +453,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/structured_clone.js"),
             "\n",
+            include_str!("js/broadcast_channel_bootstrap.js"),
+            "\n",
             include_str!("js/indexeddb_bootstrap.js"),
         );
 
@@ -498,6 +501,10 @@ pub fn create_runtime_with_signals(
                 ),
                 ("_pumpWorkerMessages", &mut captured.pump_worker_messages),
                 ("_pumpMessagePorts", &mut captured.pump_message_ports),
+                (
+                    "_pumpBroadcastChannels",
+                    &mut captured.pump_broadcast_channels,
+                ),
             ] {
                 let Some(key) = v8::String::new(scope, name) else {
                     continue;
@@ -856,6 +863,13 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/worker_bootstrap.js"))
         .expect("worker: worker bootstrap failed");
+
+    runtime
+        .execute_script(
+            "<anonymous>",
+            include_str!("js/broadcast_channel_bootstrap.js"),
+        )
+        .expect("worker: BroadcastChannel bootstrap failed");
 
     runtime
         .execute_script("<anonymous>", include_str!("js/sse_bootstrap.js"))

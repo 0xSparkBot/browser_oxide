@@ -207,6 +207,8 @@ pub fn get_snapshot() -> &'static [u8] {
             "\n",
             include_str!("js/structured_clone.js"),
             "\n",
+            include_str!("js/broadcast_channel_bootstrap.js"),
+            "\n",
             include_str!("js/indexeddb_bootstrap.js"),
         );
 
