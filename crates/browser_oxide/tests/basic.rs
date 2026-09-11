@@ -261,6 +261,117 @@ async fn module_evaluation_does_not_wait_for_unrelated_refed_timer() {
 }
 
 #[tokio::test]
+async fn response_buffer_source_and_wasm_streaming_match_browser_semantics() {
+    let mut rt = create_test_runtime();
+    rt.load_eval_module_code(
+        "https://example.test/wasm-streaming.js",
+        r#"
+            const wasm = new Uint8Array([0,97,115,109,1,0,0,0]);
+
+            const response = new Response(wasm);
+            const responseBytes = Array.from(new Uint8Array(await response.arrayBuffer()));
+
+            let good = 'not-run';
+            try {
+                const module = await WebAssembly.compileStreaming(Promise.resolve(
+                    new Response(wasm, { headers: { 'Content-Type': 'application/wasm' } })
+                ));
+                good = Object.prototype.toString.call(module);
+            } catch (e) {
+                good = `${e.name}:${e.message}`;
+            }
+
+            async function badMime(type) {
+                try {
+                    const headers = type == null ? {} : { 'Content-Type': type };
+                    await WebAssembly.compileStreaming(Promise.resolve(new Response(wasm, { headers })));
+                    return 'accepted';
+                } catch (e) {
+                    return `${e.name}:${e.message}`;
+                }
+            }
+
+            async function fakeResponse(kind) {
+                const fake = {
+                    headers: new Headers({ 'Content-Type': 'application/wasm' }),
+                    arrayBuffer: async () => wasm.buffer,
+                };
+                try {
+                    if (kind === 'compile') {
+                        await WebAssembly.compileStreaming(Promise.resolve(fake));
+                    } else {
+                        await WebAssembly.instantiateStreaming(Promise.resolve(fake), {});
+                    }
+                    return 'accepted';
+                } catch (e) {
+                    return `${e.name}:${e.message}`;
+                }
+            }
+
+            let instantiateGood = 'not-run';
+            try {
+                const result = await WebAssembly.instantiateStreaming(Promise.resolve(
+                    new Response(wasm, { headers: { 'Content-Type': 'application/wasm' } })
+                ), {});
+                instantiateGood = Object.prototype.toString.call(result.module);
+            } catch (e) {
+                instantiateGood = `${e.name}:${e.message}`;
+            }
+
+            globalThis.__wasmStreamingProbe = JSON.stringify({
+                responseBytes,
+                good,
+                instantiateGood,
+                mixedCase: await badMime('Application/Wasm'),
+                bad: await badMime('text/plain'),
+                missing: await badMime(null),
+                parameterized: await badMime('application/wasm; charset=utf-8'),
+                fakeCompile: await fakeResponse('compile'),
+                fakeInstantiate: await fakeResponse('instantiate'),
+            });
+        "#
+        .to_string(),
+    )
+    .await
+    .expect("streaming module probe");
+
+    let raw = rt
+        .execute_script("globalThis.__wasmStreamingProbe", None)
+        .expect("probe result");
+    let result: serde_json::Value = serde_json::from_str(&raw).expect("probe json");
+    assert_eq!(
+        result["responseBytes"],
+        serde_json::json!([0, 97, 115, 109, 1, 0, 0, 0]),
+        "Response(BufferSource) must preserve exact bytes"
+    );
+    assert_eq!(result["good"], "[object WebAssembly.Module]");
+    assert_eq!(result["instantiateGood"], "[object WebAssembly.Module]");
+    assert_eq!(
+        result["mixedCase"], "accepted",
+        "WASM MIME matching is ASCII case-insensitive"
+    );
+    for key in ["bad", "missing", "parameterized"] {
+        let err = result[key].as_str().unwrap_or_default();
+        assert!(
+            err.starts_with("TypeError:"),
+            "{key} MIME should reject: {err}"
+        );
+        assert!(
+            err.contains("application/wasm"),
+            "{key} MIME error should name the required WASM MIME: {err}"
+        );
+    }
+    for key in ["fakeCompile", "fakeInstantiate"] {
+        let err = result[key].as_str().unwrap_or_default();
+        assert!(err.starts_with("TypeError:"), "{key} should reject: {err}");
+        assert!(
+            err.contains("Response or Promise<Response>"),
+            "{key} should enforce Response brand: {err}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn url_with_base_preserves_absolute_opaque_schemes() {
     let mut rt = create_test_runtime();
     let result = rt

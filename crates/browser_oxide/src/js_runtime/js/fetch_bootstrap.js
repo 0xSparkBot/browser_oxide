@@ -83,12 +83,33 @@
     class Response {
         #body; #rawBytes; #status; #statusText; #headers; #url; #ok; #bodyStream;
         constructor(body, init = {}) {
-            this.#body = body ?? "";
-            // Optional authoritative binary payload. When set,
-            // arrayBuffer()/blob() hand back the exact bytes without
-            // a TextEncoder round-trip — critical for blob: fetches
-            // with non-UTF-8 content (e.g. PNG, WASM).
-            this.#rawBytes = init._rawBytes ?? null;
+            // Fetch BodyInit accepts BufferSource values. Snapshot their exact
+            // bytes at construction time instead of coercing typed arrays with
+            // String(body) ("0,97,115,..."), which corrupts arbitrary binary
+            // payloads such as PNG/WASM. Network fetches may also provide an
+            // authoritative `_rawBytes` snapshot alongside a decoded text body.
+            const suppliedRaw = init._rawBytes ?? null;
+            let rawBytes = null;
+            if (suppliedRaw instanceof ArrayBuffer) {
+                rawBytes = new Uint8Array(suppliedRaw.slice(0));
+            } else if (ArrayBuffer.isView(suppliedRaw)) {
+                rawBytes = new Uint8Array(
+                    suppliedRaw.buffer.slice(
+                        suppliedRaw.byteOffset,
+                        suppliedRaw.byteOffset + suppliedRaw.byteLength,
+                    ),
+                );
+            } else if (body instanceof ArrayBuffer) {
+                rawBytes = new Uint8Array(body.slice(0));
+            } else if (ArrayBuffer.isView(body)) {
+                rawBytes = new Uint8Array(
+                    body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+                );
+            }
+            this.#rawBytes = rawBytes;
+            this.#body = rawBytes && typeof body !== "string"
+                ? new TextDecoder().decode(rawBytes)
+                : (body ?? "");
             this.#status = init.status ?? 200;
             this.#statusText = init.statusText ?? "OK";
             this.#headers = new Headers(init.headers ?? {});

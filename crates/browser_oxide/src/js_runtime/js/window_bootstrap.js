@@ -347,14 +347,34 @@
     } catch (_) {}
 
     if (globalThis.WebAssembly) {
-        // Streaming stubs
-        WebAssembly.instantiateStreaming = async function(source, importObject) {
+        // Streaming compilation follows the browser Fetch/WebAssembly
+        // integration contract: after resolving the source promise it must be
+        // a Response whose MIME type is application/wasm. Native Chrome rejects
+        // missing or incorrect MIME before attempting to compile the bytes.
+        async function _wasmStreamingResponse(source) {
             const resp = await source;
+            if (!(resp instanceof globalThis.Response)) {
+                throw new TypeError(
+                    "Failed to execute 'compile' on 'WebAssembly': An argument must be provided, which must be a Response or Promise<Response> object"
+                );
+            }
+            const mime = resp && resp.headers && typeof resp.headers.get === 'function'
+                ? String(resp.headers.get('content-type') || '').trim().toLowerCase()
+                : '';
+            if (mime !== 'application/wasm') {
+                throw new TypeError(
+                    "Failed to execute 'compile' on 'WebAssembly': Incorrect response MIME type. Expected 'application/wasm'."
+                );
+            }
+            return resp;
+        }
+        WebAssembly.instantiateStreaming = async function(source, importObject) {
+            const resp = await _wasmStreamingResponse(source);
             const bytes = await resp.arrayBuffer();
             return WebAssembly.instantiate(bytes, importObject);
         };
         WebAssembly.compileStreaming = async function(source) {
-            const resp = await source;
+            const resp = await _wasmStreamingResponse(source);
             const bytes = await resp.arrayBuffer();
             return WebAssembly.compile(bytes);
         };
