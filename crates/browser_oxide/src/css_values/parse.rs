@@ -797,6 +797,10 @@ fn parse_color(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
             match f.name.to_ascii_lowercase().as_str() {
                 "rgb" | "rgba" => return parse_rgb_function(&f.arguments),
                 "hsl" | "hsla" => return parse_hsl_function(&f.arguments),
+                "lab" => return parse_lab_function(&f.arguments),
+                "lch" => return parse_lch_function(&f.arguments),
+                "oklab" => return parse_oklab_function(&f.arguments),
+                "oklch" => return parse_oklch_function(&f.arguments),
                 _ => {}
             }
         }
@@ -847,30 +851,209 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-fn parse_rgb_function(args: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
-    let nums = extract_numbers(args);
-    if nums.len() >= 3 {
-        let r = nums[0].clamp(0.0, 255.0) as u8;
-        let g = nums[1].clamp(0.0, 255.0) as u8;
-        let b = nums[2].clamp(0.0, 255.0) as u8;
-        let a = if nums.len() >= 4 { nums[3] as f32 } else { 1.0 };
-        Ok(CssValue::Color(Color::Rgba { r, g, b, a }))
-    } else {
-        Err(ValueError::InvalidValue("invalid rgb() arguments".into()))
+#[derive(Debug, Clone, Copy)]
+enum ColorComponent {
+    Number(f64),
+    Percentage(f64),
+    AngleDeg(f64),
+}
+
+fn color_components(
+    args: &[ComponentValue<'_>],
+) -> Result<(Vec<ColorComponent>, Option<ColorComponent>), ValueError> {
+    let mut channels = Vec::new();
+    let mut alpha = None;
+    let mut after_slash = false;
+    for cv in args {
+        let component = match cv {
+            ComponentValue::Token(Token {
+                kind: TokenKind::Whitespace | TokenKind::Comma,
+                ..
+            }) => continue,
+            ComponentValue::Token(Token {
+                kind: TokenKind::Delim('/'),
+                ..
+            }) => {
+                if after_slash {
+                    return Err(ValueError::InvalidValue(
+                        "multiple color alpha separators".into(),
+                    ));
+                }
+                after_slash = true;
+                continue;
+            }
+            ComponentValue::Token(Token {
+                kind: TokenKind::Number { value, .. },
+                ..
+            }) => ColorComponent::Number(*value),
+            ComponentValue::Token(Token {
+                kind: TokenKind::Percentage { value, .. },
+                ..
+            }) => ColorComponent::Percentage(*value),
+            ComponentValue::Token(Token {
+                kind: TokenKind::Dimension { value, unit, .. },
+                ..
+            }) => {
+                let degrees = match unit.to_ascii_lowercase().as_str() {
+                    "deg" => *value,
+                    "grad" => *value * 0.9,
+                    "rad" => value.to_degrees(),
+                    "turn" => *value * 360.0,
+                    _ => {
+                        return Err(ValueError::InvalidValue(format!(
+                            "invalid color angle unit: {unit}"
+                        )))
+                    }
+                };
+                ColorComponent::AngleDeg(degrees)
+            }
+            _ => return Err(ValueError::InvalidValue("invalid color component".into())),
+        };
+        if after_slash {
+            if alpha.replace(component).is_some() {
+                return Err(ValueError::InvalidValue("too many alpha components".into()));
+            }
+        } else {
+            channels.push(component);
+        }
+    }
+    Ok((channels, alpha))
+}
+
+fn alpha_value(component: Option<ColorComponent>) -> Result<f32, ValueError> {
+    let value = match component {
+        None => 1.0,
+        Some(ColorComponent::Number(v)) => v,
+        Some(ColorComponent::Percentage(v)) => v / 100.0,
+        Some(ColorComponent::AngleDeg(_)) => {
+            return Err(ValueError::InvalidValue("invalid alpha angle".into()))
+        }
+    };
+    Ok(value.clamp(0.0, 1.0) as f32)
+}
+
+fn number_or_percent(component: ColorComponent, percent_scale: f64) -> Result<f64, ValueError> {
+    match component {
+        ColorComponent::Number(v) => Ok(v),
+        ColorComponent::Percentage(v) => Ok(v * percent_scale / 100.0),
+        ColorComponent::AngleDeg(_) => Err(ValueError::InvalidValue(
+            "angle where numeric color component expected".into(),
+        )),
     }
 }
 
-fn parse_hsl_function(args: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
-    let nums = extract_numbers(args);
-    if nums.len() >= 3 {
-        let h = nums[0];
-        let s = nums[1];
-        let l = nums[2];
-        let a = if nums.len() >= 4 { nums[3] as f32 } else { 1.0 };
-        Ok(CssValue::Color(Color::Hsl { h, s, l, a }))
-    } else {
-        Err(ValueError::InvalidValue("invalid hsl() arguments".into()))
+fn angle_degrees(component: ColorComponent) -> Result<f64, ValueError> {
+    match component {
+        ColorComponent::Number(v) | ColorComponent::AngleDeg(v) => Ok(v),
+        ColorComponent::Percentage(_) => Err(ValueError::InvalidValue(
+            "percentage where color angle expected".into(),
+        )),
     }
+}
+
+fn split_legacy_alpha(
+    mut channels: Vec<ColorComponent>,
+    alpha: Option<ColorComponent>,
+) -> (Vec<ColorComponent>, Option<ColorComponent>) {
+    if alpha.is_none() && channels.len() == 4 {
+        let legacy_alpha = channels.pop();
+        (channels, legacy_alpha)
+    } else {
+        (channels, alpha)
+    }
+}
+
+fn parse_rgb_function(args: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    let (channels, alpha) = color_components(args)?;
+    let (channels, alpha) = split_legacy_alpha(channels, alpha);
+    if channels.len() != 3 {
+        return Err(ValueError::InvalidValue("invalid rgb() arguments".into()));
+    }
+    let channel = |c| -> Result<u8, ValueError> {
+        let value = match c {
+            ColorComponent::Number(v) => v,
+            ColorComponent::Percentage(v) => v * 255.0 / 100.0,
+            ColorComponent::AngleDeg(_) => {
+                return Err(ValueError::InvalidValue("invalid rgb() angle".into()))
+            }
+        };
+        Ok(value.clamp(0.0, 255.0).round() as u8)
+    };
+    Ok(CssValue::Color(Color::Rgba {
+        r: channel(channels[0])?,
+        g: channel(channels[1])?,
+        b: channel(channels[2])?,
+        a: alpha_value(alpha)?,
+    }))
+}
+
+fn parse_hsl_function(args: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    let (channels, alpha) = color_components(args)?;
+    let (channels, alpha) = split_legacy_alpha(channels, alpha);
+    if channels.len() != 3 {
+        return Err(ValueError::InvalidValue("invalid hsl() arguments".into()));
+    }
+    let h = angle_degrees(channels[0])?;
+    let s = number_or_percent(channels[1], 100.0)?.clamp(0.0, 100.0);
+    let l = number_or_percent(channels[2], 100.0)?.clamp(0.0, 100.0);
+    Ok(CssValue::Color(Color::Hsl {
+        h,
+        s,
+        l,
+        a: alpha_value(alpha)?,
+    }))
+}
+
+fn parse_lab_function(args: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    let (channels, alpha) = color_components(args)?;
+    if channels.len() != 3 {
+        return Err(ValueError::InvalidValue("invalid lab() arguments".into()));
+    }
+    Ok(CssValue::Color(Color::Lab {
+        l: number_or_percent(channels[0], 100.0)?.clamp(0.0, 100.0),
+        a_axis: number_or_percent(channels[1], 125.0)?,
+        b_axis: number_or_percent(channels[2], 125.0)?,
+        alpha: alpha_value(alpha)?,
+    }))
+}
+
+fn parse_lch_function(args: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    let (channels, alpha) = color_components(args)?;
+    if channels.len() != 3 {
+        return Err(ValueError::InvalidValue("invalid lch() arguments".into()));
+    }
+    Ok(CssValue::Color(Color::Lch {
+        l: number_or_percent(channels[0], 100.0)?.clamp(0.0, 100.0),
+        c: number_or_percent(channels[1], 150.0)?.max(0.0),
+        h: angle_degrees(channels[2])?,
+        a: alpha_value(alpha)?,
+    }))
+}
+
+fn parse_oklab_function(args: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    let (channels, alpha) = color_components(args)?;
+    if channels.len() != 3 {
+        return Err(ValueError::InvalidValue("invalid oklab() arguments".into()));
+    }
+    Ok(CssValue::Color(Color::Oklab {
+        l: number_or_percent(channels[0], 1.0)?.clamp(0.0, 1.0),
+        a_axis: number_or_percent(channels[1], 0.4)?,
+        b_axis: number_or_percent(channels[2], 0.4)?,
+        alpha: alpha_value(alpha)?,
+    }))
+}
+
+fn parse_oklch_function(args: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    let (channels, alpha) = color_components(args)?;
+    if channels.len() != 3 {
+        return Err(ValueError::InvalidValue("invalid oklch() arguments".into()));
+    }
+    Ok(CssValue::Color(Color::Oklch {
+        l: number_or_percent(channels[0], 1.0)?.clamp(0.0, 1.0),
+        c: number_or_percent(channels[1], 0.4)?.max(0.0),
+        h: angle_degrees(channels[2])?,
+        a: alpha_value(alpha)?,
+    }))
 }
 
 fn parse_visibility(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
@@ -1165,24 +1348,6 @@ fn try_length_percentage(cv: &ComponentValue<'_>) -> Option<LengthPercentage> {
     }
 }
 
-fn extract_numbers(args: &[ComponentValue<'_>]) -> Vec<f64> {
-    let mut nums = Vec::new();
-    for cv in args {
-        match cv {
-            ComponentValue::Token(Token {
-                kind: TokenKind::Number { value, .. },
-                ..
-            }) => nums.push(*value),
-            ComponentValue::Token(Token {
-                kind: TokenKind::Percentage { value, .. },
-                ..
-            }) => nums.push(*value),
-            _ => {}
-        }
-    }
-    nums
-}
-
 fn component_values_to_string(value: &[ComponentValue<'_>]) -> String {
     let mut s = String::new();
     for cv in value {
@@ -1439,6 +1604,89 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parse_color4_functions_and_percentage_channels() {
+        let rgb = parse_decl("color: rgb(100% 0% 0% / 50%)");
+        assert_eq!(
+            rgb[0].value,
+            CssValue::Color(Color::Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 0.5,
+            })
+        );
+
+        let hsl = parse_decl("color: hsl(0.333333turn 100% 25% / 25%)");
+        match &hsl[0].value {
+            CssValue::Color(Color::Hsl { h, s, l, a }) => {
+                assert!((*h - 119.99988).abs() < 0.001);
+                assert_eq!((*s, *l, *a), (100.0, 25.0, 0.25));
+            }
+            other => panic!("expected Hsl, got {other:?}"),
+        }
+
+        let lab = parse_decl("color: lab(50% 40 30 / 75%)");
+        assert_eq!(
+            lab[0].value,
+            CssValue::Color(Color::Lab {
+                l: 50.0,
+                a_axis: 40.0,
+                b_axis: 30.0,
+                alpha: 0.75,
+            })
+        );
+
+        let lch = parse_decl("color: lch(50% 50 0.111111turn)");
+        match &lch[0].value {
+            CssValue::Color(Color::Lch { l, c, h, a }) => {
+                assert_eq!((*l, *c, *a), (50.0, 50.0, 1.0));
+                assert!((*h - 39.99996).abs() < 0.001);
+            }
+            other => panic!("expected Lch, got {other:?}"),
+        }
+
+        let oklab = parse_decl("color: oklab(60% 25% 12.5%)");
+        assert_eq!(
+            oklab[0].value,
+            CssValue::Color(Color::Oklab {
+                l: 0.6,
+                a_axis: 0.1,
+                b_axis: 0.05,
+                alpha: 1.0,
+            })
+        );
+
+        let oklch = parse_decl("color: oklch(60% 37.5% 40deg)");
+        assert_eq!(
+            oklch[0].value,
+            CssValue::Color(Color::Oklch {
+                l: 0.6,
+                c: 0.15,
+                h: 40.0,
+                a: 1.0,
+            })
+        );
+    }
+
+    #[test]
+    fn parsed_color4_values_rasterize_like_chrome() {
+        let css = [
+            ("color: hsl(120 100% 25%)", (0, 128, 0, 1.0)),
+            ("color: lab(50% 40 30)", (187, 88, 70, 1.0)),
+            ("color: lch(50% 50 40)", (185, 89, 67, 1.0)),
+            ("color: oklab(60% 0.1 0.05)", (186, 100, 92, 1.0)),
+            ("color: oklch(60% 0.15 40deg)", (200, 91, 50, 1.0)),
+        ];
+        for (decl, expected) in css {
+            let parsed = parse_decl(decl);
+            let CssValue::Color(color) = &parsed[0].value else {
+                panic!("expected color for {decl}");
+            };
+            assert_eq!(color.to_rgba(), expected, "{decl}");
+        }
     }
 
     #[test]
