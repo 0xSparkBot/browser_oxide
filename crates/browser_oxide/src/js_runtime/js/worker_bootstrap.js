@@ -720,13 +720,12 @@
         ops.op_worker_self_post(payload);
     };
 
-    // --- close: stop this worker's message pump ---
-    // Terminating a worker from inside is rare; the parent handles cleanup.
+    // --- close: terminate this worker from inside its own global scope ---
     let _closed = false;
     self.close = function () {
+        if (_closed) return;
         _closed = true;
-        // parent.terminate() drives real shutdown via the terminate flag +
-        // notify_worker, which resolves the awaited recv and ends the pump.
+        try { ops.op_worker_self_close(); } catch (_) {}
     };
 
     function _dispatchWorkerMessage(s) {

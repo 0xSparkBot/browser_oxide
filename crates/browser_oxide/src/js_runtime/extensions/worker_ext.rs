@@ -379,11 +379,13 @@ static NEXT_WORKER_ID: AtomicU32 = AtomicU32::new(1);
 
 // ============================================================================
 // SharedWorker registry — process-global worker identity keyed by
-// (origin, resolved script URL, name, module/classic type).
+// (origin, resolved script URL, name). Module/classic type and credentials
+// are compatibility attributes of the selected global, not identity fields.
 //
 // A SharedWorker is not owned by the first Page that creates it. Each Page
-// owns only connection references; the worker thread is reaped when the last
-// connection is explicitly closed or its owning Page is dropped/reused.
+// that successfully constructs the worker owns that global until the Page is
+// dropped/reused, independently of MessagePort.close(). The worker is reaped
+// when the last Page owner disappears or the worker calls self.close().
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -391,12 +393,26 @@ struct SharedWorkerKey {
     origin: String,
     url: String,
     name: String,
-    is_module: bool,
 }
 
 struct SharedWorkerSlot {
     worker_id: u32,
     connections: usize,
+    owners: usize,
+    is_module: bool,
+    credentials: String,
+}
+
+#[derive(Debug, Clone)]
+struct SharedWorkerConnection {
+    key: SharedWorkerKey,
+    worker_id: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SharedWorkerOwner {
+    key: SharedWorkerKey,
+    worker_id: u32,
 }
 
 fn shared_worker_registry() -> &'static Mutex<HashMap<SharedWorkerKey, SharedWorkerSlot>> {
@@ -404,8 +420,8 @@ fn shared_worker_registry() -> &'static Mutex<HashMap<SharedWorkerKey, SharedWor
     INST.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn shared_worker_connections() -> &'static Mutex<HashMap<u32, SharedWorkerKey>> {
-    static INST: OnceLock<Mutex<HashMap<u32, SharedWorkerKey>>> = OnceLock::new();
+fn shared_worker_connections() -> &'static Mutex<HashMap<u32, SharedWorkerConnection>> {
+    static INST: OnceLock<Mutex<HashMap<u32, SharedWorkerConnection>>> = OnceLock::new();
     INST.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -720,6 +736,9 @@ pub fn op_broadcast_channel_close(#[smi] endpoint_id: i32) {
 // ============================================================================
 
 struct WorkerSelf {
+    /// Process-global worker registry id. Used by `self.close()` to terminate
+    /// the current worker without routing through its parent Page.
+    worker_id: u32,
     to_parent: Sender<String>,
     from_parent: Receiver<String>,
     /// Same Arc as the parent's `WorkerSlot.notify_parent`. Worker
@@ -857,6 +876,7 @@ fn spawn_worker_inner(
             let notify_message_port = Arc::new(Notify::new());
             WORKER_SELF.with(|w| {
                 *w.borrow_mut() = Some(WorkerSelf {
+                    worker_id,
                     to_parent: to_parent_tx,
                     from_parent: to_worker_rx,
                     notify_parent: notify_parent.clone(),
@@ -1054,33 +1074,27 @@ fn shared_worker_is_live(worker_id: u32) -> bool {
 }
 
 fn disconnect_shared_worker_connection_inner(connection_id: u32) {
-    let key = shared_worker_connections()
+    let connection = shared_worker_connections()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&connection_id);
-    let Some(key) = key else {
+    let Some(connection) = connection else {
         return;
     };
 
-    let terminate_id = {
-        let mut registry = shared_worker_registry()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(slot) = registry.get_mut(&key) else {
-            return;
-        };
-        slot.connections = slot.connections.saturating_sub(1);
-        if slot.connections == 0 {
-            let worker_id = slot.worker_id;
-            registry.remove(&key);
-            Some(worker_id)
-        } else {
-            None
+    let mut registry = shared_worker_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = registry.get_mut(&connection.key) {
+        if slot.worker_id == connection.worker_id {
+            // Closing a MessagePort does not release the Document's ownership
+            // of its SharedWorker. Chromium keeps the global alive while the
+            // creating realm itself is alive, so a later constructor call in
+            // the same page reconnects to the existing global. The owner is
+            // released by `drain_owned_shared_worker_connections` when that
+            // page/runtime is dropped or warm-reused.
+            slot.connections = slot.connections.saturating_sub(1);
         }
-    };
-
-    if let Some(worker_id) = terminate_id {
-        terminate_worker_inner(worker_id);
     }
 }
 
@@ -1092,6 +1106,7 @@ pub fn op_shared_worker_connect(
     #[string] url: String,
     #[string] name: String,
     is_module: bool,
+    #[string] credentials: String,
     #[string] script: String,
     storage_directory_allowed: bool,
     #[smi] endpoint_id: i32,
@@ -1100,17 +1115,27 @@ pub fn op_shared_worker_connect(
         origin,
         url: url.clone(),
         name: name.clone(),
-        is_module,
     };
 
-    let existing_id = shared_worker_registry()
+    let existing = shared_worker_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
-        .map(|slot| slot.worker_id);
-    let existing_id = existing_id.filter(|worker_id| shared_worker_is_live(*worker_id));
+        .map(|slot| (slot.worker_id, slot.is_module, slot.credentials.clone()));
+    let existing = existing.filter(|(worker_id, _, _)| shared_worker_is_live(*worker_id));
 
-    let worker_id = if let Some(worker_id) = existing_id {
+    // Chromium uses (storage key/origin, resolved URL, name) as the shared
+    // worker identity. `type` and `credentials` are compatibility checks on
+    // an existing named worker, not independent identity dimensions. A
+    // mismatch returns a SharedWorker object whose `error` event fires
+    // asynchronously instead of starting a second global.
+    if let Some((_worker_id, existing_module, existing_credentials)) = &existing {
+        if *existing_module != is_module || existing_credentials != &credentials {
+            return -1;
+        }
+    }
+
+    let worker_id = if let Some((worker_id, _, _)) = existing {
         worker_id
     } else {
         // Remove a stale registry entry before creating the replacement.
@@ -1140,23 +1165,53 @@ pub fn op_shared_worker_connect(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             match registry.get(&key) {
-                Some(slot) if shared_worker_is_live(slot.worker_id) => slot.worker_id,
+                Some(slot) if shared_worker_is_live(slot.worker_id) => {
+                    if slot.is_module != is_module || slot.credentials != credentials {
+                        0
+                    } else {
+                        slot.worker_id
+                    }
+                }
                 _ => {
                     registry.insert(
                         key.clone(),
                         SharedWorkerSlot {
                             worker_id: spawned,
                             connections: 0,
+                            owners: 0,
+                            is_module,
+                            credentials: credentials.clone(),
                         },
                     );
                     spawned
                 }
             }
         };
+        if canonical == 0 {
+            terminate_worker_inner(spawned);
+            return -1;
+        }
         if canonical != spawned {
             terminate_worker_inner(spawned);
         }
         canonical
+    };
+
+    let is_new_owner = {
+        let owned = op_state.borrow::<SharedWorkerOwnership>();
+        let mut owners = owned.owners.borrow_mut();
+        if owners
+            .iter()
+            .any(|owner| owner.worker_id == worker_id && owner.key == key)
+        {
+            false
+        } else {
+            owners.push(SharedWorkerOwner {
+                key: key.clone(),
+                worker_id,
+            });
+            true
+        }
     };
 
     let connection_id = NEXT_SHARED_WORKER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
@@ -1167,12 +1222,15 @@ pub fn op_shared_worker_connect(
         let Some(slot) = registry.get_mut(&key) else {
             return 0;
         };
+        if is_new_owner {
+            slot.owners += 1;
+        }
         slot.connections += 1;
     }
     shared_worker_connections()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(connection_id, key);
+        .insert(connection_id, SharedWorkerConnection { key, worker_id });
     op_state
         .borrow::<SharedWorkerOwnership>()
         .connection_ids
@@ -1264,6 +1322,28 @@ pub fn terminate_worker_inner(worker_id: u32) {
     reg.remove(&worker_id);
 }
 
+/// Terminate a worker that may also be registered as a SharedWorker.
+///
+/// SharedWorker owners/connections carry the worker id as a generation token,
+/// so removing this generation here is safe even if a later constructor
+/// creates a replacement for the same (origin, URL, name) key. Stale Page
+/// ownership records will no-op when they are eventually drained.
+fn terminate_shared_worker_instance_inner(worker_id: u32) {
+    {
+        let mut registry = shared_worker_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.retain(|_, slot| slot.worker_id != worker_id);
+    }
+    {
+        let mut connections = shared_worker_connections()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        connections.retain(|_, connection| connection.worker_id != worker_id);
+    }
+    terminate_worker_inner(worker_id);
+}
+
 /// Reaper for `Page::drop` — terminates every worker spawned by a
 /// page's V8 isolate. Without this, workers created via `new Worker(blob)`
 /// keep their OS thread + child `JsRuntime` alive for the lifetime of
@@ -1283,15 +1363,44 @@ pub fn drain_owned_workers(state: &mut OpState) {
 }
 
 /// Release SharedWorker connection references owned by one Page/runtime.
-/// The shared worker thread itself survives while another runtime still has
-/// an open connection to the same (origin, URL, name, type) storage key.
+/// The shared worker thread itself survives while another runtime still owns
+/// the same (origin, URL, name) worker, even if all of its ports are closed.
 pub fn drain_owned_shared_worker_connections(state: &mut OpState) {
-    let ids: Vec<u32> = state
+    let (ids, owners): (Vec<u32>, Vec<SharedWorkerOwner>) = state
         .try_borrow::<SharedWorkerOwnership>()
-        .map(|o| std::mem::take(&mut *o.connection_ids.borrow_mut()))
+        .map(|o| {
+            (
+                std::mem::take(&mut *o.connection_ids.borrow_mut()),
+                std::mem::take(&mut *o.owners.borrow_mut()),
+            )
+        })
         .unwrap_or_default();
     for id in ids {
         disconnect_shared_worker_connection_inner(id);
+    }
+
+    for owner in owners {
+        let terminate_id = {
+            let mut registry = shared_worker_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match registry.get_mut(&owner.key) {
+                Some(slot) if slot.worker_id == owner.worker_id => {
+                    slot.owners = slot.owners.saturating_sub(1);
+                    if slot.owners == 0 {
+                        let worker_id = slot.worker_id;
+                        registry.remove(&owner.key);
+                        Some(worker_id)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(worker_id) = terminate_id {
+            terminate_worker_inner(worker_id);
+        }
     }
 }
 
@@ -1309,6 +1418,7 @@ pub struct WorkerOwnership {
 #[derive(Default)]
 pub struct SharedWorkerOwnership {
     connection_ids: RefCell<Vec<u32>>,
+    owners: RefCell<Vec<SharedWorkerOwner>>,
 }
 
 /// Async op that returns the next worker→parent message,
@@ -1379,6 +1489,14 @@ pub fn op_worker_self_post(#[string] data: String) {
             }
         }
     });
+}
+
+#[op2(fast)]
+pub fn op_worker_self_close() {
+    let worker_id = WORKER_SELF.with(|w| w.borrow().as_ref().map(|state| state.worker_id));
+    if let Some(worker_id) = worker_id {
+        terminate_shared_worker_instance_inner(worker_id);
+    }
 }
 
 #[op2]
@@ -1507,6 +1625,7 @@ deno_core::extension!(
         op_worker_await_message,
         op_worker_terminate,
         op_worker_self_post,
+        op_worker_self_close,
         op_worker_self_url,
         op_worker_self_is_shared,
         op_worker_self_name,

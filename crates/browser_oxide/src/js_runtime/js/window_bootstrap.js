@@ -3397,15 +3397,25 @@
                 super();
                 let name = '';
                 let type = 'classic';
+                let credentials = 'same-origin';
                 if (typeof options === 'string') {
                     name = options;
                 } else if (options && typeof options === 'object') {
                     if (options.name !== undefined) name = String(options.name);
                     if (options.type !== undefined) type = String(options.type);
+                    if (options.credentials !== undefined) credentials = String(options.credentials);
                 }
                 if (type !== 'classic' && type !== 'module') {
-                    throw new TypeError("Failed to construct 'SharedWorker': The provided value '"
-                        + type + "' is not a valid enum value of type WorkerType.");
+                    throw new TypeError(
+                        "Failed to construct 'SharedWorker': Failed to read the 'type' property from 'WorkerOptions': The provided value '"
+                        + type + "' is not a valid enum value of type WorkerType."
+                    );
+                }
+                if (credentials !== 'omit' && credentials !== 'same-origin' && credentials !== 'include') {
+                    throw new TypeError(
+                        "Failed to construct 'SharedWorker': Failed to read the 'credentials' property from 'WorkerOptions': The provided value '"
+                        + credentials + "' is not a valid enum value of type RequestCredentials."
+                    );
                 }
 
                 const resolved = new URL(String(scriptURL), location.href);
@@ -3432,10 +3442,24 @@
                     resolved.href,
                     name,
                     type === 'module',
+                    credentials,
                     script,
                     true,
                     endpointId,
                 );
+                if (connectionId < 0) {
+                    channel.port1.close();
+                    _sharedWorkerState.set(this, {
+                        port: channel.port1,
+                        onerror: null,
+                    });
+                    setTimeout(() => {
+                        try {
+                            this.dispatchEvent(_markTrustedEvent(new Event('error')));
+                        } catch (_) {}
+                    }, 0);
+                    return;
+                }
                 if (!connectionId) {
                     channel.port1.close();
                     throw new DOMException('SharedWorker could not be started.', 'NetworkError');

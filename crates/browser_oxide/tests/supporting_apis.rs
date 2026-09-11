@@ -1459,7 +1459,7 @@ async fn shared_worker_reuses_global_for_same_key_and_isolates_by_name() {
 }
 
 #[tokio::test]
-async fn shared_worker_last_port_close_releases_worker_instance() {
+async fn shared_worker_port_close_keeps_page_owner_alive() {
     let mut page = Page::from_html_with_url(
         r#"<html><body><div id="out"></div><script>
             (() => {
@@ -1507,7 +1507,236 @@ async fn shared_worker_last_port_close_releases_worker_instance() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
+    // Chrome 148 keeps the SharedWorker global alive after the last port is
+    // explicitly closed while the owning Document is still alive. A later
+    // constructor in that page reconnects to the same global.
+    assert_eq!(page.text_of("#out"), Some("2".to_string()));
+}
+
+#[tokio::test]
+async fn shared_worker_option_mismatch_dispatches_error_like_chrome_148() {
+    let mut page = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    let connections = 0;
+                    self.onconnect = (event) => {
+                        const port = event.ports[0];
+                        port.postMessage(++connections);
+                        port.start();
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                const first = new SharedWorker(url, {
+                    name: 'mismatch', credentials: 'omit', type: 'classic'
+                });
+                const credentialMismatch = new SharedWorker(url, {
+                    name: 'mismatch', credentials: 'include', type: 'classic'
+                });
+                const typeMismatch = new SharedWorker(url, {
+                    name: 'mismatch', credentials: 'omit', type: 'module'
+                });
+                const result = { first: null, credentials: null, type: null };
+                const finish = () => {
+                    if (result.first === null || result.credentials === null || result.type === null) return;
+                    document.getElementById('out').textContent = JSON.stringify(result);
+                    first.port.close();
+                    credentialMismatch.port.close();
+                    typeMismatch.port.close();
+                    URL.revokeObjectURL(url);
+                };
+                first.port.onmessage = (event) => { result.first = event.data; finish(); };
+                first.port.start();
+                credentialMismatch.onerror = (event) => {
+                    result.credentials = { type: event.type, trusted: event.isTrusted };
+                    finish();
+                };
+                typeMismatch.onerror = (event) => {
+                    result.type = { type: event.type, trusted: event.isTrusted };
+                    finish();
+                };
+            })();
+        </script></body></html>"#,
+        "https://shared.example/page",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..80 {
+        if page.text_of("#out").is_some_and(|value| !value.is_empty()) {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        page.text_of("#out"),
+        Some(
+            r#"{"first":1,"credentials":{"type":"error","trusted":true},"type":{"type":"error","trusted":true}}"#
+                .to_string()
+        )
+    );
+
+    assert_eq!(
+        page.evaluate(
+            r#"(() => {
+                const errors = {};
+                try { new SharedWorker('x', { credentials: 'bogus' }); errors.credentials = 'ok'; }
+                catch (e) { errors.credentials = e.name + ':' + e.message; }
+                try { new SharedWorker('x', { type: 'bogus' }); errors.type = 'ok'; }
+                catch (e) { errors.type = e.name + ':' + e.message; }
+                return JSON.stringify(errors);
+            })()"#
+        )
+        .unwrap(),
+        r#"{"credentials":"TypeError:Failed to construct 'SharedWorker': Failed to read the 'credentials' property from 'WorkerOptions': The provided value 'bogus' is not a valid enum value of type RequestCredentials.","type":"TypeError:Failed to construct 'SharedWorker': Failed to read the 'type' property from 'WorkerOptions': The provided value 'bogus' is not a valid enum value of type WorkerType."}"#
+    );
+}
+
+#[tokio::test]
+async fn shared_worker_global_scope_close_releases_instance() {
+    let mut page = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    let connections = 0;
+                    self.onconnect = (event) => {
+                        const ordinal = ++connections;
+                        const port = event.ports[0];
+                        port.onmessage = (message) => {
+                            if (message.data === 'shutdown') {
+                                port.postMessage('closing');
+                                self.close();
+                                return;
+                            }
+                            port.postMessage(ordinal);
+                        };
+                        port.start();
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                const first = new SharedWorker(url, 'self-close');
+                first.port.onmessage = (event) => {
+                    if (event.data !== 'closing') return;
+                    setTimeout(() => {
+                        const second = new SharedWorker(url, 'self-close');
+                        second.port.onmessage = (next) => {
+                            document.getElementById('out').textContent = String(next.data);
+                            second.port.close();
+                            first.port.close();
+                            URL.revokeObjectURL(url);
+                        };
+                        second.port.start();
+                        second.port.postMessage('ordinal');
+                    }, 50);
+                };
+                first.port.start();
+                first.port.postMessage('shutdown');
+            })();
+        </script></body></html>"#,
+        "https://shared.example/page",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..100 {
+        if page.text_of("#out").as_deref() == Some("1") {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
     assert_eq!(page.text_of("#out"), Some("1".to_string()));
+}
+
+#[tokio::test]
+async fn shared_worker_document_drop_releases_owner() {
+    let mut first = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    let connections = 0;
+                    self.onconnect = (event) => {
+                        const ordinal = ++connections;
+                        const port = event.ports[0];
+                        port.onmessage = () => port.postMessage(ordinal);
+                        port.start();
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                globalThis.__sharedURL = url;
+                const worker = new SharedWorker(url, 'drop-owner');
+                worker.port.onmessage = (event) => {
+                    document.getElementById('out').textContent = String(event.data);
+                    worker.port.close();
+                };
+                worker.port.start();
+                worker.port.postMessage('ordinal');
+            })();
+        </script></body></html>"#,
+        "https://shared.example/first",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..80 {
+        if first.text_of("#out").as_deref() == Some("1") {
+            break;
+        }
+        let _ = first
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(first.text_of("#out"), Some("1".to_string()));
+    let url = first.evaluate("__sharedURL").unwrap();
+    drop(first);
+
+    let escaped = serde_json::to_string(&url).unwrap();
+    let html = format!(
+        r#"<html><body><div id="out"></div><script>
+            (() => {{
+                const worker = new SharedWorker({escaped}, 'drop-owner');
+                worker.port.onmessage = (event) => {{
+                    document.getElementById('out').textContent = String(event.data);
+                    worker.port.close();
+                    URL.revokeObjectURL({escaped});
+                }};
+                worker.port.start();
+                worker.port.postMessage('ordinal');
+            }})();
+        </script></body></html>"#
+    );
+    let mut second = Page::from_html_with_url(
+        &html,
+        "https://shared.example/second",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+    for _ in 0..80 {
+        if second.text_of("#out").as_deref() == Some("1") {
+            break;
+        }
+        let _ = second
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(second.text_of("#out"), Some("1".to_string()));
 }
 
 #[tokio::test]
