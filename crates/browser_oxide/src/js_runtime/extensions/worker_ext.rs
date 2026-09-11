@@ -16,7 +16,7 @@ use deno_core::{op2, v8, OpState};
 use futures_util::task::AtomicWaker;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Waker;
@@ -69,6 +69,7 @@ pub struct WorkerContextState {
 pub struct WorkerOwnerWake {
     notify: Arc<Notify>,
     task_waker: Arc<AtomicWaker>,
+    generation: Arc<AtomicU64>,
 }
 
 impl Default for WorkerOwnerWake {
@@ -76,6 +77,7 @@ impl Default for WorkerOwnerWake {
         Self {
             notify: Arc::new(Notify::new()),
             task_waker: Arc::new(AtomicWaker::new()),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -89,10 +91,19 @@ impl WorkerOwnerWake {
         self.notify.clone()
     }
 
+    /// Monotonic owner-wake generation. `BrowserEventLoop` snapshots this
+    /// before driving V8 and re-checks it before accepting an idle result, so
+    /// a worker/MessagePort wake that races with deno_core's idle transition
+    /// cannot be lost merely because both futures became ready in one poll.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     fn wake(&self) {
         // `Notify` stores a permit for BrowserEventLoop even when it is between
         // waits. AtomicWaker targets the persistent FrameWaker registered by
         // the frame-tree driver's BrowserJsRuntime::poll_once.
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.notify.notify_one();
         self.task_waker.wake();
     }

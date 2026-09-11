@@ -321,17 +321,21 @@ impl BrowserEventLoop {
             } else {
                 None
             };
-            // `biased` keeps V8 progress first; the frame/nav/readiness wakes
-            // let those transitions resume with no poll latency.
+            // Prefer a worker wake over a simultaneous deno_core idle result.
+            // A worker reply may become ready in the exact scheduler turn that
+            // the owner runtime reports idle; accepting idle first loses that
+            // MessageEvent until a later caller happens to drive the runtime.
+            // Other wake sources retain their previous ordering.
             let frame_notify = crate::js_runtime::extensions::frame_ext::frame_msg_notify();
             let ready_fut = ready_notify.notified();
+            let worker_generation = self.runtime.worker_wake_generation();
             tokio::pin!(ready_fut);
             let result: Result<Result<(), deno_core::error::AnyError>, ()> = tokio::select! {
                 biased;
+                _ = worker_notify.notified() => Err(()),
                 r = self.runtime.run_event_loop() => Ok(r),
                 _ = frame_notify.notified() => Err(()),
                 _ = nav_notify.notified() => Err(()),
-                _ = worker_notify.notified() => Err(()),
                 _ = &mut ready_fut, if honor_settle => Err(()),
             };
 
@@ -362,7 +366,14 @@ impl BrowserEventLoop {
 
             match result {
                 Ok(Ok(())) => {
-                    // Event loop completed all work
+                    // A worker/remote MessagePort can enqueue and wake the
+                    // owner during the same poll in which deno_core decides it
+                    // is idle. If that happened, re-drive instead of losing
+                    // the MessageEvent until some unrelated future caller.
+                    if self.runtime.worker_wake_generation() != worker_generation {
+                        continue;
+                    }
+                    // Event loop completed all work and no owner wake raced it.
                     break Ok(IdleReason::AllWorkDone);
                 }
                 Ok(Err(e)) => break Err(e),

@@ -188,6 +188,13 @@ impl BrowserJsRuntime {
         self.worker_owner_wake.notify_handle()
     }
 
+    /// Monotonic generation for actual worker/remote-MessagePort owner wakes.
+    /// Used by `BrowserEventLoop` to close the wake-vs-idle race without a
+    /// polling interval.
+    pub fn worker_wake_generation(&self) -> u64 {
+        self.worker_owner_wake.generation()
+    }
+
     /// Set `document.currentScript` through a private bootstrap closure that is
     /// retained after the page-visible bridge has been deleted.
     pub fn set_current_script(&mut self, node_id: Option<u32>) {
@@ -269,9 +276,9 @@ impl BrowserJsRuntime {
     /// handoff: it never waits for an idle worker, so calling it on every event
     /// loop entry preserves fast page-idle detection while ensuring a later
     /// unsolicited worker message is not stranded behind an unpolled op.
-    fn pump_worker_messages(&mut self) {
+    fn pump_worker_messages(&mut self) -> u32 {
         let Some(function) = self.worker_messages_pump_fn.clone() else {
-            return;
+            return 0;
         };
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
         let __ctx = self.inner.main_context();
@@ -279,15 +286,18 @@ impl BrowserJsRuntime {
         v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
         let function = v8::Local::new(scope, &function);
         let receiver = v8::undefined(scope).into();
-        let _ = function.call(scope, receiver, &[]);
+        function
+            .call(scope, receiver, &[])
+            .and_then(|value| value.uint32_value(scope))
+            .unwrap_or(0)
     }
 
     /// Flush messages queued on transferred MessagePort endpoints. The Rust
     /// registry wakes `worker_owner_wake` when a peer posts; draining here is
     /// synchronous and never pins the runtime waiting for an idle port.
-    fn pump_message_ports(&mut self) {
+    fn pump_message_ports(&mut self) -> u32 {
         let Some(function) = self.message_ports_pump_fn.clone() else {
-            return;
+            return 0;
         };
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
         let __ctx = self.inner.main_context();
@@ -295,7 +305,10 @@ impl BrowserJsRuntime {
         v8::scope_with_context!(scope, self.inner.v8_isolate(), __ctx);
         let function = v8::Local::new(scope, &function);
         let receiver = v8::undefined(scope).into();
-        let _ = function.call(scope, receiver, &[]);
+        function
+            .call(scope, receiver, &[])
+            .and_then(|value| value.uint32_value(scope))
+            .unwrap_or(0)
     }
 
     /// Block until a CDP frontend connects, then pause at the next statement
@@ -575,23 +588,35 @@ impl BrowserJsRuntime {
     /// Run the V8 event loop until all pending work is done.
     pub async fn run_event_loop(&mut self) -> Result<(), deno_core::error::AnyError> {
         let _tokio_guard = tokio_fallback::ensure_tokio_context();
-        self.pump_worker_messages();
-        self.pump_message_ports();
-        // v8-149: re-enter this runtime's own isolate so driving the event
-        // loop (which runs JS, microtasks, and ops that build scopes) targets
-        // the correct thread-current isolate even when a child-iframe runtime
-        // was constructed more recently and made *its* isolate current. See
-        // the long note in `execute_script`. Without this, sites that spawn
-        // iframes/workers crash with the scope.rs "not the same Isolate" panic.
-        let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
-        let result = self
-            .inner
-            .run_event_loop(deno_core::PollEventLoopOptions::default())
-            .await
-            .map_err(|e| deno_core::error::AnyError::msg(e.to_string()));
-        self.pump_worker_messages();
-        self.pump_message_ports();
-        result
+        loop {
+            let _ = self.pump_worker_messages();
+            let _ = self.pump_message_ports();
+
+            // v8-149: re-enter this runtime's own isolate so driving the event
+            // loop (which runs JS, microtasks, and ops that build scopes) targets
+            // the correct thread-current isolate even when a child-iframe runtime
+            // was constructed more recently and made *its* isolate current. See
+            // the long note in `execute_script`. Without this, sites that spawn
+            // iframes/workers crash with the scope.rs "not the same Isolate" panic.
+            {
+                let _isolate_guard = IsolateEnterGuard::enter(self.inner.v8_isolate());
+                self.inner
+                    .run_event_loop(deno_core::PollEventLoopOptions::default())
+                    .await
+                    .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
+            }
+
+            // `JsRuntime::run_event_loop` can become idle in the same scheduler
+            // turn that a worker or transferred MessagePort queues a message.
+            // Drain those cross-thread queues one final time before accepting
+            // idle. If delivery ran JS handlers, loop once more so any resulting
+            // microtasks/timers are also driven. This closes the idle-vs-owner-
+            // wake race without adding a polling cadence or artificial delay.
+            let delivered = self.pump_worker_messages() + self.pump_message_ports();
+            if delivered == 0 {
+                return Ok(());
+            }
+        }
     }
 
     /// Poll this runtime's event loop once with the driver's context, so the

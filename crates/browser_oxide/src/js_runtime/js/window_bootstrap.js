@@ -2716,11 +2716,17 @@
                 // a chance to settle. In that case its original ref would
                 // otherwise pin the page forever; convert it to the normal
                 // idle/background receive now.
-                if (_unrefWorkerOp && state.pendingReceive) {
+                if (state.pendingReceive && state.refNextReceive) {
+                    // A parent post raced worker startup. The current receive
+                    // is now the one that must observe that post's prompt
+                    // reply, so keep it ref'ed and consume the carry flag.
+                    state.refNextReceive = false;
+                } else if (_unrefWorkerOp && state.pendingReceive) {
                     try { _unrefWorkerOp(state.pendingReceive); } catch (_) {}
                 }
                 return true;
             }
+            const postEpochBeforeDispatch = state.postEpoch;
             const deserializer =
                 _browser_oxide && _browser_oxide.deserializeFromWire;
             let payload = null;
@@ -2794,7 +2800,9 @@
             // postMessage() to ref the outstanding async receive. The promise
             // itself is still waiting, so return it to background/unref state
             // after dispatching the queued message.
-            if (_unrefWorkerOp && state.pendingReceive) {
+            if (_unrefWorkerOp
+                && state.pendingReceive
+                && state.postEpoch === postEpochBeforeDispatch) {
                 try { _unrefWorkerOp(state.pendingReceive); } catch (_) {}
             }
             return true;
@@ -2914,6 +2922,14 @@
                     type,
                     initializing: true,
                     pendingReceive: null,
+                    // If postMessage() happens before the current receive is
+                    // installed, or while startup's ready marker still owns
+                    // that receive, carry the ref intent to the next receive.
+                    refNextReceive: false,
+                    // Distinguish a handler that posts a new message while a
+                    // synchronous fallback drain is dispatching the previous
+                    // reply. The new exchange must stay ref'ed.
+                    postEpoch: 0,
                     handlers: { message: null, error: null },
                 };
                 _workerState.set(this, state);
@@ -2986,7 +3002,9 @@
                     // every caller-side drain hits its timeout.  The op still
                     // wakes normally and is observed by the next event-loop
                     // turn, just like the unref'd long timers above.
-                    if (_unrefWorkerOp && !state.initializing) {
+                    const keepRefed = state.initializing || state.refNextReceive;
+                    if (state.refNextReceive) state.refNextReceive = false;
+                    if (_unrefWorkerOp && !keepRefed) {
                         _unrefWorkerOp(pending);
                     }
                     pending.then((raw) => {
@@ -3004,6 +3022,7 @@
             postMessage(message, transfer) {
                 const state = _getWorkerState(this);
                 if (!state.id) return;
+                state.postEpoch++;
                 // Engine-level call counter: survives probe wrap-timing (a
                 // page that captured Worker before the probe's wrap still
                 // counts here). Distinguishes "parent never posted" from
@@ -3072,6 +3091,18 @@
                 // again, avoiding the permanent navigation-idle pin.
                 if (_refWorkerOp && state.pendingReceive) {
                     _refWorkerOp(state.pendingReceive);
+                    if (state.initializing) {
+                        // Startup's ready marker may settle this receive before
+                        // the worker's actual response. Keep the next receive
+                        // ref'ed as well so the response cannot fall through
+                        // the owner-idle boundary.
+                        state.refNextReceive = true;
+                    }
+                } else {
+                    // A message handler can call postMessage() after its old
+                    // receive has settled but before `_drainOnce` installs the
+                    // next one. Carry the ref intent across that tiny gap.
+                    state.refNextReceive = true;
                 }
             }
 
@@ -3562,6 +3593,7 @@
         };
 
         function _pumpRemotePorts() {
+            let delivered = 0;
             for (const port of Array.from(_PortRemoteActive)) {
                 if (_PortTransferred.has(port)
                     || _PortClosed.get(port)
@@ -3593,8 +3625,10 @@
                         )
                         : [];
                     _dispatchPortEvent(port, data, ports);
+                    delivered++;
                 }
             }
+            return delivered;
         }
 
         class MessagePort extends EventTarget {
