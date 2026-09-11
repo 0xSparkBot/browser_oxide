@@ -63,10 +63,16 @@ impl ProxyConfig {
     ///
     /// Returns `None` if neither is set.
     pub fn resolve(profile_proxy: Option<&str>) -> Result<Option<Self>, NetError> {
-        if let Ok(env) = std::env::var("BROWSER_OXIDE_PROXY") {
-            if !env.is_empty() {
-                return Self::parse(&env).map(Some);
-            }
+        let env = std::env::var("BROWSER_OXIDE_PROXY").ok();
+        Self::resolve_with_env_override(profile_proxy, env.as_deref())
+    }
+
+    fn resolve_with_env_override(
+        profile_proxy: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<Option<Self>, NetError> {
+        if let Some(env) = env_override.filter(|value| !value.is_empty()) {
+            return Self::parse(env).map(Some);
         }
         match profile_proxy {
             Some(s) if !s.is_empty() => Self::parse(s).map(Some),
@@ -452,17 +458,18 @@ mod tests {
 
     #[test]
     fn resolve_env_overrides_profile() {
-        // Save and restore env to avoid affecting other tests.
-        let saved = std::env::var("BROWSER_OXIDE_PROXY").ok();
-        std::env::set_var("BROWSER_OXIDE_PROXY", "socks5://env.example:1080");
-        let r = ProxyConfig::resolve(Some("http://profile.example:8080")).unwrap();
+        // Inject the env override directly instead of mutating process-global
+        // environment state: the lib test suite runs in parallel, and a brief
+        // fake proxy value here can otherwise leak into unrelated HttpClient
+        // construction and make local navigation tests fail nondeterministically.
+        let r = ProxyConfig::resolve_with_env_override(
+            Some("http://profile.example:8080"),
+            Some("socks5://env.example:1080"),
+        )
+        .unwrap();
         match r {
             Some(ProxyConfig::Socks5 { host, .. }) => assert_eq!(host, "env.example"),
             other => panic!("expected env override Socks5, got {other:?}"),
-        }
-        match saved {
-            Some(v) => std::env::set_var("BROWSER_OXIDE_PROXY", v),
-            None => std::env::remove_var("BROWSER_OXIDE_PROXY"),
         }
     }
 
@@ -525,16 +532,12 @@ mod tests {
 
     #[test]
     fn resolve_profile_when_no_env() {
-        let saved = std::env::var("BROWSER_OXIDE_PROXY").ok();
-        std::env::remove_var("BROWSER_OXIDE_PROXY");
-        let r = ProxyConfig::resolve(Some("http://profile.example:8080")).unwrap();
+        let r = ProxyConfig::resolve_with_env_override(Some("http://profile.example:8080"), None)
+            .unwrap();
         assert!(matches!(r, Some(ProxyConfig::Http { .. })));
-        let r = ProxyConfig::resolve(None).unwrap();
+        let r = ProxyConfig::resolve_with_env_override(None, None).unwrap();
         assert!(r.is_none());
-        let r = ProxyConfig::resolve(Some("")).unwrap();
+        let r = ProxyConfig::resolve_with_env_override(Some(""), None).unwrap();
         assert!(r.is_none());
-        if let Some(v) = saved {
-            std::env::set_var("BROWSER_OXIDE_PROXY", v);
-        }
     }
 }
