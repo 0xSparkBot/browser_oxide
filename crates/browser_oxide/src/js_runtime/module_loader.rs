@@ -24,6 +24,37 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// HTML JavaScript MIME type essence matching for module scripts. Unlike
+/// classic scripts, module fetches must reject a missing or non-JavaScript
+/// MIME type instead of executing the response body as JavaScript.
+fn is_javascript_mime(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
+}
+
 #[derive(Debug, Clone)]
 enum ImportMapAddress {
     Url(String),
@@ -390,6 +421,11 @@ impl ModuleLoader for BrowserModuleLoader {
         if let Some(rest) = url.strip_prefix("data:") {
             use base64::Engine as _;
             let (meta, payload) = rest.split_once(',').unwrap_or(("", rest));
+            if !is_javascript_mime(meta) {
+                return ModuleLoadResponse::Sync(Err(ModuleLoaderError::generic(format!(
+                    "module data URL has non-JavaScript MIME type: {meta}"
+                ))));
+            }
             let code = if meta.contains(";base64") {
                 base64::engine::general_purpose::STANDARD
                     .decode(payload.trim())
@@ -409,12 +445,19 @@ impl ModuleLoader for BrowserModuleLoader {
         }
 
         if url.starts_with("blob:") {
-            let Some(code) = crate::js_runtime::extensions::worker_ext::blob_module_source(&url)
+            let Some((bytes, content_type)) =
+                crate::js_runtime::extensions::worker_ext::blob_module_entry(&url)
             else {
                 return ModuleLoadResponse::Sync(Err(ModuleLoaderError::generic(format!(
                     "module fetch {url}: blob URL not found or revoked"
                 ))));
             };
+            if !is_javascript_mime(&content_type) {
+                return ModuleLoadResponse::Sync(Err(ModuleLoaderError::generic(format!(
+                    "module blob URL has non-JavaScript MIME type: {content_type}"
+                ))));
+            }
+            let code = String::from_utf8_lossy(&bytes).into_owned();
             return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
                 ModuleType::JavaScript,
                 ModuleSourceCode::String(code.into()),
@@ -445,6 +488,17 @@ impl ModuleLoader for BrowserModuleLoader {
                 return Err(ModuleLoaderError::generic(format!(
                     "module fetch {url} -> status {}",
                     resp.status
+                )));
+            }
+            let content_type = resp
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_default();
+            if !is_javascript_mime(content_type) {
+                return Err(ModuleLoaderError::generic(format!(
+                    "module fetch {url} has non-JavaScript MIME type: {content_type}"
                 )));
             }
             let code = resp.text();

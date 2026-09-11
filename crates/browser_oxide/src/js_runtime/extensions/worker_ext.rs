@@ -187,14 +187,14 @@ fn blob_registry() -> &'static Mutex<BlobRegistry> {
     })
 }
 
-/// Read JavaScript source stored behind a registered blob: URL. The module
-/// loader shares this browser-owned registry with fetch(), Worker(), and
-/// importScripts(), so Blob URL module imports observe the same lifetime.
-pub(crate) fn blob_module_source(url: &str) -> Option<String> {
+/// Read a registered Blob URL for Rust-side consumers such as the ES module
+/// loader. Module import, fetch(), Worker(), and importScripts() all observe
+/// the same browser-owned registry and revoke/lifetime state.
+pub(crate) fn blob_module_entry(url: &str) -> Option<(Vec<u8>, String)> {
     let reg = blob_registry().lock().unwrap_or_else(|e| e.into_inner());
     reg.blobs
         .get(url)
-        .map(|entry| String::from_utf8_lossy(&entry.data).to_string())
+        .map(|entry| (entry.data.clone(), entry.content_type.clone()))
 }
 
 /// Register a blob's bytes + MIME type under a blob: URL. Called from
