@@ -276,6 +276,7 @@
             case 3: node = new Text(nodeId); break;
             case 8: node = new Comment(nodeId); break;
             case 9: node = _document; break;
+            case 10: node = new DocumentType(nodeId); break;
             case 11: node = new DocumentFragment(nodeId); break;
             default: node = new Node(nodeId); break;
         }
@@ -1160,6 +1161,7 @@
             if (type === 3) return "#text";
             if (type === 8) return "#comment";
             if (type === 9) return "#document";
+            if (type === 10) return this.name;
             if (type === 11) return "#document-fragment";
             return "";
         }
@@ -2818,6 +2820,51 @@
 
     class Comment extends CharacterData {}
 
+    class DocumentType extends Node {
+        get name() {
+            const data = ops.op_dom_get_doctype_data(_getNodeId(this));
+            return data[0] || "";
+        }
+        get publicId() {
+            const data = ops.op_dom_get_doctype_data(_getNodeId(this));
+            return data[1] || "";
+        }
+        get systemId() {
+            const data = ops.op_dom_get_doctype_data(_getNodeId(this));
+            return data[2] || "";
+        }
+        after(...nodes) {
+            const parent = this.parentNode;
+            if (!parent) return;
+            const reference = this.nextSibling;
+            for (const node of nodes) {
+                const value = typeof node === "string" ? _document.createTextNode(node) : node;
+                parent.insertBefore(value, reference);
+            }
+        }
+        before(...nodes) {
+            const parent = this.parentNode;
+            if (!parent) return;
+            for (const node of nodes) {
+                const value = typeof node === "string" ? _document.createTextNode(node) : node;
+                parent.insertBefore(value, this);
+            }
+        }
+        remove() {
+            if (this.parentNode) this.parentNode.removeChild(this);
+        }
+        replaceWith(...nodes) {
+            const parent = this.parentNode;
+            if (!parent) return;
+            const reference = this.nextSibling;
+            parent.removeChild(this);
+            for (const node of nodes) {
+                const value = typeof node === "string" ? _document.createTextNode(node) : node;
+                parent.insertBefore(value, reference);
+            }
+        }
+    }
+
     class DocumentFragment extends Node {
         constructor(nodeId) {
             const id = nodeId === undefined ? ops.op_dom_create_document_fragment() : nodeId;
@@ -2982,6 +3029,88 @@
         const h = globalThis.innerHeight || 0;
         return x >= 0 && y >= 0 && x < w && y < h;
     };
+
+    const _domImplementations = new WeakMap();
+    const _domImplementationOwners = new WeakMap();
+
+    function DOMImplementation() {
+        if (!new.target) throw new TypeError("Illegal constructor");
+        throw new TypeError("Failed to construct 'DOMImplementation': Illegal constructor");
+    }
+
+    const _domImplementationPrototype = {};
+    const _requireDOMImplementation = value => {
+        if (!_domImplementationOwners.has(value)) throw new TypeError("Illegal invocation");
+        return _domImplementationOwners.get(value);
+    };
+    Object.defineProperties(_domImplementationPrototype, {
+        createDocument: {
+            value: function createDocument(namespaceURI, qualifiedName) {
+                _requireDOMImplementation(this);
+                const name = qualifiedName == null ? "" : String(qualifiedName);
+                if (globalThis.Document && typeof globalThis.Document.parseHTMLUnsafe === "function") {
+                    const root = name || "root";
+                    return globalThis.Document.parseHTMLUnsafe(`<${root}></${root}>`);
+                }
+                return null;
+            },
+            writable: true, enumerable: true, configurable: true,
+        },
+        createDocumentType: {
+            value: function createDocumentType(qualifiedName, publicId, systemId) {
+                _requireDOMImplementation(this);
+                if (arguments.length < 3) {
+                    throw new TypeError(
+                        "Failed to execute 'createDocumentType' on 'DOMImplementation': 3 arguments required"
+                    );
+                }
+                const id = ops.op_dom_create_doctype(
+                    String(qualifiedName), String(publicId), String(systemId)
+                );
+                return _wrapNodeWithType(id, 10);
+            },
+            writable: true, enumerable: true, configurable: true,
+        },
+        createHTMLDocument: {
+            value: function createHTMLDocument() {
+                _requireDOMImplementation(this);
+                const title = arguments.length ? String(arguments[0]) : "";
+                if (globalThis.Document && typeof globalThis.Document.parseHTMLUnsafe === "function") {
+                    const doc = globalThis.Document.parseHTMLUnsafe(
+                        "<!doctype html><html><head></head><body></body></html>"
+                    );
+                    doc.title = title;
+                    return doc;
+                }
+                return null;
+            },
+            writable: true, enumerable: true, configurable: true,
+        },
+        hasFeature: {
+            value: function hasFeature() {
+                _requireDOMImplementation(this);
+                return true;
+            },
+            writable: true, enumerable: true, configurable: true,
+        },
+    });
+    Object.defineProperty(_domImplementationPrototype, "constructor", {
+        value: DOMImplementation, writable: true, enumerable: false, configurable: true,
+    });
+    Object.defineProperty(_domImplementationPrototype, Symbol.toStringTag, {
+        value: "DOMImplementation", writable: false, enumerable: false, configurable: true,
+    });
+    DOMImplementation.prototype = _domImplementationPrototype;
+
+    function _implementationFor(documentObject) {
+        let implementation = _domImplementations.get(documentObject);
+        if (!implementation) {
+            implementation = Object.create(_domImplementationPrototype);
+            _domImplementations.set(documentObject, implementation);
+            _domImplementationOwners.set(implementation, documentObject);
+        }
+        return implementation;
+    }
 
     class Document extends Node {
         constructor() {
@@ -3251,37 +3380,16 @@
         get charset() { return "windows-1252"; }
         get contentType() { return "text/html"; }
         get compatMode() { return "CSS1Compat"; }
-        // document.implementation — the DOMImplementation API. fpCollect and
-        // several bot tests call createHTMLDocument() to verify the surface.
         get implementation() {
-            return {
-                createHTMLDocument(title) {
-                    // Return a stub document with just enough of the Document
-                    // API to satisfy fingerprinters. Real browsers return a
-                    // fully functional Document, but our stubs never read it.
-                    return {
-                        title: title || "",
-                        body: { innerHTML: "", appendChild: () => {} },
-                        head: { appendChild: () => {} },
-                        documentElement: { innerHTML: "" },
-                        createElement(tag) {
-                            return { tagName: tag.toUpperCase(), innerHTML: "", appendChild: () => {} };
-                        },
-                        createTextNode(t) { return { nodeValue: t }; },
-                        querySelector() { return null; },
-                        querySelectorAll() { return []; },
-                    };
-                },
-                createDocument(ns, qualifiedName, doctype) {
-                    return this.createHTMLDocument("");
-                },
-                createDocumentType(qualifiedName, publicId, systemId) {
-                    return { name: qualifiedName, publicId, systemId };
-                },
-                hasFeature() { return true; },
-            };
+            return _implementationFor(this);
         }
-        get doctype() { return null; }
+        get doctype() {
+            const children = ops.op_dom_get_children_with_types(_getNodeId(this));
+            for (let i = 0; i + 1 < children.length; i += 2) {
+                if (children[i + 1] === 10) return _wrapNodeWithType(children[i], 10);
+            }
+            return null;
+        }
         get defaultView() { return globalThis; }
         get activeElement() { return this.body; }
         get scripts() { return this.getElementsByTagName("script"); }
@@ -3833,6 +3941,8 @@
     globalThis.CharacterData = CharacterData;
     globalThis.Text = Text;
     globalThis.Comment = Comment;
+    globalThis.DocumentType = DocumentType;
+    globalThis.DOMImplementation = DOMImplementation;
     globalThis.DocumentFragment = DocumentFragment;
     globalThis.ShadowRoot = ShadowRoot;
     globalThis.Document = Document;

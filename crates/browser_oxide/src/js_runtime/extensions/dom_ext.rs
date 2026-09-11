@@ -647,6 +647,40 @@ pub fn op_dom_create_comment(state: &mut OpState, #[string] text: &str) -> i32 {
 
 #[op2(fast)]
 #[smi]
+pub fn op_dom_create_doctype(
+    state: &mut OpState,
+    #[string] name: &str,
+    #[string] public_id: &str,
+    #[string] system_id: &str,
+) -> i32 {
+    let state = state.borrow_mut::<DomState>();
+    state
+        .dom
+        .create_doctype(
+            name.to_string(),
+            public_id.to_string(),
+            system_id.to_string(),
+        )
+        .to_raw() as i32
+}
+
+#[op2]
+#[serde]
+pub fn op_dom_get_doctype_data(state: &mut OpState, #[smi] node_id: i32) -> Vec<String> {
+    let state = state.borrow::<DomState>();
+    let id = NodeId::from_raw(node_id as u32);
+    match state.dom.get(id).map(|node| &node.data) {
+        Some(crate::dom::node::NodeData::DocumentType {
+            name,
+            public_id,
+            system_id,
+        }) => vec![name.clone(), public_id.clone(), system_id.clone()],
+        _ => Vec::new(),
+    }
+}
+
+#[op2(fast)]
+#[smi]
 pub fn op_dom_create_document_fragment(state: &mut OpState) -> i32 {
     let state = state.borrow_mut::<DomState>();
     state.dom.create_document_fragment().to_raw() as i32
@@ -797,6 +831,13 @@ pub fn op_dom_clone_node(state: &mut OpState, #[smi] node_id: i32, deep: bool) -
                 .create_element(elem.name.clone(), elem.attrs.clone()),
             crate::dom::node::NodeData::Text(t) => state.dom.create_text(t.clone()),
             crate::dom::node::NodeData::Comment(t) => state.dom.create_comment(t.clone()),
+            crate::dom::node::NodeData::DocumentType {
+                name,
+                public_id,
+                system_id,
+            } => state
+                .dom
+                .create_doctype(name.clone(), public_id.clone(), system_id.clone()),
             _ => state.dom.create_document_fragment(),
         };
         new_id.to_raw() as i32
@@ -820,6 +861,11 @@ enum SnapshotNode {
     },
     Text(String),
     Comment(String),
+    DocumentType {
+        name: String,
+        public_id: String,
+        system_id: String,
+    },
     Fragment(Vec<SnapshotNode>),
 }
 
@@ -841,6 +887,15 @@ fn collect_subtree(dom: &crate::dom::Dom, id: NodeId) -> SnapshotNode {
         },
         crate::dom::node::NodeData::Text(t) => SnapshotNode::Text(t.clone()),
         crate::dom::node::NodeData::Comment(t) => SnapshotNode::Comment(t.clone()),
+        crate::dom::node::NodeData::DocumentType {
+            name,
+            public_id,
+            system_id,
+        } => SnapshotNode::DocumentType {
+            name: name.clone(),
+            public_id: public_id.clone(),
+            system_id: system_id.clone(),
+        },
         _ => SnapshotNode::Fragment(children),
     }
 }
@@ -861,6 +916,11 @@ fn rebuild_from_snapshot(dom: &mut crate::dom::Dom, snapshot: &SnapshotNode) -> 
         }
         SnapshotNode::Text(t) => dom.create_text(t.clone()),
         SnapshotNode::Comment(t) => dom.create_comment(t.clone()),
+        SnapshotNode::DocumentType {
+            name,
+            public_id,
+            system_id,
+        } => dom.create_doctype(name.clone(), public_id.clone(), system_id.clone()),
         SnapshotNode::Fragment(children) => {
             let id = dom.create_document_fragment();
             for child in children {
@@ -2375,6 +2435,8 @@ deno_core::extension!(
         op_dom_create_element_ns,
         op_dom_create_text_node,
         op_dom_create_comment,
+        op_dom_create_doctype,
+        op_dom_get_doctype_data,
         op_dom_create_document_fragment,
         op_dom_append_child,
         op_dom_insert_before,
