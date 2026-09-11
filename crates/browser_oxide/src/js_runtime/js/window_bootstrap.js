@@ -234,6 +234,109 @@
         },
     });
 
+    const _driverInputTarget = () => document.activeElement
+        || document.body
+        || document.documentElement
+        || document;
+
+    const _insertDriverText = (target, text, inputType = 'insertText') => {
+        if (!target) return false;
+        const data = String(text ?? '');
+        const before = _markTrustedEvent(new globalThis.InputEvent('beforeinput', {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            data,
+            inputType,
+            isComposing: false,
+        }));
+        if (!target.dispatchEvent(before) || before.defaultPrevented) return false;
+
+        if ('value' in target) {
+            const value = String(target.value ?? '');
+            const hasSelection = Number.isFinite(Number(target.selectionStart))
+                && Number.isFinite(Number(target.selectionEnd));
+            const start = hasSelection
+                ? Math.max(0, Math.min(value.length, Number(target.selectionStart)))
+                : value.length;
+            const end = hasSelection
+                ? Math.max(start, Math.min(value.length, Number(target.selectionEnd)))
+                : start;
+            target.value = value.slice(0, start) + data + value.slice(end);
+            const next = start + data.length;
+            try {
+                if (typeof target.setSelectionRange === 'function') {
+                    target.setSelectionRange(next, next, 'none');
+                } else {
+                    target.selectionStart = next;
+                    target.selectionEnd = next;
+                }
+            } catch (_) {}
+        } else if (target.isContentEditable
+            || String(target.getAttribute && target.getAttribute('contenteditable') || '').toLowerCase() === 'true') {
+            target.textContent = String(target.textContent || '') + data;
+        } else {
+            return false;
+        }
+
+        target.dispatchEvent(_markTrustedEvent(new globalThis.InputEvent('input', {
+            bubbles: true,
+            cancelable: false,
+            composed: true,
+            data,
+            inputType,
+            isComposing: false,
+        })));
+        return true;
+    };
+
+    Object.defineProperty(_browser_oxide, '__dispatchTrustedKeyEvent', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value(type, init = {}) {
+            const target = _driverInputTarget();
+            const event = _markTrustedEvent(new globalThis.KeyboardEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: globalThis,
+                key: String(init.key || ''),
+                code: String(init.code || ''),
+                location: Number(init.location) || 0,
+                repeat: !!init.repeat,
+                isComposing: !!init.isComposing,
+                keyCode: Number(init.keyCode) || 0,
+                charCode: Number(init.charCode) || 0,
+                ctrlKey: !!init.ctrlKey,
+                shiftKey: !!init.shiftKey,
+                altKey: !!init.altKey,
+                metaKey: !!init.metaKey,
+            }));
+            if (type === 'keydown') _hasTrustedUserActivation = true;
+            const uncanceled = target.dispatchEvent(event);
+            let inserted = false;
+            if (uncanceled && !event.defaultPrevented && type === 'keypress' && init.text) {
+                inserted = _insertDriverText(target, init.text, 'insertText');
+            }
+            return {
+                target: String(target.tagName || target.nodeName || ''),
+                id: String(target.id || ''),
+                defaultPrevented: event.defaultPrevented,
+                inserted,
+            };
+        },
+    });
+
+    Object.defineProperty(_browser_oxide, '__insertTrustedText', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value(text) {
+            return _insertDriverText(_driverInputTarget(), text, 'insertText');
+        },
+    });
+
     // Exposed via a Symbol slot so it survives `cleanup_bootstrap` deleting the
     // `Deno`/`ops` globals; the closure keeps `ops` reachable.
     try {

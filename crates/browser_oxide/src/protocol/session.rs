@@ -784,6 +784,27 @@ impl CdpSession {
                     .get("modifiers")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
+                let location = req
+                    .params
+                    .get("location")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let auto_repeat = req
+                    .params
+                    .get("autoRepeat")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let is_composing = req
+                    .params
+                    .get("isComposing")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let key_code = req
+                    .params
+                    .get("windowsVirtualKeyCode")
+                    .or_else(|| req.params.get("nativeVirtualKeyCode"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 let js_event = match event_type {
                     "keyDown" | "rawKeyDown" => "keydown",
                     "keyUp" => "keyup",
@@ -792,29 +813,16 @@ impl CdpSession {
                 };
                 if !js_event.is_empty() {
                     let script = format!(
-                        "(() => {{ \
-                          const e = new KeyboardEvent({js_event:?}, {{ \
-                            bubbles: true, cancelable: true, \
-                            key: {key:?}, code: {code:?}, \
-                            ctrlKey: {ctrl}, shiftKey: {shift}, altKey: {alt}, metaKey: {meta} \
-                          }}); \
-                          (document.activeElement || document.body || document).dispatchEvent(e); \
-                          // For 'char' events, also fire an input event so text fields update.
-                          {input_extra} \
-                        }})()",
+                        "globalThis._browser_oxide.__dispatchTrustedKeyEvent(\
+                         {js_event:?},{{key:{key:?},code:{code:?},text:{text:?},\
+                         location:{location},repeat:{auto_repeat},isComposing:{is_composing},\
+                         keyCode:{key_code},charCode:{char_code},\
+                         ctrlKey:{ctrl},shiftKey:{shift},altKey:{alt},metaKey:{meta}}})",
+                        char_code = if event_type == "char" { key_code } else { 0 },
                         ctrl = (modifiers & 2) != 0,
                         shift = (modifiers & 8) != 0,
                         alt = (modifiers & 1) != 0,
                         meta = (modifiers & 4) != 0,
-                        input_extra = if event_type == "char" && !text.is_empty() {
-                            format!(
-                                "const ae = document.activeElement; \
-                                 if (ae && ('value' in ae)) {{ ae.value = (ae.value || '') + {text:?}; \
-                                 ae.dispatchEvent(new Event('input', {{bubbles: true}})); }}"
-                            )
-                        } else {
-                            String::new()
-                        },
                     );
                     let _ = page.evaluate(&script);
                 }
@@ -866,55 +874,8 @@ impl CdpSession {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if !text.is_empty() {
-                    let timings = crate::stealth::behavior::keystroke_timings(text, &self.behavior);
-                    for (i, t) in timings.iter().enumerate() {
-                        // Flight time (delay before this key)
-                        if i > 0 {
-                            crate::stealth::stealth_delay(std::time::Duration::from_millis(
-                                t.flight_ms as u64,
-                            ))
-                            .await;
-                        }
-
-                        // Fire keydown
-                        let kd_script = format!(
-                            "(() => {{ \
-                              const e = new KeyboardEvent('keydown', {{ \
-                                bubbles: true, cancelable: true, key: {ch:?}, code: 'Key' + {ch:?}.toUpperCase() \
-                              }}); \
-                              (document.activeElement || document.body || document).dispatchEvent(e); \
-                            }})()",
-                            ch = t.ch
-                        );
-                        let _ = page.evaluate(&kd_script);
-
-                        // Dwell time (delay while key is down)
-                        crate::stealth::stealth_delay(std::time::Duration::from_millis(
-                            t.dwell_ms as u64,
-                        ))
-                        .await;
-
-                        // Insert character + fire 'input'
-                        let script = format!(
-                            "(() => {{ const ae = document.activeElement; \
-                             if (ae && ('value' in ae)) {{ ae.value = (ae.value || '') + {text:?}; \
-                             ae.dispatchEvent(new Event('input', {{bubbles: true}})); }} }})()",
-                            text = t.ch.to_string()
-                        );
-                        let _ = page.evaluate(&script);
-
-                        // Fire keyup
-                        let ku_script = format!(
-                            "(() => {{ \
-                              const e = new KeyboardEvent('keyup', {{ \
-                                bubbles: true, cancelable: true, key: {ch:?}, code: 'Key' + {ch:?}.toUpperCase() \
-                              }}); \
-                              (document.activeElement || document.body || document).dispatchEvent(e); \
-                            }})()",
-                            ch = t.ch
-                        );
-                        let _ = page.evaluate(&ku_script);
-                    }
+                    let script = format!("globalThis._browser_oxide.__insertTrustedText({text:?})");
+                    let _ = page.evaluate(&script);
                 }
                 Ok(serde_json::json!({}))
             }
@@ -1263,6 +1224,204 @@ mod tests {
             page.evaluate("JSON.stringify(globalThis.__cancel)")
                 .unwrap(),
             r#"{"trusted":true,"touches":0,"changed":1,"id":11}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn input_key_events_target_focused_element_and_are_trusted() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            r#"<html><body>
+              <input id="target" value="abcd">
+              <script>
+                globalThis.__keys = [];
+                const target = document.getElementById('target');
+                target.focus();
+                for (const type of ['keydown', 'keyup']) {
+                  target.addEventListener(type, event => {
+                    globalThis.__keys.push({
+                      type: event.type,
+                      trusted: event.isTrusted,
+                      key: event.key,
+                      code: event.code,
+                      location: event.location,
+                      repeat: event.repeat,
+                      shift: event.shiftKey,
+                    });
+                  });
+                }
+              </script>
+            </body></html>"#,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            page.evaluate("document.activeElement.id").unwrap(),
+            "target"
+        );
+        for (id, event_type) in [(37, "keyDown"), (38, "keyUp")] {
+            let req = CdpRequest {
+                id,
+                method: "Input.dispatchKeyEvent".to_string(),
+                params: serde_json::json!({
+                    "type": event_type,
+                    "key": "A",
+                    "code": "KeyA",
+                    "location": 1,
+                    "autoRepeat": event_type == "keyDown",
+                    "windowsVirtualKeyCode": 65,
+                    "modifiers": 8,
+                }),
+            };
+            let _ = session.handle_request(&mut page, &req, None).await;
+        }
+
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__keys)").unwrap(),
+            r#"[{"type":"keydown","trusted":true,"key":"A","code":"KeyA","location":1,"repeat":true,"shift":true},{"type":"keyup","trusted":true,"key":"A","code":"KeyA","location":1,"repeat":false,"shift":true}]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn input_char_replaces_selection_and_emits_trusted_input_events() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            r#"<html><body>
+              <input id="target" value="abcd">
+              <script>
+                globalThis.__charEvents = [];
+                const target = document.getElementById('target');
+                target.focus();
+                target.setSelectionRange(1, 3);
+                for (const type of ['keypress', 'beforeinput', 'input']) {
+                  target.addEventListener(type, event => {
+                    globalThis.__charEvents.push({
+                      type: event.type,
+                      trusted: event.isTrusted,
+                      data: event.data === undefined ? null : event.data,
+                      inputType: event.inputType === undefined ? null : event.inputType,
+                    });
+                  });
+                }
+              </script>
+            </body></html>"#,
+            None,
+        )
+        .await
+        .unwrap();
+        let req = CdpRequest {
+            id: 39,
+            method: "Input.dispatchKeyEvent".to_string(),
+            params: serde_json::json!({
+                "type": "char",
+                "key": "X",
+                "code": "KeyX",
+                "text": "X",
+                "windowsVirtualKeyCode": 88,
+            }),
+        };
+
+        let _ = session.handle_request(&mut page, &req, None).await;
+        assert_eq!(
+            page.evaluate("document.getElementById('target').value")
+                .unwrap(),
+            "aXd"
+        );
+        assert_eq!(
+            page.evaluate("String(document.getElementById('target').selectionStart)")
+                .unwrap(),
+            "2"
+        );
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__charEvents)")
+                .unwrap(),
+            r#"[{"type":"keypress","trusted":true,"data":null,"inputType":null},{"type":"beforeinput","trusted":true,"data":"X","inputType":"insertText"},{"type":"input","trusted":true,"data":"X","inputType":"insertText"}]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn input_insert_text_edits_selection_without_synthetic_key_events() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            r#"<html><body>
+              <input id="target" value="abcd">
+              <script>
+                globalThis.__insertEvents = [];
+                const target = document.getElementById('target');
+                target.focus();
+                target.setSelectionRange(1, 3);
+                for (const type of ['keydown', 'keyup', 'keypress', 'beforeinput', 'input']) {
+                  target.addEventListener(type, event => {
+                    globalThis.__insertEvents.push({
+                      type: event.type,
+                      trusted: event.isTrusted,
+                      data: event.data === undefined ? null : event.data,
+                      inputType: event.inputType === undefined ? null : event.inputType,
+                    });
+                  });
+                }
+              </script>
+            </body></html>"#,
+            None,
+        )
+        .await
+        .unwrap();
+        let req = CdpRequest {
+            id: 40,
+            method: "Input.insertText".to_string(),
+            params: serde_json::json!({"text": "XY"}),
+        };
+
+        let _ = session.handle_request(&mut page, &req, None).await;
+        assert_eq!(
+            page.evaluate("document.getElementById('target').value")
+                .unwrap(),
+            "aXYd"
+        );
+        assert_eq!(
+            page.evaluate("String(document.getElementById('target').selectionStart)")
+                .unwrap(),
+            "3"
+        );
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__insertEvents)")
+                .unwrap(),
+            r#"[{"type":"beforeinput","trusted":true,"data":"XY","inputType":"insertText"},{"type":"input","trusted":true,"data":"XY","inputType":"insertText"}]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn input_insert_text_respects_beforeinput_prevent_default() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            r#"<html><body><input id="target" value="abcd"><script>
+              const target = document.getElementById('target');
+              target.focus();
+              target.setSelectionRange(1, 3);
+              target.addEventListener('beforeinput', event => event.preventDefault());
+            </script></body></html>"#,
+            None,
+        )
+        .await
+        .unwrap();
+        let req = CdpRequest {
+            id: 41,
+            method: "Input.insertText".to_string(),
+            params: serde_json::json!({"text": "XY"}),
+        };
+
+        let _ = session.handle_request(&mut page, &req, None).await;
+        assert_eq!(
+            page.evaluate("document.getElementById('target').value")
+                .unwrap(),
+            "abcd"
+        );
+        assert_eq!(
+            page.evaluate("String(document.getElementById('target').selectionStart)")
+                .unwrap(),
+            "1"
         );
     }
 

@@ -30,6 +30,7 @@
     const _nodeTypes = new WeakMap();
     const _tagNames = new WeakMap();
     const _localNames = new WeakMap();
+    const _activeElementByDocument = new WeakMap();
     const _SVG_NAMESPACE = "http://www.w3.org/2000/svg";
     const _shadowRoots = new WeakMap();
     const _shadowHosts = new WeakMap();
@@ -1906,8 +1907,36 @@
         }
         // Interaction stubs
         click() { this.dispatchEvent(new Event("click", { bubbles: true })); }
-        focus() { this.dispatchEvent(new Event("focus")); }
-        blur() { this.dispatchEvent(new Event("blur")); }
+        focus() {
+            if (!this.isConnected) return;
+            const doc = globalThis.document;
+            const previous = _activeElementByDocument.get(doc);
+            if (previous === this) return;
+            if (previous && previous.isConnected) {
+                previous.dispatchEvent(new FocusEvent("blur", { relatedTarget: this }));
+                previous.dispatchEvent(new FocusEvent("focusout", {
+                    bubbles: true,
+                    relatedTarget: this,
+                }));
+            }
+            _activeElementByDocument.set(doc, this);
+            this.dispatchEvent(new FocusEvent("focus", { relatedTarget: previous || null }));
+            this.dispatchEvent(new FocusEvent("focusin", {
+                bubbles: true,
+                relatedTarget: previous || null,
+            }));
+        }
+        blur() {
+            const doc = globalThis.document;
+            const current = _activeElementByDocument.get(doc);
+            if (current !== this) return;
+            _activeElementByDocument.delete(doc);
+            this.dispatchEvent(new FocusEvent("blur", { relatedTarget: null }));
+            this.dispatchEvent(new FocusEvent("focusout", {
+                bubbles: true,
+                relatedTarget: null,
+            }));
+        }
         checkVisibility() { return true; }
         animate() { return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; }
         getAnimations() { return []; }
@@ -3391,7 +3420,12 @@
             return null;
         }
         get defaultView() { return globalThis; }
-        get activeElement() { return this.body; }
+        get activeElement() {
+            const active = _activeElementByDocument.get(this);
+            if (active && active.isConnected) return active;
+            if (active) _activeElementByDocument.delete(this);
+            return this.body;
+        }
         get scripts() { return this.getElementsByTagName("script"); }
         get forms() { return this.getElementsByTagName("form"); }
         get images() { return this.getElementsByTagName("img"); }
