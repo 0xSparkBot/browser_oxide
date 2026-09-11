@@ -6743,6 +6743,53 @@ async fn crypto_subtle_aes_gcm_matches_nist_and_key_semantics() {
                         usages: derived.usages,
                         raw: hex(await crypto.subtle.exportKey('raw', derived)),
                     };
+
+                    const wrappingKey = await crypto.subtle.importKey(
+                        'raw', new Uint8Array(16), 'AES-GCM', true, ['wrapKey', 'unwrapKey']
+                    );
+                    const wrappedTarget = await crypto.subtle.importKey(
+                        'raw', new TextEncoder().encode('key'),
+                        { name: 'HMAC', hash: 'SHA-256' }, true, ['sign', 'verify']
+                    );
+                    const wrapped = await crypto.subtle.wrapKey(
+                        'raw', wrappedTarget, wrappingKey, { name: 'AES-GCM', iv }
+                    );
+                    const unwrapped = await crypto.subtle.unwrapKey(
+                        'raw', wrapped, wrappingKey, { name: 'AES-GCM', iv },
+                        { name: 'HMAC', hash: 'SHA-256' }, true, ['sign', 'verify']
+                    );
+                    result.wrap = {
+                        wrapLength: SubtleCrypto.prototype.wrapKey.length,
+                        unwrapLength: SubtleCrypto.prototype.unwrapKey.length,
+                        wrapped: hex(wrapped),
+                        raw: hex(await crypto.subtle.exportKey('raw', unwrapped)),
+                        algorithm: unwrapped.algorithm,
+                        usages: unwrapped.usages,
+                    };
+
+                    const tamperedWrapped = new Uint8Array(wrapped.slice(0));
+                    tamperedWrapped[tamperedWrapped.length - 1] ^= 1;
+                    try {
+                        await crypto.subtle.unwrapKey(
+                            'raw', tamperedWrapped, wrappingKey, { name: 'AES-GCM', iv },
+                            { name: 'HMAC', hash: 'SHA-256' }, true, ['sign']
+                        );
+                        result.wrapTampered = 'ok';
+                    } catch (e) {
+                        result.wrapTampered = e.name;
+                    }
+
+                    const encryptOnlyWrappingKey = await crypto.subtle.importKey(
+                        'raw', new Uint8Array(16), 'AES-GCM', true, ['encrypt']
+                    );
+                    try {
+                        await crypto.subtle.wrapKey(
+                            'raw', wrappedTarget, encryptOnlyWrappingKey, { name: 'AES-GCM', iv }
+                        );
+                        result.wrapWrongUsage = 'ok';
+                    } catch (e) {
+                        result.wrapWrongUsage = e.name;
+                    }
                 } catch (e) {
                     result.topError = `${e.name}:${e.message}`;
                 }
@@ -6806,6 +6853,23 @@ async fn crypto_subtle_aes_gcm_matches_nist_and_key_semantics() {
         value["derived"]["raw"],
         "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
     );
+    assert_eq!(value["wrap"]["wrapLength"], 4);
+    assert_eq!(value["wrap"]["unwrapLength"], 7);
+    assert_eq!(
+        value["wrap"]["wrapped"],
+        "68eda35ac6010faf9035db654c64edeedc1681"
+    );
+    assert_eq!(value["wrap"]["raw"], "6b6579");
+    assert_eq!(
+        value["wrap"]["algorithm"],
+        serde_json::json!({"name":"HMAC","hash":{"name":"SHA-256"},"length":24})
+    );
+    assert_eq!(
+        value["wrap"]["usages"],
+        serde_json::json!(["sign", "verify"])
+    );
+    assert_eq!(value["wrapTampered"], "OperationError");
+    assert_eq!(value["wrapWrongUsage"], "InvalidAccessError");
     assert!(value.get("topError").is_none());
 }
 

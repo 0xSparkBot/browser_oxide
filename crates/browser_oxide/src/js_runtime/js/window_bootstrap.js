@@ -5449,14 +5449,43 @@
         } catch (e) { return Promise.reject(e); }
     });
 
-    // RSA/ECDH and key wrapping are still explicit NotSupportedError paths until
-    // their algorithm-specific key representations are implemented.
-    const _subtleNotImplemented = (name) => function (...args) {
-        return Promise.reject(new DOMException(`${name} not implemented`, "NotSupportedError"));
-    };
-    for (const m of ['wrapKey','unwrapKey']) {
-        _defProtoMethod(_SubtleProto, m, _subtleNotImplemented(m));
-    }
+    _defProtoMethod(_SubtleProto, 'wrapKey', function wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+        try {
+            const normalizedFormat = String(format).toLowerCase();
+            const { alg, state } = _checkAesGcmOperation(wrapAlgorithm, wrappingKey, 'wrapKey');
+            return _SubtleProto.exportKey.call(this, normalizedFormat, key).then((exported) => {
+                const result = ops.op_crypto_aes_gcm_encrypt(
+                    state.bytes, alg.iv, alg.additionalData, _toBytes(exported), alg.tagLength / 8
+                );
+                if (!result.ok) {
+                    throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+                }
+                return new Uint8Array(result.data).buffer;
+            });
+        } catch (e) { return Promise.reject(e); }
+    });
+    _defProtoMethod(_SubtleProto, 'unwrapKey', function unwrapKey(
+        format, wrappedKey, unwrappingKey, unwrapAlgorithm,
+        unwrappedKeyAlgorithm, extractable, keyUsages
+    ) {
+        try {
+            if (!(wrappedKey instanceof ArrayBuffer) && !ArrayBuffer.isView(wrappedKey)) {
+                throw new TypeError("wrappedKey is not a BufferSource");
+            }
+            const normalizedFormat = String(format).toLowerCase();
+            const { alg, state } = _checkAesGcmOperation(unwrapAlgorithm, unwrappingKey, 'unwrapKey');
+            const result = ops.op_crypto_aes_gcm_decrypt(
+                state.bytes, alg.iv, alg.additionalData, _toBytes(wrappedKey), alg.tagLength / 8
+            );
+            if (!result.ok) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            const raw = new Uint8Array(result.data);
+            return _SubtleProto.importKey.call(
+                this, normalizedFormat, raw.buffer, unwrappedKeyAlgorithm, extractable, keyUsages
+            );
+        } catch (e) { return Promise.reject(e); }
+    });
 
     // Crypto.prototype.getRandomValues — backed by the Rust op.
     _defProtoMethod(_CryptoProto, 'getRandomValues', function getRandomValues(arr) {

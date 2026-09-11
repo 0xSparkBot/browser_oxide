@@ -163,12 +163,33 @@ fn worker_crypto_subtle_aes_gcm_round_trip() {
                     const decrypted = await crypto.subtle.decrypt(
                         { name: 'AES-GCM', iv }, key, encrypted
                     );
+                    const wrappingKey = await crypto.subtle.importKey(
+                        'raw', new Uint8Array(16), 'AES-GCM', true, ['wrapKey', 'unwrapKey']
+                    );
+                    const target = await crypto.subtle.importKey(
+                        'raw', new TextEncoder().encode('key'),
+                        { name: 'HMAC', hash: 'SHA-256' }, true, ['sign']
+                    );
+                    const wrapped = await crypto.subtle.wrapKey(
+                        'raw', target, wrappingKey, { name: 'AES-GCM', iv }
+                    );
+                    const unwrapped = await crypto.subtle.unwrapKey(
+                        'raw', wrapped, wrappingKey, { name: 'AES-GCM', iv },
+                        { name: 'HMAC', hash: 'SHA-256' }, true, ['sign']
+                    );
                     const hex = Array.from(new Uint8Array(encrypted))
+                        .map((b) => b.toString(16).padStart(2, '0')).join('');
+                    const wrappedHex = Array.from(new Uint8Array(wrapped))
+                        .map((b) => b.toString(16).padStart(2, '0')).join('');
+                    const unwrappedRaw = await crypto.subtle.exportKey('raw', unwrapped);
+                    const unwrappedHex = Array.from(new Uint8Array(unwrappedRaw))
                         .map((b) => b.toString(16).padStart(2, '0')).join('');
                     self.postMessage(JSON.stringify({
                         hex,
                         decryptedLength: decrypted.byteLength,
                         decryptedAllZero: Array.from(new Uint8Array(decrypted)).every((b) => b === 0),
+                        wrappedHex,
+                        unwrappedHex,
                         tag: Object.prototype.toString.call(key),
                         own: Reflect.ownKeys(key).length,
                         algorithm: key.algorithm,
@@ -193,6 +214,11 @@ fn worker_crypto_subtle_aes_gcm_round_trip() {
     );
     assert_eq!(value["decryptedLength"], 16);
     assert_eq!(value["decryptedAllZero"], true);
+    assert_eq!(
+        value["wrappedHex"],
+        "68eda35ac6010faf9035db654c64edeedc1681"
+    );
+    assert_eq!(value["unwrappedHex"], "6b6579");
     assert_eq!(value["tag"], "[object CryptoKey]");
     assert_eq!(value["own"], 0);
     assert_eq!(
