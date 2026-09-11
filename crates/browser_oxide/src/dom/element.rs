@@ -90,6 +90,10 @@ impl<'a> Element for DomElement<'a> {
             .map(|a| a.value.as_str())
     }
 
+    fn text_content(&self) -> String {
+        self.dom.text_content(self.id)
+    }
+
     fn parent_element(&self) -> Option<Self> {
         let mut parent_id = self.node().parent?;
         loop {

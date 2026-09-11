@@ -449,6 +449,7 @@ impl<'a> SelectorParser<'a> {
                     "where" => self.parse_functional_pseudo_forgiving(PseudoClass::Where),
                     "has" => self.parse_has_pseudo(),
                     "lang" => self.parse_lang_pseudo(),
+                    "dir" => self.parse_dir_pseudo(),
                     _ => Err(SelectorParseError::UnsupportedPseudoClass(name_lower)),
                 };
 
@@ -640,6 +641,31 @@ impl<'a> SelectorParser<'a> {
         }
 
         Ok(relatives)
+    }
+
+    fn parse_dir_pseudo(&mut self) -> Result<PseudoClass, SelectorParseError> {
+        self.skip_whitespace();
+        let direction = match self.current_kind() {
+            TokenKind::Ident(name) => {
+                let value = name.to_ascii_lowercase();
+                self.advance();
+                value
+            }
+            _ => {
+                return Err(SelectorParseError::UnexpectedToken {
+                    loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                    message: "expected direction identifier".into(),
+                });
+            }
+        };
+        self.skip_whitespace();
+        if !matches!(self.current_kind(), TokenKind::CloseParen) {
+            return Err(SelectorParseError::UnexpectedToken {
+                loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                message: "expected ')' after :dir() argument".into(),
+            });
+        }
+        Ok(PseudoClass::Dir(direction))
     }
 
     fn parse_lang_pseudo(&mut self) -> Result<PseudoClass, SelectorParseError> {

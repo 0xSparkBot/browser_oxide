@@ -143,6 +143,7 @@ pub enum PseudoClass {
 
     // Linguistic
     Lang(Vec<String>),
+    Dir(String),
 
     // Functional
     Is(SelectorList),

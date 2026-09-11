@@ -333,6 +333,8 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass, scope: Option
         PseudoClass::NthOfType(nth) => nth.matches(element.sibling_type_index()),
         PseudoClass::NthLastOfType(nth) => nth.matches(element.sibling_type_index_from_end()),
 
+        PseudoClass::Dir(direction) => matches_directionality(element, direction),
+
         PseudoClass::Lang(langs) => {
             if let Some(el_lang) = element.lang() {
                 langs.iter().any(|l| {
@@ -360,6 +362,79 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass, scope: Option
             false
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Directionality {
+    Ltr,
+    Rtl,
+}
+
+fn matches_directionality<E: Element>(element: &E, requested: &str) -> bool {
+    match requested.to_ascii_lowercase().as_str() {
+        "ltr" => element_directionality(element) == Directionality::Ltr,
+        "rtl" => element_directionality(element) == Directionality::Rtl,
+        // Selectors 4 accepts an identifier syntactically; unknown values
+        // simply cannot match an element's ltr/rtl directionality.
+        _ => false,
+    }
+}
+
+fn element_directionality<E: Element>(element: &E) -> Directionality {
+    if let Some(dir) = element.attribute_value("dir") {
+        match dir.trim().to_ascii_lowercase().as_str() {
+            "ltr" => return Directionality::Ltr,
+            "rtl" => return Directionality::Rtl,
+            "auto" => return auto_directionality(element),
+            _ => {}
+        }
+    }
+
+    // HTML <bdi> has auto directionality even without a dir attribute.
+    if element.local_name().eq_ignore_ascii_case("bdi") {
+        return auto_directionality(element);
+    }
+
+    element
+        .parent_element()
+        .map(|parent| element_directionality(&parent))
+        .unwrap_or(Directionality::Ltr)
+}
+
+fn auto_directionality<E: Element>(element: &E) -> Directionality {
+    let text = if element.local_name().eq_ignore_ascii_case("input") {
+        element.attribute_value("value").unwrap_or("").to_string()
+    } else {
+        element.text_content()
+    };
+    first_strong_direction(&text).unwrap_or(Directionality::Ltr)
+}
+
+fn first_strong_direction(text: &str) -> Option<Directionality> {
+    for ch in text.chars() {
+        if is_rtl_strong(ch) {
+            return Some(Directionality::Rtl);
+        }
+        if ch.is_alphabetic() {
+            return Some(Directionality::Ltr);
+        }
+    }
+    None
+}
+
+fn is_rtl_strong(ch: char) -> bool {
+    // The blocks below contain RTL scripts but also punctuation, digits and
+    // combining marks. Only alphabetic code points are strong RTL here; the
+    // others are neutral/weak and must not win `dir=auto` before a later
+    // strong character (for example U+060C ARABIC COMMA before Latin text).
+    ch.is_alphabetic()
+        && matches!(ch as u32,
+            0x0590..=0x08FF
+            | 0xFB1D..=0xFDFF
+            | 0xFE70..=0xFEFF
+            | 0x10800..=0x10FFF
+            | 0x1E800..=0x1EEFF
+        )
 }
 
 fn matches_any_with_optional_scope<E: Element>(

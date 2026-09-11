@@ -30,6 +30,11 @@ pub trait Element: Sized + Clone {
     /// The value of the attribute with the given name.
     fn attribute_value(&self, name: &str) -> Option<&str>;
 
+    /// Concatenated descendant text used by language-directionality selectors.
+    fn text_content(&self) -> String {
+        String::new()
+    }
+
     /// The parent element (not parent node — skips non-element parents).
     fn parent_element(&self) -> Option<Self>;
 

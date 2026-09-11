@@ -544,3 +544,72 @@ async fn url_https_still_parses_after_opaque_branch() {
         .unwrap();
     assert_eq!(origin, "https://example.com");
 }
+
+#[tokio::test]
+async fn selector_dir_matches_inherited_and_auto_directionality() {
+    let mut rt = BrowserJsRuntime::new(browser_oxide::html_parser::parse_html(
+        r#"<!doctype html><html dir="ltr"><body>
+          <div id="outer" dir="rtl"><span id="inherit"></span><span id="override" dir="ltr"></span></div>
+          <div id="auto-ltr" dir="auto">abc אבג</div>
+          <div id="auto-rtl" dir="auto">123 אבג abc</div>
+          <div id="auto-neutral" dir="auto">123 !!!</div>
+          <bdi id="bdi-rtl">אבג abc</bdi>
+          <input id="input-rtl" dir="auto" value="אבג abc">
+          <div id="comma-ltr" dir="auto">،abc</div>
+          <div id="ancient-rtl" dir="auto">𐠀 abc</div>
+          <div id="plain"></div>
+        </body></html>"#,
+    ));
+
+    let result = rt
+        .execute_script(
+            r#"JSON.stringify({
+          ltr:Array.from(document.querySelectorAll(':dir(ltr)'), e=>e.id||e.tagName),
+          rtl:Array.from(document.querySelectorAll(':dir(rtl)'), e=>e.id||e.tagName),
+          inherit:document.getElementById('inherit').matches(':dir(rtl)'),
+          override:document.getElementById('override').matches(':dir(ltr)'),
+          upper:Array.from(document.querySelectorAll(':dir(RTL)'), e=>e.id||e.tagName),
+          unknown:document.querySelectorAll(':dir(sideways)').length,
+          autoLtr:document.getElementById('auto-ltr').matches(':dir(ltr)'),
+          autoRtl:document.getElementById('auto-rtl').matches(':dir(rtl)'),
+          autoNeutral:document.getElementById('auto-neutral').matches(':dir(ltr)'),
+          bdiRtl:document.getElementById('bdi-rtl').matches(':dir(rtl)'),
+          inputRtl:document.getElementById('input-rtl').matches(':dir(rtl)'),
+          commaLtr:document.getElementById('comma-ltr').matches(':dir(ltr)'),
+          ancientRtl:document.getElementById('ancient-rtl').matches(':dir(rtl)')
+        })"#,
+            None,
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["inherit"], true);
+    assert_eq!(value["override"], true);
+    assert_eq!(value["unknown"], 0);
+    assert_eq!(value["autoLtr"], true);
+    assert_eq!(value["autoRtl"], true);
+    assert_eq!(value["autoNeutral"], true);
+    assert_eq!(value["bdiRtl"], true);
+    assert_eq!(value["inputRtl"], true);
+    assert_eq!(value["commaLtr"], true);
+    assert_eq!(value["ancientRtl"], true);
+    assert_eq!(
+        value["rtl"],
+        serde_json::json!([
+            "outer",
+            "inherit",
+            "auto-rtl",
+            "bdi-rtl",
+            "input-rtl",
+            "ancient-rtl"
+        ])
+    );
+
+    for selector in [":dir()", ":dir(ltr rtl)"] {
+        let js = format!("(()=>{{try{{document.querySelectorAll({selector:?});return 'NO_THROW'}}catch(e){{return e.name}}}})()");
+        assert_eq!(
+            rt.execute_script(&js, None).unwrap(),
+            "SyntaxError",
+            "{selector}"
+        );
+    }
+}
