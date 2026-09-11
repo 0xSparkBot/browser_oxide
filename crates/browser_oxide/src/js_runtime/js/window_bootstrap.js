@@ -5524,7 +5524,10 @@
         const result = { name: 'AES-KW' };
         if (requireLength) {
             const length = Number(algorithm && algorithm.length);
-            if (length !== 128 && length !== 192 && length !== 256) {
+            if (length === 192) {
+                throw new DOMException("192-bit AES keys are not supported", "OperationError");
+            }
+            if (length !== 128 && length !== 256) {
                 throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
             }
             result.length = length;
@@ -5545,7 +5548,10 @@
     const _makeAesKwKey = (bytes, extractable, usages) => {
         const material = new Uint8Array(bytes);
         const length = material.byteLength * 8;
-        if (length !== 128 && length !== 192 && length !== 256) {
+        if (length === 192) {
+            throw new DOMException("192-bit AES keys are not supported", "OperationError");
+        }
+        if (length !== 128 && length !== 256) {
             throw new DOMException("Invalid key length", "DataError");
         }
         const key = Object.create(_CryptoKeyProto);

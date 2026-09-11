@@ -54,10 +54,12 @@ async fn window_aes_kw_matches_rfc3394_and_webcrypto_semantics() {
           usages: generated.usages,
           rawLength: (await crypto.subtle.exportKey('raw', generated)).byteLength,
         };
-        const aes192 = await crypto.subtle.importKey(
+        await capture('aes192Import', () => crypto.subtle.importKey(
           'raw', new Uint8Array(24), 'AES-KW', true, ['wrapKey']
-        );
-        out.aes192 = aes192.algorithm;
+        ));
+        await capture('aes192Generate', () => crypto.subtle.generateKey(
+          { name: 'AES-KW', length: 192 }, true, ['wrapKey']
+        ));
 
         const pbkdf2 = await crypto.subtle.importKey(
           'raw', enc.encode('pw'), 'PBKDF2', false, ['deriveKey']
@@ -71,13 +73,17 @@ async fn window_aes_kw_matches_rfc3394_and_webcrypto_semantics() {
           usages: derived.usages,
           raw: hex(await crypto.subtle.exportKey('raw', derived)),
         };
+        await capture('aes192Derive', () => crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: enc.encode('salt'), iterations: 2, hash: 'SHA-256' },
+          pbkdf2, { name: 'AES-KW', length: 192 }, true, ['wrapKey']
+        ));
 
         const hkdf = await crypto.subtle.importKey(
           'raw', new Uint8Array(16).fill(7), 'HKDF', false, ['deriveKey']
         );
         const hkdfDerived = await crypto.subtle.deriveKey(
           { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array([1]), info: new Uint8Array([2]) },
-          hkdf, { name: 'AES-KW', length: 192 }, true, ['unwrapKey']
+          hkdf, { name: 'AES-KW', length: 128 }, true, ['unwrapKey']
         );
         out.hkdfDerived = {
           algorithm: hkdfDerived.algorithm,
@@ -155,8 +161,16 @@ async fn window_aes_kw_matches_rfc3394_and_webcrypto_semantics() {
     assert_eq!(value["generated"]["usages"], serde_json::json!(["wrapKey"]));
     assert_eq!(value["generated"]["rawLength"], 32);
     assert_eq!(
-        value["aes192"],
-        serde_json::json!({"name":"AES-KW","length":192})
+        value["aes192Import"],
+        "OperationError:192-bit AES keys are not supported"
+    );
+    assert_eq!(
+        value["aes192Generate"],
+        "OperationError:192-bit AES keys are not supported"
+    );
+    assert_eq!(
+        value["aes192Derive"],
+        "OperationError:192-bit AES keys are not supported"
     );
     assert_eq!(
         value["derived"]["algorithm"],
@@ -166,13 +180,13 @@ async fn window_aes_kw_matches_rfc3394_and_webcrypto_semantics() {
     assert_eq!(value["derived"]["raw"], "061df616343cb988307172e2c3074be6");
     assert_eq!(
         value["hkdfDerived"]["algorithm"],
-        serde_json::json!({"name":"AES-KW","length":192})
+        serde_json::json!({"name":"AES-KW","length":128})
     );
     assert_eq!(
         value["hkdfDerived"]["usages"],
         serde_json::json!(["unwrapKey"])
     );
-    assert_eq!(value["hkdfDerived"]["rawLength"], 24);
+    assert_eq!(value["hkdfDerived"]["rawLength"], 16);
     assert!(value["badUsage"]
         .as_str()
         .unwrap()
@@ -236,6 +250,12 @@ fn worker_aes_kw_uses_shared_webcrypto_backend() {
                 const unwrapped = await crypto.subtle.unwrapKey(
                   'raw', wrapped, wk, 'AES-KW', {name:'HMAC',hash:'SHA-256'}, true, ['sign']
                 );
+                let aes192Error = null;
+                try {
+                  await crypto.subtle.importKey('raw', new Uint8Array(24), 'AES-KW', true, ['wrapKey']);
+                } catch (error) {
+                  aes192Error = error.name + ':' + error.message;
+                }
                 const hex = (buffer) => Array.from(new Uint8Array(buffer))
                   .map((b) => b.toString(16).padStart(2,'0')).join('');
                 self.postMessage(JSON.stringify({
@@ -243,7 +263,8 @@ fn worker_aes_kw_uses_shared_webcrypto_backend() {
                   raw:hex(await crypto.subtle.exportKey('raw', unwrapped)),
                   algorithm:wk.algorithm,
                   tag:Object.prototype.toString.call(wk),
-                  own:Reflect.ownKeys(wk).length
+                  own:Reflect.ownKeys(wk).length,
+                  aes192Error
                 }));
               } catch (error) {
                 self.postMessage(JSON.stringify({error:error.name + ':' + error.message}));
@@ -279,5 +300,9 @@ fn worker_aes_kw_uses_shared_webcrypto_backend() {
     );
     assert_eq!(value["tag"], "[object CryptoKey]");
     assert_eq!(value["own"], 0);
+    assert_eq!(
+        value["aes192Error"],
+        "OperationError:192-bit AES keys are not supported"
+    );
     assert!(value.get("error").is_none());
 }
