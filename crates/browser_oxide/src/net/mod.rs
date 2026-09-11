@@ -183,8 +183,9 @@ impl QuicPool {
 }
 
 /// Process-wide shared browser-session state. One cookie jar, one DNS
-/// cache, one Alt-Svc cache, one Accept-CH origin set — shared across
-/// every [`HttpClient`] built via [`HttpClient::shared`]. This mimics
+/// cache, one Alt-Svc cache, one Accept-CH origin set, and one ALPN capability
+/// cache — shared across every [`HttpClient`] built via [`HttpClient::shared`].
+/// This mimics
 /// a real user with one persistent browser profile across all tabs.
 ///
 /// Without shared state, sites that fingerprint on "browsing history"
@@ -199,6 +200,15 @@ pub struct SharedSession {
     pub accept_ch: Arc<Mutex<HashSet<String>>>,
     pub dns: tcp::DnsCache,
     pub alt_svc: AltSvcCache,
+    /// Hosts that negotiated HTTP/1.1 instead of h2. Sharing this across
+    /// sibling/fresh-pool clients prevents every module/sync fetch from paying
+    /// the same doomed TLS+ALPN probe again.
+    pub h1_only_hosts: Arc<Mutex<HashSet<String>>>,
+    /// Per-host singleflight gates for the first TLS/ALPN capability probe.
+    /// A page can start several subresource requests to the same new host at
+    /// once; without this, they all race past the empty `h1_only_hosts` cache
+    /// and each pays a doomed h2 handshake before the first result is learned.
+    pub h2_probe_gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 static SHARED_SESSION: std::sync::OnceLock<SharedSession> = std::sync::OnceLock::new();
@@ -235,6 +245,8 @@ pub fn shared_session() -> SharedSession {
                 accept_ch: Arc::new(Mutex::new(HashSet::new())),
                 dns: tcp::DnsCache::new(),
                 alt_svc: AltSvcCache::new(),
+                h1_only_hosts: Arc::new(Mutex::new(HashSet::new())),
+                h2_probe_gates: Arc::new(Mutex::new(HashMap::new())),
             }
         })
         .clone()
@@ -289,6 +301,9 @@ pub struct HttpClient {
     /// h2 attempt on subsequent requests, halving the per-request handshake cost
     /// when a page makes many requests to such a host.
     h1_only_hosts: Arc<Mutex<HashSet<String>>>,
+    /// Per-host first-connection gate. Shared only when this client belongs to
+    /// the process SharedSession; standalone clients retain isolated gates.
+    h2_probe_gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Resolved proxy config. `BROWSER_OXIDE_PROXY` env var overrides
     /// `profile.proxy`. None = direct connect (the existing path). T1C.
     proxy: Option<proxy::ProxyConfig>,
@@ -384,6 +399,7 @@ impl HttpClient {
             alt_svc_cache: AltSvcCache::new(),
             accept_ch_origins: Arc::new(Mutex::new(HashSet::new())),
             h1_only_hosts: Arc::new(Mutex::new(HashSet::new())),
+            h2_probe_gates: Arc::new(Mutex::new(HashMap::new())),
             // Resolve proxy: BROWSER_OXIDE_PROXY env override, then profile.proxy.
             // Bad proxy URLs are non-fatal — log and continue without proxy.
             proxy: match proxy::ProxyConfig::resolve(profile.proxy.as_deref()) {
@@ -470,6 +486,29 @@ impl HttpClient {
         let connector = tls::chrome_connector(profile)?;
         let quic_client = quic::QuicClient::new().ok();
 
+        // A fresh-pool client derived from the process SharedSession should
+        // retain origin protocol capability knowledge. This is especially
+        // important for synchronous script/XHR paths, which intentionally use
+        // a separate connection pool/runtime but should not forget that a host
+        // already negotiated only HTTP/1.1. Unrelated standalone clients remain
+        // isolated.
+        let h1_only_hosts = SHARED_SESSION
+            .get()
+            .filter(|session| {
+                Arc::ptr_eq(&cookies, &session.cookies)
+                    || Arc::ptr_eq(&accept_ch, &session.accept_ch)
+            })
+            .map(|session| session.h1_only_hosts.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(HashSet::new())));
+        let h2_probe_gates = SHARED_SESSION
+            .get()
+            .filter(|session| {
+                Arc::ptr_eq(&cookies, &session.cookies)
+                    || Arc::ptr_eq(&accept_ch, &session.accept_ch)
+            })
+            .map(|session| session.h2_probe_gates.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+
         Ok(Self {
             tls_connector: Arc::new(connector),
             profile: profile.clone(),
@@ -480,7 +519,8 @@ impl HttpClient {
             quic_client,
             alt_svc_cache: alt_svc,
             accept_ch_origins: accept_ch,
-            h1_only_hosts: Arc::new(Mutex::new(HashSet::new())),
+            h1_only_hosts,
+            h2_probe_gates,
             proxy: proxy::ProxyConfig::resolve(profile.proxy.as_deref()).unwrap_or_default(),
         })
     }
@@ -725,6 +765,25 @@ impl HttpClient {
         // Known h1-only host: skip the doomed h2 connect (which would do a full
         // TLS handshake only to fail the ALPN check). Fail fast so the caller
         // goes straight to its h1 fallback path.
+        if self.h1_only_hosts.lock().await.contains(host) {
+            return Err(NetError::Http("host is http/1.1 only (cached)".into()));
+        }
+
+        // Singleflight the first ALPN capability probe for this host across
+        // sibling SharedSession clients. Re-check both caches after acquiring
+        // the gate because another request may have completed while we waited.
+        let probe_gate = {
+            let mut gates = self.h2_probe_gates.lock().await;
+            gates
+                .entry(host.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _probe_guard = probe_gate.lock().await;
+        if let Some(sender) = self.pool.get(host, port).await {
+            self.pool.touch(host, port).await;
+            return Ok(sender);
+        }
         if self.h1_only_hosts.lock().await.contains(host) {
             return Err(NetError::Http("host is http/1.1 only (cached)".into()));
         }
@@ -2114,6 +2173,38 @@ mod tests {
             resolve_redirect("https://a.com/x?old=1", "?new=2").unwrap(),
             "https://a.com/x?new=2"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_clients_and_fresh_pool_derivatives_share_h1_only_cache() {
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let first = HttpClient::shared(&profile).unwrap();
+        let second = HttpClient::shared(&profile).unwrap();
+        let derived = HttpClient::new_with_shared_state(
+            first.profile(),
+            first.cookies(),
+            first.accept_ch_origins(),
+            first.dns_cache(),
+            first.alt_svc_cache(),
+        )
+        .unwrap();
+        let isolated = HttpClient::new(&profile).unwrap();
+
+        assert!(Arc::ptr_eq(&first.h1_only_hosts, &second.h1_only_hosts));
+        assert!(Arc::ptr_eq(&first.h1_only_hosts, &derived.h1_only_hosts));
+        assert!(!Arc::ptr_eq(&first.h1_only_hosts, &isolated.h1_only_hosts));
+        assert!(Arc::ptr_eq(&first.h2_probe_gates, &second.h2_probe_gates));
+        assert!(Arc::ptr_eq(&first.h2_probe_gates, &derived.h2_probe_gates));
+        assert!(!Arc::ptr_eq(
+            &first.h2_probe_gates,
+            &isolated.h2_probe_gates
+        ));
+
+        let host = "h1-only-cache-regression.invalid".to_string();
+        first.h1_only_hosts.lock().await.insert(host.clone());
+        assert!(second.h1_only_hosts.lock().await.contains(&host));
+        assert!(derived.h1_only_hosts.lock().await.contains(&host));
+        assert!(!isolated.h1_only_hosts.lock().await.contains(&host));
     }
 
     #[test]
