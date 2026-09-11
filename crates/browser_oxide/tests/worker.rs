@@ -148,6 +148,62 @@ fn worker_crypto_subtle_hmac_round_trip() {
 }
 
 #[test]
+fn worker_crypto_subtle_aes_gcm_round_trip() {
+    let code = r#"
+        const src = `
+            (async function() {
+                try {
+                    const key = await crypto.subtle.importKey(
+                        'raw', new Uint8Array(16), 'AES-GCM', true, ['encrypt', 'decrypt']
+                    );
+                    const iv = new Uint8Array(12);
+                    const encrypted = await crypto.subtle.encrypt(
+                        { name: 'AES-GCM', iv }, key, new Uint8Array(16)
+                    );
+                    const decrypted = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv }, key, encrypted
+                    );
+                    const hex = Array.from(new Uint8Array(encrypted))
+                        .map((b) => b.toString(16).padStart(2, '0')).join('');
+                    self.postMessage(JSON.stringify({
+                        hex,
+                        decryptedLength: decrypted.byteLength,
+                        decryptedAllZero: Array.from(new Uint8Array(decrypted)).every((b) => b === 0),
+                        tag: Object.prototype.toString.call(key),
+                        own: Reflect.ownKeys(key).length,
+                        algorithm: key.algorithm,
+                        usages: key.usages
+                    }));
+                } catch (e) {
+                    self.postMessage(JSON.stringify({ error: e.name + ':' + e.message }));
+                }
+            })();
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["hex"],
+        "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"
+    );
+    assert_eq!(value["decryptedLength"], 16);
+    assert_eq!(value["decryptedAllZero"], true);
+    assert_eq!(value["tag"], "[object CryptoKey]");
+    assert_eq!(value["own"], 0);
+    assert_eq!(
+        value["algorithm"],
+        serde_json::json!({"name":"AES-GCM","length":128})
+    );
+    assert_eq!(value["usages"], serde_json::json!(["encrypt", "decrypt"]));
+    assert!(value.get("error").is_none());
+}
+
+#[test]
 fn worker_crypto_subtle_pbkdf2_derive_bits() {
     let code = r#"
         const src = `

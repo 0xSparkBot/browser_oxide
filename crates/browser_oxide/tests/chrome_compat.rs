@@ -6604,6 +6604,212 @@ async fn crypto_subtle_hmac_matches_chrome_and_known_vector() {
 }
 
 #[tokio::test]
+async fn crypto_subtle_aes_gcm_matches_nist_and_key_semantics() {
+    use browser_oxide::Page;
+    use std::time::Duration;
+
+    let mut page = Page::with_profile(
+        "<!DOCTYPE html><html><head></head><body></body></html>",
+        "https://example.com/",
+        browser_oxide::stealth::presets::chrome_148_windows(),
+    )
+    .await
+    .unwrap();
+
+    let _ = page
+        .event_loop()
+        .execute_and_run(
+            r#"
+            (async function() {
+                const hex = (buffer) => Array.from(new Uint8Array(buffer))
+                    .map((b) => b.toString(16).padStart(2, '0')).join('');
+                const result = {};
+                try {
+                    const keyBytes = new Uint8Array(16);
+                    const iv = new Uint8Array(12);
+                    const plaintext = new Uint8Array(16);
+                    const key = await crypto.subtle.importKey(
+                        'raw', keyBytes, 'AES-GCM', true, ['encrypt', 'decrypt']
+                    );
+                    const encrypted = await crypto.subtle.encrypt(
+                        { name: 'AES-GCM', iv }, key, plaintext
+                    );
+                    const decrypted = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv }, key, encrypted
+                    );
+                    result.key = {
+                        tag: Object.prototype.toString.call(key),
+                        own: Reflect.ownKeys(key).length,
+                        type: key.type,
+                        extractable: key.extractable,
+                        algorithm: key.algorithm,
+                        usages: key.usages,
+                    };
+                    result.encrypted = hex(encrypted);
+                    result.decrypted = hex(decrypted);
+                    result.exported = hex(await crypto.subtle.exportKey('raw', key));
+
+                    const tampered = new Uint8Array(encrypted.slice(0));
+                    tampered[tampered.length - 1] ^= 1;
+                    try {
+                        await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, tampered);
+                        result.tampered = 'ok';
+                    } catch (e) {
+                        result.tampered = e.name;
+                    }
+
+                    try {
+                        await crypto.subtle.encrypt(
+                            { name: 'AES-GCM', iv, tagLength: 40 }, key, plaintext
+                        );
+                        result.badTagLength = 'ok';
+                    } catch (e) {
+                        result.badTagLength = e.name;
+                    }
+
+                    try {
+                        await crypto.subtle.importKey(
+                            'raw', new Uint8Array(15), 'AES-GCM', true, ['encrypt']
+                        );
+                        result.badKeyLength = 'ok';
+                    } catch (e) {
+                        result.badKeyLength = e.name;
+                    }
+
+                    try {
+                        await crypto.subtle.importKey(
+                            'raw', keyBytes, 'AES-GCM', true, ['sign']
+                        );
+                        result.badUsage = 'ok';
+                    } catch (e) {
+                        result.badUsage = e.name;
+                    }
+
+                    const encryptOnly = await crypto.subtle.importKey(
+                        'raw', keyBytes, 'AES-GCM', true, ['encrypt']
+                    );
+                    try {
+                        await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, encryptOnly, encrypted);
+                        result.wrongUsage = 'ok';
+                    } catch (e) {
+                        result.wrongUsage = e.name;
+                    }
+
+                    const key192 = await crypto.subtle.importKey(
+                        'raw', new Uint8Array(24), 'AES-GCM', true, ['encrypt', 'decrypt']
+                    );
+                    const aad = new Uint8Array([1, 2, 3]);
+                    const shortCipher = await crypto.subtle.encrypt(
+                        { name: 'AES-GCM', iv, additionalData: aad, tagLength: 32 },
+                        key192,
+                        new Uint8Array([4, 5])
+                    );
+                    const shortPlain = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv, additionalData: aad, tagLength: 32 },
+                        key192,
+                        shortCipher
+                    );
+                    result.aes192Tag32 = {
+                        algorithm: key192.algorithm,
+                        cipherBytes: shortCipher.byteLength,
+                        plain: hex(shortPlain),
+                    };
+
+                    const generated = await crypto.subtle.generateKey(
+                        { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']
+                    );
+                    result.generated = {
+                        algorithm: generated.algorithm,
+                        usages: generated.usages,
+                        rawLength: (await crypto.subtle.exportKey('raw', generated)).byteLength,
+                    };
+
+                    const enc = new TextEncoder();
+                    const baseKey = await crypto.subtle.importKey(
+                        'raw', enc.encode('password'), 'PBKDF2', false, ['deriveKey']
+                    );
+                    const derived = await crypto.subtle.deriveKey(
+                        {
+                            name: 'PBKDF2', salt: enc.encode('salt'),
+                            iterations: 2, hash: 'SHA-256'
+                        },
+                        baseKey,
+                        { name: 'AES-GCM', length: 256 },
+                        true,
+                        ['encrypt']
+                    );
+                    result.derived = {
+                        algorithm: derived.algorithm,
+                        usages: derived.usages,
+                        raw: hex(await crypto.subtle.exportKey('raw', derived)),
+                    };
+                } catch (e) {
+                    result.topError = `${e.name}:${e.message}`;
+                }
+                globalThis.__aesGcmResult = JSON.stringify(result);
+            })();
+            "#,
+            Duration::from_secs(5),
+        )
+        .await;
+
+    let raw = page
+        .event_loop()
+        .execute_script("globalThis.__aesGcmResult || '{}' ")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    assert_eq!(value["key"]["tag"], "[object CryptoKey]");
+    assert_eq!(value["key"]["own"], 0);
+    assert_eq!(value["key"]["type"], "secret");
+    assert_eq!(value["key"]["extractable"], true);
+    assert_eq!(
+        value["key"]["algorithm"],
+        serde_json::json!({"name":"AES-GCM","length":128})
+    );
+    assert_eq!(
+        value["key"]["usages"],
+        serde_json::json!(["encrypt", "decrypt"])
+    );
+    assert_eq!(
+        value["encrypted"],
+        "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"
+    );
+    assert_eq!(value["decrypted"], "00000000000000000000000000000000");
+    assert_eq!(value["exported"], "00000000000000000000000000000000");
+    assert_eq!(value["tampered"], "OperationError");
+    assert_eq!(value["badTagLength"], "OperationError");
+    assert_eq!(value["badKeyLength"], "DataError");
+    assert_eq!(value["badUsage"], "SyntaxError");
+    assert_eq!(value["wrongUsage"], "InvalidAccessError");
+    assert_eq!(
+        value["aes192Tag32"]["algorithm"],
+        serde_json::json!({"name":"AES-GCM","length":192})
+    );
+    assert_eq!(value["aes192Tag32"]["cipherBytes"], 6);
+    assert_eq!(value["aes192Tag32"]["plain"], "0405");
+    assert_eq!(
+        value["generated"]["algorithm"],
+        serde_json::json!({"name":"AES-GCM","length":256})
+    );
+    assert_eq!(
+        value["generated"]["usages"],
+        serde_json::json!(["encrypt", "decrypt"])
+    );
+    assert_eq!(value["generated"]["rawLength"], 32);
+    assert_eq!(
+        value["derived"]["algorithm"],
+        serde_json::json!({"name":"AES-GCM","length":256})
+    );
+    assert_eq!(value["derived"]["usages"], serde_json::json!(["encrypt"]));
+    assert_eq!(
+        value["derived"]["raw"],
+        "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+    );
+    assert!(value.get("topError").is_none());
+}
+
+#[tokio::test]
 async fn crypto_subtle_pbkdf2_matches_standard_vectors_and_key_semantics() {
     use browser_oxide::Page;
     use std::time::Duration;

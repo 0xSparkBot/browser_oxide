@@ -2,9 +2,63 @@
 //! `crypto.subtle` stub so scripts that hash payloads via
 //! `crypto.subtle.digest("SHA-256", ...)` see a real result.
 
+use boring2::symm::{decrypt_aead, encrypt_aead, Cipher};
 use deno_core::op2;
+use serde::Serialize;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
+
+#[derive(Serialize)]
+pub struct AesGcmResult {
+    pub ok: bool,
+    pub data: Vec<u8>,
+}
+
+fn aes_gcm_cipher(key_len: usize) -> Option<Cipher> {
+    match key_len {
+        16 => Some(Cipher::aes_128_gcm()),
+        24 => Some(Cipher::aes_192_gcm()),
+        32 => Some(Cipher::aes_256_gcm()),
+        _ => None,
+    }
+}
+
+fn valid_gcm_tag_len(tag_len: usize) -> bool {
+    matches!(tag_len, 4 | 8 | 12 | 13 | 14 | 15 | 16)
+}
+
+fn aes_gcm_encrypt_bytes(
+    key: &[u8],
+    iv: &[u8],
+    aad: &[u8],
+    data: &[u8],
+    tag_len: usize,
+) -> Option<Vec<u8>> {
+    let cipher = aes_gcm_cipher(key.len())?;
+    if !valid_gcm_tag_len(tag_len) {
+        return None;
+    }
+    let mut tag = vec![0u8; tag_len];
+    let mut encrypted = encrypt_aead(cipher, key, Some(iv), aad, data, &mut tag).ok()?;
+    encrypted.extend_from_slice(&tag);
+    Some(encrypted)
+}
+
+fn aes_gcm_decrypt_bytes(
+    key: &[u8],
+    iv: &[u8],
+    aad: &[u8],
+    data: &[u8],
+    tag_len: usize,
+) -> Option<Vec<u8>> {
+    let cipher = aes_gcm_cipher(key.len())?;
+    if !valid_gcm_tag_len(tag_len) || data.len() < tag_len {
+        return None;
+    }
+    let split = data.len() - tag_len;
+    let (ciphertext, tag) = data.split_at(split);
+    decrypt_aead(cipher, key, Some(iv), aad, ciphertext, tag).ok()
+}
 
 fn digest_bytes(algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
     let alg = algorithm.to_ascii_uppercase();
@@ -129,6 +183,42 @@ pub fn op_crypto_pbkdf2(
     pbkdf2_bytes(&algorithm, password, salt, iterations, byte_length as usize).unwrap_or_default()
 }
 
+#[op2]
+#[serde]
+pub fn op_crypto_aes_gcm_encrypt(
+    #[buffer] key: &[u8],
+    #[buffer] iv: &[u8],
+    #[buffer] aad: &[u8],
+    #[buffer] data: &[u8],
+    tag_len: u32,
+) -> AesGcmResult {
+    match aes_gcm_encrypt_bytes(key, iv, aad, data, tag_len as usize) {
+        Some(data) => AesGcmResult { ok: true, data },
+        None => AesGcmResult {
+            ok: false,
+            data: Vec::new(),
+        },
+    }
+}
+
+#[op2]
+#[serde]
+pub fn op_crypto_aes_gcm_decrypt(
+    #[buffer] key: &[u8],
+    #[buffer] iv: &[u8],
+    #[buffer] aad: &[u8],
+    #[buffer] data: &[u8],
+    tag_len: u32,
+) -> AesGcmResult {
+    match aes_gcm_decrypt_bytes(key, iv, aad, data, tag_len as usize) {
+        Some(data) => AesGcmResult { ok: true, data },
+        None => AesGcmResult {
+            ok: false,
+            data: Vec::new(),
+        },
+    }
+}
+
 #[op2(fast)]
 pub fn op_crypto_random_fill(#[buffer] out: &mut [u8]) {
     use rand::Rng;
@@ -141,13 +231,15 @@ deno_core::extension!(
         op_crypto_digest,
         op_crypto_hmac_sign,
         op_crypto_pbkdf2,
+        op_crypto_aes_gcm_encrypt,
+        op_crypto_aes_gcm_decrypt,
         op_crypto_random_fill
     ],
 );
 
 #[cfg(test)]
 mod tests {
-    use super::{hmac_bytes, pbkdf2_bytes};
+    use super::{aes_gcm_decrypt_bytes, aes_gcm_encrypt_bytes, hmac_bytes, pbkdf2_bytes};
 
     #[test]
     fn hmac_sha256_matches_rfc_style_vector() {
@@ -220,5 +312,37 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn aes_128_gcm_matches_nist_zero_vector() {
+        let key = [0u8; 16];
+        let iv = [0u8; 12];
+        let plaintext = [0u8; 16];
+        let encrypted = aes_gcm_encrypt_bytes(&key, &iv, &[], &plaintext, 16).unwrap();
+        assert_eq!(
+            hex::encode(&encrypted),
+            "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"
+        );
+        assert_eq!(
+            aes_gcm_decrypt_bytes(&key, &iv, &[], &encrypted, 16).unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn aes_gcm_authentication_failure_is_distinct_from_empty_plaintext() {
+        let key = [0x42u8; 32];
+        let iv = [0x24u8; 12];
+        let aad = b"associated";
+        let encrypted = aes_gcm_encrypt_bytes(&key, &iv, aad, b"", 16).unwrap();
+        assert_eq!(
+            aes_gcm_decrypt_bytes(&key, &iv, aad, &encrypted, 16).unwrap(),
+            b""
+        );
+
+        let mut tampered = encrypted;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(aes_gcm_decrypt_bytes(&key, &iv, aad, &tampered, 16).is_none());
     }
 }
