@@ -41,6 +41,7 @@
     const _messageEventState = new WeakMap();
     const _inputEventState = new WeakMap();
     const _focusEventState = new WeakMap();
+    const _compositionEventState = new WeakMap();
     const _pointerEventState = new WeakMap();
     const _wheelEventState = new WeakMap();
 
@@ -385,6 +386,26 @@
     }
     _defineGetter(FocusEvent.prototype, 'relatedTarget', _focusEventState);
     _moveConstructorLast(FocusEvent);
+
+    class CompositionEvent extends UIEvent {
+        constructor(type, options = {}) {
+            super(type, options);
+            _compositionEventState.set(this, {
+                data: options.data === undefined ? '' : String(options.data),
+            });
+        }
+    }
+    _defineGetter(CompositionEvent.prototype, 'data', _compositionEventState);
+    const _initCompositionEvent = { initCompositionEvent(type, bubbles = false,
+        cancelable = false, view = null, data = '') {
+        _initUIEvent.call(this, type, bubbles, cancelable, view, 0);
+        _stateFor(_compositionEventState, this).data = String(data || '');
+    } }.initCompositionEvent;
+    Object.defineProperty(CompositionEvent.prototype, 'initCompositionEvent', {
+        value: _native(_initCompositionEvent, 'initCompositionEvent'),
+        writable: true, enumerable: true, configurable: true,
+    });
+    _moveConstructorLast(CompositionEvent);
 
     class PointerEvent extends MouseEvent {
         constructor(type, options = {}) {
@@ -1001,6 +1022,7 @@
     globalThis.KeyboardEvent = KeyboardEvent;
     globalThis.InputEvent = InputEvent;
     globalThis.FocusEvent = FocusEvent;
+    globalThis.CompositionEvent = CompositionEvent;
     globalThis.PointerEvent = PointerEvent;
     globalThis.WheelEvent = WheelEvent;
     globalThis.TouchEvent = TouchEvent;

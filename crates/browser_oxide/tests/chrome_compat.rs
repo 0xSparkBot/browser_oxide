@@ -2229,6 +2229,45 @@ async fn doc_create_event() {
     assert_eq!(check("typeof document.createEvent").await, "function");
 }
 #[tokio::test]
+async fn doc_create_event_legacy_factories_match_chrome() {
+    assert_eq!(
+        check(
+            r#"JSON.stringify((() => {
+                const event = document.createEvent('Events');
+                const htmlEvent = document.createEvent('HTMLEvents');
+                const custom = document.createEvent('CustomEvent');
+                custom.initCustomEvent('ready', true, true, { value: 7 });
+                const mouse = document.createEvent('MouseEvents');
+                const ui = document.createEvent('UIEvents');
+                const keyboard = document.createEvent('KeyboardEvent');
+                const message = document.createEvent('MessageEvent');
+                const focus = document.createEvent('FocusEvent');
+                const composition = document.createEvent('CompositionEvent');
+                composition.initCompositionEvent('compositionupdate', true, false, window, 'abc');
+                const storage = document.createEvent('StorageEvent');
+                let invalid = null;
+                try { document.createEvent('InputEvent'); }
+                catch (error) { invalid = [error.name, error.code, error.message]; }
+                return {
+                    event: [event.constructor.name, Object.prototype.toString.call(event), event.type, event.bubbles, event.cancelable],
+                    htmlEvent: [htmlEvent.constructor.name, Object.prototype.toString.call(htmlEvent)],
+                    custom: [custom.constructor.name, custom.type, custom.bubbles, custom.cancelable, custom.detail.value, typeof custom.initCustomEvent],
+                    mouse: [mouse.constructor.name, typeof mouse.initMouseEvent, mouse.bubbles, mouse.cancelable],
+                    ui: [ui.constructor.name, typeof ui.initUIEvent],
+                    keyboard: [keyboard.constructor.name, typeof keyboard.initKeyboardEvent],
+                    message: [message.constructor.name, typeof message.initMessageEvent],
+                    focus: [focus.constructor.name, Object.prototype.toString.call(focus)],
+                    composition: [composition.constructor.name, composition.type, composition.bubbles, composition.cancelable, composition.data, typeof composition.initCompositionEvent],
+                    storage: [storage.constructor.name, Object.prototype.toString.call(storage)],
+                    invalid,
+                };
+            })())"#,
+        )
+        .await,
+        r#"{"event":["Event","[object Event]","",false,false],"htmlEvent":["Event","[object Event]"],"custom":["CustomEvent","ready",true,true,7,"function"],"mouse":["MouseEvent","function",false,false],"ui":["UIEvent","function"],"keyboard":["KeyboardEvent","function"],"message":["MessageEvent","function"],"focus":["FocusEvent","[object FocusEvent]"],"composition":["CompositionEvent","compositionupdate",true,false,"abc","function"],"storage":["StorageEvent","[object StorageEvent]"],"invalid":["NotSupportedError",9,"Failed to execute 'createEvent' on 'Document': The provided event type ('InputEvent') is invalid."]}"#
+    );
+}
+#[tokio::test]
 async fn doc_create_range() {
     assert_eq!(check("typeof document.createRange").await, "function");
 }
