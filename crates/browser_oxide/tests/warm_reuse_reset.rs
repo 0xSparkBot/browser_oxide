@@ -18,6 +18,71 @@ use browser_oxide::Page;
 
 const BLANK: &str = "<html><head></head><body></body></html>";
 
+#[tokio::test]
+async fn sync_reload_skips_modules_instead_of_running_them_as_classic_scripts() {
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let mut page = Page::from_html_fast(
+        "<html><body></body></html>",
+        "https://example.test/start",
+        profile,
+    )
+    .await
+    .unwrap();
+
+    page.reload_html(
+        r#"<html><body>
+            <script>globalThis.__reloadClassic = 'classic';</script>
+            <script type="module">
+                globalThis.__reloadModule = import.meta.url;
+            </script>
+        </body></html>"#,
+        "https://example.test/reload",
+    );
+
+    assert_eq!(
+        page.evaluate("globalThis.__reloadClassic").unwrap(),
+        "classic"
+    );
+    assert_eq!(
+        page.evaluate("typeof globalThis.__reloadModule").unwrap(),
+        "undefined"
+    );
+}
+
+#[tokio::test]
+async fn async_reload_executes_multiple_inline_module_entries_as_modules() {
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let mut page = Page::from_html_fast(
+        "<html><body></body></html>",
+        "https://example.test/start",
+        profile,
+    )
+    .await
+    .unwrap();
+
+    page.reload_html_async(
+        r#"<html><body>
+            <script>globalThis.__reloadOrder = ['classic'];</script>
+            <script type="module">
+                globalThis.__reloadOrder.push('module-1');
+                await Promise.resolve();
+                globalThis.__reloadOrder.push(import.meta.url.includes('oxide-reload-mod-1') ? 'tla' : 'bad-url');
+            </script>
+            <script type="module">
+                globalThis.__reloadOrder.push('module-2');
+            </script>
+        </body></html>"#,
+        "https://example.test/reload",
+    )
+    .await;
+
+    assert_eq!(
+        page.evaluate("JSON.stringify(globalThis.__reloadOrder)")
+            .unwrap(),
+        r#"["classic","module-1","tla","module-2"]"#
+    );
+}
+
 /// Listeners bound to `window` were keyed in a `WeakMap` against the one
 /// object that is never collected for the life of the isolate, so neither the
 /// callback nor anything its closure captured could ever be released.

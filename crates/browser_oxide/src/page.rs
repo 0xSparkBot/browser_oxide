@@ -849,6 +849,12 @@ impl Page {
     /// Replace the page's content with new HTML, reusing the V8 isolate.
     /// Much faster than creating a new Page (~2ms vs ~17ms) since it skips
     /// V8 isolate creation and bootstrap script execution.
+    ///
+    /// This synchronous path executes inline **classic** scripts only. ES
+    /// module loading/linking is asynchronous in V8/deno_core, so module
+    /// scripts are intentionally skipped here rather than being incorrectly
+    /// compiled as classic scripts. Call [`Page::reload_html_async`] when the
+    /// replacement document's inline module scripts must execute.
     pub fn reload_html(&mut self, html: &str, url: &str) {
         let dom = crate::html_parser::parse_html(html);
         let scripts = script_runner::find_scripts(&dom);
@@ -879,6 +885,9 @@ impl Page {
             if script.src.is_some() {
                 continue; // skip external scripts — caller handles fetching
             }
+            if script.is_module {
+                continue; // async module link/evaluation belongs to reload_html_async
+            }
             if script.code.trim().is_empty() {
                 continue;
             }
@@ -894,6 +903,63 @@ impl Page {
                 tracing::warn!(script_index = i, error = %e, "Script error in inline script");
             }
             self.event_loop.set_current_script(None);
+        }
+    }
+
+    /// Async counterpart to [`Page::reload_html`] that executes both inline
+    /// classic scripts and inline ES-module entry points in document order.
+    /// External scripts remain caller-managed, matching the existing warm
+    /// reload contract; each inline module is loaded as an independent side
+    /// module and may use top-level await/import maps normally.
+    pub async fn reload_html_async(&mut self, html: &str, url: &str) {
+        let dom = crate::html_parser::parse_html(html);
+        let scripts = script_runner::find_scripts(&dom);
+        let stylesheet_entries = stylesheet_collector::find_stylesheets(&dom);
+        let stylesheets = stylesheet_collector::resolve_inline_only(&stylesheet_entries);
+        let document_base = document_base_url(&dom, url);
+        let import_map =
+            crate::js_runtime::module_loader::ImportMap::from_dom(&dom, &document_base);
+
+        self.event_loop
+            .runtime_mut()
+            .replace_dom(dom, stylesheets, import_map, {
+                let origin = origin_of(url);
+                (!origin.is_empty()).then_some(origin)
+            });
+
+        self.url = url.to_string();
+        let url_js = url.replace('\\', "\\\\").replace('\'', "\\'");
+        self.event_loop
+            .execute_script(&format!("location.href = '{}';", url_js))
+            .ok();
+        self.event_loop.reset_nav_pending();
+
+        for (i, script) in scripts.iter().enumerate() {
+            if script.src.is_some() || script.code.trim().is_empty() {
+                continue;
+            }
+            self.event_loop
+                .note_executed_script(&self.url, &script.code);
+            if script.is_module {
+                self.event_loop.set_current_script(None);
+                let specifier = format!("{url}#oxide-reload-mod-{i}");
+                if let Err(error) = self
+                    .event_loop
+                    .eval_module_code(&specifier, script.code.clone())
+                    .await
+                {
+                    tracing::warn!(script_index = i, error = %error, "reload module script error");
+                }
+            } else {
+                self.event_loop.set_current_script(Some(script.node_id));
+                if let Err(error) = self
+                    .event_loop
+                    .execute_script_with_name(&script.code, &self.url)
+                {
+                    tracing::warn!(script_index = i, error = %error, "reload classic script error");
+                }
+                self.event_loop.set_current_script(None);
+            }
         }
     }
 
@@ -3316,9 +3382,9 @@ impl Page {
                 // than ignoring it (the SSR HTML was already the full page).
                 // When the rendered body is below the pass floor but the server
                 // HTML carried a substantial document, the SSR content IS the
-                // page: rebuild the static server DOM via reload_html (the
-                // destructive inline module re-throws under classic eval and is
-                // skipped, so the SSR body survives). Gated on !challenge (the
+                // page: rebuild the static server DOM via synchronous reload_html
+                // (which intentionally skips module scripts, so destructive
+                // hydration cannot immediately collapse the restored DOM). Gated on !challenge (the
                 // challenge-solve path owns small bodies) and a large server
                 // HTML (challenge stubs are tiny) — and we only KEEP the restore
                 // if it actually yields a passing body, so a genuinely-thin page
