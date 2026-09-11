@@ -5051,7 +5051,7 @@
     };
     const _copyKeyAlgorithm = (state) => (state.name === 'PBKDF2' || state.name === 'HKDF')
         ? { name: state.name }
-        : (state.name === 'AES-GCM' || state.name === 'AES-CBC')
+        : (state.name === 'AES-GCM' || state.name === 'AES-CBC' || state.name === 'AES-KW')
             ? { name: state.name, length: state.length }
             : {
                 name: "HMAC",
@@ -5408,6 +5408,57 @@
         }
         return { alg, state };
     };
+    const _normalizeAesKwKeyAlgorithm = (algorithm, requireLength) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'AES-KW') {
+            throw new DOMException("Unrecognized name.", "NotSupportedError");
+        }
+        const result = { name: 'AES-KW' };
+        if (requireLength) {
+            const length = Number(algorithm && algorithm.length);
+            if (length !== 128 && length !== 192 && length !== 256) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            result.length = length;
+        }
+        return result;
+    };
+    const _normalizeAesKwUsages = (keyUsages) => {
+        const usages = Array.from(keyUsages || [], String);
+        const allowed = new Set(['wrapKey', 'unwrapKey']);
+        if (usages.length === 0) {
+            throw new DOMException("Usages cannot be empty when creating a key.", "SyntaxError");
+        }
+        if (usages.some((usage) => !allowed.has(usage))) {
+            throw new DOMException("Cannot create a key using the specified key usages.", "SyntaxError");
+        }
+        return usages;
+    };
+    const _makeAesKwKey = (bytes, extractable, usages) => {
+        const material = new Uint8Array(bytes);
+        const length = material.byteLength * 8;
+        if (length !== 128 && length !== 192 && length !== 256) {
+            throw new DOMException("Invalid key length", "DataError");
+        }
+        const key = Object.create(_CryptoKeyProto);
+        _cryptoKeyState.set(key, {
+            name: 'AES-KW',
+            type: 'secret',
+            extractable: !!extractable,
+            length,
+            usages: usages.slice(),
+            bytes: material.slice(),
+        });
+        return key;
+    };
+    const _checkAesKwOperation = (algorithm, key, usage) => {
+        _normalizeAesKwKeyAlgorithm(algorithm, false);
+        const state = _requireCryptoKey(key);
+        if (state.name !== 'AES-KW' || !state.usages.includes(usage)) {
+            throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+        }
+        return state;
+    };
     const _checkHmacOperation = (algorithm, key, usage) => {
         _normalizeHmacAlgorithm(algorithm, false);
         const state = _requireCryptoKey(key);
@@ -5433,6 +5484,13 @@
                 const bytes = new Uint8Array(alg.length / 8);
                 ops.op_crypto_random_fill(bytes);
                 return Promise.resolve(_makeAesCbcKey(bytes, extractable, usages));
+            }
+            if (String(rawName || '').toUpperCase() === 'AES-KW') {
+                const alg = _normalizeAesKwKeyAlgorithm(algorithm, true);
+                const usages = _normalizeAesKwUsages(keyUsages);
+                const bytes = new Uint8Array(alg.length / 8);
+                ops.op_crypto_random_fill(bytes);
+                return Promise.resolve(_makeAesKwKey(bytes, extractable, usages));
             }
             const alg = _normalizeHmacAlgorithm(algorithm, true);
             const usages = _normalizeHmacUsages(keyUsages);
@@ -5485,6 +5543,14 @@
                     throw new TypeError("keyData is not a BufferSource");
                 }
                 return Promise.resolve(_makeAesCbcKey(_toBytes(keyData), extractable, usages));
+            }
+            if (String(rawName || '').toUpperCase() === 'AES-KW') {
+                _normalizeAesKwKeyAlgorithm(algorithm, false);
+                const usages = _normalizeAesKwUsages(keyUsages);
+                if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+                    throw new TypeError("keyData is not a BufferSource");
+                }
+                return Promise.resolve(_makeAesKwKey(_toBytes(keyData), extractable, usages));
             }
             const alg = _normalizeHmacAlgorithm(algorithm, true);
             const usages = _normalizeHmacUsages(keyUsages);
@@ -5584,6 +5650,12 @@
                     const out = _deriveHkdfBytes(alg, state, derived.length);
                     return Promise.resolve(_makeAesCbcKey(out, extractable, usages));
                 }
+                if (String(derivedName || '').toUpperCase() === 'AES-KW') {
+                    const derived = _normalizeAesKwKeyAlgorithm(derivedKeyType, true);
+                    const usages = _normalizeAesKwUsages(keyUsages);
+                    const out = _deriveHkdfBytes(alg, state, derived.length);
+                    return Promise.resolve(_makeAesKwKey(out, extractable, usages));
+                }
                 const derived = _normalizeHmacAlgorithm(derivedKeyType, true);
                 const usages = _normalizeHmacUsages(keyUsages);
                 const bitLength = derived.length === undefined
@@ -5621,6 +5693,17 @@
                     throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
                 }
                 return Promise.resolve(_makeAesCbcKey(out, extractable, usages));
+            }
+            if (String(derivedName || '').toUpperCase() === 'AES-KW') {
+                const derived = _normalizeAesKwKeyAlgorithm(derivedKeyType, true);
+                const usages = _normalizeAesKwUsages(keyUsages);
+                const out = ops.op_crypto_pbkdf2(
+                    alg.hash, state.bytes, alg.salt, alg.iterations, derived.length / 8
+                );
+                if (out.byteLength !== derived.length / 8) {
+                    throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+                }
+                return Promise.resolve(_makeAesKwKey(out, extractable, usages));
             }
             const derived = _normalizeHmacAlgorithm(derivedKeyType, true);
             const usages = _normalizeHmacUsages(keyUsages);
@@ -5690,6 +5773,14 @@
         try {
             const normalizedFormat = String(format).toLowerCase();
             const rawName = typeof wrapAlgorithm === 'string' ? wrapAlgorithm : (wrapAlgorithm && wrapAlgorithm.name);
+            if (String(rawName || '').toUpperCase() === 'AES-KW') {
+                const state = _checkAesKwOperation(wrapAlgorithm, wrappingKey, 'wrapKey');
+                return _SubtleProto.exportKey.call(this, normalizedFormat, key).then((exported) => {
+                    const result = ops.op_crypto_aes_kw_wrap(state.bytes, _toBytes(exported));
+                    if (!result.ok) throw new DOMException('', 'OperationError');
+                    return new Uint8Array(result.data).buffer;
+                });
+            }
             if (String(rawName || '').toUpperCase() === 'AES-CBC') {
                 const { alg, state } = _checkAesCbcOperation(wrapAlgorithm, wrappingKey, 'wrapKey', 'wrapKey');
                 return _SubtleProto.exportKey.call(this, normalizedFormat, key).then((exported) => {
@@ -5721,7 +5812,11 @@
             const normalizedFormat = String(format).toLowerCase();
             const rawName = typeof unwrapAlgorithm === 'string' ? unwrapAlgorithm : (unwrapAlgorithm && unwrapAlgorithm.name);
             let result;
-            if (String(rawName || '').toUpperCase() === 'AES-CBC') {
+            if (String(rawName || '').toUpperCase() === 'AES-KW') {
+                const state = _checkAesKwOperation(unwrapAlgorithm, unwrappingKey, 'unwrapKey');
+                result = ops.op_crypto_aes_kw_unwrap(state.bytes, _toBytes(wrappedKey));
+                if (!result.ok) throw new DOMException('', 'OperationError');
+            } else if (String(rawName || '').toUpperCase() === 'AES-CBC') {
                 const checked = _checkAesCbcOperation(unwrapAlgorithm, unwrappingKey, 'unwrapKey', 'unwrapKey');
                 result = ops.op_crypto_aes_cbc_decrypt(checked.state.bytes, checked.alg.iv, _toBytes(wrappedKey));
                 if (!result.ok) throw new DOMException('', 'OperationError');

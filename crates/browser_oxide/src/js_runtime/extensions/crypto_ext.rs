@@ -2,6 +2,7 @@
 //! `crypto.subtle` stub so scripts that hash payloads via
 //! `crypto.subtle.digest("SHA-256", ...)` see a real result.
 
+use boring2::aes::{unwrap_key, wrap_key, AesKey};
 use boring2::symm::{decrypt, decrypt_aead, encrypt, encrypt_aead, Cipher};
 use deno_core::op2;
 use serde::Serialize;
@@ -79,6 +80,28 @@ fn aes_gcm_decrypt_bytes(
     let split = data.len() - tag_len;
     let (ciphertext, tag) = data.split_at(split);
     decrypt_aead(cipher, key, Some(iv), aad, ciphertext, tag).ok()
+}
+
+fn aes_kw_wrap_bytes(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if !matches!(key.len(), 16 | 24 | 32) || data.len() < 16 || !data.len().is_multiple_of(8) {
+        return None;
+    }
+    let aes = AesKey::new_encrypt(key).ok()?;
+    let mut out = vec![0u8; data.len() + 8];
+    let written = wrap_key(&aes, None, &mut out, data).ok()?;
+    out.truncate(written);
+    Some(out)
+}
+
+fn aes_kw_unwrap_bytes(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if !matches!(key.len(), 16 | 24 | 32) || data.len() < 24 || !data.len().is_multiple_of(8) {
+        return None;
+    }
+    let aes = AesKey::new_decrypt(key).ok()?;
+    let mut out = vec![0u8; data.len() - 8];
+    let written = unwrap_key(&aes, None, &mut out, data).ok()?;
+    out.truncate(written);
+    Some(out)
 }
 
 fn digest_bytes(algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
@@ -319,6 +342,30 @@ pub fn op_crypto_aes_cbc_decrypt(
     }
 }
 
+#[op2]
+#[serde]
+pub fn op_crypto_aes_kw_wrap(#[buffer] key: &[u8], #[buffer] data: &[u8]) -> AesGcmResult {
+    match aes_kw_wrap_bytes(key, data) {
+        Some(data) => AesGcmResult { ok: true, data },
+        None => AesGcmResult {
+            ok: false,
+            data: Vec::new(),
+        },
+    }
+}
+
+#[op2]
+#[serde]
+pub fn op_crypto_aes_kw_unwrap(#[buffer] key: &[u8], #[buffer] data: &[u8]) -> AesGcmResult {
+    match aes_kw_unwrap_bytes(key, data) {
+        Some(data) => AesGcmResult { ok: true, data },
+        None => AesGcmResult {
+            ok: false,
+            data: Vec::new(),
+        },
+    }
+}
+
 #[op2(fast)]
 pub fn op_crypto_random_fill(#[buffer] out: &mut [u8]) {
     use rand::Rng;
@@ -336,6 +383,8 @@ deno_core::extension!(
         op_crypto_aes_gcm_decrypt,
         op_crypto_aes_cbc_encrypt,
         op_crypto_aes_cbc_decrypt,
+        op_crypto_aes_kw_wrap,
+        op_crypto_aes_kw_unwrap,
         op_crypto_random_fill
     ],
 );
@@ -344,8 +393,24 @@ deno_core::extension!(
 mod tests {
     use super::{
         aes_cbc_decrypt_bytes, aes_cbc_encrypt_bytes, aes_gcm_decrypt_bytes, aes_gcm_encrypt_bytes,
-        hkdf_bytes, hmac_bytes, pbkdf2_bytes,
+        aes_kw_unwrap_bytes, aes_kw_wrap_bytes, hkdf_bytes, hmac_bytes, pbkdf2_bytes,
     };
+
+    #[test]
+    fn aes_kw_matches_rfc3394_128_bit_vector() {
+        let kek = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let plain = hex::decode("00112233445566778899aabbccddeeff").unwrap();
+        let wrapped = aes_kw_wrap_bytes(&kek, &plain).unwrap();
+        assert_eq!(
+            hex::encode(&wrapped),
+            "1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"
+        );
+        assert_eq!(aes_kw_unwrap_bytes(&kek, &wrapped).unwrap(), plain);
+
+        let mut tampered = wrapped;
+        tampered[0] ^= 1;
+        assert!(aes_kw_unwrap_bytes(&kek, &tampered).is_none());
+    }
 
     #[test]
     fn hmac_sha256_matches_rfc_style_vector() {
