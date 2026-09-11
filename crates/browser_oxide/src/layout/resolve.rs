@@ -19,6 +19,29 @@ impl Default for ResolveContext {
     }
 }
 
+fn calc_context(ctx: &ResolveContext, percentage_base_px: f32) -> CalcContext {
+    CalcContext {
+        viewport_w: ctx.viewport_w as f64,
+        viewport_h: ctx.viewport_h as f64,
+        root_font_size_px: ctx.root_font_size as f64,
+        font_size_px: ctx.font_size as f64,
+        // ResolveContext predates container-query units and has no dedicated
+        // container dimensions. Its existing cqw/cqh behavior approximates
+        // against the viewport, so preserve that behavior here.
+        container_w: ctx.viewport_w as f64,
+        container_h: ctx.viewport_h as f64,
+        percentage_base_px: percentage_base_px as f64,
+    }
+}
+
+pub(crate) fn resolve_calc_expression(
+    expr: &CalcExpr,
+    ctx: &ResolveContext,
+    percentage_base_px: f32,
+) -> f32 {
+    expr.evaluate(&calc_context(ctx, percentage_base_px)) as f32
+}
+
 /// Resolve a Length to absolute pixels.
 pub fn resolve_length(length: &Length, ctx: &ResolveContext) -> f32 {
     match length {
@@ -38,7 +61,7 @@ pub fn resolve_length(length: &Length, ctx: &ResolveContext) -> f32 {
         Length::Ex(v) => *v as f32 * ctx.font_size * 0.5, // approximate
         Length::Cqw(v) => *v as f32 * ctx.viewport_w / 100.0, // approximate
         Length::Cqh(v) => *v as f32 * ctx.viewport_h / 100.0, // approximate
-        Length::Calc(_) => 0.0,                           // TODO: evaluate calc expressions
+        Length::Calc(expr) => resolve_calc_expression(expr, ctx, 0.0),
         Length::Zero => 0.0,
     }
 }
@@ -52,7 +75,7 @@ pub fn resolve_length_percentage(
     match lp {
         LengthPercentage::Length(l) => resolve_length(l, ctx),
         LengthPercentage::Percentage(p) => *p as f32 / 100.0 * reference_size,
-        LengthPercentage::Calc(_) => 0.0,
+        LengthPercentage::Calc(expr) => resolve_calc_expression(expr, ctx, reference_size),
     }
 }
 
@@ -66,7 +89,9 @@ pub fn resolve_length_percentage_auto(
         LengthPercentageAuto::Length(l) => Some(resolve_length(l, ctx)),
         LengthPercentageAuto::Percentage(p) => Some(*p as f32 / 100.0 * reference_size),
         LengthPercentageAuto::Auto => None,
-        LengthPercentageAuto::Calc(_) => None,
+        LengthPercentageAuto::Calc(expr) => {
+            Some(resolve_calc_expression(expr, ctx, reference_size))
+        }
     }
 }
 
@@ -111,6 +136,32 @@ mod tests {
     fn resolve_percentage() {
         let lp = LengthPercentage::Percentage(50.0);
         assert_eq!(resolve_length_percentage(&lp, &ctx(), 200.0), 100.0);
+    }
+
+    #[test]
+    fn resolve_calc_length_uses_live_unit_context() {
+        let mut c = ctx();
+        c.font_size = 20.0;
+        let expr = CalcExpr::Add(
+            Box::new(CalcExpr::Value(CalcValue::Length(10.0, LengthUnit::Px))),
+            Box::new(CalcExpr::Value(CalcValue::Length(2.0, LengthUnit::Em))),
+        );
+        assert_eq!(resolve_length(&Length::Calc(Box::new(expr)), &c), 50.0);
+    }
+
+    #[test]
+    fn resolve_calc_length_percentage_uses_explicit_reference_size() {
+        let expr = CalcExpr::Sub(
+            Box::new(CalcExpr::Value(CalcValue::Percentage(50.0))),
+            Box::new(CalcExpr::Value(CalcValue::Length(10.0, LengthUnit::Px))),
+        );
+        let lp = LengthPercentage::Calc(Box::new(expr.clone()));
+        let lpa = LengthPercentageAuto::Calc(Box::new(expr));
+        assert_eq!(resolve_length_percentage(&lp, &ctx(), 200.0), 90.0);
+        assert_eq!(
+            resolve_length_percentage_auto(&lpa, &ctx(), 200.0),
+            Some(90.0)
+        );
     }
 
     #[test]

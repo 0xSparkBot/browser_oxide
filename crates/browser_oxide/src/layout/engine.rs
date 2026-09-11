@@ -421,6 +421,25 @@ mod tests {
     }
 
     #[test]
+    fn layout_pure_calc_width_is_not_treated_as_auto() {
+        let dom = make_dom_with_styled_div("width: calc(100px + 50px); height: 20px");
+        let viewport = Viewport::new(800.0, 600.0);
+        let mut engine = LayoutEngine::new(viewport);
+        engine.compute(&dom);
+
+        let html = dom.child_elements(NodeId::DOCUMENT)[0];
+        let body = dom.child_elements(html)[0];
+        let div = dom.child_elements(body)[0];
+        let rect = engine.get_bounding_rect(&dom, div);
+
+        assert!(
+            (rect.width - 150.0).abs() < 0.1,
+            "pure calc width should resolve to 150px, got {}",
+            rect.width
+        );
+    }
+
+    #[test]
     fn layout_text_node_has_size() {
         let mut dom = Dom::new();
         let html = dom.create_element(QualName::new("html"), vec![]);

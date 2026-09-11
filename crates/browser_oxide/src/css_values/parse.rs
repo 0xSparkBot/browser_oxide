@@ -230,6 +230,9 @@ fn parse_border_width(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueErr
         if let Some(lp) = try_length_percentage(&value[0]) {
             return Ok(match lp {
                 LengthPercentage::Length(l) => CssValue::Length(l),
+                LengthPercentage::Calc(expr) if expr.is_definite_length() => {
+                    CssValue::Length(Length::Calc(expr))
+                }
                 _ => {
                     return Err(ValueError::InvalidValue(
                         "border-width must be a length".into(),
@@ -1336,6 +1339,27 @@ mod tests {
         assert_eq!(decls[5].value, CssValue::BorderStyle(BorderStyle::Dashed));
         assert_eq!(decls[6].value, CssValue::BorderStyle(BorderStyle::Solid));
         assert_eq!(decls[7].value, CssValue::BorderStyle(BorderStyle::Hidden));
+
+        let decls = parse_decl("border-top-width: calc(1px + 2px)");
+        assert_eq!(decls.len(), 1);
+        match &decls[0].value {
+            CssValue::Length(Length::Calc(expr)) => {
+                assert!(!expr.contains_percentage());
+                assert_eq!(expr.evaluate(&CalcContext::default()), 3.0);
+            }
+            other => panic!("expected pure calc border width, got {other:?}"),
+        }
+
+        // Percentages are not valid in <line-width>, even inside calc().
+        let (raw, errors) = parse_declaration_list("border-top-width: calc(10% + 1px)");
+        assert!(errors.is_empty());
+        assert_eq!(raw.len(), 1);
+        assert!(parse_property(raw[0].name, &raw[0].value, raw[0].important).is_err());
+
+        let (raw, errors) = parse_declaration_list("border-top-width: calc(1px + 2)");
+        assert!(errors.is_empty());
+        assert_eq!(raw.len(), 1);
+        assert!(parse_property(raw[0].name, &raw[0].value, raw[0].important).is_err());
 
         let decls = parse_decl("border-color: red currentcolor #00ff00 transparent");
         assert_eq!(decls.len(), 4);

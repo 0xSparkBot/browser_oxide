@@ -229,6 +229,162 @@ impl LengthUnit {
 }
 
 impl CalcExpr {
+    /// Returns true when this expression depends on a percentage basis.
+    ///
+    /// Layout backends that do not yet expose their containing-block basis to
+    /// the CSS value resolver can use this to safely fold pure length/math
+    /// expressions while deferring mixed percentage expressions.
+    pub fn contains_percentage(&self) -> bool {
+        match self {
+            Self::Value(CalcValue::Percentage(_)) => true,
+            Self::Value(_) => false,
+            Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::Mul(a, b)
+            | Self::Div(a, b)
+            | Self::Mod(a, b)
+            | Self::Rem(a, b)
+            | Self::Atan2(a, b)
+            | Self::Pow(a, b) => a.contains_percentage() || b.contains_percentage(),
+            Self::Negate(e)
+            | Self::Sin(e)
+            | Self::Cos(e)
+            | Self::Tan(e)
+            | Self::Asin(e)
+            | Self::Acos(e)
+            | Self::Atan(e)
+            | Self::Sqrt(e)
+            | Self::Exp(e)
+            | Self::Abs(e)
+            | Self::Sign(e) => e.contains_percentage(),
+            Self::Min(args) | Self::Max(args) | Self::Hypot(args) => {
+                args.iter().any(Self::contains_percentage)
+            }
+            Self::Clamp {
+                min,
+                preferred,
+                max,
+            } => {
+                min.contains_percentage()
+                    || preferred.contains_percentage()
+                    || max.contains_percentage()
+            }
+            Self::Round(_, value, step) => {
+                value.contains_percentage() || step.contains_percentage()
+            }
+            Self::Log { value, base } => {
+                value.contains_percentage()
+                    || base.as_deref().is_some_and(Self::contains_percentage)
+            }
+        }
+    }
+
+    /// Conservatively determines whether CSS typed arithmetic guarantees that
+    /// this expression produces a length without needing a percentage basis.
+    ///
+    /// The calc parser intentionally preserves a broad expression AST for
+    /// computed-style math probes, but the layout bridge must not turn invalid
+    /// typed arithmetic such as `calc(1px + 2)` into a valid `3px` length. This
+    /// predicate therefore accepts only combinations whose dimensional result
+    /// is unambiguously a length. Unknown/advanced combinations stay deferred.
+    pub fn is_definite_length(&self) -> bool {
+        match self {
+            Self::Value(CalcValue::Length(_, _)) => true,
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mod(a, b) | Self::Rem(a, b) => {
+                a.is_definite_length() && b.is_definite_length()
+            }
+            Self::Mul(a, b) => {
+                (a.is_definite_length() && b.is_definite_number())
+                    || (a.is_definite_number() && b.is_definite_length())
+            }
+            Self::Div(a, b) => a.is_definite_length() && b.is_definite_number(),
+            Self::Negate(e) | Self::Abs(e) => e.is_definite_length(),
+            Self::Min(args) | Self::Max(args) | Self::Hypot(args) => {
+                !args.is_empty() && args.iter().all(Self::is_definite_length)
+            }
+            Self::Clamp {
+                min,
+                preferred,
+                max,
+            } => {
+                min.is_definite_length()
+                    && preferred.is_definite_length()
+                    && max.is_definite_length()
+            }
+            Self::Round(_, value, step) => value.is_definite_length() && step.is_definite_length(),
+            _ => false,
+        }
+    }
+
+    fn is_definite_number(&self) -> bool {
+        match self {
+            Self::Value(CalcValue::Number(_) | CalcValue::Constant(_)) => true,
+            Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::Mul(a, b)
+            | Self::Div(a, b)
+            | Self::Mod(a, b)
+            | Self::Rem(a, b)
+            | Self::Pow(a, b) => a.is_definite_number() && b.is_definite_number(),
+            Self::Negate(e) | Self::Sqrt(e) | Self::Exp(e) | Self::Abs(e) | Self::Sign(e) => {
+                e.is_definite_number()
+            }
+            Self::Min(args) | Self::Max(args) | Self::Hypot(args) => {
+                !args.is_empty() && args.iter().all(Self::is_definite_number)
+            }
+            Self::Clamp {
+                min,
+                preferred,
+                max,
+            } => {
+                min.is_definite_number()
+                    && preferred.is_definite_number()
+                    && max.is_definite_number()
+            }
+            Self::Round(_, value, step) => value.is_definite_number() && step.is_definite_number(),
+            Self::Sin(e) | Self::Cos(e) | Self::Tan(e) => {
+                e.is_definite_number() || e.is_definite_angle()
+            }
+            Self::Log { value, base } => {
+                value.is_definite_number() && base.as_deref().is_none_or(Self::is_definite_number)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_definite_angle(&self) -> bool {
+        match self {
+            Self::Value(CalcValue::Angle(_, _)) => true,
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mod(a, b) | Self::Rem(a, b) => {
+                a.is_definite_angle() && b.is_definite_angle()
+            }
+            Self::Mul(a, b) => {
+                (a.is_definite_angle() && b.is_definite_number())
+                    || (a.is_definite_number() && b.is_definite_angle())
+            }
+            Self::Div(a, b) => a.is_definite_angle() && b.is_definite_number(),
+            Self::Negate(e) | Self::Abs(e) => e.is_definite_angle(),
+            Self::Min(args) | Self::Max(args) | Self::Hypot(args) => {
+                !args.is_empty() && args.iter().all(Self::is_definite_angle)
+            }
+            Self::Clamp {
+                min,
+                preferred,
+                max,
+            } => {
+                min.is_definite_angle() && preferred.is_definite_angle() && max.is_definite_angle()
+            }
+            Self::Round(_, value, step) => value.is_definite_angle() && step.is_definite_angle(),
+            Self::Asin(e) | Self::Acos(e) | Self::Atan(e) => e.is_definite_number(),
+            Self::Atan2(a, b) => {
+                (a.is_definite_number() && b.is_definite_number())
+                    || (a.is_definite_length() && b.is_definite_length())
+                    || (a.is_definite_angle() && b.is_definite_angle())
+            }
+            _ => false,
+        }
+    }
+
     /// Evaluate this math expression to a single `f64` value, resolved
     /// in the appropriate unit:
     ///   - lengths resolve to **pixels**
@@ -438,6 +594,52 @@ mod calc_eval_tests {
             Box::new(CalcExpr::Value(CalcValue::Length(50.0, LengthUnit::Vw))),
         );
         assert_eq!(e.evaluate(&ctx), 540.0);
+    }
+
+    #[test]
+    fn percentage_dependency_walks_nested_expression_tree() {
+        let pure = CalcExpr::Add(
+            Box::new(CalcExpr::Value(CalcValue::Length(10.0, LengthUnit::Px))),
+            Box::new(CalcExpr::Sin(pi())),
+        );
+        assert!(!pure.contains_percentage());
+
+        let mixed = CalcExpr::Clamp {
+            min: Box::new(CalcExpr::Value(CalcValue::Length(1.0, LengthUnit::Px))),
+            preferred: Box::new(CalcExpr::Add(
+                Box::new(CalcExpr::Value(CalcValue::Percentage(50.0))),
+                Box::new(CalcExpr::Value(CalcValue::Length(2.0, LengthUnit::Px))),
+            )),
+            max: Box::new(CalcExpr::Value(CalcValue::Length(100.0, LengthUnit::Px))),
+        };
+        assert!(mixed.contains_percentage());
+    }
+
+    #[test]
+    fn definite_length_rejects_incompatible_typed_arithmetic() {
+        let valid = CalcExpr::Mul(
+            Box::new(CalcExpr::Value(CalcValue::Length(8.0, LengthUnit::Px))),
+            Box::new(CalcExpr::Add(
+                Box::new(CalcExpr::Value(CalcValue::Number(1.0))),
+                Box::new(CalcExpr::Sin(Box::new(CalcExpr::Value(CalcValue::Angle(
+                    90.0,
+                    AngleUnit::Deg,
+                ))))),
+            )),
+        );
+        assert!(valid.is_definite_length());
+
+        let mixed_percentage = CalcExpr::Add(
+            Box::new(CalcExpr::Value(CalcValue::Length(1.0, LengthUnit::Px))),
+            Box::new(CalcExpr::Value(CalcValue::Percentage(10.0))),
+        );
+        assert!(!mixed_percentage.is_definite_length());
+
+        let invalid_number_addition = CalcExpr::Add(
+            Box::new(CalcExpr::Value(CalcValue::Length(1.0, LengthUnit::Px))),
+            Box::new(CalcExpr::Value(CalcValue::Number(2.0))),
+        );
+        assert!(!invalid_number_addition.is_definite_length());
     }
 
     #[test]
