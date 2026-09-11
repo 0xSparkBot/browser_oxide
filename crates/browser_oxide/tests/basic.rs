@@ -260,6 +260,72 @@ async fn module_evaluation_does_not_wait_for_unrelated_refed_timer() {
     );
 }
 
+fn runtime_at(url: &str) -> BrowserJsRuntime {
+    let dom = browser_oxide::html_parser::parse_html(
+        "<!doctype html><html><head></head><body></body></html>",
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    let encoded = serde_json::to_string(url).unwrap();
+    rt.execute_script(&format!("location.href = {encoded}"), None)
+        .unwrap();
+    rt.reset_nav_pending();
+    rt
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn broadcast_channel_isolates_origins_across_page_runtimes() {
+    let mut page_a = runtime_at("https://a.example/page-a");
+    let mut page_b = runtime_at("https://a.example/page-b");
+    let mut cross_origin = runtime_at("https://b.example/page-c");
+
+    page_a
+        .execute_script(
+            "globalThis.got=[]; globalThis.bc=new BroadcastChannel('room'); bc.onmessage=e=>got.push(e.data)",
+            None,
+        )
+        .unwrap();
+    page_b
+        .execute_script("globalThis.bc=new BroadcastChannel('room')", None)
+        .unwrap();
+    cross_origin
+        .execute_script(
+            "globalThis.got=[]; globalThis.bc=new BroadcastChannel('room'); bc.onmessage=e=>got.push(e.data)",
+            None,
+        )
+        .unwrap();
+
+    page_b
+        .execute_script("bc.postMessage('same-origin')", None)
+        .unwrap();
+    cross_origin
+        .execute_script("bc.postMessage('cross-origin')", None)
+        .unwrap();
+
+    page_a.run_event_loop().await.unwrap();
+    cross_origin.run_event_loop().await.unwrap();
+
+    assert_eq!(
+        page_a.execute_script("JSON.stringify(got)", None).unwrap(),
+        r#"["same-origin"]"#
+    );
+    assert_eq!(
+        cross_origin
+            .execute_script("JSON.stringify(got)", None)
+            .unwrap(),
+        "[]"
+    );
+
+    page_a.execute_script("bc.close()", None).unwrap();
+    page_b
+        .execute_script("bc.postMessage('after-close')", None)
+        .unwrap();
+    page_a.run_event_loop().await.unwrap();
+    assert_eq!(
+        page_a.execute_script("JSON.stringify(got)", None).unwrap(),
+        r#"["same-origin"]"#
+    );
+}
+
 #[tokio::test]
 async fn console_log_capture() {
     let mut rt = create_test_runtime();
