@@ -229,6 +229,24 @@ pub fn op_frame_register_origin(#[smi] frame_id: u32, #[string] origin: &str) {
     }
 }
 
+#[op2]
+#[string]
+pub fn op_frame_normalize_target_origin(
+    #[string] target_origin: &str,
+    #[string] sender_href: &str,
+) -> String {
+    let base = url::Url::parse(sender_href).ok();
+    let parsed = match base.as_ref() {
+        Some(base) => url::Url::options()
+            .base_url(Some(base))
+            .parse(target_origin),
+        None => url::Url::parse(target_origin),
+    };
+    parsed
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_default()
+}
+
 #[op2(fast)]
 pub fn op_frame_post_message(
     #[smi] target_id: u32,
@@ -312,6 +330,7 @@ deno_core::extension!(
     ops = [
         op_frame_pending,
         op_frame_register_origin,
+        op_frame_normalize_target_origin,
         op_frame_post_message,
         op_frame_take_messages
     ],

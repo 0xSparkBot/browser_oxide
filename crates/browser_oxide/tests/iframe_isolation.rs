@@ -1,6 +1,25 @@
 //! Iframe V8 isolation tests — verify separate JS context per iframe.
 
 use browser_oxide::Page;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+async fn spawn_frame_server(body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{addr}/child")
+}
 
 #[tokio::test]
 async fn iframe_srcdoc_creates_child() {
@@ -218,6 +237,106 @@ async fn cross_realm_post_message_to_parent() {
     assert_eq!(
         message_count, "1",
         "one child postMessage must dispatch exactly one parent MessageEvent"
+    );
+}
+
+#[tokio::test]
+async fn frame_tree_post_message_normalizes_target_origin_and_propagates_errors() {
+    let child_url = spawn_frame_server("<!doctype html><html><body>child</body></html>").await;
+    let child_origin = url::Url::parse(&child_url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    let parent_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let parent_addr = parent_listener.local_addr().unwrap();
+    drop(parent_listener);
+    let parent_url = format!("http://{parent_addr}/parent");
+    let parent_origin = url::Url::parse(&parent_url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let client = browser_oxide::net::HttpClient::shared(&profile).unwrap();
+    let mut page = Page::from_html_with_url(
+        "<!doctype html><html><body></body></html>",
+        &parent_url,
+        Some(profile.clone()),
+    )
+    .await
+    .unwrap();
+    page.init_top_frame();
+    page.evaluate(&format!(
+        "const f=document.createElement('iframe');f.src={};document.body.appendChild(f);",
+        serde_json::to_string(&child_url).unwrap()
+    ))
+    .unwrap();
+    page.drive_frame_tree(&client, &profile).await;
+    assert_eq!(
+        page.frame_tree_count(),
+        1,
+        "local child frame must materialize"
+    );
+
+    page.frame_tree_evaluate(
+        0,
+        "globalThis.__down=[];addEventListener('message',e=>__down.push(e.data));",
+    );
+    page.evaluate("globalThis.__up=[];addEventListener('message',e=>__up.push(e.data));")
+        .unwrap();
+
+    let child_origin_js = serde_json::to_string(&child_origin).unwrap();
+    let parent_origin_js = serde_json::to_string(&parent_origin).unwrap();
+    page.evaluate(&format!(
+        r#"(()=>{{
+            const w=document.querySelector('iframe').contentWindow;
+            globalThis.__badOrigin='no-throw';
+            try {{ w.postMessage('invalid','http://['); }}
+            catch(e) {{ globalThis.__badOrigin=e.name; }}
+            globalThis.__cloneError='no-throw';
+            try {{ w.postMessage(function(){{}}, '*'); }}
+            catch(e) {{ globalThis.__cloneError=e.name; }}
+            w.postMessage('path', {child_origin_js} + '/deep/path?q=1');
+            w.postMessage('options', {{targetOrigin:{child_origin_js} + '/options'}});
+            w.postMessage('star', '*');
+            w.postMessage('wrong', {parent_origin_js} + '/wrong');
+            w.postMessage('slash', '/');
+            w.postMessage('omitted');
+        }})()"#
+    ))
+    .unwrap();
+    page.drive_frame_tree(&client, &profile).await;
+
+    assert_eq!(page.evaluate("__badOrigin").unwrap(), "SyntaxError");
+    assert_eq!(page.evaluate("__cloneError").unwrap(), "DataCloneError");
+    assert_eq!(
+        page.frame_tree_evaluate(0, "JSON.stringify(__down)")
+            .unwrap_or_default(),
+        r#"["path","options","star"]"#
+    );
+
+    page.frame_tree_evaluate(
+        0,
+        &format!(
+            r#"(()=>{{
+                globalThis.__childBadOrigin='no-throw';
+                try {{ parent.postMessage('invalid-up','http://['); }}
+                catch(e) {{ globalThis.__childBadOrigin=e.name; }}
+                parent.postMessage('up-path', {parent_origin_js} + '/route');
+                parent.postMessage('up-wrong', {child_origin_js} + '/wrong');
+                parent.postMessage('up-omitted');
+            }})()"#
+        ),
+    );
+    page.drive_frame_tree(&client, &profile).await;
+    assert_eq!(
+        page.frame_tree_evaluate(0, "__childBadOrigin")
+            .unwrap_or_default(),
+        "SyntaxError"
+    );
+    assert_eq!(
+        page.evaluate("JSON.stringify(__up)").unwrap(),
+        r#"["up-path"]"#
     );
 }
 

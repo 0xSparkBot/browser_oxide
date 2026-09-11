@@ -6493,6 +6493,20 @@
         globalThis.__frameOriginForNode = globalThis.__frameOriginForNode || {};
         globalThis.__frameNodeForId = globalThis.__frameNodeForId || {};
         const _frameHandleCache = {};
+        const _normalizeFrameTargetOrigin = (requested, senderHref, senderOrigin) => {
+            let target = requested;
+            if (target && typeof target === "object") target = target.targetOrigin;
+            if (target === undefined || target === "/") return senderOrigin;
+            if (target === "*") return "*";
+            let normalized = "";
+            try {
+                normalized = ops.op_frame_normalize_target_origin(String(target), String(senderHref));
+            } catch (_) {}
+            if (!normalized) {
+                throw new DOMException("Invalid target origin", "SyntaxError");
+            }
+            return normalized;
+        };
         function _frameHandle(fid) {
             if (fid === undefined || fid === null) return null;
             // Stable identity per frame id: pages compare `event.source ===
@@ -6503,33 +6517,32 @@
                 __frameId: fid,
                 postMessage: function(msg, _targetOrigin, _transfer) {
                     if (_closedFrameIds.has(fid)) return;
-                    try {
-                        let _requestedOrigin = _targetOrigin;
-                        let _transferList = _transfer;
-                        if (_targetOrigin && typeof _targetOrigin === "object") {
-                            _requestedOrigin = _targetOrigin.targetOrigin;
-                            _transferList = _targetOrigin.transfer;
-                        }
-                        const _origin = (globalThis.location && globalThis.location.origin) || "null";
-                        if (_requestedOrigin === undefined || _requestedOrigin === "/") {
-                            _requestedOrigin = _origin;
-                        }
-                        if (globalThis.__OX_FT_MSGDBG) {
-                            const _t = _transferList;
-                            (globalThis.__OXPOSTS || (globalThis.__OXPOSTS = [])).push(
-                                "->" + fid + " transfer=" + (_t && _t.length ? _t.length : 0)
-                                + " keys=" + (msg && typeof msg === 'object' ? Object.keys(msg).slice(0, 4).join(',') : typeof msg));
-                        }
-                        const _s = (_browser_oxide && _browser_oxide.serializeForWire)
-                            ? _browser_oxide.serializeForWire(msg) : msg;
-                        // event.origin on the receiving side is the sender's origin
-                        // (spec), not the targetOrigin arg; frames check it.
-                        ops.op_frame_post_message(
-                            fid, globalThis.__frameId || 0,
-                            JSON.stringify(_s),
-                            _origin,
-                            String(_requestedOrigin));
-                    } catch (_) {}
+                    let _requestedOrigin = _targetOrigin;
+                    let _transferList = _transfer;
+                    if (_targetOrigin && typeof _targetOrigin === "object") {
+                        _requestedOrigin = _targetOrigin.targetOrigin;
+                        _transferList = _targetOrigin.transfer;
+                    }
+                    const _senderHref = (globalThis.location && globalThis.location.href) || "about:blank";
+                    const _origin = (globalThis.location && globalThis.location.origin) || "null";
+                    _requestedOrigin = _normalizeFrameTargetOrigin(
+                        _requestedOrigin, _senderHref, _origin);
+                    if (globalThis.__OX_FT_MSGDBG) {
+                        const _t = _transferList;
+                        (globalThis.__OXPOSTS || (globalThis.__OXPOSTS = [])).push(
+                            "->" + fid + " transfer=" + (_t && _t.length ? _t.length : 0)
+                            + " keys=" + (msg && typeof msg === 'object' ? Object.keys(msg).slice(0, 4).join(',') : typeof msg));
+                    }
+                    const _s = (_browser_oxide && _browser_oxide.serializeForWire)
+                        ? _browser_oxide.serializeForWire(msg) : msg;
+                    // event.origin on the receiving side is the sender's origin
+                    // (spec), not the targetOrigin arg; Rust receives the
+                    // normalized origin and only performs the final equality gate.
+                    ops.op_frame_post_message(
+                        fid, globalThis.__frameId || 0,
+                        JSON.stringify(_s),
+                        _origin,
+                        String(_requestedOrigin));
                 },
                 get closed() { return _closedFrameIds.has(fid); },
                 get length() { return 0; },
