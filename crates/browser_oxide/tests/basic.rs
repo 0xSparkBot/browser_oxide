@@ -99,6 +99,73 @@ async fn attribute_selector_s_modifier_is_rejected_like_chrome() {
 }
 
 #[tokio::test]
+async fn html_default_attribute_value_case_sensitivity_matches_chrome() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<!doctype html><html><body>
+            <input id="i" type="text" autocomplete="ON" inputmode="NUMERIC" name="Foo">
+            <form id="f" method="POST" enctype="MULTIPART/FORM-DATA"></form>
+            <button id="btn" type="SUBMIT"></button>
+            <ol id="ol" type="A"></ol>
+            <a id="a" target="_BLANK" rel="NOFOLLOW" hreflang="EN"></a>
+            <link id="link" rel="STYLESHEET" media="SCREEN">
+            <meta id="meta" http-equiv="REFRESH">
+            <iframe id="frame" scrolling="NO"></iframe>
+            <table id="table" frame="BOX"><tbody><tr>
+                <th id="th" scope="ROW"></th><td id="td" valign="MIDDLE"></td>
+            </tr></tbody></table>
+            <p id="p" align="CENTER"></p>
+            <div id="d" dir="RTL" lang="EN" class="Foo" data-x="Bar"
+                 contenteditable="TRUE" draggable="TRUE" translate="YES"></div>
+            <img id="img" crossorigin="ANONYMOUS">
+        </body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    let result = rt
+        .execute_script(
+            r#"(() => {
+                const ids = s => Array.from(document.querySelectorAll(s), e => e.id);
+                return JSON.stringify({
+                    inputType: ids('input[type="TEXT"]'),
+                    formMethod: ids('form[method="post"]'),
+                    formEnctype: ids('form[enctype="multipart/form-data"]'),
+                    buttonType: ids('button[type="submit"]'),
+                    olType: ids('ol[type="a"]'),
+                    target: ids('a[target="_blank"]'),
+                    rel: ids('a[rel="nofollow"]'),
+                    hreflang: ids('a[hreflang="en"]'),
+                    linkRel: ids('link[rel="stylesheet"]'),
+                    media: ids('link[media="screen"]'),
+                    scope: ids('th[scope="row"]'),
+                    httpEquiv: ids('meta[http-equiv="refresh"]'),
+                    scrolling: ids('iframe[scrolling="no"]'),
+                    frame: ids('table[frame="box"]'),
+                    valign: ids('td[valign="middle"]'),
+                    align: ids('p[align="center"]'),
+                    dir: ids('[dir="rtl"]'),
+                    lang: ids('[lang="en"]'),
+                    autocompleteStrict: ids('input[autocomplete="on"]'),
+                    inputmodeStrict: ids('input[inputmode="numeric"]'),
+                    nameStrict: ids('input[name="foo"]'),
+                    classStrict: ids('[class="foo"]'),
+                    dataStrict: ids('[data-x="bar"]'),
+                    contenteditableStrict: ids('[contenteditable="true"]'),
+                    draggableStrict: ids('[draggable="true"]'),
+                    translateStrict: ids('[translate="yes"]'),
+                    crossoriginStrict: ids('img[crossorigin="anonymous"]'),
+                    explicitI: ids('[data-x="bar" i]')
+                });
+            })()"#,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        result,
+        r#"{"inputType":["i"],"formMethod":["f"],"formEnctype":["f"],"buttonType":["btn"],"olType":["ol"],"target":["a"],"rel":["a"],"hreflang":["a"],"linkRel":["link"],"media":["link"],"scope":["th"],"httpEquiv":["meta"],"scrolling":["frame"],"frame":["table"],"valign":["td"],"align":["p"],"dir":["d"],"lang":["d"],"autocompleteStrict":[],"inputmodeStrict":[],"nameStrict":[],"classStrict":[],"dataStrict":[],"contenteditableStrict":[],"draggableStrict":[],"translateStrict":[],"crossoriginStrict":[],"explicitI":["d"]}"#
+    );
+}
+
+#[tokio::test]
 async fn has_relative_selectors_match_chrome_semantics() {
     let dom = browser_oxide::html_parser::parse_html(
         r#"<!doctype html><html><body>

@@ -217,7 +217,11 @@ fn match_attribute<E: Element>(
                 None => return false,
             };
 
-            let ci = matches!(case_sensitivity, CaseSensitivity::CaseInsensitive);
+            let ci = match case_sensitivity {
+                CaseSensitivity::CaseInsensitive => true,
+                CaseSensitivity::CaseSensitive => false,
+                CaseSensitivity::Default => html_default_ascii_case_insensitive(element, name),
+            };
 
             match op {
                 AttributeOperator::Exact => str_eq(attr_val, expected, ci),
@@ -264,6 +268,43 @@ fn match_attribute<E: Element>(
             }
         }
     }
+}
+
+/// HTML defines a legacy set of attribute values whose selector matching is
+/// ASCII-case-insensitive even without an explicit `[attr=value i]` modifier.
+/// This is intentionally element-specific: many modern enumerated attributes
+/// (`autocomplete`, `inputmode`, `crossorigin`, `formmethod`, etc.) remain
+/// case-sensitive in Chromium's Selectors API, and SVG/custom attributes must
+/// not inherit HTML's compatibility rules.
+fn html_default_ascii_case_insensitive<E: Element>(element: &E, name: &str) -> bool {
+    let tag = element.local_name();
+    let attr = name;
+
+    // Global HTML language/direction keywords are ASCII case-insensitive for
+    // selector matching. Keep this limited to elements in the HTML namespace
+    // (the DOM adapter reports None for synthetic test elements).
+    if attr.eq_ignore_ascii_case("dir") || attr.eq_ignore_ascii_case("lang") {
+        return element
+            .namespace()
+            .map(|ns| ns == "http://www.w3.org/1999/xhtml")
+            .unwrap_or(true);
+    }
+
+    let tag_is = |expected: &str| tag.eq_ignore_ascii_case(expected);
+    let attr_is = |expected: &str| attr.eq_ignore_ascii_case(expected);
+
+    (tag_is("input") && attr_is("type"))
+        || (tag_is("button") && attr_is("type"))
+        || (tag_is("ol") && attr_is("type"))
+        || (tag_is("form") && (attr_is("method") || attr_is("enctype")))
+        || (tag_is("a") && (attr_is("rel") || attr_is("target") || attr_is("hreflang")))
+        || (tag_is("link") && (attr_is("rel") || attr_is("media")))
+        || (tag_is("th") && attr_is("scope"))
+        || (tag_is("meta") && attr_is("http-equiv"))
+        || (tag_is("iframe") && attr_is("scrolling"))
+        || (tag_is("table") && attr_is("frame"))
+        || (tag_is("td") && attr_is("valign"))
+        || (tag_is("p") && attr_is("align"))
 }
 
 fn str_eq(a: &str, b: &str, case_insensitive: bool) -> bool {
