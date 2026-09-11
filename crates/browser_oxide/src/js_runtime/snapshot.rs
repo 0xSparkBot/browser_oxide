@@ -141,6 +141,8 @@ pub fn get_snapshot() -> &'static [u8] {
             "\n",
             include_str!("js/interfaces_bootstrap.js"),
             "\n",
+            include_str!("js/dom_exception_bootstrap.js"),
+            "\n",
             include_str!("js/instances_bootstrap.js"),
             "\n",
             include_str!("js/fetch_bootstrap.js"),
