@@ -1667,6 +1667,7 @@
     const _analyserState = new WeakMap();
     const _gainState = new WeakMap();
     const _offlineAudioState = new WeakMap();
+    const _offlineAudioCompletionEventState = new WeakMap();
     const _BASE_CONTEXT_TOKEN = Symbol('BaseAudioContext internal');
     const _AUDIO_NODE_TOKEN = Symbol('AudioNode internal');
     const _SCHEDULED_NODE_TOKEN = Symbol('AudioScheduledSourceNode internal');
@@ -2132,6 +2133,23 @@
         value:'AudioContext', writable:false, enumerable:false, configurable:true,
     });
 
+    class OfflineAudioCompletionEvent extends Event {
+        constructor(type, eventInitDict) {
+            _audioRequireArg('OfflineAudioCompletionEvent',2,arguments.length);
+            if (!eventInitDict || !_audioBufferState.has(eventInitDict.renderedBuffer)) {
+                throw new TypeError("Failed to construct 'OfflineAudioCompletionEvent': Failed to read the 'renderedBuffer' property from 'OfflineAudioCompletionEventInit': The provided value is not of type 'AudioBuffer'.");
+            }
+            super(type, eventInitDict);
+            _offlineAudioCompletionEventState.set(this,{renderedBuffer:eventInitDict.renderedBuffer});
+        }
+    }
+    _audioAccessor(OfflineAudioCompletionEvent.prototype,'renderedBuffer',function(){
+        const s=_offlineAudioCompletionEventState.get(this);
+        if(!s)throw new TypeError('Illegal invocation');
+        return s.renderedBuffer;
+    });
+    _audioFinalize(OfflineAudioCompletionEvent,'OfflineAudioCompletionEvent',2);
+
     class OfflineAudioContext extends BaseAudioContext {
         constructor(numberOfChannels, length = undefined, sampleRate = undefined) {
             _audioRequireArg('OfflineAudioContext',1,arguments.length);
@@ -2162,8 +2180,16 @@
             for(let c=0;c<offline.channels;c++)buffer.getChannelData(c).set(data);
             context.currentTime=len/sr;context.state='closed';
             if(globalThis.__browser_oxide_debug){try{globalThis.__oxAsyncApiDiag.push({api:'OfflineAudioContext.startRendering',phase:'resolve',length:len,at:performance.now()});}catch(_) {}}
-            if(typeof offline.oncomplete==='function'){try{offline.oncomplete.call(self,new Event('complete'));}catch(_) {}}
-            resolve(buffer);
+            // Rendering completion is asynchronous in browsers. Queue the
+            // completion so code can install `oncomplete` / `complete`
+            // listeners immediately after startRendering() returns. Dispatch
+            // through EventTarget so both listener styles observe the same
+            // event and the Promise resolves to the identical AudioBuffer.
+            queueMicrotask(()=>{
+                const event=new OfflineAudioCompletionEvent('complete',{renderedBuffer:buffer});
+                try{self.dispatchEvent(event);}catch(_){}
+                resolve(buffer);
+            });
         });
     },0);
     _audioMethod(OfflineAudioContext.prototype,'suspend',function(suspendTime){void suspendTime;const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.state='suspended';return Promise.resolve();},1);
@@ -2171,7 +2197,7 @@
 
     // Publish the functional constructors over the early interface placeholders.
     Object.assign(globalThis,{
-        AudioContext,BaseAudioContext,OfflineAudioContext,AudioNode,AudioScheduledSourceNode,
+        AudioContext,BaseAudioContext,OfflineAudioContext,OfflineAudioCompletionEvent,AudioNode,AudioScheduledSourceNode,
         OscillatorNode,AudioParam,DynamicsCompressorNode,BiquadFilterNode,AnalyserNode,
         AudioBuffer,AudioListener,AudioDestinationNode,GainNode,
     });
