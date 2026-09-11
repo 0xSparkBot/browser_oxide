@@ -436,6 +436,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/instance_webidl_bootstrap.js"),
             "\n",
+            include_str!("js/scheduling_webidl_bootstrap.js"),
+            "\n",
             include_str!("js/window_reflection_spec.js"),
             "\n",
             include_str!("js/structured_clone.js"),
@@ -856,6 +858,13 @@ pub fn create_worker_runtime(
             include_str!("js/instance_webidl_bootstrap.js"),
         )
         .expect("worker: instance WebIDL bootstrap failed");
+
+    runtime
+        .execute_script(
+            "<anonymous>",
+            include_str!("js/scheduling_webidl_bootstrap.js"),
+        )
+        .expect("worker: scheduling WebIDL bootstrap failed");
 
     // Final cleanup in worker
     runtime
