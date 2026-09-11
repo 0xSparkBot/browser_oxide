@@ -404,6 +404,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/window_bootstrap.js"),
             "\n",
+            include_str!("js/sse_bootstrap.js"),
+            "\n",
             include_str!("js/geometry_bootstrap.js"),
             "\n",
             include_str!("js/streams_bootstrap.js"),
@@ -667,6 +669,7 @@ pub fn create_worker_runtime(
             crypto_extension::init(),
             timer_extension::init(),
             fetch_extension::init(),
+            sse_extension::init(),
             worker_extension::init(),
             canvas_extension::init(),
             stealth_extension::init(),
@@ -684,6 +687,7 @@ pub fn create_worker_runtime(
     // Populate minimum states required by the enabled extensions.
     runtime.op_state().borrow_mut().put(TimerState::new());
     runtime.op_state().borrow_mut().put(FetchState::new(None));
+    runtime.op_state().borrow_mut().put(SseState::new());
     runtime.op_state().borrow_mut().put(CanvasState::new());
     // PerfState is required by perf_extension's ops. Without it,
     // worker code that calls `performance.now()` or similar panics
@@ -837,6 +841,10 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/worker_bootstrap.js"))
         .expect("worker: worker bootstrap failed");
+
+    runtime
+        .execute_script("<anonymous>", include_str!("js/sse_bootstrap.js"))
+        .expect("worker: EventSource bootstrap failed");
 
     // canvas_bootstrap installs CanvasRenderingContext2D and the real
     // OffscreenCanvas backed by canvas_ext ops. Safe in workers

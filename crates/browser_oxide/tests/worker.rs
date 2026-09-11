@@ -1289,3 +1289,95 @@ fn worker_file_reader_sync_matches_chrome_148() {
         "Failed to execute 'readAsText' on 'FileReaderSync': parameter 1 is not of type 'Blob'."
     );
 }
+
+#[test]
+fn worker_eventsource_receives_trusted_sse_events() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind SSE server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept SSE connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = stream.read(&mut buf).expect("read SSE request");
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&request);
+        assert!(request.starts_with("GET /events HTTP/1.1\r\n"));
+        let body = "id: worker-id\ndata: worker-message\n\nevent: custom\ndata: done\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write SSE response");
+        let _ = stream.flush();
+    });
+
+    let code = r#"
+        const src = `
+            const result = {
+                tag: '', target: false, opened: false,
+                message: null, custom: null
+            };
+            const source = new EventSource('http://__ADDR__/events');
+            result.tag = Object.prototype.toString.call(source);
+            result.target = source instanceof EventTarget;
+            source.onopen = event => {
+                result.opened = event.isTrusted && source.readyState === EventSource.OPEN;
+            };
+            source.onmessage = event => {
+                result.message = {
+                    trusted: event.isTrusted,
+                    tag: Object.prototype.toString.call(event),
+                    data: event.data,
+                    id: event.lastEventId,
+                    origin: event.origin,
+                };
+            };
+            source.addEventListener('custom', event => {
+                result.custom = {
+                    trusted: event.isTrusted,
+                    tag: Object.prototype.toString.call(event),
+                    data: event.data,
+                };
+                source.close();
+                self.postMessage(JSON.stringify(result));
+            });
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = event => {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#
+    .replace("__ADDR__", &addr.to_string());
+
+    let out = drive_runtime(&code, 2500);
+    server.join().expect("SSE server thread");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("worker SSE result JSON");
+    assert_eq!(value["tag"], "[object EventSource]");
+    assert_eq!(value["target"], true);
+    assert_eq!(value["opened"], true);
+    assert_eq!(value["message"]["trusted"], true);
+    assert_eq!(value["message"]["tag"], "[object MessageEvent]");
+    assert_eq!(value["message"]["data"], "worker-message");
+    assert_eq!(value["message"]["id"], "worker-id");
+    assert_eq!(value["message"]["origin"], format!("http://{addr}"));
+    assert_eq!(value["custom"]["trusted"], true);
+    assert_eq!(value["custom"]["tag"], "[object MessageEvent]");
+    assert_eq!(value["custom"]["data"], "done");
+}
