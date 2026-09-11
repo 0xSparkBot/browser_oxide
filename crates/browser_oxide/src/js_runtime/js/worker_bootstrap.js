@@ -879,7 +879,114 @@
     _workerStub('CompressionStream');
     _workerStub('DecompressionStream');
     _workerStub('EventSource', ['close']);
-    _workerStub('FileReaderSync', ['readAsArrayBuffer', 'readAsBinaryString', 'readAsDataURL', 'readAsText']);
+    // FileReaderSync is a real worker-only API, not an illegal-constructor
+    // surface stub. binary_fetch_webidl_bootstrap keeps normalized Blob bytes
+    // in a WeakMap and exposes a short-lived engine-private snapshot closure
+    // for structured clone. Capture that closure here before cleanup removes
+    // the bridge, so synchronous worker reads never have to re-introduce a
+    // page-visible Blob `_data` field.
+    const _fileReaderBlobSnapshot = (() => {
+        for (const bridge of [globalThis._browser_oxide, globalThis.__browser_oxide]) {
+            if (bridge && typeof bridge.blobSnapshotForClone === 'function') {
+                return bridge.blobSnapshotForClone;
+            }
+        }
+        return null;
+    })();
+    function FileReaderSync() {
+        if (!new.target) {
+            throw new TypeError(
+                "Failed to construct 'FileReaderSync': Please use the 'new' operator, this DOM object constructor cannot be called as a function."
+            );
+        }
+    }
+    const _fileReaderBytes = (self, method, args, blob) => {
+        if (!(self instanceof FileReaderSync)) throw new TypeError('Illegal invocation');
+        if (args.length < 1) {
+            throw new TypeError(
+                `Failed to execute '${method}' on 'FileReaderSync': 1 argument required, but only 0 present.`
+            );
+        }
+        const snapshot = _fileReaderBlobSnapshot && _fileReaderBlobSnapshot(blob);
+        if (!snapshot || !(snapshot.bytes instanceof Uint8Array)) {
+            throw new TypeError(
+                `Failed to execute '${method}' on 'FileReaderSync': parameter 1 is not of type 'Blob'.`
+            );
+        }
+        return snapshot;
+    };
+    const _copyFileReaderBytes = (bytes) => {
+        const out = new Uint8Array(bytes.byteLength);
+        out.set(bytes);
+        return out;
+    };
+    const _binaryString = (bytes) => {
+        let out = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            out += String.fromCharCode(...bytes.subarray(i, i + chunk));
+        }
+        return out;
+    };
+    const _base64 = (bytes) => {
+        const binary = _binaryString(bytes);
+        if (typeof globalThis.btoa === 'function') return globalThis.btoa(binary);
+        const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        let out = '';
+        for (let i = 0; i < binary.length; i += 3) {
+            const a = binary.charCodeAt(i);
+            const hasB = i + 1 < binary.length;
+            const hasC = i + 2 < binary.length;
+            const b = hasB ? binary.charCodeAt(i + 1) : 0;
+            const c = hasC ? binary.charCodeAt(i + 2) : 0;
+            out += alphabet[a >> 2];
+            out += alphabet[((a & 3) << 4) | (b >> 4)];
+            out += hasB ? alphabet[((b & 15) << 2) | (c >> 6)] : '=';
+            out += hasC ? alphabet[c & 63] : '=';
+        }
+        return out;
+    };
+    const _fileReaderMethod = (name, value) => {
+        Object.defineProperty(FileReaderSync.prototype, name, {
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value,
+        });
+        if (typeof _maskFunction === 'function') _maskFunction(value, name);
+    };
+    delete FileReaderSync.prototype.constructor;
+    _fileReaderMethod('readAsArrayBuffer', function readAsArrayBuffer(blob) {
+        const snapshot = _fileReaderBytes(this, 'readAsArrayBuffer', arguments, blob);
+        return _copyFileReaderBytes(snapshot.bytes).buffer;
+    });
+    _fileReaderMethod('readAsBinaryString', function readAsBinaryString(blob) {
+        const snapshot = _fileReaderBytes(this, 'readAsBinaryString', arguments, blob);
+        return _binaryString(snapshot.bytes);
+    });
+    _fileReaderMethod('readAsDataURL', function readAsDataURL(blob) {
+        const snapshot = _fileReaderBytes(this, 'readAsDataURL', arguments, blob);
+        const type = snapshot.type || 'application/octet-stream';
+        return `data:${type};base64,${_base64(snapshot.bytes)}`;
+    });
+    _fileReaderMethod('readAsText', function readAsText(blob) {
+        const snapshot = _fileReaderBytes(this, 'readAsText', arguments, blob);
+        const label = arguments.length > 1 && arguments[1] !== undefined
+            ? String(arguments[1])
+            : 'utf-8';
+        return new TextDecoder(label).decode(snapshot.bytes);
+    });
+    Object.defineProperty(FileReaderSync.prototype, 'constructor', {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: FileReaderSync,
+    });
+    Object.defineProperty(FileReaderSync.prototype, Symbol.toStringTag, {
+        value: 'FileReaderSync', configurable: true,
+    });
+    globalThis.FileReaderSync = FileReaderSync;
+    if (typeof _maskFunction === 'function') _maskFunction(FileReaderSync, 'FileReaderSync');
     const FileSystemSyncAccessHandle = _workerStub(
         'FileSystemSyncAccessHandle',
         ['close', 'flush', 'getSize', 'read', 'truncate', 'write']

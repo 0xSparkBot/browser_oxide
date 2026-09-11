@@ -1155,3 +1155,137 @@ fn worker_indexeddb_transaction_round_trip() {
     assert_eq!(value["requestOwn"], serde_json::json!([]));
     assert!(value.get("error").is_none());
 }
+
+#[test]
+fn worker_file_reader_sync_matches_chrome_148() {
+    let code = r#"
+        const src = `
+            const descriptor = (object, name) => {
+                const d = Object.getOwnPropertyDescriptor(object, name);
+                return d && {
+                    enumerable: d.enumerable,
+                    configurable: d.configurable,
+                    writable: d.writable,
+                    name: typeof d.value === 'function' ? d.value.name : null,
+                    length: typeof d.value === 'function' ? d.value.length : null,
+                    source: typeof d.value === 'function' ? Function.prototype.toString.call(d.value) : null,
+                };
+            };
+            const capture = (fn) => {
+                try { return { ok: true, value: fn() }; }
+                catch (e) { return { ok: false, name: e.name, message: e.message }; }
+            };
+            const reader = new FileReaderSync();
+            const binary = new Blob([new Uint8Array([0, 65, 255])], { type: 'application/octet-stream' });
+            const text = new Blob(['héllo'], { type: 'text/plain;charset=utf-8' });
+            const arrayBuffer = reader.readAsArrayBuffer(binary);
+            const binaryString = reader.readAsBinaryString(binary);
+            self.postMessage(JSON.stringify({
+                ctor: {
+                    name: FileReaderSync.name,
+                    length: FileReaderSync.length,
+                    source: Function.prototype.toString.call(FileReaderSync),
+                    own: Reflect.ownKeys(FileReaderSync).map(String),
+                },
+                proto: {
+                    own: Reflect.ownKeys(FileReaderSync.prototype).map(String),
+                    readAsArrayBuffer: descriptor(FileReaderSync.prototype, 'readAsArrayBuffer'),
+                    readAsBinaryString: descriptor(FileReaderSync.prototype, 'readAsBinaryString'),
+                    readAsDataURL: descriptor(FileReaderSync.prototype, 'readAsDataURL'),
+                    readAsText: descriptor(FileReaderSync.prototype, 'readAsText'),
+                },
+                instance: {
+                    tag: Object.prototype.toString.call(reader),
+                    own: Reflect.ownKeys(reader).map(String),
+                },
+                values: {
+                    arrayBuffer: Array.from(new Uint8Array(arrayBuffer)),
+                    binaryCodes: Array.from(binaryString, (c) => c.charCodeAt(0)),
+                    dataURL: reader.readAsDataURL(binary),
+                    text: reader.readAsText(text),
+                },
+                errors: {
+                    noArg: capture(() => reader.readAsText()),
+                    nonBlob: capture(() => reader.readAsText('x')),
+                },
+            }));
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = event => {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime(code, 2000);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+    assert_eq!(value["ctor"]["name"], "FileReaderSync");
+    assert_eq!(value["ctor"]["length"], 0);
+    assert_eq!(
+        value["ctor"]["source"],
+        "function FileReaderSync() { [native code] }"
+    );
+    assert_eq!(
+        value["ctor"]["own"],
+        serde_json::json!(["length", "name", "prototype"])
+    );
+    assert_eq!(
+        value["proto"]["own"],
+        serde_json::json!([
+            "readAsArrayBuffer",
+            "readAsBinaryString",
+            "readAsDataURL",
+            "readAsText",
+            "constructor",
+            "Symbol(Symbol.toStringTag)"
+        ])
+    );
+    for method in [
+        "readAsArrayBuffer",
+        "readAsBinaryString",
+        "readAsDataURL",
+        "readAsText",
+    ] {
+        assert_eq!(
+            value["proto"][method]["enumerable"], true,
+            "{method}: {out}"
+        );
+        assert_eq!(
+            value["proto"][method]["configurable"], true,
+            "{method}: {out}"
+        );
+        assert_eq!(value["proto"][method]["writable"], true, "{method}: {out}");
+        assert_eq!(value["proto"][method]["name"], method, "{method}: {out}");
+        assert_eq!(value["proto"][method]["length"], 1, "{method}: {out}");
+        assert_eq!(
+            value["proto"][method]["source"],
+            format!("function {method}() {{ [native code] }}"),
+            "{method}: {out}"
+        );
+    }
+    assert_eq!(value["instance"]["tag"], "[object FileReaderSync]");
+    assert_eq!(value["instance"]["own"], serde_json::json!([]));
+    assert_eq!(
+        value["values"]["arrayBuffer"],
+        serde_json::json!([0, 65, 255])
+    );
+    assert_eq!(
+        value["values"]["binaryCodes"],
+        serde_json::json!([0, 65, 255])
+    );
+    assert_eq!(
+        value["values"]["dataURL"],
+        "data:application/octet-stream;base64,AEH/"
+    );
+    assert_eq!(value["values"]["text"], "héllo");
+    assert_eq!(value["errors"]["noArg"]["name"], "TypeError");
+    assert_eq!(
+        value["errors"]["noArg"]["message"],
+        "Failed to execute 'readAsText' on 'FileReaderSync': 1 argument required, but only 0 present."
+    );
+    assert_eq!(value["errors"]["nonBlob"]["name"], "TypeError");
+    assert_eq!(
+        value["errors"]["nonBlob"]["message"],
+        "Failed to execute 'readAsText' on 'FileReaderSync': parameter 1 is not of type 'Blob'."
+    );
+}
