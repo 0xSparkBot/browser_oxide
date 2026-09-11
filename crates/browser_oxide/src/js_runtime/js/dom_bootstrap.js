@@ -1404,6 +1404,17 @@
         });
     }
 
+    function _validatedSelector(value, method, receiver) {
+        const selector = String(value);
+        if (!ops.op_dom_selector_is_valid(selector)) {
+            throw new DOMException(
+                `Failed to execute '${method}' on '${receiver}': '${selector}' is not a valid selector.`,
+                "SyntaxError"
+            );
+        }
+        return selector;
+    }
+
     class Element extends Node {
         get tagName() {
             const t = _tagNames.get(this);
@@ -1588,15 +1599,21 @@
             return attr;
         }
         querySelector(sel) {
-            const id = ops.op_dom_query_selector(_getNodeId(this), sel);
+            const selector = _validatedSelector(sel, "querySelector", "Element");
+            const id = ops.op_dom_query_selector(_getNodeId(this), selector);
             return id !== null ? _wrapNode(id) : null;
         }
         querySelectorAll(sel) {
-            return new NodeList(ops.op_dom_query_selector_all(_getNodeId(this), sel), 2);
+            const selector = _validatedSelector(sel, "querySelectorAll", "Element");
+            return new NodeList(ops.op_dom_query_selector_all(_getNodeId(this), selector), 2);
         }
-        matches(sel) { return ops.op_dom_matches(_getNodeId(this), String(sel)); }
+        matches(sel) {
+            const selector = _validatedSelector(sel, "matches", "Element");
+            return ops.op_dom_matches(_getNodeId(this), selector);
+        }
         closest(sel) {
-            const id = ops.op_dom_closest(_getNodeId(this), String(sel));
+            const selector = _validatedSelector(sel, "closest", "Element");
+            const id = ops.op_dom_closest(_getNodeId(this), selector);
             return id !== -1 ? _wrapNode(id) : null;
         }
         getElementsByTagName(tag) {
@@ -2835,11 +2852,15 @@
         get lastElementChild() { return _wrapNode(ops.op_dom_get_last_element_child(_getNodeId(this))); }
         get childElementCount() { return ops.op_dom_get_child_element_count(_getNodeId(this)); }
         querySelector(sel) {
-            const ids = this._scopedElementIds(sel);
+            const receiver = this instanceof ShadowRoot ? "ShadowRoot" : "DocumentFragment";
+            const selector = _validatedSelector(sel, "querySelector", receiver);
+            const ids = this._scopedElementIds(selector);
             return ids.length ? _wrapNode(ids[0]) : null;
         }
         querySelectorAll(sel) {
-            return new NodeList(this._scopedElementIds(sel), 2);
+            const receiver = this instanceof ShadowRoot ? "ShadowRoot" : "DocumentFragment";
+            const selector = _validatedSelector(sel, "querySelectorAll", receiver);
+            return new NodeList(this._scopedElementIds(selector), 2);
         }
         getElementById(id) {
             const wanted = String(id);
@@ -3033,11 +3054,13 @@
             return new NodeList(ids, 2);
         }
         querySelector(sel) {
-            const id = ops.op_dom_query_selector(ops.op_dom_document_node(), sel);
+            const selector = _validatedSelector(sel, "querySelector", "Document");
+            const id = ops.op_dom_query_selector(ops.op_dom_document_node(), selector);
             return id !== null ? _wrapNode(id) : null;
         }
         querySelectorAll(sel) {
-            return new NodeList(ops.op_dom_query_selector_all(ops.op_dom_document_node(), sel), 2);
+            const selector = _validatedSelector(sel, "querySelectorAll", "Document");
+            return new NodeList(ops.op_dom_query_selector_all(ops.op_dom_document_node(), selector), 2);
         }
         createElement(tag) {
             const el = _wrapNode(ops.op_dom_create_element(tag));
@@ -3061,8 +3084,49 @@
             return _wrapNode(ops.op_dom_create_comment(String(text)));
         }
         createEvent(type) {
-            // Legacy event factory
-            return new Event(type);
+            // Legacy DOM event factory. Resolve constructors at call time from
+            // this Document's realm: event_bootstrap installs the final WebIDL
+            // event hierarchy after this DOM class is defined, and child-frame
+            // documents must produce child-realm Event objects rather than
+            // instances of this bootstrap's early Event class.
+            const requested = String(type);
+            const realm = (this && this.defaultView) || globalThis;
+            let Ctor = null;
+            switch (requested.toLowerCase()) {
+                case 'event':
+                case 'events':
+                case 'htmlevents':
+                    Ctor = realm.Event;
+                    break;
+                case 'customevent': Ctor = realm.CustomEvent; break;
+                case 'mouseevent':
+                case 'mouseevents':
+                    Ctor = realm.MouseEvent;
+                    break;
+                case 'uievent':
+                case 'uievents':
+                    Ctor = realm.UIEvent;
+                    break;
+                case 'keyboardevent': Ctor = realm.KeyboardEvent; break;
+                case 'messageevent': Ctor = realm.MessageEvent; break;
+                case 'focusevent': Ctor = realm.FocusEvent; break;
+                case 'compositionevent': Ctor = realm.CompositionEvent; break;
+                case 'storageevent': Ctor = realm.StorageEvent; break;
+                default:
+                    throw new DOMException(
+                        `Failed to execute 'createEvent' on 'Document': The provided event type ('${requested}') is invalid.`,
+                        'NotSupportedError'
+                    );
+            }
+            if (typeof Ctor !== 'function') {
+                throw new DOMException(
+                    `Failed to execute 'createEvent' on 'Document': The provided event type ('${requested}') is invalid.`,
+                    'NotSupportedError'
+                );
+            }
+            // Factory-created events are uninitialized: Blink exposes empty
+            // type, bubbles=false and cancelable=false until init*Event runs.
+            return new Ctor('', { bubbles: false, cancelable: false });
         }
         createRange() {
             return new Range();

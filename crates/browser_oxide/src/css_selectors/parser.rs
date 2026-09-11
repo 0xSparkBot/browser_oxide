@@ -568,15 +568,78 @@ impl<'a> SelectorParser<'a> {
     fn parse_has_pseudo(&mut self) -> Result<PseudoClass, SelectorParseError> {
         let inner_tokens = self.collect_until_close_paren();
         let mut inner_parser = SelectorParser::from_tokens(inner_tokens);
-        let list = inner_parser.parse_selector_list()?;
-        let relatives = list
-            .into_iter()
-            .map(|s| RelativeSelector {
-                combinator: None,
-                selector: s,
-            })
-            .collect();
-        Ok(PseudoClass::Has(relatives))
+        Ok(PseudoClass::Has(
+            inner_parser.parse_relative_selector_list()?,
+        ))
+    }
+
+    /// Parse the relative-selector-list accepted by `:has()`.
+    ///
+    /// Relative selectors are anchored to the subject. We encode that anchor
+    /// as an explicit `:scope <combinator> ...` tail in our right-to-left AST,
+    /// while keeping the original selector specificity so the synthetic
+    /// `:scope` does not contribute to `:has()` specificity.
+    fn parse_relative_selector_list(
+        &mut self,
+    ) -> Result<Vec<RelativeSelector>, SelectorParseError> {
+        let mut relatives = Vec::new();
+        self.skip_whitespace();
+        if self.is_eof() {
+            return Err(SelectorParseError::EmptySelector);
+        }
+
+        loop {
+            self.skip_whitespace();
+            let leading = match self.current_kind() {
+                TokenKind::Delim('>') => {
+                    self.advance();
+                    self.skip_whitespace();
+                    Combinator::Child
+                }
+                TokenKind::Delim('+') => {
+                    self.advance();
+                    self.skip_whitespace();
+                    Combinator::NextSibling
+                }
+                TokenKind::Delim('~') => {
+                    self.advance();
+                    self.skip_whitespace();
+                    Combinator::SubsequentSibling
+                }
+                _ => Combinator::Descendant,
+            };
+
+            let selector = self.parse_complex_selector()?;
+            let specificity = selector.specificity();
+            let mut components = selector.components().to_vec();
+            components.push(Component::Combinator(leading));
+            components.push(Component::Simple(SimpleSelector::PseudoClass(
+                PseudoClass::Scope,
+            )));
+
+            relatives.push(RelativeSelector {
+                combinator: Some(leading),
+                selector: Selector::new(components, specificity),
+            });
+
+            self.skip_whitespace();
+            if self.is_eof() {
+                break;
+            }
+            if !matches!(self.current_kind(), TokenKind::Comma) {
+                return Err(SelectorParseError::UnexpectedToken {
+                    loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                    message: "expected ',' between relative selectors".into(),
+                });
+            }
+            self.advance();
+            self.skip_whitespace();
+            if self.is_eof() {
+                return Err(SelectorParseError::EmptySelector);
+            }
+        }
+
+        Ok(relatives)
     }
 
     fn parse_lang_pseudo(&mut self) -> Result<PseudoClass, SelectorParseError> {
@@ -859,6 +922,15 @@ mod tests {
         } else {
             panic!("Expected :is()");
         }
+    }
+
+    #[test]
+    fn has_relative_selector_keeps_original_specificity() {
+        let list = parse_selector_list("div:has(+ #target)").unwrap();
+        assert_eq!(list[0].specificity(), Specificity::new(1, 0, 1));
+
+        let list = parse_selector_list(":has(> .child, + #target)").unwrap();
+        assert_eq!(list[0].specificity(), Specificity::new(1, 0, 0));
     }
 
     #[test]

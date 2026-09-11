@@ -51,6 +51,48 @@ async fn scope_selector_matches_document_and_element_semantics() {
 }
 
 #[tokio::test]
+async fn has_relative_selectors_match_chrome_semantics() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<!doctype html><html><body>
+            <div id="a"><span class="child"></span></div>
+            <div id="b"></div><div id="c" class="sib"></div>
+            <div id="d"></div><div id="e" class="sib"></div>
+        </body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    let result = rt
+        .execute_script(
+            r#"JSON.stringify({
+                direct: Array.from(document.querySelectorAll('div:has(> .child)'), e => e.id),
+                adjacent: Array.from(document.querySelectorAll('#b:has(+ .sib)'), e => e.id),
+                general: Array.from(document.querySelectorAll('#b:has(~ .sib)'), e => e.id),
+                descendant: Array.from(document.querySelectorAll('div:has(.child)'), e => e.id),
+                complex: Array.from(document.querySelectorAll('#b:has(+ .sib + #d ~ .sib)'), e => e.id),
+                list: Array.from(document.querySelectorAll('div:has(> .child, + .sib)'), e => e.id),
+                matchesDirect: document.getElementById('a').matches(':has(> .child)'),
+                matchesAdjacent: document.getElementById('b').matches(':has(+ .sib)')
+            })"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"direct":["a"],"adjacent":["b"],"general":["b"],"descendant":["a"],"complex":["b"],"list":["a","b","d"],"matchesDirect":true,"matchesAdjacent":true}"#
+    );
+
+    let invalid = rt
+        .execute_script(
+            r#"(()=>{try{document.querySelectorAll('div:has(> )');return 'NO_THROW'}catch(e){return JSON.stringify({name:e.name,code:e.code,ctor:e.constructor.name,tag:Object.prototype.toString.call(e),isDOM:e instanceof DOMException,message:e.message})}})()"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        invalid,
+        r#"{"name":"SyntaxError","code":12,"ctor":"DOMException","tag":"[object DOMException]","isDOM":true,"message":"Failed to execute 'querySelectorAll' on 'Document': 'div:has(> )' is not a valid selector."}"#
+    );
+}
+
+#[tokio::test]
 async fn pseudo_elements_parse_but_never_match_dom_elements() {
     let dom = browser_oxide::html_parser::parse_html(
         r#"<html><body><div id="target"></div></body></html>"#,

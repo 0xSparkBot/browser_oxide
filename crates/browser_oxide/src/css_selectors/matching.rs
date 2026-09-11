@@ -353,8 +353,7 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass, scope: Option
 
         PseudoClass::Has(relatives) => {
             for rel in relatives {
-                // Check descendants
-                if has_matching_descendant(element, &rel.selector, Some(element)) {
+                if has_matching_relative(element, rel) {
                     return true;
                 }
             }
@@ -409,6 +408,35 @@ fn has_matching_descendant<E: Element>(
         }
     }
     false
+}
+
+/// Match one `:has()` relative selector against its subject element.
+///
+/// The parser has already anchored the selector with a synthetic `:scope`.
+/// The leading combinator narrows the candidate region; the existing
+/// right-to-left matcher then validates the full anchored selector chain.
+fn has_matching_relative<E: Element>(element: &E, relative: &RelativeSelector) -> bool {
+    match relative.combinator.unwrap_or(Combinator::Descendant) {
+        Combinator::Descendant | Combinator::Child => {
+            has_matching_descendant(element, &relative.selector, Some(element))
+        }
+        Combinator::NextSibling | Combinator::SubsequentSibling => {
+            let mut sibling = element.next_sibling_element();
+            while let Some(candidate_root) = sibling {
+                if match_components(
+                    &candidate_root,
+                    relative.selector.components(),
+                    0,
+                    Some(element),
+                ) || has_matching_descendant(&candidate_root, &relative.selector, Some(element))
+                {
+                    return true;
+                }
+                sibling = candidate_root.next_sibling_element();
+            }
+            false
+        }
+    }
 }
 
 #[cfg(test)]

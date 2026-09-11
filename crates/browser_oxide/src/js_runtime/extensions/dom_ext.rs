@@ -289,6 +289,11 @@ pub fn op_dom_get_prev_sibling(state: &mut OpState, #[smi] node_id: i32) -> i32 
 }
 
 #[op2(fast)]
+pub fn op_dom_selector_is_valid(#[string] selector: &str) -> bool {
+    crate::css_selectors::parse_selector_list(selector).is_ok()
+}
+
+#[op2(fast)]
 #[smi]
 pub fn op_dom_query_selector(
     state: &mut OpState,
@@ -2350,6 +2355,7 @@ deno_core::extension!(
         op_dom_get_last_child,
         op_dom_get_next_sibling,
         op_dom_get_prev_sibling,
+        op_dom_selector_is_valid,
         op_dom_query_selector,
         op_dom_query_selector_all,
         op_dom_get_element_by_id,
