@@ -1,14 +1,22 @@
 ((globalThis) => {
-    const ops = Deno && Deno.core && Deno.core.ops;
+    // This cleanup intentionally runs more than once for a document. The
+    // first pass scrubs the page-visible `Deno` global, so later passes must
+    // not resolve the bare `Deno` identifier before cleanup can even start.
+    const ops = globalThis.Deno && globalThis.Deno.core && globalThis.Deno.core.ops;
     // -- Per-page secure-context gating (Phase 7) --------------------
     // The V8 snapshot bootstraps with is_secure_context=true so all
     // [SecureContext]-only Web Platform APIs are baked in. On insecure
     // pages (data:/http:/about:blank) we strip them here to match real
     // Chrome.
     try {
-        const _ops = Deno && Deno.core && Deno.core.ops;
-        const _isSecure = _ops && _ops.op_is_secure_context && _ops.op_is_secure_context();
-        if (!_isSecure) {
+        const _ops = ops;
+        const _hasSecureContextSignal = !!(_ops && _ops.op_is_secure_context);
+        const _isSecure = _hasSecureContextSignal ? _ops.op_is_secure_context() : null;
+        // A repeated cleanup pass runs after the first pass has hidden Deno,
+        // so `ops` is intentionally unavailable. Unknown is not equivalent to
+        // an insecure context: only a real browser-context signal may strip
+        // secure-only interfaces.
+        if (_isSecure === false) {
             // Methods + globals registered as values in the snapshot.
             // Navigator getters (mediaDevices, clipboard, ...) gate
             // themselves lazily so they don't need stripping.
@@ -88,7 +96,10 @@
     // These run AFTER the V8 startup snapshot is restored, so the
     // stealth profile is loaded and op-based reads return real values.
     // (Snapshot-time bootstraps see profile=None and would mis-gate.)
-    try {
+    // A second cleanup pass has no Deno/ops by design. Profile-conditioned
+    // installs/removals are one-time bootstrap work; do not recompute them
+    // from fallback Chrome/Linux defaults after the profile signal is gone.
+    if (ops) try {
         const _hasProfile = ops && ops.op_has_stealth_profile && ops.op_has_stealth_profile();
         const _osName = (_hasProfile && ops.op_get_profile_value)
             ? (ops.op_get_profile_value("os_name") || "Linux")
@@ -102,7 +113,7 @@
         // on a macOS UA is a strong inconsistency versus a real browser.
         // Constructor + statics shaped to match
         // Chrome 147's ApplePaySession surface.
-        const _ops2 = Deno && Deno.core && Deno.core.ops;
+        const _ops2 = ops;
         const _isSecureForAP = _ops2 && _ops2.op_is_secure_context && _ops2.op_is_secure_context();
         if (_browserName === "Safari" && _isSecureForAP && typeof globalThis.ApplePaySession === "undefined") {
             const _APP = function ApplePaySession(_version, _paymentRequest) {

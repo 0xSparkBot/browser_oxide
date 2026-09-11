@@ -42,6 +42,13 @@ fn runtime_env_and_tokio_context() {
     {
         let mut rt = BrowserJsRuntime::new(dom());
         assert_eq!(rt.execute_script("1 + 2", None).unwrap(), "3");
+        assert_eq!(rt.execute_script("typeof Deno", None).unwrap(), "undefined");
+        rt.execute_script(
+            include_str!("../src/js_runtime/js/cleanup_bootstrap.js"),
+            Some("<anonymous>"),
+        )
+        .expect("cleanup must remain runnable after its first pass hides Deno");
+        assert_eq!(rt.execute_script("typeof Deno", None).unwrap(), "undefined");
         for i in 0..25 {
             let src = format!(
                 "globalThis.k{i} = new Array(100000).fill('{i}'); globalThis.k{i} = null; 0"
