@@ -412,6 +412,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/compression_stream_bootstrap.js"),
             "\n",
+            include_str!("js/webtransport_bootstrap.js"),
+            "\n",
             include_str!("js/webidl_arity_bootstrap.js"),
             "\n",
             include_str!("js/webidl_surface_bootstrap.js"),
@@ -801,6 +803,10 @@ pub fn create_worker_runtime(
             include_str!("js/compression_stream_bootstrap.js"),
         )
         .expect("worker: compression streams bootstrap failed");
+
+    runtime
+        .execute_script("<anonymous>", include_str!("js/webtransport_bootstrap.js"))
+        .expect("worker: WebTransport bootstrap failed");
 
     // event_bootstrap defines Event, MessageEvent, EventTarget, and wires
     // addEventListener / removeEventListener / dispatchEvent onto

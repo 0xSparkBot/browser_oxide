@@ -21,7 +21,7 @@
             // Navigator getters (mediaDevices, clipboard, ...) gate
             // themselves lazily so they don't need stripping.
             try { delete globalThis.Navigator.prototype.getBattery; } catch (_e) {}
-            for (const k of ['caches', 'cookieStore', 'IdleDetector', 'EyeDropper', 'WebTransport']) {
+            for (const k of ['caches', 'cookieStore', 'IdleDetector', 'EyeDropper', 'WebTransport', 'WebTransportBidirectionalStream', 'WebTransportDatagramDuplexStream', 'WebTransportError']) {
                 try { delete globalThis[k]; } catch (_e) {}
             }
             // Phase 7 — also strip the constructor *interfaces* for the

@@ -167,6 +167,8 @@ pub fn get_snapshot() -> &'static [u8] {
             "\n",
             include_str!("js/compression_stream_bootstrap.js"),
             "\n",
+            include_str!("js/webtransport_bootstrap.js"),
+            "\n",
             include_str!("js/webidl_arity_bootstrap.js"),
             "\n",
             include_str!("js/webidl_surface_bootstrap.js"),
