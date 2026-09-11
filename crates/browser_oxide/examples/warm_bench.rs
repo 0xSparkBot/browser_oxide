@@ -34,36 +34,33 @@ fn spa_html() -> &'static str {
 </body></html>"#
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let mut page =
-                Page::from_html_fast("<html></html>", "about:blank", chrome_148_windows())
-                    .await
-                    .unwrap();
+fn main() {
+    browser_oxide::js_runtime::block_on_v8_thread("warm-bench", async_main);
+}
 
-            // warm up
-            for _ in 0..10 {
-                page.reload_html(spa_html(), "http://bench/p");
-            }
+async fn async_main() {
+    let mut page = Page::from_html_fast("<html></html>", "about:blank", chrome_148_windows())
+        .await
+        .unwrap();
 
-            // reload_html parses + runs inline scripts synchronously (no `load`
-            // dispatch), so this is the per-nav CPU cost.
-            let n = 200;
-            let mut reload = Vec::with_capacity(n);
-            for _ in 0..n {
-                let t0 = Instant::now();
-                page.reload_html(spa_html(), "http://bench/p");
-                reload.push(t0.elapsed());
-            }
-            let rows = page
-                .evaluate("String(document.querySelectorAll('#root .row').length)")
-                .unwrap_or_default();
+    // warm up
+    for _ in 0..10 {
+        page.reload_html(spa_html(), "http://bench/p");
+    }
 
-            println!("\n=== warm per-nav CPU (reload SPA parse+scripts), rendered rows={rows} ===");
-            report("reload_html", reload);
-        })
-        .await;
+    // reload_html parses + runs inline scripts synchronously (no `load`
+    // dispatch), so this is the per-nav CPU cost.
+    let n = 200;
+    let mut reload = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t0 = Instant::now();
+        page.reload_html(spa_html(), "http://bench/p");
+        reload.push(t0.elapsed());
+    }
+    let rows = page
+        .evaluate("String(document.querySelectorAll('#root .row').length)")
+        .unwrap_or_default();
+
+    println!("\n=== warm per-nav CPU (reload SPA parse+scripts), rendered rows={rows} ===");
+    report("reload_html", reload);
 }

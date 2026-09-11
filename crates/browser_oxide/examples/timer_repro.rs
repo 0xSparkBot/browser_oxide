@@ -4,8 +4,11 @@
 
 use std::time::Duration;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    browser_oxide::js_runtime::block_on_v8_thread("timer-repro", async_main);
+}
+
+async fn async_main() {
     let profile = browser_oxide::stealth::presets::chrome_148_macos();
     let client = browser_oxide::net::HttpClient::shared(&profile).expect("http client");
     let mut page = browser_oxide::Page::navigate("https://example.com/", profile.clone(), 2)

@@ -28,9 +28,10 @@ use state::{ConsoleMessage, DomState};
 pub const V8_THREAD_STACK: usize = 64 * 1024 * 1024;
 
 /// Like `std::thread::spawn` but with a stack big enough to build or drive a V8 isolate.
-pub fn spawn_v8_thread<F>(name: impl Into<String>, f: F) -> std::thread::JoinHandle<()>
+pub fn spawn_v8_thread<F, T>(name: impl Into<String>, f: F) -> std::thread::JoinHandle<T>
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
 {
     let name = name.into();
     std::thread::Builder::new()
@@ -38,6 +39,31 @@ where
         .stack_size(V8_THREAD_STACK)
         .spawn(f)
         .unwrap_or_else(|e| panic!("failed to spawn V8 thread {name}: {e}"))
+}
+
+/// Run an async V8 entry point on a dedicated large-stack current-thread Tokio runtime.
+///
+/// The future is created *inside* the V8 thread, so it may be `!Send` (as browser
+/// page futures are). Executables and examples that construct or drive V8 should
+/// prefer this helper over `#[tokio::main]`, whose caller thread may not have enough
+/// native stack for deno_core/V8 primordials initialization.
+pub fn block_on_v8_thread<F, Fut, T>(name: impl Into<String>, make_future: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    let handle = spawn_v8_thread(name, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build V8 tokio runtime");
+        runtime.block_on(make_future())
+    });
+    match handle.join() {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// A V8 JavaScript runtime with browser DOM bindings.

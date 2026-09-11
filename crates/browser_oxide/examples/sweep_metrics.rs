@@ -101,8 +101,11 @@ fn self_rss_mb() -> f64 {
     0.0
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    browser_oxide::js_runtime::block_on_v8_thread("sweep-metrics", async_main);
+}
+
+async fn async_main() {
     let mut args = std::env::args().skip(1);
     let profile_name = args
         .next()
@@ -135,236 +138,233 @@ async fn main() {
     let corpus: Vec<Site> = serde_json::from_slice(&corpus_bytes).expect("parse corpus");
     let total = corpus.len();
 
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            let sweep_t0 = Instant::now();
+    let sweep_t0 = Instant::now();
 
-            // Cold-start: time-to-first-page-ready. For the pool mode, we
-            // pre-warm one Page; for the cold mode it's just the first
-            // Page::navigate.
-            let pool = if use_pool {
-                Some(browser_oxide::PagePool::new(4))
-            } else {
-                None
-            };
+    // Cold-start: time-to-first-page-ready. For the pool mode, we
+    // pre-warm one Page; for the cold mode it's just the first
+    // Page::navigate.
+    let pool = if use_pool {
+        Some(browser_oxide::PagePool::new(4))
+    } else {
+        None
+    };
 
-            let t_launch_ms;
-            let t_first_page_ready_ms;
-            if let Some(pool) = pool.as_ref() {
-                let t0 = Instant::now();
-                let seed = pool.acquire(Some(profile.clone())).await.expect("seed");
-                t_launch_ms = t0.elapsed().as_millis() as u64;
-                pool.release(seed);
-                t_first_page_ready_ms = t_launch_ms; // pool acquire = first-page-ready
-            } else {
-                t_launch_ms = 0;
-                t_first_page_ready_ms = 0;
-            };
+    let t_launch_ms;
+    let t_first_page_ready_ms;
+    if let Some(pool) = pool.as_ref() {
+        let t0 = Instant::now();
+        let seed = pool.acquire(Some(profile.clone())).await.expect("seed");
+        t_launch_ms = t0.elapsed().as_millis() as u64;
+        pool.release(seed);
+        t_first_page_ready_ms = t_launch_ms; // pool acquire = first-page-ready
+    } else {
+        t_launch_ms = 0;
+        t_first_page_ready_ms = 0;
+    };
 
-            let mut results: Vec<SiteResult> = Vec::with_capacity(total);
-            let mut rss_peak: f64 = 0.0;
-            // Atomic-checkpoint writer: every site appends to
-            // `<out_path>.partial` so a cap-truncated kill (SIGTERM /
-            // SIGKILL from a wrapping `timeout`) leaves a per-site log
-            // readable by the aggregator. The
-            // final summary still writes `out_path` atomically on
-            // 126/126 completion.
-            let partial_path = format!("{out_path}.partial");
-            // Clear any stale partial from a prior crashed run.
-            let _ = fs::remove_file(&partial_path);
-            for (i, site) in corpus.iter().enumerate() {
-                let t0 = Instant::now();
-                let mut err: Option<String> = None;
-                // Per-site profile (sampled or shared)
-                let site_profile = if sample_per_site {
-                    browser_oxide::stealth::presets::chrome_148_macos_sampled()
-                } else {
-                    profile.clone()
-                };
-                let (tag, body_len): (String, usize) = if use_pool {
-                    let pool = pool.as_ref().unwrap();
-                    match pool.navigate(&site.url, site_profile.clone()).await {
-                        Ok(mut page) => {
-                            let body = page.content();
-                            let ec = browser_oxide::engine_classify(&body);
-                            let r = (ec.tag.to_string(), ec.len);
-                            pool.release(page);
-                            r
-                        }
-                        Err(e) => {
-                            err = Some(format!("{}", e).chars().take(200).collect());
-                            ("ERROR".to_string(), 0)
-                        }
-                    }
-                } else {
-                    match browser_oxide::Page::navigate(&site.url, site_profile, 3).await {
-                        Ok(mut page) => {
-                            let body = page.content();
-                            let ec = browser_oxide::engine_classify(&body);
-                            (ec.tag.to_string(), ec.len)
-                        }
-                        Err(e) => {
-                            err = Some(format!("{}", e).chars().take(200).collect());
-                            ("ERROR".to_string(), 0)
-                        }
-                    }
-                };
-                let ms = t0.elapsed().as_millis() as u64;
-                let rss = self_rss_mb();
-                if rss > rss_peak {
-                    rss_peak = rss;
+    let mut results: Vec<SiteResult> = Vec::with_capacity(total);
+    let mut rss_peak: f64 = 0.0;
+    // Atomic-checkpoint writer: every site appends to
+    // `<out_path>.partial` so a cap-truncated kill (SIGTERM /
+    // SIGKILL from a wrapping `timeout`) leaves a per-site log
+    // readable by the aggregator. The
+    // final summary still writes `out_path` atomically on
+    // 126/126 completion.
+    let partial_path = format!("{out_path}.partial");
+    // Clear any stale partial from a prior crashed run.
+    let _ = fs::remove_file(&partial_path);
+    for (i, site) in corpus.iter().enumerate() {
+        let t0 = Instant::now();
+        let mut err: Option<String> = None;
+        // Per-site profile (sampled or shared)
+        let site_profile = if sample_per_site {
+            browser_oxide::stealth::presets::chrome_148_macos_sampled()
+        } else {
+            profile.clone()
+        };
+        let (tag, body_len): (String, usize) = if use_pool {
+            let pool = pool.as_ref().unwrap();
+            match pool.navigate(&site.url, site_profile.clone()).await {
+                Ok(mut page) => {
+                    let body = page.content();
+                    let ec = browser_oxide::engine_classify(&body);
+                    let r = (ec.tag.to_string(), ec.len);
+                    pool.release(page);
+                    r
                 }
-                let line = format!(
-                    "sweep: [{}/{}] {} {} {} len={} ms={} rss={:.0}{}",
-                    i + 1,
-                    total,
-                    site.cat,
-                    site.name,
-                    tag,
-                    body_len,
-                    ms,
-                    rss,
-                    err.as_ref().map(|e| format!(" err={}", e)).unwrap_or_default()
-                );
-                println!("{}", line);
-                let sr = SiteResult {
-                    cat: site.cat.clone(),
-                    name: site.name.clone(),
-                    url: site.url.clone(),
-                    tag,
-                    len: body_len,
-                    ms,
-                    rss_mb: (rss * 10.0).round() / 10.0,
-                    err,
-                };
-                // Checkpoint to `<out>.partial` (one JSON line per site)
-                // so cap-truncated runs leave a usable result trace.
-                if let Ok(json_line) = serde_json::to_string(&sr) {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&partial_path)
-                    {
-                        let _ = writeln!(f, "{json_line}");
-                    }
-                }
-                results.push(sr);
-            }
-
-            let wall_total_ms = sweep_t0.elapsed().as_millis() as u64;
-
-            // Aggregate
-            let pass_count = results
-                .iter()
-                .filter(|r| r.tag == "L3-RENDERED" && r.len >= 15000)
-                .count();
-            let thin_shell = results
-                .iter()
-                .filter(|r| r.tag == "L3-RENDERED" && r.len >= 1000 && r.len < 15000)
-                .count();
-            let chl = results
-                .iter()
-                .filter(|r| r.tag.contains("CHL") || r.tag == "BLOCKED" || r.tag.contains("PaH"))
-                .count();
-            let thin_body = results
-                .iter()
-                .filter(|r| r.tag != "L3-RENDERED" && r.len < 1000 && r.err.is_none())
-                .count();
-            let error = results.iter().filter(|r| r.err.is_some()).count();
-
-            // Dual-metric: production (non-diagnostic) sites only.
-            // Diagnostic probes (`areyouheadless` etc.) are INTENDED to fail
-            // and drag every engine's pass-rate down equally; the production
-            // metric is the honest "% of real sites we can browse" number.
-            let diagnostic_n = corpus.iter().filter(|s| s.diagnostic).count();
-            let production_n = total - diagnostic_n;
-            let production_pass = corpus
-                .iter()
-                .zip(results.iter())
-                .filter(|(s, r)| {
-                    !s.diagnostic && r.tag == "L3-RENDERED" && r.len >= 15000
-                })
-                .count();
-            let production_pass_pct = if production_n > 0 {
-                (100.0 * production_pass as f64 / production_n as f64 * 10.0).round() / 10.0
-            } else {
-                0.0
-            };
-
-            let mut timings: Vec<u64> = results.iter().map(|r| r.ms).collect();
-            timings.sort_unstable();
-            let ms_median = timings.get(timings.len() / 2).copied().unwrap_or(0);
-            let ms_p95 = timings
-                .get((timings.len() as f64 * 0.95) as usize)
-                .copied()
-                .unwrap_or(0);
-            let ms_p99 = timings
-                .get((timings.len() as f64 * 0.99) as usize)
-                .copied()
-                .unwrap_or(0);
-
-            let mut by_category: HashMap<String, CategoryStats> = HashMap::new();
-            for r in &results {
-                let entry = by_category.entry(r.cat.clone()).or_default();
-                entry.n += 1;
-                if r.tag == "L3-RENDERED" && r.len >= 15000 {
-                    entry.pass += 1;
+                Err(e) => {
+                    err = Some(format!("{}", e).chars().take(200).collect());
+                    ("ERROR".to_string(), 0)
                 }
             }
+        } else {
+            match browser_oxide::Page::navigate(&site.url, site_profile, 3).await {
+                Ok(mut page) => {
+                    let body = page.content();
+                    let ec = browser_oxide::engine_classify(&body);
+                    (ec.tag.to_string(), ec.len)
+                }
+                Err(e) => {
+                    err = Some(format!("{}", e).chars().take(200).collect());
+                    ("ERROR".to_string(), 0)
+                }
+            }
+        };
+        let ms = t0.elapsed().as_millis() as u64;
+        let rss = self_rss_mb();
+        if rss > rss_peak {
+            rss_peak = rss;
+        }
+        let line = format!(
+            "sweep: [{}/{}] {} {} {} len={} ms={} rss={:.0}{}",
+            i + 1,
+            total,
+            site.cat,
+            site.name,
+            tag,
+            body_len,
+            ms,
+            rss,
+            err.as_ref()
+                .map(|e| format!(" err={}", e))
+                .unwrap_or_default()
+        );
+        println!("{}", line);
+        let sr = SiteResult {
+            cat: site.cat.clone(),
+            name: site.name.clone(),
+            url: site.url.clone(),
+            tag,
+            len: body_len,
+            ms,
+            rss_mb: (rss * 10.0).round() / 10.0,
+            err,
+        };
+        // Checkpoint to `<out>.partial` (one JSON line per site)
+        // so cap-truncated runs leave a usable result trace.
+        if let Ok(json_line) = serde_json::to_string(&sr) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&partial_path)
+            {
+                let _ = writeln!(f, "{json_line}");
+            }
+        }
+        results.push(sr);
+    }
 
-            let throughput =
-                60_000.0 * total as f64 / wall_total_ms.max(1) as f64;
-            let summary = Summary {
-                engine: "browser_oxide".to_string(),
-                profile: profile_name.clone(),
-                mode: mode.clone(),
-                n: total,
-                pass: pass_count,
-                thin_shell,
-                chl,
-                thin_body,
-                error,
-                pass_pct: (100.0 * pass_count as f64 / total as f64 * 10.0).round() / 10.0,
-                diagnostic_n,
-                production_n,
-                production_pass,
-                production_pass_pct,
-                t_launch_ms,
-                t_first_page_ready_ms,
-                rss_peak_mb: (rss_peak * 10.0).round() / 10.0,
-                ms_median,
-                ms_p95,
-                ms_p99,
-                wall_total_ms,
-                throughput_pages_per_min: (throughput * 100.0).round() / 100.0,
-                by_category,
-            };
+    let wall_total_ms = sweep_t0.elapsed().as_millis() as u64;
 
-            let json = serde_json::json!({
-                "summary": summary,
-                "results": results,
-            });
-            fs::write(&out_path, serde_json::to_vec_pretty(&json).expect("serialize"))
-                .expect("write out.json");
+    // Aggregate
+    let pass_count = results
+        .iter()
+        .filter(|r| r.tag == "L3-RENDERED" && r.len >= 15000)
+        .count();
+    let thin_shell = results
+        .iter()
+        .filter(|r| r.tag == "L3-RENDERED" && r.len >= 1000 && r.len < 15000)
+        .count();
+    let chl = results
+        .iter()
+        .filter(|r| r.tag.contains("CHL") || r.tag == "BLOCKED" || r.tag.contains("PaH"))
+        .count();
+    let thin_body = results
+        .iter()
+        .filter(|r| r.tag != "L3-RENDERED" && r.len < 1000 && r.err.is_none())
+        .count();
+    let error = results.iter().filter(|r| r.err.is_some()).count();
 
-            eprintln!(
-                "\n=== browser_oxide [{} / {}]: pass={}/{} ({}%) | production={}/{} ({}%) wall={}s rss_peak={}MB median={}ms p95={}ms ===",
-                profile_name,
-                mode,
-                summary.pass,
-                summary.n,
-                summary.pass_pct,
-                summary.production_pass,
-                summary.production_n,
-                summary.production_pass_pct,
-                wall_total_ms / 1000,
-                summary.rss_peak_mb,
-                summary.ms_median,
-                summary.ms_p95,
-            );
-            eprintln!("  -> {}", out_path);
-        })
-        .await;
+    // Dual-metric: production (non-diagnostic) sites only.
+    // Diagnostic probes (`areyouheadless` etc.) are INTENDED to fail
+    // and drag every engine's pass-rate down equally; the production
+    // metric is the honest "% of real sites we can browse" number.
+    let diagnostic_n = corpus.iter().filter(|s| s.diagnostic).count();
+    let production_n = total - diagnostic_n;
+    let production_pass = corpus
+        .iter()
+        .zip(results.iter())
+        .filter(|(s, r)| !s.diagnostic && r.tag == "L3-RENDERED" && r.len >= 15000)
+        .count();
+    let production_pass_pct = if production_n > 0 {
+        (100.0 * production_pass as f64 / production_n as f64 * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    let mut timings: Vec<u64> = results.iter().map(|r| r.ms).collect();
+    timings.sort_unstable();
+    let ms_median = timings.get(timings.len() / 2).copied().unwrap_or(0);
+    let ms_p95 = timings
+        .get((timings.len() as f64 * 0.95) as usize)
+        .copied()
+        .unwrap_or(0);
+    let ms_p99 = timings
+        .get((timings.len() as f64 * 0.99) as usize)
+        .copied()
+        .unwrap_or(0);
+
+    let mut by_category: HashMap<String, CategoryStats> = HashMap::new();
+    for r in &results {
+        let entry = by_category.entry(r.cat.clone()).or_default();
+        entry.n += 1;
+        if r.tag == "L3-RENDERED" && r.len >= 15000 {
+            entry.pass += 1;
+        }
+    }
+
+    let throughput = 60_000.0 * total as f64 / wall_total_ms.max(1) as f64;
+    let summary = Summary {
+        engine: "browser_oxide".to_string(),
+        profile: profile_name.clone(),
+        mode: mode.clone(),
+        n: total,
+        pass: pass_count,
+        thin_shell,
+        chl,
+        thin_body,
+        error,
+        pass_pct: (100.0 * pass_count as f64 / total as f64 * 10.0).round() / 10.0,
+        diagnostic_n,
+        production_n,
+        production_pass,
+        production_pass_pct,
+        t_launch_ms,
+        t_first_page_ready_ms,
+        rss_peak_mb: (rss_peak * 10.0).round() / 10.0,
+        ms_median,
+        ms_p95,
+        ms_p99,
+        wall_total_ms,
+        throughput_pages_per_min: (throughput * 100.0).round() / 100.0,
+        by_category,
+    };
+
+    let json = serde_json::json!({
+        "summary": summary,
+        "results": results,
+    });
+    fs::write(
+        &out_path,
+        serde_json::to_vec_pretty(&json).expect("serialize"),
+    )
+    .expect("write out.json");
+
+    eprintln!(
+        "\n=== browser_oxide [{} / {}]: pass={}/{} ({}%) | production={}/{} ({}%) wall={}s rss_peak={}MB median={}ms p95={}ms ===",
+        profile_name,
+        mode,
+        summary.pass,
+        summary.n,
+        summary.pass_pct,
+        summary.production_pass,
+        summary.production_n,
+        summary.production_pass_pct,
+        wall_total_ms / 1000,
+        summary.rss_peak_mb,
+        summary.ms_median,
+        summary.ms_p95,
+    );
+    eprintln!("  -> {}", out_path);
 }

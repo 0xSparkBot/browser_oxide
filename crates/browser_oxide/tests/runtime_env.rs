@@ -98,3 +98,13 @@ fn runtime_env_and_tokio_context() {
         std::env::remove_var("BROWSER_OXIDE_HEAP_INITIAL_MB");
     }
 }
+
+#[test]
+fn block_on_v8_thread_accepts_non_send_future() {
+    let result = browser_oxide::js_runtime::block_on_v8_thread("non-send-future-test", || async {
+        let value = std::rc::Rc::new(41_u32);
+        tokio::task::yield_now().await;
+        *value + 1
+    });
+    assert_eq!(result, 42);
+}

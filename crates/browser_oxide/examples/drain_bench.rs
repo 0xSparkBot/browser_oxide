@@ -17,67 +17,64 @@ fn report(label: &str, mut v: Vec<Duration>) {
     );
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let mut page = Page::from_html_fast(
-                "<html><body><div id=x>a</div></body></html>",
-                "about:blank",
-                chrome_148_windows(),
-            )
-            .await
-            .unwrap();
-            let el = page.event_loop();
+fn main() {
+    browser_oxide::js_runtime::block_on_v8_thread("drain-bench", async_main);
+}
 
-            let micro =
-                "Promise.resolve().then(()=>{document.getElementById('x').textContent='y';})";
-            let timer = "setTimeout(()=>{document.getElementById('x').textContent='z';}, 5)";
+async fn async_main() {
+    let mut page = Page::from_html_fast(
+        "<html><body><div id=x>a</div></body></html>",
+        "about:blank",
+        chrome_148_windows(),
+    )
+    .await
+    .unwrap();
+    let el = page.event_loop();
 
-            // Warm up JIT / caches.
-            for _ in 0..200 {
-                el.execute_script(micro).ok();
-                el.drain_microtasks();
-            }
+    let micro = "Promise.resolve().then(()=>{document.getElementById('x').textContent='y';})";
+    let timer = "setTimeout(()=>{document.getElementById('x').textContent='z';}, 5)";
 
-            let n = 3000;
+    // Warm up JIT / caches.
+    for _ in 0..200 {
+        el.execute_script(micro).ok();
+        el.drain_microtasks();
+    }
 
-            let mut new_micro = Vec::with_capacity(n);
-            for _ in 0..n {
-                el.execute_script(micro).ok();
-                let t = Instant::now();
-                el.drain_microtasks();
-                new_micro.push(t.elapsed());
-            }
-            let mut old_micro = Vec::with_capacity(n);
-            for _ in 0..n {
-                el.execute_script(micro).ok();
-                let t = Instant::now();
-                let _ = el.run_until_idle(Duration::from_millis(50)).await;
-                old_micro.push(t.elapsed());
-            }
+    let n = 3000;
 
-            let mut new_timer = Vec::with_capacity(n);
-            for _ in 0..n {
-                el.execute_script(timer).ok();
-                let t = Instant::now();
-                el.drain_microtasks();
-                new_timer.push(t.elapsed());
-            }
-            let mut old_timer = Vec::with_capacity(n);
-            for _ in 0..n {
-                el.execute_script(timer).ok();
-                let t = Instant::now();
-                let _ = el.run_until_idle(Duration::from_millis(50)).await;
-                old_timer.push(t.elapsed());
-            }
+    let mut new_micro = Vec::with_capacity(n);
+    for _ in 0..n {
+        el.execute_script(micro).ok();
+        let t = Instant::now();
+        el.drain_microtasks();
+        new_micro.push(t.elapsed());
+    }
+    let mut old_micro = Vec::with_capacity(n);
+    for _ in 0..n {
+        el.execute_script(micro).ok();
+        let t = Instant::now();
+        let _ = el.run_until_idle(Duration::from_millis(50)).await;
+        old_micro.push(t.elapsed());
+    }
 
-            println!("\n=== per-script drain cost (lower = faster) ===");
-            report("microtask render : drain_microtasks (NEW)", new_micro);
-            report("microtask render : run_until_idle(50ms) (OLD)", old_micro);
-            report("timer-start      : drain_microtasks (NEW)", new_timer);
-            report("timer-start      : run_until_idle(50ms) (OLD)", old_timer);
-        })
-        .await;
+    let mut new_timer = Vec::with_capacity(n);
+    for _ in 0..n {
+        el.execute_script(timer).ok();
+        let t = Instant::now();
+        el.drain_microtasks();
+        new_timer.push(t.elapsed());
+    }
+    let mut old_timer = Vec::with_capacity(n);
+    for _ in 0..n {
+        el.execute_script(timer).ok();
+        let t = Instant::now();
+        let _ = el.run_until_idle(Duration::from_millis(50)).await;
+        old_timer.push(t.elapsed());
+    }
+
+    println!("\n=== per-script drain cost (lower = faster) ===");
+    report("microtask render : drain_microtasks (NEW)", new_micro);
+    report("microtask render : run_until_idle(50ms) (OLD)", old_micro);
+    report("timer-start      : drain_microtasks (NEW)", new_timer);
+    report("timer-start      : run_until_idle(50ms) (OLD)", old_timer);
 }

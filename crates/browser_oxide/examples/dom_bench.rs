@@ -43,46 +43,44 @@ const BUILD: &str = r#"(function(){
   return 'built '+document.querySelectorAll('*').length+' els';
 })()"#;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let mut page = Page::from_html_fast(
-                "<html><head></head><body></body></html>",
-                "about:blank",
-                chrome_148_windows(),
-            )
-            .await
-            .unwrap();
+fn main() {
+    browser_oxide::js_runtime::block_on_v8_thread("dom-bench", async_main);
+}
 
-            println!("\n=== DOM boundary microbench ===");
-            println!("build: {}", page.evaluate(BUILD).unwrap_or_default());
+async fn async_main() {
+    let mut page = Page::from_html_fast(
+        "<html><head></head><body></body></html>",
+        "about:blank",
+        chrome_148_windows(),
+    )
+    .await
+    .unwrap();
 
-            bench(&mut page, "matches", 50_000,
-                "(function(){var e=globalThis.__deepRow,n=0;for(var k=0;k<50000;k++){if(e.matches('div.row.active'))n++;}return n;})()");
-            bench(&mut page, "closest", 20_000,
-                "(function(){var e=globalThis.__deepCell,n=0;for(var k=0;k<20000;k++){if(e.closest('#app'))n++;}return n;})()");
-            bench(&mut page, "contains", 50_000,
-                "(function(){var a=globalThis.__app,e=globalThis.__deepCell,n=0;for(var k=0;k<50000;k++){if(a.contains(e))n++;}return n;})()");
-            bench(&mut page, "isConnected", 50_000,
-                "(function(){var e=globalThis.__deepCell,n=0;for(var k=0;k<50000;k++){if(e.isConnected)n++;}return n;})()");
-            bench(&mut page, "nextElementSibling walk", 5_000,
-                "(function(){var sec=globalThis.__sec,n=0;for(var k=0;k<5000;k++){var c=sec.firstElementChild;while(c){n++;c=c.nextElementSibling;}}return n;})()");
-            bench(&mut page, "nodeType access", 200_000,
-                "(function(){var e=globalThis.__deepRow,n=0;for(var k=0;k<200000;k++){if(e.nodeType===1)n++;}return n;})()");
-            bench(&mut page, "tagName access", 100_000,
-                "(function(){var e=globalThis.__deepRow,n=0;for(var k=0;k<100000;k++){if(e.tagName==='DIV')n++;}return n;})()");
-            bench(&mut page, "getElementById", 20_000,
-                "(function(){var n=0;for(var k=0;k<20000;k++){if(document.getElementById('app'))n++;}return n;})()");
-            bench(&mut page, "firstElementChild+count", 50_000,
-                "(function(){var sec=globalThis.__sec,n=0;for(var k=0;k<50000;k++){if(sec.firstElementChild)n++;n+=sec.childElementCount;}return n;})()");
+    println!("\n=== DOM boundary microbench ===");
+    println!("build: {}", page.evaluate(BUILD).unwrap_or_default());
 
-            // appendChild of a 100-node script-free subtree: exercises the
-            // _onNodeInserted insertion scan.
-            page.evaluate("(function(){var t=document.createElement('div');for(var i=0;i<100;i++){var d=document.createElement('div');d.className='n';t.appendChild(d);}globalThis.__tree=t;})()").ok();
-            bench(&mut page, "appendChild 100-subtree", 5_000,
-                "(function(){var b=document.body,t=globalThis.__tree,n=0;for(var k=0;k<5000;k++){b.appendChild(t);b.removeChild(t);n++;}return n;})()");
-        })
-        .await;
+    bench(&mut page, "matches", 50_000,
+        "(function(){var e=globalThis.__deepRow,n=0;for(var k=0;k<50000;k++){if(e.matches('div.row.active'))n++;}return n;})()");
+    bench(&mut page, "closest", 20_000,
+        "(function(){var e=globalThis.__deepCell,n=0;for(var k=0;k<20000;k++){if(e.closest('#app'))n++;}return n;})()");
+    bench(&mut page, "contains", 50_000,
+        "(function(){var a=globalThis.__app,e=globalThis.__deepCell,n=0;for(var k=0;k<50000;k++){if(a.contains(e))n++;}return n;})()");
+    bench(&mut page, "isConnected", 50_000,
+        "(function(){var e=globalThis.__deepCell,n=0;for(var k=0;k<50000;k++){if(e.isConnected)n++;}return n;})()");
+    bench(&mut page, "nextElementSibling walk", 5_000,
+        "(function(){var sec=globalThis.__sec,n=0;for(var k=0;k<5000;k++){var c=sec.firstElementChild;while(c){n++;c=c.nextElementSibling;}}return n;})()");
+    bench(&mut page, "nodeType access", 200_000,
+        "(function(){var e=globalThis.__deepRow,n=0;for(var k=0;k<200000;k++){if(e.nodeType===1)n++;}return n;})()");
+    bench(&mut page, "tagName access", 100_000,
+        "(function(){var e=globalThis.__deepRow,n=0;for(var k=0;k<100000;k++){if(e.tagName==='DIV')n++;}return n;})()");
+    bench(&mut page, "getElementById", 20_000,
+        "(function(){var n=0;for(var k=0;k<20000;k++){if(document.getElementById('app'))n++;}return n;})()");
+    bench(&mut page, "firstElementChild+count", 50_000,
+        "(function(){var sec=globalThis.__sec,n=0;for(var k=0;k<50000;k++){if(sec.firstElementChild)n++;n+=sec.childElementCount;}return n;})()");
+
+    // appendChild of a 100-node script-free subtree: exercises the
+    // _onNodeInserted insertion scan.
+    page.evaluate("(function(){var t=document.createElement('div');for(var i=0;i<100;i++){var d=document.createElement('div');d.className='n';t.appendChild(d);}globalThis.__tree=t;})()").ok();
+    bench(&mut page, "appendChild 100-subtree", 5_000,
+        "(function(){var b=document.body,t=globalThis.__tree,n=0;for(var k=0;k<5000;k++){b.appendChild(t);b.removeChild(t);n++;}return n;})()");
 }

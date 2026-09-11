@@ -26,8 +26,11 @@ const CANVAS_FP_SEQUENCE_JS: &str = r#"(() => {
     return c.toDataURL();
 })()"#;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    browser_oxide::js_runtime::block_on_v8_thread("canvas-fp-probe", async_main);
+}
+
+async fn async_main() {
     let profile = browser_oxide::stealth::chrome_148_macos();
     let mut page = Page::from_html(
         "<!DOCTYPE html><html><head></head><body></body></html>",
