@@ -1,5 +1,6 @@
 use crate::css_cascade::ComputedStyle;
 use crate::css_values::property::{CssValue, PropertyId};
+use crate::css_values::types::display::BorderStyle;
 use crate::layout::resolve::{resolve_length, resolve_length_percentage, ResolveContext};
 
 /// Convert a ComputedStyle into a taffy::Style.
@@ -48,10 +49,30 @@ pub fn computed_to_taffy(style: &ComputedStyle, ctx: &ResolveContext) -> taffy::
     ts.padding.left = css_to_lp(style, &PropertyId::PaddingLeft, ctx);
 
     // Border
-    ts.border.top = css_to_border(style, &PropertyId::BorderTopWidth, ctx);
-    ts.border.right = css_to_border(style, &PropertyId::BorderRightWidth, ctx);
-    ts.border.bottom = css_to_border(style, &PropertyId::BorderBottomWidth, ctx);
-    ts.border.left = css_to_border(style, &PropertyId::BorderLeftWidth, ctx);
+    ts.border.top = css_to_border(
+        style,
+        &PropertyId::BorderTopWidth,
+        &PropertyId::BorderTopStyle,
+        ctx,
+    );
+    ts.border.right = css_to_border(
+        style,
+        &PropertyId::BorderRightWidth,
+        &PropertyId::BorderRightStyle,
+        ctx,
+    );
+    ts.border.bottom = css_to_border(
+        style,
+        &PropertyId::BorderBottomWidth,
+        &PropertyId::BorderBottomStyle,
+        ctx,
+    );
+    ts.border.left = css_to_border(
+        style,
+        &PropertyId::BorderLeftWidth,
+        &PropertyId::BorderLeftStyle,
+        ctx,
+    );
 
     // Flex
     if let Some(CssValue::FlexDirection(fd)) = style.get(&PropertyId::FlexDirection) {
@@ -161,10 +182,19 @@ fn css_to_lp(
 
 fn css_to_border(
     style: &ComputedStyle,
-    prop: &PropertyId,
+    width_prop: &PropertyId,
+    style_prop: &PropertyId,
     ctx: &ResolveContext,
 ) -> taffy::LengthPercentage {
-    match style.get(prop) {
+    if matches!(
+        style.get(style_prop),
+        Some(CssValue::BorderStyle(
+            BorderStyle::None | BorderStyle::Hidden
+        ))
+    ) {
+        return taffy::LengthPercentage::length(0.0);
+    }
+    match style.get(width_prop) {
         Some(CssValue::Length(l)) => taffy::LengthPercentage::length(resolve_length(l, ctx)),
         _ => taffy::LengthPercentage::length(0.0),
     }
@@ -223,5 +253,40 @@ mod tests {
         let ctx = ResolveContext::default();
         let ts = computed_to_taffy(&style, &ctx);
         assert_eq!(ts.margin.left, taffy::LengthPercentageAuto::auto());
+    }
+
+    #[test]
+    fn border_none_and_hidden_suppress_computed_layout_width() {
+        let ctx = ResolveContext::default();
+        for border_style in [BorderStyle::None, BorderStyle::Hidden] {
+            let mut cascaded = HashMap::new();
+            cascaded.insert(
+                PropertyId::BorderTopWidth,
+                CssValue::Length(Length::Px(9.0)),
+            );
+            cascaded.insert(
+                PropertyId::BorderTopStyle,
+                CssValue::BorderStyle(border_style),
+            );
+            let style = ComputedStyle::resolve(&cascaded, None);
+            let ts = computed_to_taffy(&style, &ctx);
+            assert_eq!(ts.border.top, taffy::LengthPercentage::length(0.0));
+        }
+    }
+
+    #[test]
+    fn visible_border_style_preserves_computed_layout_width() {
+        let mut cascaded = HashMap::new();
+        cascaded.insert(
+            PropertyId::BorderTopWidth,
+            CssValue::Length(Length::Px(9.0)),
+        );
+        cascaded.insert(
+            PropertyId::BorderTopStyle,
+            CssValue::BorderStyle(BorderStyle::Solid),
+        );
+        let style = ComputedStyle::resolve(&cascaded, None);
+        let ts = computed_to_taffy(&style, &ResolveContext::default());
+        assert_eq!(ts.border.top, taffy::LengthPercentage::length(9.0));
     }
 }

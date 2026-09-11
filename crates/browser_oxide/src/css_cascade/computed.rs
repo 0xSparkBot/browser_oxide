@@ -113,6 +113,14 @@ fn all_property_ids() -> Vec<PropertyId> {
         PropertyId::BorderRightWidth,
         PropertyId::BorderBottomWidth,
         PropertyId::BorderLeftWidth,
+        PropertyId::BorderTopStyle,
+        PropertyId::BorderRightStyle,
+        PropertyId::BorderBottomStyle,
+        PropertyId::BorderLeftStyle,
+        PropertyId::BorderTopColor,
+        PropertyId::BorderRightColor,
+        PropertyId::BorderBottomColor,
+        PropertyId::BorderLeftColor,
         PropertyId::BoxSizing,
         PropertyId::OverflowX,
         PropertyId::OverflowY,
@@ -165,6 +173,10 @@ mod tests {
         assert_eq!(
             style.get_or_initial(&PropertyId::Opacity),
             CssValue::Number(1.0)
+        );
+        assert_eq!(
+            style.get_or_initial(&PropertyId::BorderTopColor),
+            CssValue::Color(Color::CurrentColor)
         );
     }
 

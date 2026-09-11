@@ -59,6 +59,21 @@ pub enum BoxSizing {
     BorderBox,
 }
 
+/// CSS `border-*-style` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderStyle {
+    None,
+    Hidden,
+    Dotted,
+    Dashed,
+    Solid,
+    Double,
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+}
+
 /// CSS `float` property values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Float {

@@ -29,6 +29,14 @@ pub fn parse_property(
     match name_lower.as_str() {
         "margin" => return parse_box_shorthand(value_trimmed, important, "margin"),
         "padding" => return parse_box_shorthand(value_trimmed, important, "padding"),
+        "border-width" => return parse_border_width_shorthand(value_trimmed, important),
+        "border-style" => return parse_border_style_shorthand(value_trimmed, important),
+        "border-color" => return parse_border_color_shorthand(value_trimmed, important),
+        "border" => return parse_border_shorthand(value_trimmed, important, None),
+        "border-top" => return parse_border_shorthand(value_trimmed, important, Some("top")),
+        "border-right" => return parse_border_shorthand(value_trimmed, important, Some("right")),
+        "border-bottom" => return parse_border_shorthand(value_trimmed, important, Some("bottom")),
+        "border-left" => return parse_border_shorthand(value_trimmed, important, Some("left")),
         "overflow" => return parse_overflow_shorthand(value_trimmed, important),
         _ => {}
     }
@@ -49,6 +57,12 @@ pub fn parse_property(
         }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             parse_border_width(value_trimmed)?
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            parse_border_style(value_trimmed)?
+        }
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
+            parse_color(value_trimmed)?
         }
         "box-sizing" => parse_box_sizing(value_trimmed)?,
         "overflow-x" | "overflow-y" => parse_overflow(value_trimmed)?,
@@ -227,6 +241,184 @@ fn parse_border_width(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueErr
     Err(ValueError::InvalidValue(
         "expected border-width value".into(),
     ))
+}
+
+fn parse_border_style(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
+    let ident = expect_single_ident(value)?;
+    let style = match ident.to_ascii_lowercase().as_str() {
+        "none" => BorderStyle::None,
+        "hidden" => BorderStyle::Hidden,
+        "dotted" => BorderStyle::Dotted,
+        "dashed" => BorderStyle::Dashed,
+        "solid" => BorderStyle::Solid,
+        "double" => BorderStyle::Double,
+        "groove" => BorderStyle::Groove,
+        "ridge" => BorderStyle::Ridge,
+        "inset" => BorderStyle::Inset,
+        "outset" => BorderStyle::Outset,
+        _ => {
+            return Err(ValueError::InvalidValue(format!(
+                "invalid border-style: {ident}"
+            )))
+        }
+    };
+    Ok(CssValue::BorderStyle(style))
+}
+
+fn border_box_four<'a, 'b>(
+    value: &'a [ComponentValue<'b>],
+    what: &str,
+) -> Result<[&'a ComponentValue<'b>; 4], ValueError> {
+    let parts: Vec<_> = value
+        .iter()
+        .filter(|v| {
+            !matches!(
+                v,
+                ComponentValue::Token(Token {
+                    kind: TokenKind::Whitespace,
+                    ..
+                })
+            )
+        })
+        .collect();
+    match parts.as_slice() {
+        [a] => Ok([*a, *a, *a, *a]),
+        [a, b] => Ok([*a, *b, *a, *b]),
+        [a, b, c] => Ok([*a, *b, *c, *b]),
+        [a, b, c, d] => Ok([*a, *b, *c, *d]),
+        _ => Err(ValueError::InvalidValue(format!(
+            "invalid {what} shorthand"
+        ))),
+    }
+}
+
+fn parse_border_width_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let values = border_box_four(value, "border-width")?;
+    let sides = ["top", "right", "bottom", "left"];
+    let mut declarations = Vec::with_capacity(4);
+    for (side, value) in sides.iter().zip(values) {
+        declarations.push(PropertyDeclaration {
+            property: PropertyId::from_name(&format!("border-{side}-width")),
+            value: parse_border_width(std::slice::from_ref(value))?,
+            important,
+        });
+    }
+    Ok(declarations)
+}
+
+fn parse_border_style_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let values = border_box_four(value, "border-style")?;
+    let sides = ["top", "right", "bottom", "left"];
+    let mut declarations = Vec::with_capacity(4);
+    for (side, value) in sides.iter().zip(values) {
+        declarations.push(PropertyDeclaration {
+            property: PropertyId::from_name(&format!("border-{side}-style")),
+            value: parse_border_style(std::slice::from_ref(value))?,
+            important,
+        });
+    }
+    Ok(declarations)
+}
+
+fn parse_border_color_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let values = border_box_four(value, "border-color")?;
+    let sides = ["top", "right", "bottom", "left"];
+    let mut declarations = Vec::with_capacity(4);
+    for (side, value) in sides.iter().zip(values) {
+        declarations.push(PropertyDeclaration {
+            property: PropertyId::from_name(&format!("border-{side}-color")),
+            value: parse_color(std::slice::from_ref(value))?,
+            important,
+        });
+    }
+    Ok(declarations)
+}
+
+fn parse_border_shorthand(
+    value: &[ComponentValue<'_>],
+    important: bool,
+    side: Option<&str>,
+) -> Result<Vec<PropertyDeclaration>, ValueError> {
+    let parts: Vec<_> = value
+        .iter()
+        .filter(|v| {
+            !matches!(
+                v,
+                ComponentValue::Token(Token {
+                    kind: TokenKind::Whitespace,
+                    ..
+                })
+            )
+        })
+        .collect();
+
+    let mut width = CssValue::Length(Length::Px(3.0));
+    let mut style = CssValue::BorderStyle(BorderStyle::None);
+    let mut color = CssValue::Color(Color::CurrentColor);
+    let mut saw_width = false;
+    let mut saw_style = false;
+    let mut saw_color = false;
+
+    for part in parts {
+        let one = std::slice::from_ref(part);
+        if let Ok(parsed) = parse_border_width(one) {
+            if saw_width {
+                return Err(ValueError::InvalidValue("duplicate border width".into()));
+            }
+            saw_width = true;
+            width = parsed;
+            continue;
+        }
+        if let Ok(parsed) = parse_border_style(one) {
+            if saw_style {
+                return Err(ValueError::InvalidValue("duplicate border style".into()));
+            }
+            saw_style = true;
+            style = parsed;
+            continue;
+        }
+        if let Ok(parsed) = parse_color(one) {
+            if saw_color {
+                return Err(ValueError::InvalidValue("duplicate border color".into()));
+            }
+            saw_color = true;
+            color = parsed;
+            continue;
+        }
+        return Err(ValueError::InvalidValue("invalid border shorthand".into()));
+    }
+
+    let sides: Vec<&str> = side
+        .map(|side| vec![side])
+        .unwrap_or_else(|| vec!["top", "right", "bottom", "left"]);
+    let mut declarations = Vec::with_capacity(sides.len() * 3);
+    for side in sides {
+        declarations.push(PropertyDeclaration {
+            property: PropertyId::from_name(&format!("border-{side}-width")),
+            value: width.clone(),
+            important,
+        });
+        declarations.push(PropertyDeclaration {
+            property: PropertyId::from_name(&format!("border-{side}-style")),
+            value: style.clone(),
+            important,
+        });
+        declarations.push(PropertyDeclaration {
+            property: PropertyId::from_name(&format!("border-{side}-color")),
+            value: color.clone(),
+            important,
+        });
+    }
+    Ok(declarations)
 }
 
 fn parse_box_sizing(value: &[ComponentValue<'_>]) -> Result<CssValue, ValueError> {
@@ -1110,6 +1302,63 @@ mod tests {
         assert_eq!(decls[1].property, PropertyId::MarginRight);
         assert_eq!(decls[2].property, PropertyId::MarginBottom);
         assert_eq!(decls[3].property, PropertyId::MarginLeft);
+    }
+
+    #[test]
+    fn parse_border_shorthands_expand_width_and_style() {
+        let decls = parse_decl("border: 2px solid red");
+        assert_eq!(decls.len(), 12);
+        for side in 0..4 {
+            assert_eq!(decls[side * 3].value, CssValue::Length(Length::Px(2.0)));
+            assert_eq!(
+                decls[side * 3 + 1].value,
+                CssValue::BorderStyle(BorderStyle::Solid)
+            );
+            assert_eq!(
+                decls[side * 3 + 2].value,
+                CssValue::Color(Color::Rgba {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 1.0,
+                })
+            );
+        }
+
+        let decls =
+            parse_decl("border-width: 1px 2px 3px 4px; border-style: none dashed solid hidden");
+        assert_eq!(decls.len(), 8);
+        assert_eq!(decls[0].value, CssValue::Length(Length::Px(1.0)));
+        assert_eq!(decls[1].value, CssValue::Length(Length::Px(2.0)));
+        assert_eq!(decls[2].value, CssValue::Length(Length::Px(3.0)));
+        assert_eq!(decls[3].value, CssValue::Length(Length::Px(4.0)));
+        assert_eq!(decls[4].value, CssValue::BorderStyle(BorderStyle::None));
+        assert_eq!(decls[5].value, CssValue::BorderStyle(BorderStyle::Dashed));
+        assert_eq!(decls[6].value, CssValue::BorderStyle(BorderStyle::Solid));
+        assert_eq!(decls[7].value, CssValue::BorderStyle(BorderStyle::Hidden));
+
+        let decls = parse_decl("border-color: red currentcolor #00ff00 transparent");
+        assert_eq!(decls.len(), 4);
+        assert!(matches!(
+            decls[0].value,
+            CssValue::Color(Color::Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                ..
+            })
+        ));
+        assert_eq!(decls[1].value, CssValue::Color(Color::CurrentColor));
+        assert!(matches!(
+            decls[2].value,
+            CssValue::Color(Color::Rgba {
+                r: 0,
+                g: 255,
+                b: 0,
+                ..
+            })
+        ));
+        assert_eq!(decls[3].value, CssValue::Color(Color::Transparent));
     }
 
     #[test]
