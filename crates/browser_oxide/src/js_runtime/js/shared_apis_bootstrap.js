@@ -119,8 +119,8 @@
     };
     const _copyKeyAlgorithm = (state) => (state.name === 'PBKDF2' || state.name === 'HKDF')
         ? { name: state.name }
-        : state.name === 'AES-GCM'
-            ? { name: 'AES-GCM', length: state.length }
+        : (state.name === 'AES-GCM' || state.name === 'AES-CBC')
+            ? { name: state.name, length: state.length }
             : {
                 name: "HMAC",
                 hash: { name: state.hash },
@@ -326,7 +326,10 @@
         const result = { name: 'AES-GCM' };
         if (requireLength) {
             const length = Number(algorithm && algorithm.length);
-            if (length !== 128 && length !== 192 && length !== 256) {
+            if (length === 192) {
+                throw new DOMException("192-bit AES keys are not supported", "OperationError");
+            }
+            if (length !== 128 && length !== 256) {
                 throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
             }
             result.length = length;
@@ -336,7 +339,10 @@
     const _normalizeAesGcmUsages = (keyUsages) => {
         const usages = Array.from(keyUsages || [], String);
         const allowed = new Set(['encrypt', 'decrypt', 'wrapKey', 'unwrapKey']);
-        if (usages.length === 0 || usages.some((usage) => !allowed.has(usage))) {
+        if (usages.length === 0) {
+            throw new DOMException("Usages cannot be empty when creating a key.", "SyntaxError");
+        }
+        if (usages.some((usage) => !allowed.has(usage))) {
             throw new DOMException("Cannot create a key using the specified key usages.", "SyntaxError");
         }
         return usages;
@@ -344,7 +350,10 @@
     const _makeAesGcmKey = (bytes, extractable, usages) => {
         const material = new Uint8Array(bytes);
         const length = material.byteLength * 8;
-        if (length !== 128 && length !== 192 && length !== 256) {
+        if (length === 192) {
+            throw new DOMException("192-bit AES keys are not supported", "OperationError");
+        }
+        if (length !== 128 && length !== 256) {
             throw new DOMException("Invalid key length", "DataError");
         }
         const key = Object.create(_CryptoKeyProto);
@@ -392,6 +401,77 @@
         }
         return { alg, state };
     };
+    const _normalizeAesCbcKeyAlgorithm = (algorithm, requireLength) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'AES-CBC') {
+            throw new DOMException("Unrecognized name.", "NotSupportedError");
+        }
+        const result = { name: 'AES-CBC' };
+        if (requireLength) {
+            const length = Number(algorithm && algorithm.length);
+            if (length === 192) {
+                throw new DOMException("192-bit AES keys are not supported", "OperationError");
+            }
+            if (length !== 128 && length !== 256) {
+                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            }
+            result.length = length;
+        }
+        return result;
+    };
+    const _normalizeAesCbcUsages = (keyUsages) => {
+        const usages = Array.from(keyUsages || [], String);
+        const allowed = new Set(['encrypt', 'decrypt', 'wrapKey', 'unwrapKey']);
+        if (usages.length === 0) {
+            throw new DOMException("Usages cannot be empty when creating a key.", "SyntaxError");
+        }
+        if (usages.some((usage) => !allowed.has(usage))) {
+            throw new DOMException("Cannot create a key using the specified key usages.", "SyntaxError");
+        }
+        return usages;
+    };
+    const _makeAesCbcKey = (bytes, extractable, usages) => {
+        const material = new Uint8Array(bytes);
+        const length = material.byteLength * 8;
+        if (length === 192) {
+            throw new DOMException("192-bit AES keys are not supported", "OperationError");
+        }
+        if (length !== 128 && length !== 256) {
+            throw new DOMException("Invalid key length", "DataError");
+        }
+        const key = Object.create(_CryptoKeyProto);
+        _cryptoKeyState.set(key, {
+            name: 'AES-CBC',
+            type: 'secret',
+            extractable: !!extractable,
+            length,
+            usages: usages.slice(),
+            bytes: material.slice(),
+        });
+        return key;
+    };
+    const _normalizeAesCbcOperation = (algorithm, operationName) => {
+        _normalizeAesCbcKeyAlgorithm(algorithm, false);
+        if (!algorithm || typeof algorithm !== 'object' || algorithm.iv === undefined) {
+            throw new TypeError(`Failed to execute '${operationName}' on 'SubtleCrypto': AesCbcParams: iv: Missing required property`);
+        }
+        if (!(algorithm.iv instanceof ArrayBuffer) && !ArrayBuffer.isView(algorithm.iv)) {
+            throw new TypeError(`Failed to execute '${operationName}' on 'SubtleCrypto': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.`);
+        }
+        const iv = _toBytes(algorithm.iv).slice();
+        if (iv.byteLength !== 16) {
+            throw new DOMException('The "iv" has an unexpected length -- must be 16 bytes', 'OperationError');
+        }
+        return { name: 'AES-CBC', iv };
+    };
+    const _checkAesCbcOperation = (algorithm, key, usage, operationName) => {
+        const alg = _normalizeAesCbcOperation(algorithm, operationName);
+        const state = _requireCryptoKey(key);
+        if (state.name !== 'AES-CBC' || !state.usages.includes(usage)) {
+            throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+        }
+        return { alg, state };
+    };
     const _checkHmacOperation = (algorithm, key, usage) => {
         _normalizeHmacAlgorithm(algorithm, false);
         const state = _requireCryptoKey(key);
@@ -410,6 +490,13 @@
                 const bytes = new Uint8Array(alg.length / 8);
                 ops.op_crypto_random_fill(bytes);
                 return Promise.resolve(_makeAesGcmKey(bytes, extractable, usages));
+            }
+            if (String(rawName || '').toUpperCase() === 'AES-CBC') {
+                const alg = _normalizeAesCbcKeyAlgorithm(algorithm, true);
+                const usages = _normalizeAesCbcUsages(keyUsages);
+                const bytes = new Uint8Array(alg.length / 8);
+                ops.op_crypto_random_fill(bytes);
+                return Promise.resolve(_makeAesCbcKey(bytes, extractable, usages));
             }
             const alg = _normalizeHmacAlgorithm(algorithm, true);
             const usages = _normalizeHmacUsages(keyUsages);
@@ -454,6 +541,14 @@
                     throw new TypeError("keyData is not a BufferSource");
                 }
                 return Promise.resolve(_makeAesGcmKey(_toBytes(keyData), extractable, usages));
+            }
+            if (String(rawName || '').toUpperCase() === 'AES-CBC') {
+                _normalizeAesCbcKeyAlgorithm(algorithm, false);
+                const usages = _normalizeAesCbcUsages(keyUsages);
+                if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+                    throw new TypeError("keyData is not a BufferSource");
+                }
+                return Promise.resolve(_makeAesCbcKey(_toBytes(keyData), extractable, usages));
             }
             const alg = _normalizeHmacAlgorithm(algorithm, true);
             const usages = _normalizeHmacUsages(keyUsages);
@@ -547,6 +642,12 @@
                     const out = _deriveHkdfBytes(alg, state, derived.length);
                     return Promise.resolve(_makeAesGcmKey(out, extractable, usages));
                 }
+                if (String(derivedName || '').toUpperCase() === 'AES-CBC') {
+                    const derived = _normalizeAesCbcKeyAlgorithm(derivedKeyType, true);
+                    const usages = _normalizeAesCbcUsages(keyUsages);
+                    const out = _deriveHkdfBytes(alg, state, derived.length);
+                    return Promise.resolve(_makeAesCbcKey(out, extractable, usages));
+                }
                 const derived = _normalizeHmacAlgorithm(derivedKeyType, true);
                 const usages = _normalizeHmacUsages(keyUsages);
                 const bitLength = derived.length === undefined
@@ -574,6 +675,17 @@
                 }
                 return Promise.resolve(_makeAesGcmKey(out, extractable, usages));
             }
+            if (String(derivedName || '').toUpperCase() === 'AES-CBC') {
+                const derived = _normalizeAesCbcKeyAlgorithm(derivedKeyType, true);
+                const usages = _normalizeAesCbcUsages(keyUsages);
+                const out = ops.op_crypto_pbkdf2(
+                    alg.hash, state.bytes, alg.salt, alg.iterations, derived.length / 8
+                );
+                if (out.byteLength !== derived.length / 8) {
+                    throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+                }
+                return Promise.resolve(_makeAesCbcKey(out, extractable, usages));
+            }
             const derived = _normalizeHmacAlgorithm(derivedKeyType, true);
             const usages = _normalizeHmacUsages(keyUsages);
             const bitLength = derived.length === undefined
@@ -593,10 +705,17 @@
 
     _defProtoMethod(_SubtleProto, 'encrypt', function encrypt(algorithm, key, data) {
         try {
-            const { alg, state } = _checkAesGcmOperation(algorithm, key, 'encrypt');
             if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
                 throw new TypeError("data is not a BufferSource");
             }
+            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'AES-CBC') {
+                const { alg, state } = _checkAesCbcOperation(algorithm, key, 'encrypt', 'encrypt');
+                const result = ops.op_crypto_aes_cbc_encrypt(state.bytes, alg.iv, _toBytes(data));
+                if (!result.ok) throw new DOMException('', 'OperationError');
+                return Promise.resolve(new Uint8Array(result.data).buffer);
+            }
+            const { alg, state } = _checkAesGcmOperation(algorithm, key, 'encrypt');
             const result = ops.op_crypto_aes_gcm_encrypt(
                 state.bytes, alg.iv, alg.additionalData, _toBytes(data), alg.tagLength / 8
             );
@@ -609,10 +728,17 @@
     });
     _defProtoMethod(_SubtleProto, 'decrypt', function decrypt(algorithm, key, data) {
         try {
-            const { alg, state } = _checkAesGcmOperation(algorithm, key, 'decrypt');
             if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
                 throw new TypeError("data is not a BufferSource");
             }
+            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'AES-CBC') {
+                const { alg, state } = _checkAesCbcOperation(algorithm, key, 'decrypt', 'decrypt');
+                const result = ops.op_crypto_aes_cbc_decrypt(state.bytes, alg.iv, _toBytes(data));
+                if (!result.ok) throw new DOMException('', 'OperationError');
+                return Promise.resolve(new Uint8Array(result.data).buffer);
+            }
+            const { alg, state } = _checkAesGcmOperation(algorithm, key, 'decrypt');
             const result = ops.op_crypto_aes_gcm_decrypt(
                 state.bytes, alg.iv, alg.additionalData, _toBytes(data), alg.tagLength / 8
             );
@@ -627,6 +753,15 @@
     _defProtoMethod(_SubtleProto, 'wrapKey', function wrapKey(format, key, wrappingKey, wrapAlgorithm) {
         try {
             const normalizedFormat = String(format).toLowerCase();
+            const rawName = typeof wrapAlgorithm === 'string' ? wrapAlgorithm : (wrapAlgorithm && wrapAlgorithm.name);
+            if (String(rawName || '').toUpperCase() === 'AES-CBC') {
+                const { alg, state } = _checkAesCbcOperation(wrapAlgorithm, wrappingKey, 'wrapKey', 'wrapKey');
+                return _SubtleProto.exportKey.call(this, normalizedFormat, key).then((exported) => {
+                    const result = ops.op_crypto_aes_cbc_encrypt(state.bytes, alg.iv, _toBytes(exported));
+                    if (!result.ok) throw new DOMException('', 'OperationError');
+                    return new Uint8Array(result.data).buffer;
+                });
+            }
             const { alg, state } = _checkAesGcmOperation(wrapAlgorithm, wrappingKey, 'wrapKey');
             return _SubtleProto.exportKey.call(this, normalizedFormat, key).then((exported) => {
                 const result = ops.op_crypto_aes_gcm_encrypt(
@@ -648,12 +783,20 @@
                 throw new TypeError("wrappedKey is not a BufferSource");
             }
             const normalizedFormat = String(format).toLowerCase();
-            const { alg, state } = _checkAesGcmOperation(unwrapAlgorithm, unwrappingKey, 'unwrapKey');
-            const result = ops.op_crypto_aes_gcm_decrypt(
-                state.bytes, alg.iv, alg.additionalData, _toBytes(wrappedKey), alg.tagLength / 8
-            );
-            if (!result.ok) {
-                throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+            const rawName = typeof unwrapAlgorithm === 'string' ? unwrapAlgorithm : (unwrapAlgorithm && unwrapAlgorithm.name);
+            let result;
+            if (String(rawName || '').toUpperCase() === 'AES-CBC') {
+                const checked = _checkAesCbcOperation(unwrapAlgorithm, unwrappingKey, 'unwrapKey', 'unwrapKey');
+                result = ops.op_crypto_aes_cbc_decrypt(checked.state.bytes, checked.alg.iv, _toBytes(wrappedKey));
+                if (!result.ok) throw new DOMException('', 'OperationError');
+            } else {
+                const { alg, state } = _checkAesGcmOperation(unwrapAlgorithm, unwrappingKey, 'unwrapKey');
+                result = ops.op_crypto_aes_gcm_decrypt(
+                    state.bytes, alg.iv, alg.additionalData, _toBytes(wrappedKey), alg.tagLength / 8
+                );
+                if (!result.ok) {
+                    throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
+                }
             }
             const raw = new Uint8Array(result.data);
             return _SubtleProto.importKey.call(

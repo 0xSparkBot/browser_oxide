@@ -6695,25 +6695,30 @@ async fn crypto_subtle_aes_gcm_matches_nist_and_key_semantics() {
                         result.wrongUsage = e.name;
                     }
 
-                    const key192 = await crypto.subtle.importKey(
-                        'raw', new Uint8Array(24), 'AES-GCM', true, ['encrypt', 'decrypt']
-                    );
-                    const aad = new Uint8Array([1, 2, 3]);
-                    const shortCipher = await crypto.subtle.encrypt(
-                        { name: 'AES-GCM', iv, additionalData: aad, tagLength: 32 },
-                        key192,
-                        new Uint8Array([4, 5])
-                    );
-                    const shortPlain = await crypto.subtle.decrypt(
-                        { name: 'AES-GCM', iv, additionalData: aad, tagLength: 32 },
-                        key192,
-                        shortCipher
-                    );
-                    result.aes192Tag32 = {
-                        algorithm: key192.algorithm,
-                        cipherBytes: shortCipher.byteLength,
-                        plain: hex(shortPlain),
-                    };
+                    try {
+                        await crypto.subtle.importKey(
+                            'raw', new Uint8Array(24), 'AES-GCM', true, ['encrypt', 'decrypt']
+                        );
+                        result.aes192 = 'ok';
+                    } catch (e) {
+                        result.aes192 = `${e.name}:${e.message}`;
+                    }
+                    try {
+                        await crypto.subtle.generateKey(
+                            { name: 'AES-GCM', length: 192 }, true, ['encrypt']
+                        );
+                        result.aes192Generate = 'ok';
+                    } catch (e) {
+                        result.aes192Generate = `${e.name}:${e.message}`;
+                    }
+                    try {
+                        await crypto.subtle.importKey(
+                            'raw', keyBytes, 'AES-GCM', true, []
+                        );
+                        result.emptyUsages = 'ok';
+                    } catch (e) {
+                        result.emptyUsages = `${e.name}:${e.message}`;
+                    }
 
                     const generated = await crypto.subtle.generateKey(
                         { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']
@@ -6830,11 +6835,17 @@ async fn crypto_subtle_aes_gcm_matches_nist_and_key_semantics() {
     assert_eq!(value["badUsage"], "SyntaxError");
     assert_eq!(value["wrongUsage"], "InvalidAccessError");
     assert_eq!(
-        value["aes192Tag32"]["algorithm"],
-        serde_json::json!({"name":"AES-GCM","length":192})
+        value["aes192"],
+        "OperationError:192-bit AES keys are not supported"
     );
-    assert_eq!(value["aes192Tag32"]["cipherBytes"], 6);
-    assert_eq!(value["aes192Tag32"]["plain"], "0405");
+    assert_eq!(
+        value["aes192Generate"],
+        "OperationError:192-bit AES keys are not supported"
+    );
+    assert_eq!(
+        value["emptyUsages"],
+        "SyntaxError:Usages cannot be empty when creating a key."
+    );
     assert_eq!(
         value["generated"]["algorithm"],
         serde_json::json!({"name":"AES-GCM","length":256})

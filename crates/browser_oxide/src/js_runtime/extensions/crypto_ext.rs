@@ -2,7 +2,7 @@
 //! `crypto.subtle` stub so scripts that hash payloads via
 //! `crypto.subtle.digest("SHA-256", ...)` see a real result.
 
-use boring2::symm::{decrypt_aead, encrypt_aead, Cipher};
+use boring2::symm::{decrypt, decrypt_aead, encrypt, encrypt_aead, Cipher};
 use deno_core::op2;
 use serde::Serialize;
 use sha1::Sha1;
@@ -14,10 +14,31 @@ pub struct AesGcmResult {
     pub data: Vec<u8>,
 }
 
+fn aes_cbc_cipher(key_len: usize) -> Option<Cipher> {
+    match key_len {
+        16 => Some(Cipher::aes_128_cbc()),
+        32 => Some(Cipher::aes_256_cbc()),
+        _ => None,
+    }
+}
+
+fn aes_cbc_encrypt_bytes(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if iv.len() != 16 {
+        return None;
+    }
+    encrypt(aes_cbc_cipher(key.len())?, key, Some(iv), data).ok()
+}
+
+fn aes_cbc_decrypt_bytes(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if iv.len() != 16 || data.is_empty() || !data.len().is_multiple_of(16) {
+        return None;
+    }
+    decrypt(aes_cbc_cipher(key.len())?, key, Some(iv), data).ok()
+}
+
 fn aes_gcm_cipher(key_len: usize) -> Option<Cipher> {
     match key_len {
         16 => Some(Cipher::aes_128_gcm()),
-        24 => Some(Cipher::aes_192_gcm()),
         32 => Some(Cipher::aes_256_gcm()),
         _ => None,
     }
@@ -266,6 +287,38 @@ pub fn op_crypto_aes_gcm_decrypt(
     }
 }
 
+#[op2]
+#[serde]
+pub fn op_crypto_aes_cbc_encrypt(
+    #[buffer] key: &[u8],
+    #[buffer] iv: &[u8],
+    #[buffer] data: &[u8],
+) -> AesGcmResult {
+    match aes_cbc_encrypt_bytes(key, iv, data) {
+        Some(data) => AesGcmResult { ok: true, data },
+        None => AesGcmResult {
+            ok: false,
+            data: Vec::new(),
+        },
+    }
+}
+
+#[op2]
+#[serde]
+pub fn op_crypto_aes_cbc_decrypt(
+    #[buffer] key: &[u8],
+    #[buffer] iv: &[u8],
+    #[buffer] data: &[u8],
+) -> AesGcmResult {
+    match aes_cbc_decrypt_bytes(key, iv, data) {
+        Some(data) => AesGcmResult { ok: true, data },
+        None => AesGcmResult {
+            ok: false,
+            data: Vec::new(),
+        },
+    }
+}
+
 #[op2(fast)]
 pub fn op_crypto_random_fill(#[buffer] out: &mut [u8]) {
     use rand::Rng;
@@ -281,6 +334,8 @@ deno_core::extension!(
         op_crypto_hkdf,
         op_crypto_aes_gcm_encrypt,
         op_crypto_aes_gcm_decrypt,
+        op_crypto_aes_cbc_encrypt,
+        op_crypto_aes_cbc_decrypt,
         op_crypto_random_fill
     ],
 );
@@ -288,7 +343,8 @@ deno_core::extension!(
 #[cfg(test)]
 mod tests {
     use super::{
-        aes_gcm_decrypt_bytes, aes_gcm_encrypt_bytes, hkdf_bytes, hmac_bytes, pbkdf2_bytes,
+        aes_cbc_decrypt_bytes, aes_cbc_encrypt_bytes, aes_gcm_decrypt_bytes, aes_gcm_encrypt_bytes,
+        hkdf_bytes, hmac_bytes, pbkdf2_bytes,
     };
 
     #[test]
@@ -411,5 +467,24 @@ mod tests {
         let mut tampered = encrypted;
         *tampered.last_mut().unwrap() ^= 1;
         assert!(aes_gcm_decrypt_bytes(&key, &iv, aad, &tampered, 16).is_none());
+    }
+
+    #[test]
+    fn aes_cbc_matches_chromium_pkcs7_vector_and_rejects_invalid_inputs() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let encrypted = aes_cbc_encrypt_bytes(&key, &iv, b"hello").unwrap();
+        assert_eq!(hex::encode(&encrypted), "9834ed518cbc8fbe9af3c6ecb75eb8c0");
+        assert_eq!(
+            aes_cbc_decrypt_bytes(&key, &iv, &encrypted).unwrap(),
+            b"hello"
+        );
+
+        let mut tampered = encrypted;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(aes_cbc_decrypt_bytes(&key, &iv, &tampered).is_none());
+        assert!(aes_cbc_decrypt_bytes(&key, &iv, &[0u8; 15]).is_none());
+        assert!(aes_cbc_encrypt_bytes(&[0u8; 24], &iv, b"hello").is_none());
+        assert!(aes_cbc_encrypt_bytes(&key, &[0u8; 15], b"hello").is_none());
     }
 }
