@@ -193,6 +193,27 @@ impl<'a> Element for DomElement<'a> {
         true
     }
 
+    fn lang(&self) -> Option<&str> {
+        // HTML language is inherited from the nearest ancestor carrying a
+        // `lang` attribute. An explicitly empty value is significant: it
+        // declares the language unknown and therefore stops inheritance.
+        let mut current = Some(self.id);
+        while let Some(id) = current {
+            let node = self.dom.get(id)?;
+            if let Some(data) = node.as_element() {
+                if let Some(attr) = data
+                    .attrs
+                    .iter()
+                    .find(|a| a.name.local.eq_ignore_ascii_case("lang"))
+                {
+                    return Some(attr.value.as_str());
+                }
+            }
+            current = node.parent;
+        }
+        None
+    }
+
     fn is_link(&self) -> bool {
         let name = self.local_name();
         (name == "a" || name == "area") && self.has_attribute("href")

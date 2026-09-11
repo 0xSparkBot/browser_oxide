@@ -613,3 +613,63 @@ async fn selector_dir_matches_inherited_and_auto_directionality() {
         );
     }
 }
+
+#[tokio::test]
+async fn selector_lang_matches_inherited_html_language() {
+    let mut rt = BrowserJsRuntime::new(browser_oxide::html_parser::parse_html(
+        r#"<!doctype html><html lang="en-US"><body>
+          <div id="fr" lang="fr-CA"><span id="fr-child"></span></div>
+          <div id="empty" lang=""><span id="empty-child"></span></div>
+          <div id="private" lang="x-private"><span id="private-child"></span></div>
+          <div id="plain"><span id="plain-child"></span></div>
+        </body></html>"#,
+    ));
+
+    let result = rt
+        .execute_script(
+            r#"JSON.stringify({
+              bodyEn:document.body.matches(':lang(en)'),
+              bodyEnUs:document.body.matches(':lang(en-US)'),
+              bodyUpper:document.body.matches(':lang(EN)'),
+              fr:document.getElementById('fr').matches(':lang(fr)'),
+              frChild:document.getElementById('fr-child').matches(':lang(fr-ca)'),
+              emptyEn:document.getElementById('empty').matches(':lang(en)'),
+              emptyChildEn:document.getElementById('empty-child').matches(':lang(en)'),
+              private:document.getElementById('private-child').matches(':lang(x-private)'),
+              plain:document.getElementById('plain-child').matches(':lang(en)'),
+              unknown:document.querySelectorAll(':lang(zz)').length
+            })"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+        serde_json::json!({
+            "bodyEn": true,
+            "bodyEnUs": true,
+            "bodyUpper": true,
+            "fr": true,
+            "frChild": true,
+            "emptyEn": false,
+            "emptyChildEn": false,
+            "private": true,
+            "plain": true,
+            "unknown": 0
+        })
+    );
+
+    for selector in [
+        ":lang()",
+        ":lang(de, fr)",
+        ":lang(\"fr\")",
+        ":lang(en fr)",
+        ":lang(*)",
+    ] {
+        let js = format!("(()=>{{try{{document.querySelectorAll({selector:?});return 'NO_THROW'}}catch(e){{return e.name}}}})()");
+        assert_eq!(
+            rt.execute_script(&js, None).unwrap(),
+            "SyntaxError",
+            "{selector}"
+        );
+    }
+}

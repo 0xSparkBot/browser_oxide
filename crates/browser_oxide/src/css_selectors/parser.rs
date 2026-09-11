@@ -669,25 +669,28 @@ impl<'a> SelectorParser<'a> {
     }
 
     fn parse_lang_pseudo(&mut self) -> Result<PseudoClass, SelectorParseError> {
-        let mut langs = Vec::new();
-        loop {
-            self.skip_whitespace();
-            match self.current_kind() {
-                TokenKind::Ident(name) => {
-                    langs.push(name.to_string());
-                    self.advance();
-                }
-                TokenKind::String(s) => {
-                    langs.push(s.to_string());
-                    self.advance();
-                }
-                TokenKind::Comma => {
-                    self.advance();
-                }
-                _ => break,
+        self.skip_whitespace();
+        let language = match self.current_kind() {
+            TokenKind::Ident(name) => {
+                let value = name.to_string();
+                self.advance();
+                value
             }
+            _ => {
+                return Err(SelectorParseError::UnexpectedToken {
+                    loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                    message: "expected language identifier".into(),
+                });
+            }
+        };
+        self.skip_whitespace();
+        if !matches!(self.current_kind(), TokenKind::CloseParen) {
+            return Err(SelectorParseError::UnexpectedToken {
+                loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                message: "expected ')' after :lang() argument".into(),
+            });
         }
-        Ok(PseudoClass::Lang(langs))
+        Ok(PseudoClass::Lang(vec![language]))
     }
 
     fn parse_pseudo_element(&mut self) -> Result<SimpleSelector, SelectorParseError> {
