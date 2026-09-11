@@ -1992,6 +1992,77 @@ impl Page {
         Self::build_page_with_scripts_and_init(html, url, &profile, &client, &[]).await
     }
 
+    /// Build a fresh document from a response that has already been fetched by
+    /// an embedding layer (for example the CDP server's `Page.navigate`).
+    ///
+    /// This preserves the normal browser document pipeline — response CSP,
+    /// cross-origin-isolation state, init scripts, external resources and the
+    /// full classic/module/defer/async scheduler — without issuing a second
+    /// main-document request.  The caller remains responsible for its own
+    /// inspector/network bookkeeping for `response`.
+    pub(crate) async fn from_fetched_response_with_init(
+        response: &crate::net::Response,
+        client: &crate::net::HttpClient,
+        init_scripts: &[String],
+    ) -> Result<Self, deno_core::error::AnyError> {
+        let html = response.text();
+        let url = response.url.clone();
+        let profile = client.profile().clone();
+
+        // Response-header CSP participates in the same policy set as meta CSP.
+        // `build_page_with_scripts_init_and_storage` consumes the process-level
+        // policy while it fetches parser-inserted subresources, so install it
+        // before entering the shared document builder.
+        let csp_headers: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-security-policy"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        let csp_headers_ro: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-security-policy-report-only"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        let csp_dom = crate::html_parser::parse_html(&html);
+        let policy_set = crate::csp_collector::collect_csp_with_report_only(
+            &csp_headers,
+            &csp_headers_ro,
+            &csp_dom,
+        );
+        let enforce_csp = profile.enforce_csp && std::env::var("BROWSER_OXIDE_CSP_BYPASS").is_err();
+        if let Ok(origin) = url::Url::parse(&url) {
+            if policy_set.is_empty() {
+                crate::js_runtime::extensions::fetch_ext::clear_csp_policy();
+            } else {
+                crate::js_runtime::extensions::fetch_ext::set_csp_policy(
+                    std::sync::Arc::new(policy_set),
+                    origin,
+                    enforce_csp,
+                );
+            }
+        } else {
+            crate::js_runtime::extensions::fetch_ext::clear_csp_policy();
+        }
+
+        let cross_origin_isolated = response_is_cross_origin_isolated(&url, &response.headers);
+        let mut page = Self::build_page_with_scripts_init_and_storage(
+            &html,
+            &url,
+            &profile,
+            client,
+            init_scripts,
+            None,
+            cross_origin_isolated,
+        )
+        .await?;
+        // Keep the same connection/cookie/Accept-CH pools available to any
+        // later warm navigation performed through this Page.
+        page.http_client = Some(client.clone());
+        Ok(page)
+    }
+
     pub fn consume_and_print_logs(&mut self) {
         let logs = {
             let runtime = self.event_loop.runtime_mut().inner();
@@ -4288,6 +4359,17 @@ impl Page {
     ) {
         if code.trim().is_empty() {
             return;
+        }
+        if script.src.is_none() {
+            if let Err(violated) = crate::js_runtime::extensions::fetch_ext::check_inline_script_csp(
+                &code,
+                script.nonce.as_deref(),
+            ) {
+                eprintln!(
+                    "[csp] Refused to execute inline script because it violates the following Content Security Policy directive: \"{violated}\"."
+                );
+                return;
+            }
         }
         let name = script
             .src

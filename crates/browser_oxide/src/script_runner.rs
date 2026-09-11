@@ -74,29 +74,31 @@ enum ScriptKind {
 /// Classify an HTML `<script type>` value using browser-style semantics.
 ///
 /// Missing/empty `type` is classic JavaScript. `module` is an ES-module
-/// entry. Otherwise only JavaScript MIME types execute; every other value is
-/// a data block and must not be handed to V8 as source code.
+/// entry, matched ASCII-case-insensitively but without trimming. Otherwise
+/// only exact JavaScript MIME type strings execute after stripping surrounding
+/// ASCII whitespace; MIME parameters are not accepted by the HTML `type`
+/// attribute. Every other value is a data block and must not be handed to V8.
 fn classify_script_type(raw: Option<&str>) -> ScriptKind {
     let Some(raw) = raw else {
         return ScriptKind::Classic;
     };
-    let value = raw.trim();
-    if value.is_empty() {
+    if raw.is_empty() {
         return ScriptKind::Classic;
     }
-    if value.eq_ignore_ascii_case("module") {
+    if raw.eq_ignore_ascii_case("module") {
         return ScriptKind::Module;
     }
-    if value.eq_ignore_ascii_case("importmap") || value.eq_ignore_ascii_case("speculationrules") {
+    if raw.eq_ignore_ascii_case("importmap") || raw.eq_ignore_ascii_case("speculationrules") {
         return ScriptKind::Data;
     }
 
-    // MIME parameters do not change the JavaScript MIME essence, e.g.
-    // `text/javascript; charset=utf-8` is still executable JavaScript.
-    let essence = value
-        .split_once(';')
-        .map_or(value, |(essence, _)| essence)
-        .trim();
+    // Chrome strips surrounding ASCII whitespace for JavaScript MIME tokens,
+    // but a non-empty whitespace-only value is still an invalid/data type.
+    // Do not use str::trim(): HTML only treats ASCII whitespace specially.
+    let value = raw.trim_matches(|c| matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' '));
+    if value.is_empty() {
+        return ScriptKind::Data;
+    }
     let is_javascript_mime = [
         "application/ecmascript",
         "application/javascript",
@@ -116,7 +118,7 @@ fn classify_script_type(raw: Option<&str>) -> ScriptKind {
         "text/x-javascript",
     ]
     .iter()
-    .any(|candidate| essence.eq_ignore_ascii_case(candidate));
+    .any(|candidate| value.eq_ignore_ascii_case(candidate));
 
     if is_javascript_mime {
         ScriptKind::Classic
@@ -243,12 +245,21 @@ mod tests {
     fn script_type_classification_matches_browser_execution_rules() {
         assert_eq!(classify_script_type(None), ScriptKind::Classic);
         assert_eq!(classify_script_type(Some("")), ScriptKind::Classic);
-        assert_eq!(classify_script_type(Some("  \t")), ScriptKind::Classic);
+        assert_eq!(classify_script_type(Some("  \t")), ScriptKind::Data);
         assert_eq!(classify_script_type(Some("module")), ScriptKind::Module);
         assert_eq!(classify_script_type(Some("MODULE")), ScriptKind::Module);
+        assert_eq!(classify_script_type(Some(" module ")), ScriptKind::Data);
+        assert_eq!(
+            classify_script_type(Some(" text/javascript ")),
+            ScriptKind::Classic
+        );
         assert_eq!(
             classify_script_type(Some("text/javascript; charset=utf-8")),
-            ScriptKind::Classic
+            ScriptKind::Data
+        );
+        assert_eq!(
+            classify_script_type(Some("text/javascript;charset=utf-8")),
+            ScriptKind::Data
         );
         assert_eq!(
             classify_script_type(Some("application/javascript")),
@@ -277,9 +288,11 @@ mod tests {
                 <script>globalThis.a = 1;</script>
                 <script type="a-state">{"not":"javascript"}</script>
                 <script type="application/x-custom-data">value: still-data</script>
-                <script type="text/javascript; charset=utf-8">globalThis.b = 2;</script>
+                <script type="text/javascript; charset=utf-8">globalThis.param = 'data';</script>
+                <script type=" text/javascript ">globalThis.b = 2;</script>
                 <script nomodule>globalThis.legacy = true;</script>
-                <script type="module">globalThis.c = 3;</script>
+                <script type="MODULE">globalThis.c = 3;</script>
+                <script type=" module ">globalThis.spacedModule = 'data';</script>
                 <script type="importmap">{"imports":{}}</script>
                 <script type="speculationrules">{"prefetch":[]}</script>
             </body></html>"#,

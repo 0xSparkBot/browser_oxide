@@ -120,6 +120,35 @@ pub fn check_csp(
     check_csp_for_document_origin(directive, url, nonce, parser_inserted, None)
 }
 
+/// Enforce the active document CSP for an inline `<script>` element.
+/// URL allowlists such as `'self'` do not authorize inline source; only
+/// inline-specific sources (`'unsafe-inline'`, nonce, hash) are considered.
+pub fn check_inline_script_csp(source_text: &str, nonce: Option<&str>) -> Result<(), &'static str> {
+    let decision = ACTIVE_CSP.with(|c| {
+        let guard = c.borrow();
+        let active = guard.as_ref()?;
+        if !active.enforce {
+            return None;
+        }
+        Some(active.policy.allows_inline_script(nonce, source_text))
+    });
+    let Some(decision) = decision else {
+        return Ok(());
+    };
+    if decision.allowed {
+        Ok(())
+    } else {
+        let dir_name = decision.matched_directive.as_str();
+        push_csp_violation(CspViolation {
+            blocked_uri: "inline".to_string(),
+            effective_directive: dir_name.to_string(),
+            violated_directive: dir_name.to_string(),
+            disposition: "enforce".to_string(),
+        });
+        Err(dir_name)
+    }
+}
+
 /// The op-fetch variant of [`check_csp`], scoped to the document that
 /// initiated the request. Child frame runtimes share the same OS thread as
 /// their parent, so the thread-local active policy can belong to a different

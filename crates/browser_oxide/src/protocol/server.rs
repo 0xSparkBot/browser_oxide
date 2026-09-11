@@ -12,6 +12,8 @@ use std::rc::Rc;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
+type SharedPage = Rc<RefCell<Option<crate::Page>>>;
+
 /// A running CDP server. Stops when dropped.
 pub struct CdpServer {
     port: u16,
@@ -56,7 +58,7 @@ impl CdpServer {
                             return;
                         }
                     };
-                let page = Rc::new(RefCell::new(page));
+                let page = Rc::new(RefCell::new(Some(page)));
 
                 let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
                     Ok(l) => l,
@@ -150,7 +152,7 @@ impl CdpServer {
                         return;
                     }
                 };
-                let page = Rc::new(RefCell::new(page));
+                let page = Rc::new(RefCell::new(Some(page)));
                 let http_client = Some(Rc::new(client));
 
                 let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
@@ -236,7 +238,7 @@ impl CdpServer {
                         return;
                     }
                 };
-                let page = Rc::new(RefCell::new(page));
+                let page = Rc::new(RefCell::new(Some(page)));
                 let http_client = Some(Rc::new(client));
 
                 let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
@@ -303,7 +305,7 @@ impl Drop for CdpServer {
 
 async fn accept_loop(
     listener: TcpListener,
-    page: Rc<RefCell<crate::Page>>,
+    page: SharedPage,
     http_client: Option<Rc<crate::net::HttpClient>>,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
 ) {
@@ -342,7 +344,7 @@ async fn accept_loop(
 )]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
-    page: Rc<RefCell<crate::Page>>,
+    page: SharedPage,
     http_client: Option<Rc<crate::net::HttpClient>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Peek enough bytes to check for WebSocket upgrade header
@@ -386,16 +388,15 @@ async fn handle_connection(
                 };
 
                 let (response, mut events) = {
-                    let mut page_ref = page.borrow_mut();
+                    let mut page_slot = page.borrow_mut();
+                    let page_ref = page_slot.as_mut().ok_or_else(|| {
+                        std::io::Error::other("CDP page is temporarily unavailable")
+                    })?;
                     let client_ref = http_client.as_deref();
-                    session
-                        .handle_request(&mut page_ref, &req, client_ref)
-                        .await
+                    session.handle_request(page_ref, &req, client_ref).await
                 };
 
                 // Handle pending navigation (Page.navigate).
-                // Uses reload_html to swap DOM in the existing V8 isolate —
-                // avoids the 17ms cost of creating a new isolate.
                 if let Some(navigation) = session.pending_navigate.take() {
                     if let Some(client) = http_client.as_deref() {
                         let extra_headers = session.navigation_extra_headers();
@@ -425,21 +426,23 @@ async fn handle_connection(
                                     }
                                 }
 
-                                let html = resp.text();
-                                let mut borrow = page.borrow_mut();
-                                // Same warm-reuse contract as `PagePool` (#33):
-                                // this session keeps ONE `Page` alive for its whole
-                                // lifetime, so without an explicit reset the
-                                // previous document's listeners, DOM registries and
-                                // window properties accumulate for as long as the
-                                // client stays connected — and its listeners misfire
-                                // on the new document, since node IDs restart.
-                                borrow.reset_for_reuse();
-                                borrow.reload_html(&html, &navigation.url);
-                                // Re-inject scripts registered via addScriptToEvaluateOnNewDocument
-                                for script in &session.scripts_on_new_document {
-                                    let _ = borrow.evaluate(script);
-                                }
+                                // A top-level browser navigation creates a fresh
+                                // document execution context. Drop the old Page
+                                // before constructing the replacement so V8
+                                // isolates are destroyed in LIFO order, then send
+                                // the already-fetched response through the normal
+                                // document builder. This preserves external/module
+                                // scheduling and runs addScriptToEvaluateOnNewDocument
+                                // scripts before the document's own scripts.
+                                let old_page = page.borrow_mut().take();
+                                drop(old_page);
+                                let new_page = crate::Page::from_fetched_response_with_init(
+                                    &resp,
+                                    client,
+                                    &session.scripts_on_new_document,
+                                )
+                                .await?;
+                                *page.borrow_mut() = Some(new_page);
                             }
                             Err(error) => {
                                 let failure_events = session
@@ -476,7 +479,7 @@ async fn handle_connection(
 /// Fast path for Runtime.evaluate — extracts id+expression with string scanning
 /// instead of full JSON parse, evaluates directly, formats response manually.
 /// Returns None if the message isn't a simple Runtime.evaluate.
-fn fast_evaluate(text: &str, page: &Rc<RefCell<crate::Page>>) -> Option<String> {
+fn fast_evaluate(text: &str, page: &SharedPage) -> Option<String> {
     // Quick check: must contain Runtime.evaluate
     if !text.contains("Runtime.evaluate") {
         return None;
@@ -507,7 +510,8 @@ fn fast_evaluate(text: &str, page: &Rc<RefCell<crate::Page>>) -> Option<String> 
         serde_json::from_str(&after_trim[..find_json_string_end(after_trim)?]).ok()?;
 
     // Evaluate
-    let mut page_ref = page.borrow_mut();
+    let mut page_slot = page.borrow_mut();
+    let page_ref = page_slot.as_mut()?;
     match page_ref.evaluate(&expression) {
         Ok(result_str) => {
             let js_t = match result_str.as_str() {
@@ -554,7 +558,7 @@ fn find_json_string_end(s: &str) -> Option<usize> {
 
 async fn handle_http(
     stream: tokio::net::TcpStream,
-    page: &Rc<RefCell<crate::Page>>,
+    page: &SharedPage,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -585,10 +589,12 @@ async fn handle_http(
         .to_string(),
         "/json" | "/json/list" => {
             let (title, url) = {
-                let mut page_ref = page.borrow_mut();
-                let title = page_ref.title();
-                let url = page_ref.url().to_string();
-                (title, url)
+                let mut page_slot = page.borrow_mut();
+                if let Some(page_ref) = page_slot.as_mut() {
+                    (page_ref.title(), page_ref.url().to_string())
+                } else {
+                    (String::new(), "about:blank".to_string())
+                }
             };
             serde_json::json!([{
                 "description": "",
@@ -638,6 +644,55 @@ mod tests {
             stream.flush().unwrap();
         });
         (format!("http://{addr}/fixture"), thread)
+    }
+
+    fn start_local_script_fixture() -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 8192];
+                let n = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (content_type, extra_headers, body) = if path.starts_with("/external.js") {
+                    (
+                        "text/javascript; charset=utf-8",
+                        "",
+                        "globalThis.__cdpOrder.push('external:' + String(document.currentScript && document.currentScript.src.endsWith('/external.js')));",
+                    )
+                } else {
+                    (
+                        "text/html; charset=utf-8",
+                        "Content-Security-Policy: script-src 'self' 'nonce-ok'\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\n",
+                        r#"<!doctype html><html><body>
+                            <script>globalThis.__cdpOrder.push('blocked-by-response-csp');</script>
+                            <script nonce="ok">
+                                globalThis.__cdpOrder.push('inline:' + String(document.currentScript !== null));
+                            </script>
+                            <script src="/external.js"></script>
+                            <script type="module" nonce="ok">
+                                await Promise.resolve();
+                                globalThis.__cdpOrder.push('module:' + String(document.currentScript === null));
+                            </script>
+                        </body></html>"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (format!("http://{addr}/index.html"), thread)
     }
 
     #[test]
@@ -747,6 +802,94 @@ mod tests {
                 if value.get("id").and_then(|v| v.as_u64()) == Some(4) {
                     assert_eq!(value["result"]["body"], BODY);
                     assert_eq!(value["result"]["base64Encoded"], false);
+                    break;
+                }
+            }
+
+            tx.send(Message::Close(None)).await.ok();
+        });
+
+        fixture_thread.join().unwrap();
+        drop(server);
+    }
+
+    #[test]
+    fn cdp_navigation_runs_init_external_and_module_scripts_in_browser_order() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (url, fixture_thread) = start_local_script_fixture();
+        let server = CdpServer::start_navigable(0).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let (ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+                .await
+                .unwrap();
+            let (mut tx, mut rx) = ws.split();
+
+            tx.send(Message::Text(
+                serde_json::json!({
+                    "id": 1,
+                    "method": "Page.addScriptToEvaluateOnNewDocument",
+                    "params": {"source": "globalThis.__cdpOrder = ['init'];"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                let Message::Text(text) = rx.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value.get("id").and_then(|v| v.as_u64()) == Some(1) {
+                    break;
+                }
+            }
+
+            tx.send(Message::Text(
+                serde_json::json!({
+                    "id": 2,
+                    "method": "Page.navigate",
+                    "params": {"url": url},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                let Message::Text(text) = rx.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value.get("id").and_then(|v| v.as_u64()) == Some(2) {
+                    break;
+                }
+            }
+
+            tx.send(Message::Text(
+                serde_json::json!({
+                    "id": 3,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "JSON.stringify({order: globalThis.__cdpOrder, isolated: crossOriginIsolated})"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                let Message::Text(text) = rx.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value.get("id").and_then(|v| v.as_u64()) == Some(3) {
+                    assert_eq!(
+                        value["result"]["value"],
+                        r#"{"order":["init","inline:true","external:true","module:true"],"isolated":true}"#
+                    );
                     break;
                 }
             }

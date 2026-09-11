@@ -24,6 +24,8 @@
 
 use std::collections::HashMap;
 
+use base64::Engine as _;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use url::Url;
 
 // ---------------------------------------------------------------------
@@ -521,6 +523,78 @@ impl Policy {
     }
 }
 
+impl PolicySet {
+    /// Check an inline `<script>` element. Network source expressions such as
+    /// `'self'`, host sources and schemes never authorize inline source text;
+    /// the script needs `'unsafe-inline'`, a matching nonce, or a matching hash.
+    pub fn allows_inline_script(&self, nonce: Option<&str>, source_text: &str) -> AllowDecision {
+        if self.policies.is_empty() {
+            return AllowDecision::allow_no_policy();
+        }
+        for policy in &self.policies {
+            let decision = policy.allows_inline_script(nonce, source_text);
+            if !decision.allowed && !policy.report_only {
+                return decision;
+            }
+        }
+        AllowDecision::allow_no_policy()
+    }
+}
+
+impl Policy {
+    fn allows_inline_script(&self, nonce: Option<&str>, source_text: &str) -> AllowDecision {
+        for &candidate in Directive::ScriptSrcElem.fallback_chain() {
+            if let Some(sources) = self.directives.get(&candidate) {
+                return AllowDecision {
+                    allowed: match_inline_script_sources(sources, nonce, source_text),
+                    matched_directive: candidate,
+                    report_only: self.report_only,
+                };
+            }
+        }
+        AllowDecision::allow_no_policy()
+    }
+}
+
+fn match_inline_script_sources(sources: &[Source], nonce: Option<&str>, source_text: &str) -> bool {
+    if sources.is_empty() {
+        return false;
+    }
+
+    for source in sources {
+        match source {
+            Source::Nonce(expected) if nonce.is_some_and(|supplied| supplied == expected) => {
+                return true;
+            }
+            Source::Hash(algo, expected) => {
+                let digest = match algo {
+                    HashAlgo::Sha256 => base64::engine::general_purpose::STANDARD
+                        .encode(Sha256::digest(source_text.as_bytes())),
+                    HashAlgo::Sha384 => base64::engine::general_purpose::STANDARD
+                        .encode(Sha384::digest(source_text.as_bytes())),
+                    HashAlgo::Sha512 => base64::engine::general_purpose::STANDARD
+                        .encode(Sha512::digest(source_text.as_bytes())),
+                };
+                if &digest == expected {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // CSP2+ ignores unsafe-inline when the source list contains a nonce or
+    // hash trust root. This is the standard backwards-compatible policy shape
+    // used by modern sites.
+    let has_nonce_or_hash = sources
+        .iter()
+        .any(|source| matches!(source, Source::Nonce(_) | Source::Hash(_, _)));
+    !has_nonce_or_hash
+        && sources
+            .iter()
+            .any(|source| matches!(source, Source::UnsafeInline))
+}
+
 /// Match a CheckCtx against a single directive's source list.
 ///
 /// Empty list ⇒ block (CSP3: directive with no values acts like `'none'`).
@@ -989,6 +1063,49 @@ mod tests {
         );
         assert!(
             !set.allows(&ctx(Directive::ScriptSrcElem, &any, &origin, None, true))
+                .allowed
+        );
+    }
+
+    #[test]
+    fn inline_script_requires_inline_authorization_not_self() {
+        let set = Policy::parse_meta_content("script-src 'self'");
+        let decision = set.allows_inline_script(None, "globalThis.ran = true;");
+        assert!(!decision.allowed);
+        assert_eq!(decision.matched_directive, Directive::ScriptSrc);
+    }
+
+    #[test]
+    fn inline_script_unsafe_inline_is_ignored_when_nonce_root_exists() {
+        let legacy = Policy::parse_meta_content("script-src 'self' 'unsafe-inline'");
+        assert!(
+            legacy
+                .allows_inline_script(None, "globalThis.ran = true;")
+                .allowed
+        );
+
+        let modern = Policy::parse_meta_content("script-src 'self' 'unsafe-inline' 'nonce-good'");
+        assert!(
+            !modern
+                .allows_inline_script(None, "globalThis.ran = true;")
+                .allowed
+        );
+        assert!(
+            modern
+                .allows_inline_script(Some("good"), "globalThis.ran = true;")
+                .allowed
+        );
+    }
+
+    #[test]
+    fn inline_script_hash_source_matches_exact_source_text() {
+        let source = "globalThis.ran = 'hash';";
+        let digest =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(source.as_bytes()));
+        let set = Policy::parse_meta_content(&format!("script-src 'sha256-{digest}'"));
+        assert!(set.allows_inline_script(None, source).allowed);
+        assert!(
+            !set.allows_inline_script(None, "globalThis.ran = 'different';")
                 .allowed
         );
     }
