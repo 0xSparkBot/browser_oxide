@@ -161,6 +161,79 @@
         },
     });
 
+    let _driverActiveTouches = [];
+    const _driverTouchFromPoint = (point) => {
+        const clientX = Number(point && point.x) || 0;
+        const clientY = Number(point && point.y) || 0;
+        const target = (document.elementFromPoint
+            && document.elementFromPoint(clientX, clientY))
+            || document.body
+            || document.documentElement
+            || document;
+        return new globalThis.Touch({
+            identifier: Number(point && point.id) || 0,
+            target,
+            clientX,
+            clientY,
+            screenX: clientX,
+            screenY: clientY,
+            pageX: clientX + (Number(globalThis.scrollX) || 0),
+            pageY: clientY + (Number(globalThis.scrollY) || 0),
+            radiusX: Number(point && point.radiusX) || 0,
+            radiusY: Number(point && point.radiusY) || 0,
+            rotationAngle: Number(point && point.rotationAngle) || 0,
+            force: Number(point && point.force) || 0,
+            touchType: 'direct',
+        });
+    };
+
+    Object.defineProperty(_browser_oxide, '__dispatchTrustedTouchEvent', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value(type, points, init = {}) {
+            const current = Array.isArray(points)
+                ? points.map(_driverTouchFromPoint)
+                : [];
+            let changed = current;
+            if (type === 'touchend' || type === 'touchcancel') {
+                changed = _driverActiveTouches;
+                _driverActiveTouches = [];
+            } else {
+                _driverActiveTouches = current;
+            }
+            const target = (changed[0] && changed[0].target)
+                || (current[0] && current[0].target)
+                || document.body
+                || document.documentElement
+                || document;
+            if (type === 'touchstart') {
+                _hasTrustedUserActivation = true;
+            }
+            const targetTouches = _driverActiveTouches.filter(touch => touch.target === target);
+            const event = _markTrustedEvent(new globalThis.TouchEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: globalThis,
+                touches: _driverActiveTouches.slice(),
+                targetTouches,
+                changedTouches: changed.slice(),
+                ctrlKey: !!init.ctrlKey,
+                shiftKey: !!init.shiftKey,
+                altKey: !!init.altKey,
+                metaKey: !!init.metaKey,
+            }));
+            target.dispatchEvent(event);
+            return {
+                target: String(target.tagName || target.nodeName || ''),
+                id: String(target.id || ''),
+                activeTouches: _driverActiveTouches.length,
+                changedTouches: changed.length,
+            };
+        },
+    });
+
     // Exposed via a Symbol slot so it survives `cleanup_bootstrap` deleting the
     // `Deno`/`ops` globals; the closure keeps `ops` reachable.
     try {

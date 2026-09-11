@@ -820,7 +820,45 @@ impl CdpSession {
                 }
                 Ok(serde_json::json!({}))
             }
-            "Input.dispatchTouchEvent" => Ok(serde_json::json!({})),
+            "Input.dispatchTouchEvent" => {
+                let event_type = req
+                    .params
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let dom_type = match event_type {
+                    "touchStart" => "touchstart",
+                    "touchMove" => "touchmove",
+                    "touchEnd" => "touchend",
+                    "touchCancel" => "touchcancel",
+                    _ => "",
+                };
+                if !dom_type.is_empty() {
+                    let points = req
+                        .params
+                        .get("touchPoints")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([]));
+                    let points_json =
+                        serde_json::to_string(&points).unwrap_or_else(|_| "[]".into());
+                    let modifiers = req
+                        .params
+                        .get("modifiers")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let script = format!(
+                        "globalThis._browser_oxide.__dispatchTrustedTouchEvent(\
+                         {dom_type:?},{points_json},{{\
+                         ctrlKey:{ctrl},shiftKey:{shift},altKey:{alt},metaKey:{meta}}})",
+                        ctrl = (modifiers & 2) != 0,
+                        shift = (modifiers & 8) != 0,
+                        alt = (modifiers & 1) != 0,
+                        meta = (modifiers & 4) != 0,
+                    );
+                    let _ = page.evaluate(&script);
+                }
+                Ok(serde_json::json!({}))
+            }
             "Input.insertText" => {
                 let text = req
                     .params
@@ -1116,6 +1154,116 @@ mod tests {
             "true"
         );
         assert_eq!(page.evaluate("String(window.scrollY)").unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn input_touch_events_preserve_points_and_trust() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            r#"<html><body style="margin:0">
+              <div id="target" style="width:300px;height:300px"></div>
+              <script>
+                globalThis.__touchEvents = [];
+                for (const type of ['touchstart', 'touchmove', 'touchend']) {
+                  document.addEventListener(type, event => {
+                    const point = list => list.length ? {
+                      id: list[0].identifier,
+                      x: list[0].clientX,
+                      y: list[0].clientY,
+                      force: list[0].force,
+                      target: list[0].target && list[0].target.id,
+                    } : null;
+                    globalThis.__touchEvents.push({
+                      type: event.type,
+                      trusted: event.isTrusted,
+                      shift: event.shiftKey,
+                      touches: event.touches.length,
+                      changed: event.changedTouches.length,
+                      touch: point(event.touches),
+                      changedTouch: point(event.changedTouches),
+                    });
+                  });
+                }
+              </script>
+            </body></html>"#,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for (id, event_type, points) in [
+            (
+                32,
+                "touchStart",
+                serde_json::json!([{"id":7,"x":10,"y":20,"radiusX":4,"radiusY":5,"force":0.5}]),
+            ),
+            (
+                33,
+                "touchMove",
+                serde_json::json!([{"id":7,"x":15,"y":25,"radiusX":4,"radiusY":5,"force":0.75}]),
+            ),
+            (34, "touchEnd", serde_json::json!([])),
+        ] {
+            let req = CdpRequest {
+                id,
+                method: "Input.dispatchTouchEvent".to_string(),
+                params: serde_json::json!({
+                    "type": event_type,
+                    "touchPoints": points,
+                    "modifiers": 8,
+                }),
+            };
+            let (resp, _) = session.handle_request(&mut page, &req, None).await;
+            assert!(resp.contains(&format!("\"id\":{id}")), "response: {resp}");
+        }
+
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__touchEvents)")
+                .unwrap(),
+            r#"[{"type":"touchstart","trusted":true,"shift":true,"touches":1,"changed":1,"touch":{"id":7,"x":10,"y":20,"force":0.5,"target":"target"},"changedTouch":{"id":7,"x":10,"y":20,"force":0.5,"target":"target"}},{"type":"touchmove","trusted":true,"shift":true,"touches":1,"changed":1,"touch":{"id":7,"x":15,"y":25,"force":0.75,"target":"target"},"changedTouch":{"id":7,"x":15,"y":25,"force":0.75,"target":"target"}},{"type":"touchend","trusted":true,"shift":true,"touches":0,"changed":1,"touch":null,"changedTouch":{"id":7,"x":15,"y":25,"force":0.75,"target":"target"}}]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn input_touch_cancel_uses_last_active_touch_as_changed_touch() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            r#"<html><body><script>
+              globalThis.__cancel = null;
+              document.addEventListener('touchcancel', event => {
+                globalThis.__cancel = {
+                  trusted: event.isTrusted,
+                  touches: event.touches.length,
+                  changed: event.changedTouches.length,
+                  id: event.changedTouches.length ? event.changedTouches[0].identifier : -1,
+                };
+              });
+            </script></body></html>"#,
+            None,
+        )
+        .await
+        .unwrap();
+        let start = CdpRequest {
+            id: 35,
+            method: "Input.dispatchTouchEvent".to_string(),
+            params: serde_json::json!({
+                "type": "touchStart",
+                "touchPoints": [{"id":11,"x":1,"y":1}],
+            }),
+        };
+        let cancel = CdpRequest {
+            id: 36,
+            method: "Input.dispatchTouchEvent".to_string(),
+            params: serde_json::json!({"type": "touchCancel", "touchPoints": []}),
+        };
+        let _ = session.handle_request(&mut page, &start, None).await;
+        let _ = session.handle_request(&mut page, &cancel, None).await;
+
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__cancel)")
+                .unwrap(),
+            r#"{"trusted":true,"touches":0,"changed":1,"id":11}"#
+        );
     }
 
     #[tokio::test]
