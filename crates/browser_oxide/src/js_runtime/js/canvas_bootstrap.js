@@ -1630,179 +1630,13 @@
         }
     }
 
-    // AudioContext + OfflineAudioContext
-    // Simulates the pipeline commonly used for audio fingerprinting:
-    //   OscillatorNode → DynamicsCompressorNode → destination
-    
-    class AudioNode extends EventTarget {
-        constructor() { super(); }
-        connect() {}
-        disconnect() {}
-    }
-
-    class AudioScheduledSourceNode extends AudioNode {
-        constructor() { super(); }
-        start() {}
-        stop() {}
-    }
-
-    class OscillatorNode extends AudioScheduledSourceNode {
-        _type = "sine";
-        constructor(context) {
-            super();
-            this._context = context;
-            this.frequency = {
-                _value: 440,
-                get value() { return this._value; },
-                set value(v) { this._value = v; if (context._setOscFreq) context._setOscFreq(v); }
-            };
-            this.detune = { value: 0 };
-        }
-        get type() { return this._type; }
-        set type(v) { this._type = v; if (this._context._setOscType) this._context._setOscType(v); }
-    }
-
-    class AudioParam {
-        constructor(val, context, setter) {
-            this._value = val;
-            this._context = context;
-            this._setter = setter;
-        }
-        get value() { return this._value; }
-        set value(v) { this._value = v; if (this._setter) this._setter(v); }
-        setValueAtTime() { return this; }
-        linearRampToValueAtTime() { return this; }
-        exponentialRampToValueAtTime() { return this; }
-        setTargetAtTime() { return this; }
-        setValueCurveAtTime() { return this; }
-        cancelScheduledValues() { return this; }
-        cancelAndHoldAtTime() { return this; }
-    }
-
-    class GainNode extends AudioNode {
-        constructor() {
-            super();
-            this.gain = new AudioParam(1);
-        }
-    }
-
-    class DynamicsCompressorNode extends AudioNode {
-        constructor(context) {
-            super();
-            this.threshold = new AudioParam(-24, context, v => { if (context._setCompThreshold) context._setCompThreshold(v); });
-            this.knee = new AudioParam(30, context, v => { if (context._setCompKnee) context._setCompKnee(v); });
-            this.ratio = new AudioParam(12, context, v => { if (context._setCompRatio) context._setCompRatio(v); });
-            this.attack = new AudioParam(0.003, context, v => { if (context._setCompAttack) context._setCompAttack(v); });
-            this.release = new AudioParam(0.25, context, v => { if (context._setCompRelease) context._setCompRelease(v); });
-        }
-    }
-
-    class BiquadFilterNode extends AudioNode {
-        constructor() {
-            super();
-            this.type = "lowpass";
-            this.frequency = new AudioParam(350);
-            this.detune = new AudioParam(0);
-            this.Q = new AudioParam(1);
-            this.gain = new AudioParam(0);
-        }
-        getFrequencyResponse(freqArr, magOut, phaseOut) {
-            if (!(freqArr instanceof Float32Array)) return;
-            const _typeIds = {
-                lowpass: 0, highpass: 1, bandpass: 2, lowshelf: 3,
-                highshelf: 4, peaking: 5, notch: 6, allpass: 7,
-            };
-            const tid = _typeIds[this.type] ?? 0;
-            const sr = (this._sampleRate || 44100);
-            const inBytes = new Uint8Array(freqArr.buffer, freqArr.byteOffset, freqArr.byteLength);
-            const out = ops.op_audio_biquad_response(
-                inBytes, tid,
-                this.frequency.value, this.Q.value,
-                this.gain.value, sr
-            );
-            const result = new Float32Array(out.buffer, out.byteOffset, out.byteLength / 4);
-            const n = freqArr.length;
-            const lenM = Math.min(magOut.length, n);
-            const lenP = Math.min(phaseOut.length, n);
-            for (let i = 0; i < lenM; i++) magOut[i] = result[i];
-            for (let i = 0; i < lenP; i++) phaseOut[i] = result[n + i];
-        }
-    }
-
-    class AnalyserNode extends AudioNode {
-        constructor() {
-            super();
-            this.fftSize = 2048;
-            this.smoothingTimeConstant = 0.8;
-            this.minDecibels = -100;
-            this.maxDecibels = -30;
-            this._timeDomain = null;
-            this._prevFreq = null;
-        }
-        get frequencyBinCount() { return this.fftSize / 2; }
-        getByteFrequencyData(arr) {
-            const f = new Float32Array(this.frequencyBinCount);
-            this.getFloatFrequencyData(f);
-            const range = this.maxDecibels - this.minDecibels;
-            const len = Math.min(arr.length, f.length);
-            for (let i = 0; i < len; i++) {
-                const norm = (f[i] - this.minDecibels) / range;
-                arr[i] = Math.max(0, Math.min(255, Math.round(norm * 255)));
-            }
-        }
-        getFloatFrequencyData(arr) {
-            if (!this._timeDomain || this._timeDomain.length < this.fftSize) {
-                for (let i = 0; i < arr.length; i++) arr[i] = this.minDecibels;
-                return;
-            }
-            const tdBytes = new Uint8Array(this._timeDomain.buffer, 0, this.fftSize * 4);
-            const prevBytes = this._prevFreq
-                ? new Uint8Array(this._prevFreq.buffer)
-                : new Uint8Array(0);
-            const out = ops.op_audio_analyser_freq_data(
-                tdBytes, this.fftSize,
-                Math.round(this.smoothingTimeConstant * 100),
-                prevBytes
-            );
-            const result = new Float32Array(out.buffer, out.byteOffset, out.byteLength / 4);
-            const len = Math.min(arr.length, result.length);
-            for (let i = 0; i < len; i++) arr[i] = result[i];
-            this._prevFreq = result.slice();
-        }
-        getByteTimeDomainData(arr) {
-            if (!this._timeDomain) {
-                for (let i = 0; i < arr.length; i++) arr[i] = 128;
-                return;
-            }
-            const len = Math.min(arr.length, this._timeDomain.length);
-            for (let i = 0; i < len; i++) {
-                arr[i] = Math.max(0, Math.min(255, Math.round((this._timeDomain[i] + 1) * 127.5)));
-            }
-        }
-        getFloatTimeDomainData(arr) {
-            if (!this._timeDomain) {
-                for (let i = 0; i < arr.length; i++) arr[i] = 0;
-                return;
-            }
-            const len = Math.min(arr.length, this._timeDomain.length);
-            for (let i = 0; i < len; i++) arr[i] = this._timeDomain[i];
-        }
-    }
-
-    class AudioDestinationNode extends AudioNode {
-        constructor() { super(); this.maxChannelCount = 2; }
-    }
-
-    // AudioContext fingerprintable surface. Real Chrome reports a
-    // stable per-device value across page loads. Previously this used
-    // `Math.random()` per-IIFE which made sequential page loads in the
-    // same SharedSession return DIFFERENT sampleRates — an inconsistency
-    // a real browser would not exhibit.
-    //
-    // Now: sampleRate reads from profile.audio_sample_rate (48000 on
-    // Apple Silicon, 44100 elsewhere). baseLatency + outputLatency are
-    // derived deterministically from `audio_seed` so they look like real
-    // hardware variation but stay stable across page loads.
+    // WebAudio. Keep the existing native-rendering fingerprint path, but model
+    // the public objects as actual WebIDL objects. The old implementation put
+    // nearly every implementation detail directly on instances (`_context`,
+    // AudioParam objects, compressor fields, etc.), while Blink stores the
+    // state internally and exposes the surface through prototype accessors.
+    // Chrome 148 therefore reports no own keys for these objects. WeakMaps here
+    // preserve that shape without changing the Rust audio rendering algorithm.
     const _audioSampleRate = (() => {
         try {
             const has = ops.op_has_stealth_profile && ops.op_has_stealth_profile();
@@ -1821,143 +1655,526 @@
     // There is no physical output device, so outputLatency is exactly zero.
     const _audioBaseLatency = 256 / _audioSampleRate;
     const _audioOutputLatency = 0;
+    const _audioContextState = new WeakMap();
+    const _audioNodeState = new WeakMap();
+    const _audioScheduledState = new WeakMap();
+    const _audioParamState = new WeakMap();
+    const _audioBufferState = new WeakMap();
+    const _audioListenerState = new WeakMap();
+    const _oscillatorState = new WeakMap();
+    const _compressorState = new WeakMap();
+    const _biquadState = new WeakMap();
+    const _analyserState = new WeakMap();
+    const _gainState = new WeakMap();
+    const _offlineAudioState = new WeakMap();
+    const _BASE_CONTEXT_TOKEN = Symbol('BaseAudioContext internal');
+    const _AUDIO_NODE_TOKEN = Symbol('AudioNode internal');
+    const _SCHEDULED_NODE_TOKEN = Symbol('AudioScheduledSourceNode internal');
+    const _AUDIO_PARAM_TOKEN = Symbol('AudioParam internal');
+    const _AUDIO_LISTENER_TOKEN = Symbol('AudioListener internal');
+    const _DESTINATION_NODE_TOKEN = Symbol('AudioDestinationNode internal');
 
-    class BaseAudioContext extends EventTarget {
-        constructor() {
-            super();
-            this.sampleRate = _audioSampleRate;
-            this.baseLatency = _audioBaseLatency;
-            this.outputLatency = _audioOutputLatency;
-            this.state = "suspended";
-            this.currentTime = 0;
-            this.destination = new AudioDestinationNode();
-            this.listener = {}; // AudioListener stub
+    const _audioMask = (fn, name) => {
+        if (typeof fn !== 'function') return fn;
+        try {
+            Object.defineProperty(fn, 'name', { value: name, configurable: true });
+            if (typeof globalThis._maskFunction === 'function') globalThis._maskFunction(fn, name);
+        } catch (_) {}
+        return fn;
+    };
+    const _audioMethod = (prototype, name, fn, length) => {
+        try { Object.defineProperty(fn, 'length', { value: length, configurable: true }); } catch (_) {}
+        _audioMask(fn, name);
+        Object.defineProperty(prototype, name, {
+            value: fn, writable: true, enumerable: true, configurable: true,
+        });
+    };
+    const _audioAccessor = (prototype, name, get, set) => {
+        if (get) _audioMask(get, `get ${name}`);
+        if (set) _audioMask(set, `set ${name}`);
+        Object.defineProperty(prototype, name, {
+            get, set, enumerable: true, configurable: true,
+        });
+    };
+    const _audioFinalize = (Ctor, name, length) => {
+        try { delete Ctor.prototype.constructor; } catch (_) {}
+        Object.defineProperty(Ctor.prototype, 'constructor', {
+            value: Ctor, writable: true, enumerable: false, configurable: true,
+        });
+        Object.defineProperty(Ctor.prototype, Symbol.toStringTag, {
+            value: name, writable: false, enumerable: false, configurable: true,
+        });
+        try { Object.defineProperty(Ctor, 'length', { value: length, configurable: true }); } catch (_) {}
+        _audioMask(Ctor, name);
+    };
+    const _audioIllegal = name => {
+        throw new TypeError(`Failed to construct '${name}': Illegal constructor`);
+    };
+    const _audioRequireArg = (name, count, actual) => {
+        if (actual < count) {
+            throw new TypeError(`Failed to construct '${name}': ${count} argument required, but only ${actual} present.`);
         }
-        createOscillator() { return new OscillatorNode(this); }
-        createDynamicsCompressor() { return new DynamicsCompressorNode(this); }
-        createAnalyser() { return new AnalyserNode(this); }
-        createGain() { return new GainNode(this); }
-        createBiquadFilter() { return new BiquadFilterNode(this); }
-        createBufferSource() {
-             return { connect() {}, start() {}, stop() {}, buffer: null, loop: false };
+    };
+    const _requireAudioContext = (value, name) => {
+        if (!_audioContextState.has(value)) {
+            throw new TypeError(`Failed to construct '${name}': parameter 1 is not of type 'BaseAudioContext'.`);
         }
-        createBuffer(channels, length, sampleRate) {
-            const bufs = [];
-            for (let c = 0; c < channels; c++) bufs.push(new Float32Array(length));
-            return {
-                numberOfChannels: channels, length, sampleRate,
-                duration: length / sampleRate,
-                getChannelData(c) { return bufs[c]; }
-            };
+        return value;
+    };
+    const _dispatchAudioStateChange = context => {
+        const state = _audioContextState.get(context);
+        if (!state) return;
+        try { context.dispatchEvent(new Event('statechange')); } catch (_) {}
+        if (typeof state.onstatechange === 'function') {
+            try { state.onstatechange.call(context, new Event('statechange')); } catch (_) {}
         }
-        decodeAudioData() { return Promise.resolve(); }
-        resume() { this.state = "running"; return Promise.resolve(); }
-    }
-    globalThis.BaseAudioContext = BaseAudioContext;
+    };
 
-    class AudioContext extends BaseAudioContext {
-        constructor() {
-            super();
-        }
-        close() { this.state = "closed"; return Promise.resolve(); }
-        suspend() { this.state = "suspended"; return Promise.resolve(); }
-    }
-
-    class OfflineAudioContext extends BaseAudioContext {
-        constructor(channels, length, sampleRate) {
-            super();
-            this._channels = channels || 1;
-            this._length = length || _audioSampleRate;
-            this.sampleRate = sampleRate || _audioSampleRate;
-            this._oscType = "triangle";
-            this._oscFreq = 10000;
-            this._compThreshold = -24;
-            this._compKnee = 30;
-            this._compRatio = 12;
-            this._compAttack = 0.003;
-            this._compRelease = 0.25;
-        }
-        _setOscType(v) { this._oscType = v; }
-        _setOscFreq(v) { this._oscFreq = v; }
-        _setCompThreshold(v) { this._compThreshold = v; }
-        _setCompKnee(v) { this._compKnee = v; }
-        _setCompRatio(v) { this._compRatio = v; }
-        _setCompAttack(v) { this._compAttack = v; }
-        _setCompRelease(v) { this._compRelease = v; }
-
-        startRendering() {
-            const self = this;
-            return new Promise((resolve) => {
-                if (globalThis.__browser_oxide_debug) {
-                    try {
-                        const log = globalThis.__oxAsyncApiDiag
-                            || (globalThis.__oxAsyncApiDiag = []);
-                        log.push({ api: 'OfflineAudioContext.startRendering', phase: 'call', at: performance.now() });
-                    } catch (_) {}
-                }
-                const sr = self.sampleRate;
-                const len = self._length;
-                const freq = self._oscFreq;
-                const type = self._oscType;
-                const waveTypeId = type === "sine" ? 0
-                    : type === "square" ? 2
-                    : type === "sawtooth" ? 3
-                    : 1; // triangle
-
-                let seed = 0;
-                try {
-                    // Use the local `ops` binding (same as canvas_seed path
-                    // at line 59) — `Deno` may be removed by stealth cleanup,
-                    // but `ops` was captured at IIFE entry.
-                    if (ops.op_has_stealth_profile && ops.op_has_stealth_profile()) {
-                        const raw = ops.op_get_profile_value("audio_seed");
-                        if (raw) {
-                            // op_get_profile_value returns u64 stringified.
-                            // parseInt → Number lossy-coerces past 2^53, then
-                            // `| 0` truncates a rounded float — distinct u64s
-                            // can collapse to the same int32. BigInt.asIntN(32)
-                            // does exact 32-bit truncation.
-                            try {
-                                seed = Number(BigInt.asIntN(32, BigInt(raw)));
-                            } catch (_) {
-                                const parsed = parseInt(raw, 10);
-                                if (!Number.isNaN(parsed)) seed = parsed | 0;
-                            }
-                        }
-                    }
-                } catch (e) {}
-
-                let data;
-                try {
-                    const bytes = ops.op_offline_audio_render(
-                        seed, sr | 0, len | 0, freq, waveTypeId,
-                        self._compThreshold, self._compKnee, self._compRatio,
-                        self._compAttack, self._compRelease,
-                    );
-                    data = new Float32Array(bytes.buffer, bytes.byteOffset, len);
-                } catch (e) {
-                    data = new Float32Array(len);
-                }
-
-                const buf = {
-                    numberOfChannels: self._channels,
-                    length: len,
-                    sampleRate: sr,
-                    duration: len / sr,
-                    getChannelData() { return data; },
-                };
-                if (globalThis.__browser_oxide_debug) {
-                    try {
-                        globalThis.__oxAsyncApiDiag.push({
-                            api: 'OfflineAudioContext.startRendering', phase: 'resolve',
-                            length: len, at: performance.now(),
-                        });
-                    } catch (_) {}
-                }
-                resolve(buf);
+    class AudioParam {
+        constructor(token = undefined, initial = 0, options = {}) {
+            if (token !== _AUDIO_PARAM_TOKEN) _audioIllegal('AudioParam');
+            const value = Number(initial);
+            _audioParamState.set(this, {
+                value,
+                defaultValue: options.defaultValue === undefined ? value : Number(options.defaultValue),
+                minValue: options.minValue === undefined ? -3.4028234663852886e38 : Number(options.minValue),
+                maxValue: options.maxValue === undefined ? 3.4028234663852886e38 : Number(options.maxValue),
+                automationRate: options.automationRate || 'a-rate',
+                setter: typeof options.setter === 'function' ? options.setter : null,
             });
         }
     }
+    delete AudioParam.prototype.constructor;
+    _audioAccessor(AudioParam.prototype, 'value', function() {
+        const state = _audioParamState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.value;
+    }, function(value) {
+        const state = _audioParamState.get(this); if (!state) throw new TypeError('Illegal invocation');
+        state.value = Number(value); if (state.setter) state.setter(state.value);
+    });
+    _audioAccessor(AudioParam.prototype, 'automationRate', function() {
+        const state = _audioParamState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.automationRate;
+    }, function(value) {
+        const state = _audioParamState.get(this); if (!state) throw new TypeError('Illegal invocation');
+        const rate = String(value); if (rate === 'a-rate' || rate === 'k-rate') state.automationRate = rate;
+    });
+    for (const key of ['defaultValue', 'minValue', 'maxValue']) {
+        _audioAccessor(AudioParam.prototype, key, function() {
+            const state = _audioParamState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state[key];
+        });
+    }
+    _audioMethod(AudioParam.prototype, 'cancelAndHoldAtTime', function(cancelTime) { void cancelTime; return this; }, 1);
+    _audioMethod(AudioParam.prototype, 'cancelScheduledValues', function(cancelTime) { void cancelTime; return this; }, 1);
+    _audioMethod(AudioParam.prototype, 'exponentialRampToValueAtTime', function(value, endTime) { void endTime; this.value = value; return this; }, 2);
+    _audioMethod(AudioParam.prototype, 'linearRampToValueAtTime', function(value, endTime) { void endTime; this.value = value; return this; }, 2);
+    _audioMethod(AudioParam.prototype, 'setTargetAtTime', function(target, startTime, timeConstant) { void startTime; void timeConstant; this.value = target; return this; }, 3);
+    _audioMethod(AudioParam.prototype, 'setValueAtTime', function(value, startTime) { void startTime; this.value = value; return this; }, 2);
+    _audioMethod(AudioParam.prototype, 'setValueCurveAtTime', function(values, startTime, duration) {
+        void startTime; void duration;
+        if (values && values.length) this.value = values[values.length - 1];
+        return this;
+    }, 3);
+    _audioFinalize(AudioParam, 'AudioParam', 0);
+
+    const _makeAudioParam = (value, options = {}) => new AudioParam(_AUDIO_PARAM_TOKEN, value, options);
+
+    class AudioNode extends EventTarget {
+        constructor(token = undefined, context, options = {}) {
+            super();
+            if (token !== _AUDIO_NODE_TOKEN) _audioIllegal('AudioNode');
+            _audioNodeState.set(this, {
+                context,
+                numberOfInputs: options.numberOfInputs === undefined ? 1 : options.numberOfInputs,
+                numberOfOutputs: options.numberOfOutputs === undefined ? 1 : options.numberOfOutputs,
+                channelCount: options.channelCount === undefined ? 2 : options.channelCount,
+                channelCountMode: options.channelCountMode || 'max',
+                channelInterpretation: options.channelInterpretation || 'speakers',
+                connections: [],
+            });
+        }
+    }
+    delete AudioNode.prototype.constructor;
+    _audioAccessor(AudioNode.prototype, 'context', function() {
+        const state = _audioNodeState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.context;
+    });
+    _audioAccessor(AudioNode.prototype, 'numberOfInputs', function() {
+        const state = _audioNodeState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.numberOfInputs;
+    });
+    _audioAccessor(AudioNode.prototype, 'numberOfOutputs', function() {
+        const state = _audioNodeState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.numberOfOutputs;
+    });
+    for (const key of ['channelCount', 'channelCountMode', 'channelInterpretation']) {
+        _audioAccessor(AudioNode.prototype, key, function() {
+            const state = _audioNodeState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state[key];
+        }, function(value) {
+            const state = _audioNodeState.get(this); if (!state) throw new TypeError('Illegal invocation');
+            state[key] = key === 'channelCount' ? Number(value) : String(value);
+        });
+    }
+    _audioMethod(AudioNode.prototype, 'connect', function(destination, output = 0, input = 0) {
+        const state = _audioNodeState.get(this); if (!state) throw new TypeError('Illegal invocation');
+        state.connections.push({ destination, output, input });
+        return destination;
+    }, 1);
+    _audioMethod(AudioNode.prototype, 'disconnect', function() {
+        const state = _audioNodeState.get(this); if (!state) throw new TypeError('Illegal invocation'); state.connections.length = 0;
+    }, 0);
+    _audioFinalize(AudioNode, 'AudioNode', 0);
+
+    class AudioScheduledSourceNode extends AudioNode {
+        constructor(token = undefined, context, options = {}) {
+            super(_AUDIO_NODE_TOKEN, context, options);
+            if (token !== _SCHEDULED_NODE_TOKEN) _audioIllegal('AudioScheduledSourceNode');
+            _audioScheduledState.set(this, { onended: null, started: false, stopped: false });
+        }
+    }
+    delete AudioScheduledSourceNode.prototype.constructor;
+    _audioAccessor(AudioScheduledSourceNode.prototype, 'onended', function() {
+        const state = _audioScheduledState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.onended;
+    }, function(value) {
+        const state = _audioScheduledState.get(this); if (!state) throw new TypeError('Illegal invocation'); state.onended = typeof value === 'function' ? value : null;
+    });
+    _audioMethod(AudioScheduledSourceNode.prototype, 'start', function(when = 0) {
+        void when; const state = _audioScheduledState.get(this); if (!state) throw new TypeError('Illegal invocation'); state.started = true;
+    }, 0);
+    _audioMethod(AudioScheduledSourceNode.prototype, 'stop', function(when = 0) {
+        void when; const state = _audioScheduledState.get(this); if (!state) throw new TypeError('Illegal invocation'); state.stopped = true;
+    }, 0);
+    _audioFinalize(AudioScheduledSourceNode, 'AudioScheduledSourceNode', 0);
+
+    class OscillatorNode extends AudioScheduledSourceNode {
+        constructor(context, options = {}) {
+            _audioRequireArg('OscillatorNode', 1, arguments.length);
+            _requireAudioContext(context, 'OscillatorNode');
+            super(_SCHEDULED_NODE_TOKEN, context, { numberOfInputs: 0, numberOfOutputs: 1 });
+            const offline = _offlineAudioState.get(context);
+            const frequency = options.frequency === undefined ? 440 : Number(options.frequency);
+            const detune = options.detune === undefined ? 0 : Number(options.detune);
+            const sampleRate = _audioContextState.get(context).sampleRate;
+            _oscillatorState.set(this, {
+                type: options.type || 'sine',
+                frequency: _makeAudioParam(frequency, {
+                    defaultValue: 440, minValue: -sampleRate / 2, maxValue: sampleRate / 2,
+                    setter: value => { const state = _offlineAudioState.get(context); if (state) state.oscFreq = value; },
+                }),
+                detune: _makeAudioParam(detune, { defaultValue: 0 }),
+            });
+            if (offline) { offline.oscType = options.type || 'sine'; offline.oscFreq = frequency; }
+        }
+    }
+    delete OscillatorNode.prototype.constructor;
+    _audioAccessor(OscillatorNode.prototype, 'type', function() {
+        const state = _oscillatorState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.type;
+    }, function(value) {
+        const state = _oscillatorState.get(this); if (!state) throw new TypeError('Illegal invocation');
+        state.type = String(value); const offline = _offlineAudioState.get(this.context); if (offline) offline.oscType = state.type;
+    });
+    _audioAccessor(OscillatorNode.prototype, 'frequency', function() { const s=_oscillatorState.get(this); if(!s) throw new TypeError('Illegal invocation'); return s.frequency; });
+    _audioAccessor(OscillatorNode.prototype, 'detune', function() { const s=_oscillatorState.get(this); if(!s) throw new TypeError('Illegal invocation'); return s.detune; });
+    _audioMethod(OscillatorNode.prototype, 'setPeriodicWave', function(periodicWave) { void periodicWave; }, 1);
+    _audioFinalize(OscillatorNode, 'OscillatorNode', 1);
+
+    class GainNode extends AudioNode {
+        constructor(context, options = {}) {
+            _audioRequireArg('GainNode', 1, arguments.length); _requireAudioContext(context, 'GainNode');
+            super(_AUDIO_NODE_TOKEN, context);
+            _gainState.set(this, { gain: _makeAudioParam(options.gain === undefined ? 1 : Number(options.gain), { defaultValue: 1 }) });
+        }
+    }
+    delete GainNode.prototype.constructor;
+    _audioAccessor(GainNode.prototype, 'gain', function() { const s=_gainState.get(this); if(!s) throw new TypeError('Illegal invocation'); return s.gain; });
+    _audioFinalize(GainNode, 'GainNode', 1);
+
+    class DynamicsCompressorNode extends AudioNode {
+        constructor(context, options = {}) {
+            _audioRequireArg('DynamicsCompressorNode', 1, arguments.length); _requireAudioContext(context, 'DynamicsCompressorNode');
+            super(_AUDIO_NODE_TOKEN, context);
+            const update = (key, value) => { const state = _offlineAudioState.get(context); if (state) state[key] = value; };
+            _compressorState.set(this, {
+                threshold: _makeAudioParam(options.threshold === undefined ? -24 : Number(options.threshold), { defaultValue: -24, setter: v => update('compThreshold', v) }),
+                knee: _makeAudioParam(options.knee === undefined ? 30 : Number(options.knee), { defaultValue: 30, setter: v => update('compKnee', v) }),
+                ratio: _makeAudioParam(options.ratio === undefined ? 12 : Number(options.ratio), { defaultValue: 12, setter: v => update('compRatio', v) }),
+                attack: _makeAudioParam(options.attack === undefined ? Math.fround(0.003) : Number(options.attack), { defaultValue: Math.fround(0.003), setter: v => update('compAttack', v) }),
+                release: _makeAudioParam(options.release === undefined ? 0.25 : Number(options.release), { defaultValue: 0.25, setter: v => update('compRelease', v) }),
+                reduction: 0,
+            });
+        }
+    }
+    delete DynamicsCompressorNode.prototype.constructor;
+    for (const key of ['threshold', 'knee', 'ratio', 'reduction', 'attack', 'release']) {
+        _audioAccessor(DynamicsCompressorNode.prototype, key, function() {
+            const state = _compressorState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state[key];
+        });
+    }
+    _audioFinalize(DynamicsCompressorNode, 'DynamicsCompressorNode', 1);
+
+    class BiquadFilterNode extends AudioNode {
+        constructor(context, options = {}) {
+            _audioRequireArg('BiquadFilterNode', 1, arguments.length); _requireAudioContext(context, 'BiquadFilterNode');
+            super(_AUDIO_NODE_TOKEN, context);
+            _biquadState.set(this, {
+                type: options.type || 'lowpass',
+                frequency: _makeAudioParam(options.frequency === undefined ? 350 : Number(options.frequency), { defaultValue: 350 }),
+                detune: _makeAudioParam(options.detune === undefined ? 0 : Number(options.detune), { defaultValue: 0 }),
+                Q: _makeAudioParam(options.Q === undefined ? 1 : Number(options.Q), { defaultValue: 1 }),
+                gain: _makeAudioParam(options.gain === undefined ? 0 : Number(options.gain), { defaultValue: 0 }),
+            });
+        }
+    }
+    delete BiquadFilterNode.prototype.constructor;
+    _audioAccessor(BiquadFilterNode.prototype, 'type', function() { const s=_biquadState.get(this); if(!s) throw new TypeError('Illegal invocation'); return s.type; }, function(v) { const s=_biquadState.get(this); if(!s) throw new TypeError('Illegal invocation'); s.type=String(v); });
+    for (const key of ['frequency', 'detune', 'Q', 'gain']) {
+        _audioAccessor(BiquadFilterNode.prototype, key, function() { const s=_biquadState.get(this); if(!s) throw new TypeError('Illegal invocation'); return s[key]; });
+    }
+    _audioMethod(BiquadFilterNode.prototype, 'getFrequencyResponse', function(freqArr, magOut, phaseOut) {
+        const state = _biquadState.get(this); if (!state) throw new TypeError('Illegal invocation');
+        if (!(freqArr instanceof Float32Array)) return;
+        const _typeIds = { lowpass:0, highpass:1, bandpass:2, lowshelf:3, highshelf:4, peaking:5, notch:6, allpass:7 };
+        const contextState = _audioContextState.get(this.context);
+        const out = ops.op_audio_biquad_response(
+            new Uint8Array(freqArr.buffer, freqArr.byteOffset, freqArr.byteLength),
+            _typeIds[state.type] ?? 0,
+            state.frequency.value, state.Q.value, state.gain.value,
+            contextState ? contextState.sampleRate : 44100,
+        );
+        const result = new Float32Array(out.buffer, out.byteOffset, out.byteLength / 4);
+        const n = freqArr.length;
+        for (let i=0; i<Math.min(magOut.length,n); i++) magOut[i]=result[i];
+        for (let i=0; i<Math.min(phaseOut.length,n); i++) phaseOut[i]=result[n+i];
+    }, 3);
+    _audioFinalize(BiquadFilterNode, 'BiquadFilterNode', 1);
+
+    class AnalyserNode extends AudioNode {
+        constructor(context, options = {}) {
+            _audioRequireArg('AnalyserNode', 1, arguments.length); _requireAudioContext(context, 'AnalyserNode');
+            super(_AUDIO_NODE_TOKEN, context);
+            _analyserState.set(this, {
+                fftSize: options.fftSize === undefined ? 2048 : Number(options.fftSize),
+                smoothingTimeConstant: options.smoothingTimeConstant === undefined ? 0.8 : Number(options.smoothingTimeConstant),
+                minDecibels: options.minDecibels === undefined ? -100 : Number(options.minDecibels),
+                maxDecibels: options.maxDecibels === undefined ? -30 : Number(options.maxDecibels),
+                timeDomain: null, prevFreq: null,
+            });
+        }
+    }
+    delete AnalyserNode.prototype.constructor;
+    _audioAccessor(AnalyserNode.prototype, 'fftSize', function() { const s=_analyserState.get(this); if(!s) throw new TypeError('Illegal invocation'); return s.fftSize; }, function(v) { const s=_analyserState.get(this); if(!s) throw new TypeError('Illegal invocation'); s.fftSize=Number(v); });
+    _audioAccessor(AnalyserNode.prototype, 'frequencyBinCount', function() { const s=_analyserState.get(this); if(!s) throw new TypeError('Illegal invocation'); return s.fftSize/2; });
+    for (const key of ['minDecibels', 'maxDecibels', 'smoothingTimeConstant']) {
+        _audioAccessor(AnalyserNode.prototype, key, function() { const s=_analyserState.get(this); if(!s) throw new TypeError('Illegal invocation'); return s[key]; }, function(v) { const s=_analyserState.get(this); if(!s) throw new TypeError('Illegal invocation'); s[key]=Number(v); });
+    }
+    _audioMethod(AnalyserNode.prototype, 'getByteFrequencyData', function(arr) {
+        const f=new Float32Array(this.frequencyBinCount); this.getFloatFrequencyData(f);
+        const s=_analyserState.get(this), range=s.maxDecibels-s.minDecibels;
+        for(let i=0;i<Math.min(arr.length,f.length);i++) arr[i]=Math.max(0,Math.min(255,Math.round(((f[i]-s.minDecibels)/range)*255)));
+    }, 1);
+    _audioMethod(AnalyserNode.prototype, 'getByteTimeDomainData', function(arr) {
+        const s=_analyserState.get(this); if(!s) throw new TypeError('Illegal invocation');
+        if(!s.timeDomain){arr.fill(128);return;} for(let i=0;i<Math.min(arr.length,s.timeDomain.length);i++) arr[i]=Math.max(0,Math.min(255,Math.round((s.timeDomain[i]+1)*127.5)));
+    }, 1);
+    _audioMethod(AnalyserNode.prototype, 'getFloatFrequencyData', function(arr) {
+        const s=_analyserState.get(this); if(!s) throw new TypeError('Illegal invocation');
+        if(!s.timeDomain||s.timeDomain.length<s.fftSize){for(let i=0;i<arr.length;i++)arr[i]=s.minDecibels;return;}
+        const prev=s.prevFreq?new Uint8Array(s.prevFreq.buffer):new Uint8Array(0);
+        const out=ops.op_audio_analyser_freq_data(new Uint8Array(s.timeDomain.buffer,0,s.fftSize*4),s.fftSize,Math.round(s.smoothingTimeConstant*100),prev);
+        const result=new Float32Array(out.buffer,out.byteOffset,out.byteLength/4); for(let i=0;i<Math.min(arr.length,result.length);i++)arr[i]=result[i]; s.prevFreq=result.slice();
+    }, 1);
+    _audioMethod(AnalyserNode.prototype, 'getFloatTimeDomainData', function(arr) {
+        const s=_analyserState.get(this); if(!s) throw new TypeError('Illegal invocation');
+        if(!s.timeDomain){arr.fill(0);return;} for(let i=0;i<Math.min(arr.length,s.timeDomain.length);i++)arr[i]=s.timeDomain[i];
+    }, 1);
+    _audioFinalize(AnalyserNode, 'AnalyserNode', 1);
+
+    class AudioDestinationNode extends AudioNode {
+        constructor(token = undefined, context) {
+            if (token !== _DESTINATION_NODE_TOKEN) _audioIllegal('AudioDestinationNode');
+            super(_AUDIO_NODE_TOKEN, context, { numberOfInputs:1, numberOfOutputs:0, channelCount:2, channelCountMode:'explicit', channelInterpretation:'speakers' });
+        }
+    }
+    delete AudioDestinationNode.prototype.constructor;
+    _audioAccessor(AudioDestinationNode.prototype, 'maxChannelCount', function() { if(!_audioNodeState.has(this))throw new TypeError('Illegal invocation'); return 2; });
+    _audioFinalize(AudioDestinationNode, 'AudioDestinationNode', 0);
+
+    class AudioListener {
+        constructor(token = undefined) {
+            if (token !== _AUDIO_LISTENER_TOKEN) _audioIllegal('AudioListener');
+            _audioListenerState.set(this, {
+                positionX:_makeAudioParam(0), positionY:_makeAudioParam(0), positionZ:_makeAudioParam(0),
+                forwardX:_makeAudioParam(0), forwardY:_makeAudioParam(0), forwardZ:_makeAudioParam(-1),
+                upX:_makeAudioParam(0), upY:_makeAudioParam(1), upZ:_makeAudioParam(0),
+            });
+        }
+    }
+    delete AudioListener.prototype.constructor;
+    for (const key of ['positionX','positionY','positionZ','forwardX','forwardY','forwardZ','upX','upY','upZ']) {
+        _audioAccessor(AudioListener.prototype, key, function() { const s=_audioListenerState.get(this); if(!s)throw new TypeError('Illegal invocation'); return s[key]; });
+    }
+    _audioMethod(AudioListener.prototype, 'setOrientation', function(x,y,z,xUp,yUp,zUp) {
+        const s=_audioListenerState.get(this); if(!s)throw new TypeError('Illegal invocation');
+        s.forwardX.value=x;s.forwardY.value=y;s.forwardZ.value=z;s.upX.value=xUp;s.upY.value=yUp;s.upZ.value=zUp;
+    }, 6);
+    _audioMethod(AudioListener.prototype, 'setPosition', function(x,y,z) {
+        const s=_audioListenerState.get(this); if(!s)throw new TypeError('Illegal invocation'); s.positionX.value=x;s.positionY.value=y;s.positionZ.value=z;
+    }, 3);
+    _audioFinalize(AudioListener, 'AudioListener', 0);
+
+    class AudioBuffer {
+        constructor(options) {
+            _audioRequireArg('AudioBuffer', 1, arguments.length);
+            options = options || {};
+            const channels=Math.max(1,Number(options.numberOfChannels===undefined?1:options.numberOfChannels)|0);
+            const length=Math.max(1,Number(options.length)|0);
+            const sampleRate=Number(options.sampleRate);
+            const data=Array.from({length:channels},()=>new Float32Array(length));
+            _audioBufferState.set(this,{channels,length,sampleRate,data});
+        }
+    }
+    delete AudioBuffer.prototype.constructor;
+    _audioAccessor(AudioBuffer.prototype,'length',function(){const s=_audioBufferState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.length;});
+    _audioAccessor(AudioBuffer.prototype,'duration',function(){const s=_audioBufferState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.length/s.sampleRate;});
+    _audioAccessor(AudioBuffer.prototype,'sampleRate',function(){const s=_audioBufferState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.sampleRate;});
+    _audioAccessor(AudioBuffer.prototype,'numberOfChannels',function(){const s=_audioBufferState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.channels;});
+    _audioMethod(AudioBuffer.prototype,'copyFromChannel',function(destination,channelNumber,startInChannel=0){const s=_audioBufferState.get(this);if(!s)throw new TypeError('Illegal invocation');const src=s.data[channelNumber];if(!src)throw new DOMException('The channel index provided is greater than or equal to the maximum bound.','IndexSizeError');destination.set(src.subarray(Number(startInChannel)||0,(Number(startInChannel)||0)+destination.length));},2);
+    _audioMethod(AudioBuffer.prototype,'copyToChannel',function(source,channelNumber,startInChannel=0){const s=_audioBufferState.get(this);if(!s)throw new TypeError('Illegal invocation');const dst=s.data[channelNumber];if(!dst)throw new DOMException('The channel index provided is greater than or equal to the maximum bound.','IndexSizeError');dst.set(source.subarray(0,Math.max(0,dst.length-(Number(startInChannel)||0))),Number(startInChannel)||0);},2);
+    _audioMethod(AudioBuffer.prototype,'getChannelData',function(channel){const s=_audioBufferState.get(this);if(!s)throw new TypeError('Illegal invocation');const data=s.data[Number(channel)];if(!data)throw new DOMException('The channel index provided is greater than or equal to the maximum bound.','IndexSizeError');return data;},1);
+    _audioFinalize(AudioBuffer,'AudioBuffer',1);
+
+    const _makeGenericNode = (name, context, scheduled = false) => {
+        let proto = scheduled ? AudioScheduledSourceNode.prototype : AudioNode.prototype;
+        try {
+            const C = globalThis[name];
+            if (typeof C === 'function' && C.prototype) {
+                const parentProto = scheduled ? AudioScheduledSourceNode.prototype : AudioNode.prototype;
+                if (Object.getPrototypeOf(C.prototype) !== parentProto) Object.setPrototypeOf(C.prototype, parentProto);
+                if (Object.getPrototypeOf(C) !== (scheduled ? AudioScheduledSourceNode : AudioNode)) Object.setPrototypeOf(C, scheduled ? AudioScheduledSourceNode : AudioNode);
+                proto = C.prototype;
+            }
+        } catch (_) {}
+        const node=Object.create(proto);
+        _audioNodeState.set(node,{context,numberOfInputs:scheduled?0:1,numberOfOutputs:1,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',connections:[]});
+        if(scheduled)_audioScheduledState.set(node,{onended:null,started:false,stopped:false});
+        return node;
+    };
+
+    class BaseAudioContext extends EventTarget {
+        constructor(token = undefined, options = {}) {
+            super();
+            if (token !== _BASE_CONTEXT_TOKEN) _audioIllegal('BaseAudioContext');
+            const sampleRate=Number(options.sampleRate||_audioSampleRate);
+            _audioContextState.set(this,{
+                sampleRate,currentTime:0,state:'suspended',onstatechange:null,onerror:null,onsinkchange:null,sinkId:'',
+                baseLatency:256/sampleRate,outputLatency:0,listener:null,destination:null,audioWorklet:null,playbackStats:{},
+            });
+            const state=_audioContextState.get(this);
+            state.destination=new AudioDestinationNode(_DESTINATION_NODE_TOKEN,this);
+            state.listener=new AudioListener(_AUDIO_LISTENER_TOKEN);
+            state.audioWorklet=Object.create(globalThis.AudioWorklet?.prototype||Object.prototype);
+        }
+    }
+    delete BaseAudioContext.prototype.constructor;
+    for(const key of ['destination','sampleRate','currentTime','listener','state']) _audioAccessor(BaseAudioContext.prototype,key,function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s[key];});
+    _audioAccessor(BaseAudioContext.prototype,'onstatechange',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.onstatechange;},function(v){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.onstatechange=typeof v==='function'?v:null;});
+    _audioMethod(BaseAudioContext.prototype,'createAnalyser',function(){return new AnalyserNode(this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createBiquadFilter',function(){return new BiquadFilterNode(this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createBuffer',function(channels,length,sampleRate){return new AudioBuffer({numberOfChannels:channels,length,sampleRate});},3);
+    _audioMethod(BaseAudioContext.prototype,'createBufferSource',function(){return _makeGenericNode('AudioBufferSourceNode',this,true);},0);
+    _audioMethod(BaseAudioContext.prototype,'createChannelMerger',function(){return _makeGenericNode('ChannelMergerNode',this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createChannelSplitter',function(){return _makeGenericNode('ChannelSplitterNode',this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createConstantSource',function(){return _makeGenericNode('ConstantSourceNode',this,true);},0);
+    _audioMethod(BaseAudioContext.prototype,'createConvolver',function(){return _makeGenericNode('ConvolverNode',this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createDelay',function(){return _makeGenericNode('DelayNode',this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createDynamicsCompressor',function(){return new DynamicsCompressorNode(this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createGain',function(){return new GainNode(this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createIIRFilter',function(feedforward,feedback){void feedforward;void feedback;return _makeGenericNode('IIRFilterNode',this);},2);
+    _audioMethod(BaseAudioContext.prototype,'createOscillator',function(){return new OscillatorNode(this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createPanner',function(){return _makeGenericNode('PannerNode',this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createPeriodicWave',function(real,imag){void real;void imag;const C=globalThis.PeriodicWave;return typeof C==='function'?Object.create(C.prototype):{};},2);
+    _audioMethod(BaseAudioContext.prototype,'createScriptProcessor',function(){return _makeGenericNode('ScriptProcessorNode',this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createStereoPanner',function(){return _makeGenericNode('StereoPannerNode',this);},0);
+    _audioMethod(BaseAudioContext.prototype,'createWaveShaper',function(){return _makeGenericNode('WaveShaperNode',this);},0);
+    _audioMethod(BaseAudioContext.prototype,'decodeAudioData',function(audioData,successCallback,errorCallback){
+        void audioData;void errorCallback;
+        const buffer=new AudioBuffer({numberOfChannels:1,length:1,sampleRate:this.sampleRate});
+        if(typeof successCallback==='function')queueMicrotask(()=>successCallback(buffer));
+        return Promise.resolve(buffer);
+    },1);
+    _audioFinalize(BaseAudioContext,'BaseAudioContext',0);
+    // Chromium installs `audioWorklet` after the prototype constructor.
+    // Reposition the toStringTag so Reflect.ownKeys follows the WebIDL order.
+    try { delete BaseAudioContext.prototype[Symbol.toStringTag]; } catch (_) {}
+    _audioAccessor(BaseAudioContext.prototype,'audioWorklet',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.audioWorklet;});
+    Object.defineProperty(BaseAudioContext.prototype, Symbol.toStringTag, {
+        value:'BaseAudioContext', writable:false, enumerable:false, configurable:true,
+    });
+
+    class AudioContext extends BaseAudioContext {
+        constructor(options = undefined) { super(_BASE_CONTEXT_TOKEN,options||{}); }
+    }
+    delete AudioContext.prototype.constructor;
+    _audioAccessor(AudioContext.prototype,'baseLatency',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.baseLatency;});
+    _audioAccessor(AudioContext.prototype,'outputLatency',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.outputLatency;});
+    _audioAccessor(AudioContext.prototype,'onerror',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.onerror;},function(v){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.onerror=typeof v==='function'?v:null;});
+    _audioMethod(AudioContext.prototype,'close',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.state='closed';_dispatchAudioStateChange(this);return Promise.resolve();},0);
+    _audioMethod(AudioContext.prototype,'createMediaElementSource',function(element){void element;return _makeGenericNode('MediaElementAudioSourceNode',this);},1);
+    _audioMethod(AudioContext.prototype,'createMediaStreamDestination',function(){return _makeGenericNode('MediaStreamAudioDestinationNode',this);},0);
+    _audioMethod(AudioContext.prototype,'createMediaStreamSource',function(stream){void stream;return _makeGenericNode('MediaStreamAudioSourceNode',this);},1);
+    _audioMethod(AudioContext.prototype,'getOutputTimestamp',function(){return {contextTime:this.currentTime,performanceTime:performance.now()};},0);
+    _audioMethod(AudioContext.prototype,'resume',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.state='running';_dispatchAudioStateChange(this);return Promise.resolve();},0);
+    _audioMethod(AudioContext.prototype,'suspend',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.state='suspended';_dispatchAudioStateChange(this);return Promise.resolve();},0);
+    _audioAccessor(AudioContext.prototype,'playbackStats',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.playbackStats;});
+    _audioFinalize(AudioContext,'AudioContext',0);
+    // sink selection members were added after the original AudioContext
+    // constructor slot and therefore appear after it in Chromium's own-key order.
+    try { delete AudioContext.prototype[Symbol.toStringTag]; } catch (_) {}
+    _audioAccessor(AudioContext.prototype,'sinkId',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.sinkId;});
+    _audioAccessor(AudioContext.prototype,'onsinkchange',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.onsinkchange;},function(v){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.onsinkchange=typeof v==='function'?v:null;});
+    _audioMethod(AudioContext.prototype,'setSinkId',function(id){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.sinkId=String(id);return Promise.resolve();},1);
+    Object.defineProperty(AudioContext.prototype, Symbol.toStringTag, {
+        value:'AudioContext', writable:false, enumerable:false, configurable:true,
+    });
+
+    class OfflineAudioContext extends BaseAudioContext {
+        constructor(numberOfChannels, length = undefined, sampleRate = undefined) {
+            _audioRequireArg('OfflineAudioContext',1,arguments.length);
+            let channels=numberOfChannels;
+            if(numberOfChannels&&typeof numberOfChannels==='object'){
+                const opts=numberOfChannels;channels=opts.numberOfChannels;length=opts.length;sampleRate=opts.sampleRate;
+            }
+            channels=Math.max(1,Number(channels)||1);length=Math.max(1,Number(length)||_audioSampleRate);sampleRate=Number(sampleRate)||_audioSampleRate;
+            super(_BASE_CONTEXT_TOKEN,{sampleRate});
+            _offlineAudioState.set(this,{channels,length,oscType:'triangle',oscFreq:10000,compThreshold:-24,compKnee:30,compRatio:12,compAttack:Math.fround(0.003),compRelease:0.25,oncomplete:null});
+        }
+    }
+    delete OfflineAudioContext.prototype.constructor;
+    _audioAccessor(OfflineAudioContext.prototype,'oncomplete',function(){const s=_offlineAudioState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.oncomplete;},function(v){const s=_offlineAudioState.get(this);if(!s)throw new TypeError('Illegal invocation');s.oncomplete=typeof v==='function'?v:null;});
+    _audioAccessor(OfflineAudioContext.prototype,'length',function(){const s=_offlineAudioState.get(this);if(!s)throw new TypeError('Illegal invocation');return s.length;});
+    _audioMethod(OfflineAudioContext.prototype,'resume',function(){const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.state='running';return Promise.resolve();},0);
+    _audioMethod(OfflineAudioContext.prototype,'startRendering',function(){
+        const self=this, offline=_offlineAudioState.get(this), context=_audioContextState.get(this);
+        if(!offline||!context)return Promise.reject(new TypeError('Illegal invocation'));
+        context.state='running';
+        return new Promise(resolve=>{
+            if(globalThis.__browser_oxide_debug){try{const log=globalThis.__oxAsyncApiDiag||(globalThis.__oxAsyncApiDiag=[]);log.push({api:'OfflineAudioContext.startRendering',phase:'call',at:performance.now()});}catch(_) {}}
+            const sr=context.sampleRate,len=offline.length,freq=offline.oscFreq,type=offline.oscType;
+            const waveTypeId=type==='sine'?0:type==='square'?2:type==='sawtooth'?3:1;
+            let seed=0;try{if(ops.op_has_stealth_profile&&ops.op_has_stealth_profile()){const raw=ops.op_get_profile_value('audio_seed');if(raw){try{seed=Number(BigInt.asIntN(32,BigInt(raw)));}catch(_){const parsed=parseInt(raw,10);if(!Number.isNaN(parsed))seed=parsed|0;}}}}catch(_){}
+            let data;try{const bytes=ops.op_offline_audio_render(seed,sr|0,len|0,freq,waveTypeId,offline.compThreshold,offline.compKnee,offline.compRatio,offline.compAttack,offline.compRelease);data=new Float32Array(bytes.buffer,bytes.byteOffset,len);}catch(_){data=new Float32Array(len);}
+            const buffer=new AudioBuffer({numberOfChannels:offline.channels,length:len,sampleRate:sr});
+            for(let c=0;c<offline.channels;c++)buffer.getChannelData(c).set(data);
+            context.currentTime=len/sr;context.state='closed';
+            if(globalThis.__browser_oxide_debug){try{globalThis.__oxAsyncApiDiag.push({api:'OfflineAudioContext.startRendering',phase:'resolve',length:len,at:performance.now()});}catch(_) {}}
+            if(typeof offline.oncomplete==='function'){try{offline.oncomplete.call(self,new Event('complete'));}catch(_) {}}
+            resolve(buffer);
+        });
+    },0);
+    _audioMethod(OfflineAudioContext.prototype,'suspend',function(suspendTime){void suspendTime;const s=_audioContextState.get(this);if(!s)throw new TypeError('Illegal invocation');s.state='suspended';return Promise.resolve();},1);
+    _audioFinalize(OfflineAudioContext,'OfflineAudioContext',1);
+
+    // Publish the functional constructors over the early interface placeholders.
+    Object.assign(globalThis,{
+        AudioContext,BaseAudioContext,OfflineAudioContext,AudioNode,AudioScheduledSourceNode,
+        OscillatorNode,AudioParam,DynamicsCompressorNode,BiquadFilterNode,AnalyserNode,
+        AudioBuffer,AudioListener,AudioDestinationNode,GainNode,
+    });
 
     // HTMLCanvasElement: getContext returns the right context
     class HTMLCanvasElement {
