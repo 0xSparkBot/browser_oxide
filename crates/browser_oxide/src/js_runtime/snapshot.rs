@@ -183,6 +183,8 @@ pub fn get_snapshot() -> &'static [u8] {
             "\n",
             include_str!("js/event_details_bootstrap.js"),
             "\n",
+            include_str!("js/promise_rejection_bootstrap.js"),
+            "\n",
             include_str!("js/range_selection_bootstrap.js"),
             "\n",
             include_str!("js/cssom_bootstrap.js"),

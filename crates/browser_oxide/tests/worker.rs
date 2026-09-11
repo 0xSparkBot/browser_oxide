@@ -100,6 +100,35 @@ fn worker_message_port_post_message_arity_matches_chrome() {
 }
 
 #[test]
+fn worker_unhandled_rejection_dispatches_event_without_terminating() {
+    let code = r#"
+        const src = `
+            self.addEventListener('unhandledrejection', function(event) {
+                event.preventDefault();
+                self.postMessage(JSON.stringify([
+                    event.type,
+                    event.isTrusted,
+                    event.cancelable,
+                    event.bubbles,
+                    String(event.reason)
+                ]));
+            });
+            Promise.reject('worker-boom');
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime(code, 1500);
+    assert_eq!(
+        out,
+        r#"["unhandledrejection",true,true,false,"worker-boom"]"#
+    );
+}
+
+#[test]
 fn worker_crypto_subtle_hmac_round_trip() {
     let code = r#"
         const src = `

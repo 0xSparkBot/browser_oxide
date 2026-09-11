@@ -428,6 +428,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/event_details_bootstrap.js"),
             "\n",
+            include_str!("js/promise_rejection_bootstrap.js"),
+            "\n",
             include_str!("js/range_selection_bootstrap.js"),
             "\n",
             include_str!("js/cssom_bootstrap.js"),
@@ -824,6 +826,13 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/event_details_bootstrap.js"))
         .expect("worker: event details bootstrap failed");
+
+    runtime
+        .execute_script(
+            "<anonymous>",
+            include_str!("js/promise_rejection_bootstrap.js"),
+        )
+        .expect("worker: promise rejection bootstrap failed");
 
     runtime
         .execute_script(
