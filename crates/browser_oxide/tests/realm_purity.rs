@@ -209,6 +209,105 @@ async fn iframe_dom_instances_belong_to_child_realm() {
 }
 
 #[tokio::test]
+async fn iframe_storage_shares_area_but_keeps_realm_local_wrappers() {
+    let mut page = Page::from_html_with_url(
+        "<!doctype html><html><body><iframe id='f' srcdoc='<p>child</p>'></iframe></body></html>",
+        "https://example.test/parent",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    let result = page
+        .evaluate(
+            r#"(() => {
+                localStorage.clear();
+                sessionStorage.clear();
+                localStorage.setItem('parentLocal', 'parent');
+                sessionStorage.setItem('parentSession', 'parent');
+                const cw = document.getElementById('f').contentWindow;
+                let construction = '';
+                try { new cw.Storage(); construction = 'ok'; }
+                catch (error) { construction = error.name + ':' + error.message; }
+                let illegal = '';
+                try { cw.Storage.prototype.getItem.call({}); illegal = 'ok'; }
+                catch (error) { illegal = error.name + ':' + error.message; }
+                const before = {
+                    storageType: typeof cw.Storage,
+                    local: cw.localStorage.getItem('parentLocal'),
+                    session: cw.sessionStorage.getItem('parentSession'),
+                    localNamed: cw.localStorage.parentLocal,
+                    sessionNamed: cw.sessionStorage.parentSession,
+                    localSame: cw.localStorage === localStorage,
+                    sessionSame: cw.sessionStorage === sessionStorage,
+                    childAreasDistinct: cw.localStorage !== cw.sessionStorage,
+                    localTag: Object.prototype.toString.call(cw.localStorage),
+                    sessionTag: Object.prototype.toString.call(cw.sessionStorage),
+                    localInstance: cw.localStorage instanceof cw.Storage,
+                    sessionInstance: cw.sessionStorage instanceof cw.Storage,
+                    localProto: Object.getPrototypeOf(cw.localStorage) === cw.Storage.prototype,
+                    methodRealmLocal: cw.Storage.prototype.getItem !== Storage.prototype.getItem,
+                    prototypeShape: Object.getOwnPropertyNames(cw.Storage.prototype).sort().join(',') ===
+                        Object.getOwnPropertyNames(Storage.prototype).sort().join(','),
+                    crossRealmInstance: cw.localStorage instanceof Storage,
+                    parentCrossRealmInstance: localStorage instanceof cw.Storage,
+                    construction,
+                    illegal,
+                };
+                cw.localStorage.setItem('childLocal', 'child');
+                cw.sessionStorage.childSession = 'child';
+                const after = {
+                    parentLocal: localStorage.getItem('childLocal'),
+                    parentSession: sessionStorage.getItem('childSession'),
+                    localKeys: Object.keys(cw.localStorage).sort(),
+                    sessionKeys: Object.keys(cw.sessionStorage).sort(),
+                };
+                localStorage.clear();
+                sessionStorage.clear();
+                return JSON.stringify({before, after});
+            })()"#,
+        )
+        .unwrap();
+
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["before"]["storageType"], "function");
+    assert_eq!(value["before"]["local"], "parent");
+    assert_eq!(value["before"]["session"], "parent");
+    assert_eq!(value["before"]["localNamed"], "parent");
+    assert_eq!(value["before"]["sessionNamed"], "parent");
+    assert_eq!(value["before"]["localSame"], false);
+    assert_eq!(value["before"]["sessionSame"], false);
+    assert_eq!(value["before"]["childAreasDistinct"], true);
+    assert_eq!(value["before"]["localTag"], "[object Storage]");
+    assert_eq!(value["before"]["sessionTag"], "[object Storage]");
+    assert_eq!(value["before"]["localInstance"], true);
+    assert_eq!(value["before"]["sessionInstance"], true);
+    assert_eq!(value["before"]["localProto"], true);
+    assert_eq!(value["before"]["methodRealmLocal"], true);
+    assert_eq!(value["before"]["prototypeShape"], true);
+    assert_eq!(value["before"]["crossRealmInstance"], false);
+    assert_eq!(value["before"]["parentCrossRealmInstance"], false);
+    assert!(value["before"]["construction"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert!(value["before"]["illegal"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal invocation"));
+    assert_eq!(value["after"]["parentLocal"], "child");
+    assert_eq!(value["after"]["parentSession"], "child");
+    assert_eq!(
+        value["after"]["localKeys"],
+        serde_json::json!(["childLocal", "parentLocal"])
+    );
+    assert_eq!(
+        value["after"]["sessionKeys"],
+        serde_json::json!(["childSession", "parentSession"])
+    );
+}
+
+#[tokio::test]
 async fn iframe_child_nodes_follow_child_document_lifecycle() {
     let r = evaluate(
         r#"

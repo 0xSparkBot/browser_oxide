@@ -4699,7 +4699,7 @@
     // `new w.Function(...)` to materialize a fresh-realm function; if we
     // throw where real Chrome succeeds, that differs from real Chrome.
     const _ILLEGAL_CONSTRUCTORS = new Set([
-        "Navigator", "Window", "Document", "HTMLDocument",
+        "Navigator", "Window", "Document", "HTMLDocument", "Storage",
         "IdleDeadline", "MediaCapabilities", "BatteryManager",
         "Node", "Element", "HTMLElement",
         "SVGElement", "SVGGraphicsElement", "SVGGeometryElement",
@@ -4905,7 +4905,7 @@
         "SVGEllipseElement", "SVGLineElement", "SVGPathElement",
         "SVGPolygonElement", "SVGPolylineElement", "SVGScriptElement",
         "SVGStyleElement", "SVGTitleElement", "SVGRect",
-        "NodeList", "HTMLCollection", "DOMTokenList",
+        "NodeList", "HTMLCollection", "DOMTokenList", "Storage",
         "HTMLHtmlElement", "HTMLHeadElement", "HTMLBodyElement",
         "HTMLDivElement", "HTMLSpanElement", "HTMLParagraphElement", "HTMLHeadingElement",
         "HTMLAnchorElement", "HTMLImageElement",
@@ -5292,6 +5292,133 @@
         })();`;
         try { ops.op_eval_in_child_realm(realmId, code); } catch (_) {}
         try { ops.op_delete_child_realm_prop(realmId, "__oxideInterfaceSources"); } catch (_) {}
+    }
+
+    // Same-origin child realms have their own Storage wrappers/prototype, but
+    // localStorage and sessionStorage address the same backing areas as the
+    // embedding top-level browsing context. Keep the Rust ops private by
+    // passing one temporary bridge into the child and deleting its global name
+    // immediately after the child-local closures capture it.
+    function _installChildRealmStorage(realmId) {
+        const quota = 5242880;
+        const bridge = Object.freeze({
+            get(area, key) {
+                return ops.op_dom_storage_get(String(area), String(key));
+            },
+            keys(area) {
+                return ops.op_dom_storage_keys(String(area));
+            },
+            set(area, key, value) {
+                area = String(area);
+                key = String(key);
+                const valueString = String(value);
+                const keys = ops.op_dom_storage_keys(area);
+                let currentSize = 0;
+                for (const existingKey of keys) {
+                    const existingValue = ops.op_dom_storage_get(area, existingKey);
+                    currentSize += String(existingKey).length
+                        + (existingValue === null ? 0 : String(existingValue).length);
+                }
+                const oldValue = ops.op_dom_storage_get(area, key);
+                const oldSize = oldValue === null ? 0 : key.length + String(oldValue).length;
+                const newSize = key.length + valueString.length;
+                if (currentSize - oldSize + newSize > quota) return false;
+                ops.op_dom_storage_set(area, key, valueString);
+                return true;
+            },
+            remove(area, key) {
+                ops.op_dom_storage_remove(String(area), String(key));
+            },
+            clear(area) {
+                ops.op_dom_storage_clear(String(area));
+            },
+        });
+        try {
+            ops.op_set_child_realm_prop(realmId, "__oxideStorageBridge", bridge);
+            ops.op_eval_in_child_realm(realmId, `(function(){
+                const bridge=globalThis.__oxideStorageBridge;
+                try{delete globalThis.__oxideStorageBridge;}catch(_){}
+                if(!bridge||typeof Storage!=='function')return;
+                const nativeTag=Symbol.for('__browser_oxide_native__');
+                function nativeShape(fn,name){
+                    try{Object.defineProperty(fn,'name',{value:name,configurable:true});}catch(_){}
+                    try{Object.defineProperty(fn,nativeTag,{value:name,configurable:true});}catch(_){}
+                    return fn;
+                }
+                const areaType=new WeakMap();
+                function typeFor(storage){
+                    const type=areaType.get(storage);
+                    if(!type)throw new TypeError('Illegal invocation');
+                    return type;
+                }
+                function quotaError(key){
+                    throw new DOMException(
+                        "Failed to execute 'setItem' on 'Storage': Setting the value of '"+String(key)+"' exceeded the quota.",
+                        'QuotaExceededError'
+                    );
+                }
+                const proto=Storage.prototype;
+                Object.defineProperty(proto,'length',{
+                    get:nativeShape(function(){return bridge.keys(typeFor(this)).length;},'get length'),
+                    enumerable:true,configurable:true
+                });
+                Object.defineProperty(proto,'key',{
+                    value:nativeShape(function(index){return bridge.keys(typeFor(this))[Number(index)>>>0]??null;},'key'),
+                    writable:true,enumerable:true,configurable:true
+                });
+                Object.defineProperty(proto,'getItem',{
+                    value:nativeShape(function(key){return bridge.get(typeFor(this),String(key));},'getItem'),
+                    writable:true,enumerable:true,configurable:true
+                });
+                Object.defineProperty(proto,'setItem',{
+                    value:nativeShape(function(key,value){if(!bridge.set(typeFor(this),String(key),value))quotaError(key);},'setItem'),
+                    writable:true,enumerable:true,configurable:true
+                });
+                Object.defineProperty(proto,'removeItem',{
+                    value:nativeShape(function(key){bridge.remove(typeFor(this),String(key));},'removeItem'),
+                    writable:true,enumerable:true,configurable:true
+                });
+                Object.defineProperty(proto,'clear',{
+                    value:nativeShape(function(){bridge.clear(typeFor(this));},'clear'),
+                    writable:true,enumerable:true,configurable:true
+                });
+                const methods=new Set(['getItem','setItem','removeItem','clear','key','length']);
+                function makeStorage(type){
+                    const target=Object.create(proto);
+                    const proxy=new Proxy(target,{
+                        get(target,key,receiver){
+                            if(typeof key==='symbol'||methods.has(key))return Reflect.get(target,key,receiver);
+                            const value=bridge.get(type,String(key));
+                            return value!==null?value:Reflect.get(target,key,receiver);
+                        },
+                        has(target,key){
+                            if(typeof key==='symbol')return Reflect.has(target,key);
+                            if(methods.has(key))return true;
+                            return bridge.get(type,String(key))!==null||Reflect.has(target,key);
+                        },
+                        set(_target,key,value){if(!bridge.set(type,String(key),value))quotaError(key);return true;},
+                        deleteProperty(_target,key){bridge.remove(type,String(key));return true;},
+                        ownKeys(){return bridge.keys(type);},
+                        getOwnPropertyDescriptor(_target,key){
+                            const value=bridge.get(type,String(key));
+                            if(value!==null)return{value,enumerable:true,configurable:true,writable:true};
+                        }
+                    });
+                    areaType.set(target,type);
+                    areaType.set(proxy,type);
+                    return proxy;
+                }
+                Object.defineProperty(globalThis,'localStorage',{
+                    value:makeStorage('local'),writable:false,enumerable:true,configurable:true
+                });
+                Object.defineProperty(globalThis,'sessionStorage',{
+                    value:makeStorage('session'),writable:false,enumerable:true,configurable:true
+                });
+            })();`);
+        } catch (_) {
+        } finally {
+            try { ops.op_delete_child_realm_prop(realmId, "__oxideStorageBridge"); } catch (_) {}
+        }
     }
 
     // Monotonically-increasing ID for child realms; used as the Rust-side
@@ -6401,6 +6528,7 @@
             // Replace copied DOM/Web-interface aliases with constructors and
             // prototypes created inside this child V8 context.
             _installChildRealmInterfaces(_realmId);
+            _installChildRealmStorage(_realmId);
             try {
                 ops.op_eval_in_child_realm(_realmId,
                     `(function(){
