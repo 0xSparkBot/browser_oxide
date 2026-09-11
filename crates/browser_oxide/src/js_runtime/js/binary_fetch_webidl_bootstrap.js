@@ -189,6 +189,16 @@
             lastModified: file ? file.lastModified : 0,
         };
     };
+    // fetch_bootstrap runs before Blob normalization. Hand its closed-over
+    // BodyInit serializer the same private snapshot function now that the
+    // Blob WeakMap exists, then remove the temporary realm-global hook before
+    // any page-authored script can observe it.
+    try {
+        const key = Symbol.for('__browser_oxide_fetch_blob_snapshot__');
+        const install = globalThis[key];
+        if (typeof install === 'function') install(blobSnapshotForClone);
+        delete globalThis[key];
+    } catch (_) {}
     // Worker runtimes execute this normalization layer before
     // structured_clone.js creates its legacy private bridge. Ensure the bridge
     // already exists here so the Blob snapshot hook is captured in both Window

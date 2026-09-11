@@ -2,6 +2,47 @@
     const ops = Deno.core.ops;
     const _diagnosticsEnabled = globalThis.__browser_oxide_debug === true;
 
+    // Blob/File are normalized later in binary_fetch_webidl_bootstrap.js,
+    // where their backing bytes live in a private WeakMap.  Install a
+    // one-shot private hook now so that later layer can inject a synchronous
+    // snapshot function into this fetch closure without exposing `_data` on
+    // page-visible Blob instances.
+    let _blobSnapshotForFetch = null;
+    const _blobSnapshotInstallKey = Symbol.for('__browser_oxide_fetch_blob_snapshot__');
+    try {
+        Object.defineProperty(globalThis, _blobSnapshotInstallKey, {
+            value(snapshot) {
+                if (typeof snapshot === 'function') _blobSnapshotForFetch = snapshot;
+            },
+            configurable: true,
+            enumerable: false,
+            writable: false,
+        });
+    } catch (_) {}
+
+    const _snapshotBlobForFetch = (value) => {
+        if (typeof _blobSnapshotForFetch !== 'function') return null;
+        try { return _blobSnapshotForFetch(value); } catch (_) { return null; }
+    };
+    const _bytesToBody = (bytes) => {
+        const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || 0);
+        let bin = '';
+        for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+        return 'b:' + btoa(bin);
+    };
+    const _concatBytes = (chunks) => {
+        let length = 0;
+        for (const chunk of chunks) length += chunk.byteLength;
+        const out = new Uint8Array(length);
+        let offset = 0;
+        for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.byteLength; }
+        return out;
+    };
+    const _multipartQuoted = (value) => String(value)
+        .replace(/\r/g, '%0D')
+        .replace(/\n/g, '%0A')
+        .replace(/"/g, '%22');
+
     function _pushFetchDiag(entry) {
         if (!_diagnosticsEnabled) return;
         try {
@@ -347,6 +388,8 @@
         // FormData). Track the boundary so we can force the header below.
         let multipartBoundary = null;
         let urlencodedBody = false;
+        let bodyKind = 'none';
+        let blobContentType = '';
         const _isFormData =
             typeof FormData !== "undefined" && rawBody instanceof FormData;
         const _isUSP =
@@ -355,53 +398,76 @@
             body = "";
         } else if (typeof rawBody === "string") {
             body = "s:" + rawBody;
+            bodyKind = 'text';
         } else if (rawBody instanceof ArrayBuffer || ArrayBuffer.isView(rawBody)) {
-            // Convert typed array / ArrayBuffer → Uint8Array → base64.
-            const u8 =
-                rawBody instanceof Uint8Array
-                    ? rawBody
-                    : new Uint8Array(rawBody.buffer || rawBody, rawBody.byteOffset || 0, rawBody.byteLength);
-            // btoa only handles latin-1; build a binary string first.
-            let bin = "";
-            for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
-            body = "b:" + btoa(bin);
+            // BufferSource bodies are byte sequences. Chromium does not
+            // synthesize a Content-Type for them.
+            const u8 = rawBody instanceof Uint8Array
+                ? rawBody
+                : new Uint8Array(
+                    rawBody.buffer || rawBody,
+                    rawBody.byteOffset || 0,
+                    rawBody.byteLength,
+                );
+            body = _bytesToBody(u8);
+            bodyKind = 'binary';
         } else if (_isFormData) {
-            // Serialize FormData → multipart with a generated boundary.
-            // Some challenge scripts POST their proof as FormData; without
-            // this we sent the literal "[object FormData]" and the server
-            // rejected the POST with 400 "Invalid boundary for
-            // multipart/form-data request".
+            // Serialize FormData as bytes so File/Blob fields retain arbitrary
+            // binary payloads rather than becoming "[object Blob]" strings.
             multipartBoundary =
                 "----browserOxideFormBoundary" +
                 Math.random().toString(36).slice(2) +
                 Math.random().toString(36).slice(2);
-            let mp = "";
+            const encoder = new TextEncoder();
+            const chunks = [];
             rawBody.forEach((value, name) => {
-                mp += "--" + multipartBoundary + "\r\n";
-                if (typeof Blob !== "undefined" && value instanceof Blob) {
-                    const fn = value.name || "blob";
-                    const ct = value.type || "application/octet-stream";
-                    mp +=
-                        'Content-Disposition: form-data; name="' + name +
-                        '"; filename="' + fn + '"\r\n';
-                    mp += "Content-Type: " + ct + "\r\n\r\n";
-                    mp += String(value) + "\r\n";
+                chunks.push(encoder.encode("--" + multipartBoundary + "\r\n"));
+                const snapshot = typeof Blob !== 'undefined' && value instanceof Blob
+                    ? _snapshotBlobForFetch(value)
+                    : null;
+                if (snapshot) {
+                    const filename = snapshot.isFile ? snapshot.name : (value.name || 'blob');
+                    const contentType = snapshot.type || 'application/octet-stream';
+                    chunks.push(encoder.encode(
+                        'Content-Disposition: form-data; name="' + _multipartQuoted(name) +
+                        '"; filename="' + _multipartQuoted(filename) + '"\r\n' +
+                        'Content-Type: ' + contentType + '\r\n\r\n'
+                    ));
+                    chunks.push(snapshot.bytes instanceof Uint8Array
+                        ? snapshot.bytes
+                        : new Uint8Array(snapshot.bytes || 0));
+                    chunks.push(encoder.encode('\r\n'));
                 } else {
-                    mp += 'Content-Disposition: form-data; name="' + name + '"\r\n\r\n';
-                    mp += String(value) + "\r\n";
+                    chunks.push(encoder.encode(
+                        'Content-Disposition: form-data; name="' + _multipartQuoted(name) +
+                        '"\r\n\r\n' + String(value) + '\r\n'
+                    ));
                 }
             });
-            mp += "--" + multipartBoundary + "--\r\n";
-            body = "s:" + mp;
+            chunks.push(encoder.encode("--" + multipartBoundary + "--\r\n"));
+            body = _bytesToBody(_concatBytes(chunks));
+            bodyKind = 'binary';
         } else if (_isUSP) {
             // URLSearchParams → application/x-www-form-urlencoded.
             body = "s:" + rawBody.toString();
+            bodyKind = 'text';
             urlencodedBody = true;
         } else if (typeof Blob !== "undefined" && rawBody instanceof Blob) {
-            // Blobs — best effort; we don't have a sync read, use toString.
-            body = "s:" + String(rawBody);
+            const snapshot = _snapshotBlobForFetch(rawBody);
+            if (snapshot) {
+                body = _bytesToBody(snapshot.bytes);
+                bodyKind = 'binary';
+                blobContentType = String(snapshot.type || '');
+            } else {
+                // Legacy bootstrap Blob fallback. Page-created normalized Blob
+                // objects always take the byte-exact snapshot path above.
+                body = "s:" + String(rawBody);
+                bodyKind = 'text';
+                blobContentType = String(rawBody.type || '');
+            }
         } else {
             body = "s:" + String(rawBody);
+            bodyKind = 'text';
         }
         headers = _flattenHeaders(init.headers);
         const internalRequestType = headers["x-browser-oxide-request-type"];
@@ -419,10 +485,11 @@
                 "multipart/form-data; boundary=" + multipartBoundary;
         } else if (urlencodedBody && !headers["content-type"]) {
             headers["content-type"] = "application/x-www-form-urlencoded;charset=UTF-8";
-        }
-
-        // Auto-set Content-Type for POSTs with a body (mirrors Chrome fetch default)
-        if (body && !headers["content-type"] && (method === "POST" || method === "PUT" || method === "PATCH")) {
+        } else if (blobContentType && !headers["content-type"]) {
+            headers["content-type"] = blobContentType;
+        } else if (bodyKind === 'text' && body && !headers["content-type"]) {
+            // Fetch extracts text/plain only for scalar string-like bodies.
+            // BufferSource bodies have no synthesized MIME type.
             headers["content-type"] = "text/plain;charset=UTF-8";
         }
 
