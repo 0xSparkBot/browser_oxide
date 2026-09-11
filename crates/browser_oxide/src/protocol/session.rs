@@ -636,6 +636,31 @@ impl CdpSession {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
 
+                if event_type == "mouseWheel" {
+                    let delta_x = req
+                        .params
+                        .get("deltaX")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let delta_y = req
+                        .params
+                        .get("deltaY")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let script = format!(
+                        "globalThis._browser_oxide.__dispatchTrustedWheelEvent(\
+                         {x},{y},{delta_x},{delta_y},{{\
+                         ctrlKey:{ctrl},shiftKey:{shift},altKey:{alt},metaKey:{meta}}})",
+                        ctrl = (modifiers & 2) != 0,
+                        shift = (modifiers & 8) != 0,
+                        alt = (modifiers & 1) != 0,
+                        meta = (modifiers & 4) != 0,
+                    );
+                    let _ = page.evaluate(&script);
+                    self.last_mouse_x = x;
+                    self.last_mouse_y = y;
+                }
+
                 let js_event = match event_type {
                     "mousePressed" => "mousedown",
                     "mouseReleased" => "mouseup",
@@ -999,6 +1024,98 @@ mod tests {
         let (_, events) = session.handle_request(&mut page, &req, None).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].method, "Runtime.executionContextCreated");
+    }
+
+    #[tokio::test]
+    async fn input_mouse_wheel_dispatches_trusted_wheel_and_scrolls() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            r#"<html><body style="margin:0;width:5000px;height:5000px">
+              <div id="target" style="width:200px;height:200px"></div>
+              <script>
+                globalThis.__wheel = null;
+                globalThis.__scroll = null;
+                document.addEventListener('wheel', event => {
+                  globalThis.__wheel = {
+                    dx: event.deltaX,
+                    dy: event.deltaY,
+                    mode: event.deltaMode,
+                    x: event.clientX,
+                    y: event.clientY,
+                    shift: event.shiftKey,
+                    trusted: event.isTrusted,
+                  };
+                });
+                document.addEventListener('scroll', event => {
+                  globalThis.__scroll = { trusted: event.isTrusted };
+                });
+              </script>
+            </body></html>"#,
+            None,
+        )
+        .await
+        .unwrap();
+        let req = CdpRequest {
+            id: 30,
+            method: "Input.dispatchMouseEvent".to_string(),
+            params: serde_json::json!({
+                "type": "mouseWheel",
+                "x": 12,
+                "y": 34,
+                "deltaX": 5,
+                "deltaY": 120,
+                "modifiers": 8,
+            }),
+        };
+
+        let (resp, _) = session.handle_request(&mut page, &req, None).await;
+        assert!(resp.contains("\"id\":30"), "response: {resp}");
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__wheel)").unwrap(),
+            r#"{"dx":5,"dy":120,"mode":0,"x":12,"y":34,"shift":true,"trusted":true}"#
+        );
+        assert_eq!(page.evaluate("String(window.scrollX)").unwrap(), "5");
+        assert_eq!(page.evaluate("String(window.scrollY)").unwrap(), "120");
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__scroll)")
+                .unwrap(),
+            r#"{"trusted":true}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn input_mouse_wheel_prevent_default_blocks_scroll() {
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html(
+            r#"<html><body><script>
+              globalThis.__wheelTrusted = null;
+              document.addEventListener('wheel', event => {
+                globalThis.__wheelTrusted = event.isTrusted;
+                event.preventDefault();
+              });
+            </script></body></html>"#,
+            None,
+        )
+        .await
+        .unwrap();
+        let req = CdpRequest {
+            id: 31,
+            method: "Input.dispatchMouseEvent".to_string(),
+            params: serde_json::json!({
+                "type": "mouseWheel",
+                "x": 1,
+                "y": 1,
+                "deltaX": 0,
+                "deltaY": 80,
+            }),
+        };
+
+        let _ = session.handle_request(&mut page, &req, None).await;
+        assert_eq!(
+            page.evaluate("String(globalThis.__wheelTrusted)").unwrap(),
+            "true"
+        );
+        assert_eq!(page.evaluate("String(window.scrollY)").unwrap(), "0");
     }
 
     #[tokio::test]

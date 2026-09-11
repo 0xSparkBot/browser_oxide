@@ -116,6 +116,51 @@
         },
     });
 
+    Object.defineProperty(_browser_oxide, '__dispatchTrustedWheelEvent', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value(x, y, deltaX, deltaY, init = {}) {
+            const clientX = Number(x) || 0;
+            const clientY = Number(y) || 0;
+            const target = (document.elementFromPoint
+                && document.elementFromPoint(clientX, clientY))
+                || document.body
+                || document.documentElement
+                || document;
+            const dx = Number(deltaX) || 0;
+            const dy = Number(deltaY) || 0;
+            const wheel = _markTrustedEvent(new globalThis.WheelEvent('wheel', {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: globalThis,
+                clientX,
+                clientY,
+                screenX: Number(init.screenX ?? clientX) || 0,
+                screenY: Number(init.screenY ?? clientY) || 0,
+                deltaX: dx,
+                deltaY: dy,
+                deltaZ: Number(init.deltaZ) || 0,
+                deltaMode: Number(init.deltaMode) || 0,
+                ctrlKey: !!init.ctrlKey,
+                shiftKey: !!init.shiftKey,
+                altKey: !!init.altKey,
+                metaKey: !!init.metaKey,
+            }));
+            const uncanceled = target.dispatchEvent(wheel);
+            if (uncanceled && !wheel.defaultPrevented) {
+                globalThis.scrollBy({ left: dx, top: dy, behavior: 'instant' });
+                document.dispatchEvent(_markTrustedEvent(new globalThis.Event('scroll')));
+            }
+            return {
+                target: String(target.tagName || target.nodeName || ''),
+                id: String(target.id || ''),
+                defaultPrevented: wheel.defaultPrevented,
+            };
+        },
+    });
+
     // Exposed via a Symbol slot so it survives `cleanup_bootstrap` deleting the
     // `Deno`/`ops` globals; the closure keeps `ops` reachable.
     try {
