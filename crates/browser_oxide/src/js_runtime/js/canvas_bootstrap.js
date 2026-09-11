@@ -89,6 +89,72 @@
         const hidden = _canvasElementIds.get(value);
         return hidden !== undefined ? hidden : value._canvasId;
     };
+    const _readImageBitmapEnum = (options, property, values, typeName, defaultValue) => {
+        const raw = options[property];
+        if (raw === undefined) return defaultValue;
+        const value = String(raw);
+        if (!values.includes(value)) {
+            throw new TypeError(
+                "Failed to execute 'createImageBitmap' on 'Window': Failed to read the '" +
+                property + "' property from 'ImageBitmapOptions': The provided value '" + value +
+                "' is not a valid enum value of type " + typeName + "."
+            );
+        }
+        return value;
+    };
+    const _readImageBitmapUnsignedLong = (options, property) => {
+        const raw = options[property];
+        if (raw === undefined) return undefined;
+        const value = Number(raw);
+        const prefix = "Failed to execute 'createImageBitmap' on 'Window': Failed to read the '" +
+            property + "' property from 'ImageBitmapOptions': ";
+        if (Number.isNaN(value)) {
+            throw new TypeError(prefix + "Value is not of type 'unsigned long'.");
+        }
+        if (!Number.isFinite(value)) {
+            throw new TypeError(prefix + "Value is infinite and not of type 'unsigned long'.");
+        }
+        if (value < 0 || value > 0xFFFFFFFF) {
+            throw new TypeError(prefix + "Value is outside the 'unsigned long' value range.");
+        }
+        return Math.trunc(value);
+    };
+    const _readImageBitmapOptions = rawOptions => {
+        if (rawOptions == null) rawOptions = {};
+        if ((typeof rawOptions !== 'object' && typeof rawOptions !== 'function')) {
+            throw new TypeError(
+                "Failed to execute 'createImageBitmap' on 'Window': " +
+                "The provided value is not of type 'ImageBitmapOptions'."
+            );
+        }
+        // Web IDL dictionary members are observed in lexicographic order.
+        const colorSpaceConversion = _readImageBitmapEnum(
+            rawOptions, 'colorSpaceConversion', ['none', 'default'],
+            'ColorSpaceConversion', 'default'
+        );
+        const imageOrientation = _readImageBitmapEnum(
+            rawOptions, 'imageOrientation', ['from-image', 'flipY'],
+            'ImageOrientation', 'from-image'
+        );
+        const premultiplyAlpha = _readImageBitmapEnum(
+            rawOptions, 'premultiplyAlpha', ['none', 'premultiply', 'default'],
+            'PremultiplyAlpha', 'default'
+        );
+        const resizeHeight = _readImageBitmapUnsignedLong(rawOptions, 'resizeHeight');
+        const resizeQuality = _readImageBitmapEnum(
+            rawOptions, 'resizeQuality', ['pixelated', 'low', 'medium', 'high'],
+            'ResizeQuality', 'low'
+        );
+        const resizeWidth = _readImageBitmapUnsignedLong(rawOptions, 'resizeWidth');
+        return {
+            colorSpaceConversion,
+            imageOrientation,
+            premultiplyAlpha,
+            resizeHeight,
+            resizeQuality,
+            resizeWidth,
+        };
+    };
     globalThis.createImageBitmap = function createImageBitmap(image) {
         const sourceSnapshot = {
             tag: Object.prototype.toString.call(image),
@@ -96,40 +162,136 @@
             height: Number(image && image.height) || 0,
             argc: arguments.length,
         };
+        const args = arguments;
         const finish = () => {
-            let bitmap;
-            const imageCanvasId = _canvasBackingId(image);
-            if (imageCanvasId !== undefined) {
-                bitmap = _makeImageBitmap({
-                    canvasId: imageCanvasId,
-                    width: Number(image.width) || 0,
-                    height: Number(image.height) || 0,
-                });
-            } else if (image instanceof ImageData) {
-                const canvasId = ops.op_canvas_create(
-                    image.width, image.height, _getOsName(), _getCanvasSeed()
-                );
-                ops.op_canvas_put_image_data(
-                    canvasId, image.data, 0, 0, image.width, image.height
-                );
-                bitmap = _makeImageBitmap({
-                    canvasId, width: image.width, height: image.height,
-                });
-            } else {
-                const bytes = (typeof _getImageBytes === 'function' && _getImageBytes(image))
-                    || (image && image._data)
-                    || null;
-                const imageId = _decodeBytes(bytes);
-                if (imageId < 0) {
-                    throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
+            let sourceKind = '';
+            let sourceId = -1;
+            let sourceBytes = new Uint8Array(0);
+            let sourceWidth = 0;
+            let sourceHeight = 0;
+
+            const bitmapState = image && _imageBitmapState.get(image);
+            if (bitmapState) {
+                sourceWidth = Number(bitmapState.width) || 0;
+                sourceHeight = Number(bitmapState.height) || 0;
+                if (bitmapState.imageId !== undefined) {
+                    sourceKind = 'image';
+                    sourceId = bitmapState.imageId;
+                } else if (bitmapState.canvasId !== undefined) {
+                    sourceKind = 'canvas';
+                    sourceId = bitmapState.canvasId;
                 }
-                const dimensions = ops.op_image_get_dimensions(imageId);
-                bitmap = _makeImageBitmap({
-                    imageId,
-                    width: Number(image && image.naturalWidth) || Number(dimensions[0]) || 0,
-                    height: Number(image && image.naturalHeight) || Number(dimensions[1]) || 0,
-                });
+            } else {
+                const imageCanvasId = _canvasBackingId(image);
+                if (imageCanvasId !== undefined) {
+                    sourceKind = 'canvas';
+                    sourceId = imageCanvasId;
+                    sourceWidth = Number(image.width) || 0;
+                    sourceHeight = Number(image.height) || 0;
+                } else if (image instanceof ImageData) {
+                    sourceKind = 'rgba';
+                    sourceWidth = Number(image.width) || 0;
+                    sourceHeight = Number(image.height) || 0;
+                    if (image.data instanceof Uint8ClampedArray || image.data instanceof Uint8Array) {
+                        sourceBytes = new Uint8Array(
+                            image.data.buffer,
+                            image.data.byteOffset,
+                            image.data.byteLength,
+                        );
+                    } else {
+                        sourceBytes = Uint8Array.from(image.data, value =>
+                            Math.max(0, Math.min(255, Math.round(Number(value) * 255)))
+                        );
+                    }
+                } else {
+                    const bytes = (typeof _getImageBytes === 'function' && _getImageBytes(image))
+                        || (image && image._data)
+                        || null;
+                    sourceId = _decodeBytes(bytes);
+                    if (sourceId >= 0) {
+                        sourceKind = 'image';
+                        const dimensions = ops.op_image_get_dimensions(sourceId);
+                        sourceWidth = Number(image && image.naturalWidth)
+                            || Number(dimensions[0]) || 0;
+                        sourceHeight = Number(image && image.naturalHeight)
+                            || Number(dimensions[1]) || 0;
+                    }
+                }
             }
+
+            if (!sourceKind || sourceWidth <= 0 || sourceHeight <= 0) {
+                throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
+            }
+
+            const hasCrop = args.length >= 5;
+            let sx = 0;
+            let sy = 0;
+            let sw = sourceWidth;
+            let sh = sourceHeight;
+            const options = _readImageBitmapOptions(hasCrop ? args[5] : args[1]);
+
+            if (hasCrop) {
+                sx = Math.trunc(Number(args[1]));
+                sy = Math.trunc(Number(args[2]));
+                sw = Math.trunc(Number(args[3]));
+                sh = Math.trunc(Number(args[4]));
+                if (sw === 0) {
+                    throw new RangeError("Failed to execute 'createImageBitmap' on 'Window': The crop rect width is 0.");
+                }
+                if (sh === 0) {
+                    throw new RangeError("Failed to execute 'createImageBitmap' on 'Window': The crop rect height is 0.");
+                }
+                // Negative crop extents grow in the opposite direction; they
+                // do not mirror the selected pixels.
+                if (sw < 0) { sx += sw; sw = -sw; }
+                if (sh < 0) { sy += sh; sh = -sh; }
+            }
+
+            const resizeWidth = options.resizeWidth;
+            const resizeHeight = options.resizeHeight;
+            if (resizeWidth === 0 || resizeHeight === 0) {
+                throw new DOMException(
+                    "Failed to execute 'createImageBitmap' on 'Window': The options's resizeWidth or resizeHeight is 0.",
+                    'InvalidStateError'
+                );
+            }
+
+            const outputWidth = resizeWidth !== undefined
+                ? resizeWidth
+                : resizeHeight !== undefined
+                    ? Math.max(1, Math.ceil(sw * resizeHeight / sh))
+                    : sw;
+            const outputHeight = resizeHeight !== undefined
+                ? resizeHeight
+                : resizeWidth !== undefined
+                    ? Math.max(1, Math.ceil(sh * resizeWidth / sw))
+                    : sh;
+            const resizeQuality = options.resizeQuality;
+            const flipY = options.imageOrientation === 'flipY';
+
+            const transformedId = ops.op_image_bitmap_transform(
+                sourceKind,
+                sourceId,
+                sourceBytes,
+                sourceWidth,
+                sourceHeight,
+                sx,
+                sy,
+                sw,
+                sh,
+                outputWidth,
+                outputHeight,
+                resizeQuality,
+                flipY,
+            );
+            if (transformedId < 0) {
+                throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
+            }
+            const bitmap = _makeImageBitmap({
+                imageId: transformedId,
+                width: outputWidth,
+                height: outputHeight,
+            });
             _debugCanvas({
                 op: 'createImageBitmap', source: sourceSnapshot,
                 width: bitmap.width, height: bitmap.height,

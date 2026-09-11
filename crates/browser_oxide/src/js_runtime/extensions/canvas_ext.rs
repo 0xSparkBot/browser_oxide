@@ -642,6 +642,160 @@ pub fn op_image_get_dimensions(state: &mut OpState, #[smi] image_id: i32) -> Vec
         .unwrap_or_default()
 }
 
+fn crop_resize_rgba(
+    rgba: &[u8],
+    source_width: u32,
+    source_height: u32,
+    sx: i32,
+    sy: i32,
+    crop_width: u32,
+    crop_height: u32,
+    output_width: u32,
+    output_height: u32,
+    resize_quality: &str,
+    flip_y: bool,
+) -> Option<DecodedImage> {
+    if crop_width == 0 || crop_height == 0 || output_width == 0 || output_height == 0 {
+        return None;
+    }
+
+    let source_len = (source_width as usize)
+        .checked_mul(source_height as usize)?
+        .checked_mul(4)?;
+    if rgba.len() < source_len {
+        return None;
+    }
+    let crop_len = (crop_width as usize)
+        .checked_mul(crop_height as usize)?
+        .checked_mul(4)?;
+    if crop_len > 512 * 1024 * 1024 {
+        return None;
+    }
+
+    let mut cropped = vec![0_u8; crop_len];
+    let sx64 = sx as i64;
+    let sy64 = sy as i64;
+    let src_x0 = sx64.max(0).min(source_width as i64);
+    let src_y0 = sy64.max(0).min(source_height as i64);
+    let src_x1 = (sx64 + crop_width as i64).max(0).min(source_width as i64);
+    let src_y1 = (sy64 + crop_height as i64).max(0).min(source_height as i64);
+
+    if src_x1 > src_x0 && src_y1 > src_y0 {
+        let copy_width = (src_x1 - src_x0) as usize;
+        let dst_x = (src_x0 - sx64) as usize;
+        let dst_y = (src_y0 - sy64) as usize;
+        for row in 0..(src_y1 - src_y0) as usize {
+            let source_row = src_y0 as usize + row;
+            let source_start = (source_row * source_width as usize + src_x0 as usize) * 4;
+            let source_end = source_start + copy_width * 4;
+            let destination_row = dst_y + row;
+            let destination_start = (destination_row * crop_width as usize + dst_x) * 4;
+            let destination_end = destination_start + copy_width * 4;
+            cropped[destination_start..destination_end]
+                .copy_from_slice(&rgba[source_start..source_end]);
+        }
+    }
+
+    let mut image = image::RgbaImage::from_raw(crop_width, crop_height, cropped)?;
+    if flip_y {
+        image::imageops::flip_vertical_in_place(&mut image);
+    }
+    let image = if output_width != crop_width || output_height != crop_height {
+        let filter = match resize_quality {
+            "pixelated" => image::imageops::FilterType::Nearest,
+            "medium" => image::imageops::FilterType::CatmullRom,
+            "high" => image::imageops::FilterType::Lanczos3,
+            _ => image::imageops::FilterType::Triangle,
+        };
+        image::imageops::resize(&image, output_width, output_height, filter)
+    } else {
+        image
+    };
+
+    Some(DecodedImage {
+        rgba: image.into_raw(),
+        width: output_width,
+        height: output_height,
+    })
+}
+
+/// Snapshot an ImageBitmap source, crop it (transparent-black outside the
+/// source bounds), and optionally resize it. The result is stored as a decoded
+/// image so a bitmap created from a canvas is immutable rather than a live
+/// reference to later canvas mutations.
+#[op2(fast)]
+#[smi]
+pub fn op_image_bitmap_transform(
+    state: &mut OpState,
+    #[string] source_kind: &str,
+    #[smi] source_id: i32,
+    #[buffer] source_rgba: &[u8],
+    #[smi] source_width: i32,
+    #[smi] source_height: i32,
+    #[smi] sx: i32,
+    #[smi] sy: i32,
+    #[smi] crop_width: i32,
+    #[smi] crop_height: i32,
+    #[smi] output_width: i32,
+    #[smi] output_height: i32,
+    #[string] resize_quality: &str,
+    flip_y: bool,
+) -> i32 {
+    let (rgba, width, height) = {
+        let canvas_state = state.borrow::<CanvasState>();
+        match source_kind {
+            "canvas" => match canvas_state.canvases.get(&source_id) {
+                Some(canvas) => (
+                    canvas.get_image_data(0, 0, canvas.width(), canvas.height()),
+                    canvas.width(),
+                    canvas.height(),
+                ),
+                None => return -1,
+            },
+            "image" => match canvas_state.images.get(&source_id) {
+                Some(image) => (image.rgba.clone(), image.width, image.height),
+                None => return -1,
+            },
+            "rgba" => {
+                if source_width <= 0 || source_height <= 0 {
+                    return -1;
+                }
+                (
+                    source_rgba.to_vec(),
+                    source_width as u32,
+                    source_height as u32,
+                )
+            }
+            _ => return -1,
+        }
+    };
+
+    if crop_width <= 0 || crop_height <= 0 || output_width <= 0 || output_height <= 0 {
+        return -1;
+    }
+    let Some(transformed) = crop_resize_rgba(
+        &rgba,
+        width,
+        height,
+        sx,
+        sy,
+        crop_width as u32,
+        crop_height as u32,
+        output_width as u32,
+        output_height as u32,
+        resize_quality,
+        flip_y,
+    ) else {
+        return -1;
+    };
+
+    let canvas_state = state.borrow_mut::<CanvasState>();
+    let id = canvas_state.next_id;
+    canvas_state.next_id += 1;
+    canvas_state.images.insert(id, transformed);
+    id
+}
+
 /// Draw a decoded image onto a canvas.
 #[op2(fast)]
 pub fn op_canvas_draw_decoded_image(
@@ -706,6 +860,7 @@ deno_core::extension!(
         op_canvas_set_fill_gradient,
         op_image_decode_base64,
         op_image_get_dimensions,
+        op_image_bitmap_transform,
         op_canvas_draw_decoded_image,
     ],
 );
