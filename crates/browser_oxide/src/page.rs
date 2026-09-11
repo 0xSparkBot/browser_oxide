@@ -802,7 +802,10 @@ impl Page {
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
         crate::js_runtime::extensions::fetch_ext::set_fetch_client(client.clone());
 
-        // Execute inline scripts (fast mode skips external scripts by default)
+        // Execute inline scripts (fast mode skips external scripts by default).
+        // Module scripts still use the ES-module loader: compiling them as
+        // classic scripts rejects valid `import`/top-level-await syntax and
+        // gives `document.currentScript` the wrong non-null value.
         for (i, script) in scripts.iter().enumerate() {
             if script.src.is_some() {
                 continue;
@@ -811,12 +814,24 @@ impl Page {
                 // W2.7 — name inline scripts with document URL (Chrome
                 // parity) instead of letting V8 default to <anonymous>.
                 event_loop.note_executed_script(url, &script.code);
-                // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-                event_loop.set_current_script(Some(script.node_id));
-                if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
-                    tracing::warn!(script_index = i, error = %e, "Script error in inline script");
+                if script.is_module {
+                    event_loop.set_current_script(None);
+                    let spec = format!("{url}#oxide-fast-mod-{i}");
+                    if let Err(e) = event_loop
+                        .eval_module_code(&spec, script.code.clone())
+                        .await
+                    {
+                        tracing::warn!(script_index = i, error = %e, "Module script error in inline script");
+                    }
+                } else {
+                    // document.currentScript parity (see
+                    // build_page_with_scripts_init_and_storage).
+                    event_loop.set_current_script(Some(script.node_id));
+                    if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
+                        tracing::warn!(script_index = i, error = %e, "Script error in inline script");
+                    }
+                    event_loop.set_current_script(None);
                 }
-                event_loop.set_current_script(None);
             }
         }
 
@@ -5265,6 +5280,31 @@ mod tests {
             page.evaluate("JSON.stringify(globalThis.__moduleEntries)")
                 .expect("module result"),
             r#"["first","first-after-await","second"]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn from_html_fast_executes_inline_module_as_module() {
+        let html = r#"<!doctype html><html><body>
+            <script type="module">
+                globalThis.__fastModule = {
+                    currentScriptIsNull: document.currentScript === null,
+                    value: await Promise.resolve(42),
+                };
+            </script>
+        </body></html>"#;
+        let mut page = Page::from_html_fast(
+            html,
+            "https://example.test/fast-module",
+            crate::stealth::presets::chrome_148_macos(),
+        )
+        .await
+        .expect("fast page");
+
+        assert_eq!(
+            page.evaluate("JSON.stringify(globalThis.__fastModule)")
+                .expect("module result"),
+            r#"{"currentScriptIsNull":true,"value":42}"#
         );
     }
 
