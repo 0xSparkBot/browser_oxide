@@ -5094,6 +5094,114 @@
         return new Uint8Array(src);
     };
 
+
+    const _jwkDataError = (message) => new DOMException(message, 'DataError');
+    const _base64urlEncode = (bytes) => {
+        let binary = '';
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    };
+    const _base64urlDecodeJwkK = (jwk) => {
+        if (!Object.prototype.hasOwnProperty.call(jwk, 'k')) {
+            throw _jwkDataError('The required JWK member "k" was missing');
+        }
+        const encoded = String(jwk.k);
+        if (encoded.includes('=') || !/^[A-Za-z0-9_-]*$/.test(encoded) || encoded.length % 4 === 1) {
+            throw _jwkDataError('The JWK member "k" could not be base64url decoded or contained padding');
+        }
+        const padded = encoded.replace(/-/g, '+').replace(/_/g, '/')
+            + '='.repeat((4 - (encoded.length % 4)) % 4);
+        let binary;
+        try {
+            binary = atob(padded);
+        } catch (_) {
+            throw _jwkDataError('The JWK member "k" could not be base64url decoded or contained padding');
+        }
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return out;
+    };
+    const _aesJwkAlg = (name, length) => name === 'AES-GCM'
+        ? `A${length}GCM`
+        : name === 'AES-CBC'
+            ? `A${length}CBC`
+            : `A${length}KW`;
+    const _hmacJwkAlg = (hash) => hash === 'SHA-1' ? 'HS1'
+        : hash === 'SHA-256' ? 'HS256'
+            : hash === 'SHA-384' ? 'HS384' : 'HS512';
+    const _validateJwkCommon = (jwk, extractable, usages, expectedUse) => {
+        if (!jwk || typeof jwk !== 'object' || ArrayBuffer.isView(jwk) || jwk instanceof ArrayBuffer) {
+            throw new TypeError("Failed to execute 'importKey' on 'SubtleCrypto': The provided value is not of type '(ArrayBuffer or ArrayBufferView or JsonWebKey)'.");
+        }
+        if (!Object.prototype.hasOwnProperty.call(jwk, 'kty')) {
+            throw _jwkDataError('The required JWK member "kty" was missing');
+        }
+        if (jwk.kty !== 'oct') {
+            throw _jwkDataError('The JWK "kty" member was not "oct"');
+        }
+        if (jwk.use !== undefined && String(jwk.use) !== expectedUse) {
+            throw _jwkDataError('The JWK "use" member was inconsistent with that specified by the Web Crypto call. The JWK usage must be a superset of those requested');
+        }
+        if (jwk.key_ops !== undefined) {
+            let keyOps;
+            try { keyOps = Array.from(jwk.key_ops, String); }
+            catch (_) { throw new TypeError("Failed to execute 'importKey' on 'SubtleCrypto': The provided value is not of type '(ArrayBuffer or ArrayBufferView or JsonWebKey)'."); }
+            if (usages.some((usage) => !keyOps.includes(usage))) {
+                throw _jwkDataError('The JWK "key_ops" member was inconsistent with that specified by the Web Crypto call. The JWK usage must be a superset of those requested');
+            }
+        }
+        if (jwk.ext === false && extractable) {
+            throw _jwkDataError('The "ext" member of the JWK dictionary is inconsistent what that specified by the Web Crypto call');
+        }
+    };
+    const _importAesJwk = (jwk, name, extractable, usages, makeKey) => {
+        _validateJwkCommon(jwk, extractable, usages, 'enc');
+        const bytes = _base64urlDecodeJwkK(jwk);
+        const length = bytes.byteLength * 8;
+        if (jwk.alg !== undefined) {
+            const expected = _aesJwkAlg(name, length);
+            if (String(jwk.alg) !== expected) {
+                const familySuffix = name === 'AES-GCM' ? 'GCM' : name === 'AES-CBC' ? 'CBC' : 'KW';
+                if (new RegExp(`^A(?:128|192|256)${familySuffix}$`).test(String(jwk.alg))) {
+                    throw _jwkDataError('The JWK "k" member did not include the right length of key data for the given algorithm.');
+                }
+                throw _jwkDataError('The JWK "alg" member was inconsistent with that specified by the Web Crypto call');
+            }
+        }
+        return makeKey(bytes, extractable, usages);
+    };
+    const _exportSecretJwk = (state) => {
+        let alg;
+        if (state.name === 'AES-GCM' || state.name === 'AES-CBC' || state.name === 'AES-KW') {
+            alg = _aesJwkAlg(state.name, state.length);
+        } else if (state.name === 'HMAC') {
+            alg = _hmacJwkAlg(state.hash);
+        } else {
+            throw new DOMException("The requested operation is not supported", "NotSupportedError");
+        }
+        // Chromium exposes JsonWebKey dictionary members in WebIDL member order.
+        return {
+            alg,
+            ext: state.extractable,
+            k: _base64urlEncode(state.bytes),
+            key_ops: state.usages.slice(),
+            kty: 'oct',
+        };
+    };
+    const _wrappedKeyBytes = (format, exported) => {
+        if (format !== 'jwk') return _toBytes(exported);
+        return new TextEncoder().encode(JSON.stringify(exported));
+    };
+    const _unwrappedKeyData = (format, bytes) => {
+        if (format !== 'jwk') return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        try {
+            return JSON.parse(new TextDecoder().decode(bytes));
+        } catch (_) {
+            throw _jwkDataError('The JWK could not be parsed');
+        }
+    };
+
+
     _defProtoMethod(_SubtleProto, 'digest', function digest(algorithm, data) {
         try {
             const algName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name) || "";
@@ -5504,11 +5612,15 @@
     });
     _defProtoMethod(_SubtleProto, 'importKey', function importKey(format, keyData, algorithm, extractable, keyUsages) {
         try {
-            if (String(format).toLowerCase() !== 'raw') {
+            const normalizedFormat = String(format).toLowerCase();
+            if (normalizedFormat !== 'raw' && normalizedFormat !== 'jwk') {
                 throw new DOMException("The requested operation is not supported", "NotSupportedError");
             }
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
             if (String(rawName || '').toUpperCase() === 'HKDF') {
+                if (normalizedFormat !== 'raw') {
+                    throw new DOMException("The requested operation is not supported", "NotSupportedError");
+                }
                 if (extractable) {
                     throw new DOMException("KDF keys must set extractable=false", "SyntaxError");
                 }
@@ -5519,6 +5631,9 @@
                 return Promise.resolve(_makeHkdfKey(_toBytes(keyData), usages));
             }
             if (String(rawName || '').toUpperCase() === 'PBKDF2') {
+                if (normalizedFormat !== 'raw') {
+                    throw new DOMException("The requested operation is not supported", "NotSupportedError");
+                }
                 if (extractable) {
                     throw new DOMException("PBKDF2 keys are not extractable", "SyntaxError");
                 }
@@ -5531,6 +5646,9 @@
             if (String(rawName || '').toUpperCase() === 'AES-GCM') {
                 _normalizeAesGcmKeyAlgorithm(algorithm, false);
                 const usages = _normalizeAesGcmUsages(keyUsages);
+                if (normalizedFormat === 'jwk') {
+                    return Promise.resolve(_importAesJwk(keyData, 'AES-GCM', extractable, usages, _makeAesGcmKey));
+                }
                 if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
                     throw new TypeError("keyData is not a BufferSource");
                 }
@@ -5539,6 +5657,9 @@
             if (String(rawName || '').toUpperCase() === 'AES-CBC') {
                 _normalizeAesCbcKeyAlgorithm(algorithm, false);
                 const usages = _normalizeAesCbcUsages(keyUsages);
+                if (normalizedFormat === 'jwk') {
+                    return Promise.resolve(_importAesJwk(keyData, 'AES-CBC', extractable, usages, _makeAesCbcKey));
+                }
                 if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
                     throw new TypeError("keyData is not a BufferSource");
                 }
@@ -5547,6 +5668,9 @@
             if (String(rawName || '').toUpperCase() === 'AES-KW') {
                 _normalizeAesKwKeyAlgorithm(algorithm, false);
                 const usages = _normalizeAesKwUsages(keyUsages);
+                if (normalizedFormat === 'jwk') {
+                    return Promise.resolve(_importAesJwk(keyData, 'AES-KW', extractable, usages, _makeAesKwKey));
+                }
                 if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
                     throw new TypeError("keyData is not a BufferSource");
                 }
@@ -5554,6 +5678,15 @@
             }
             const alg = _normalizeHmacAlgorithm(algorithm, true);
             const usages = _normalizeHmacUsages(keyUsages);
+            if (normalizedFormat === 'jwk') {
+                _validateJwkCommon(keyData, extractable, usages, 'sig');
+                const bytes = _base64urlDecodeJwkK(keyData);
+                if (keyData.alg !== undefined && String(keyData.alg) !== _hmacJwkAlg(alg.hash)) {
+                    throw _jwkDataError('The JWK "alg" member was inconsistent with that specified by the Web Crypto call');
+                }
+                const length = alg.length === undefined ? bytes.byteLength * 8 : alg.length;
+                return Promise.resolve(_makeHmacKey(bytes, alg.hash, extractable, usages, length));
+            }
             if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
                 throw new TypeError("keyData is not a BufferSource");
             }
@@ -5567,7 +5700,11 @@
             if (!state.extractable) {
                 throw new DOMException("Failed to execute 'exportKey' on 'SubtleCrypto': key is not extractable", "InvalidAccessError");
             }
-            if (String(format).toLowerCase() !== 'raw') {
+            const normalizedFormat = String(format).toLowerCase();
+            if (normalizedFormat === 'jwk') {
+                return Promise.resolve(_exportSecretJwk(state));
+            }
+            if (normalizedFormat !== 'raw') {
                 throw new DOMException("The requested operation is not supported", "NotSupportedError");
             }
             const copy = state.bytes.slice();
@@ -5776,7 +5913,14 @@
             if (String(rawName || '').toUpperCase() === 'AES-KW') {
                 const state = _checkAesKwOperation(wrapAlgorithm, wrappingKey, 'wrapKey');
                 return _SubtleProto.exportKey.call(this, normalizedFormat, key).then((exported) => {
-                    const result = ops.op_crypto_aes_kw_wrap(state.bytes, _toBytes(exported));
+                    const plain = _wrappedKeyBytes(normalizedFormat, exported);
+                    if (plain.byteLength < 16) {
+                        throw new DOMException('The provided data is too small', 'OperationError');
+                    }
+                    if (plain.byteLength % 8 !== 0) {
+                        throw new DOMException('The AES-KW input data length is invalid: not a multiple of 8 bytes', 'DataError');
+                    }
+                    const result = ops.op_crypto_aes_kw_wrap(state.bytes, plain);
                     if (!result.ok) throw new DOMException('', 'OperationError');
                     return new Uint8Array(result.data).buffer;
                 });
@@ -5784,7 +5928,7 @@
             if (String(rawName || '').toUpperCase() === 'AES-CBC') {
                 const { alg, state } = _checkAesCbcOperation(wrapAlgorithm, wrappingKey, 'wrapKey', 'wrapKey');
                 return _SubtleProto.exportKey.call(this, normalizedFormat, key).then((exported) => {
-                    const result = ops.op_crypto_aes_cbc_encrypt(state.bytes, alg.iv, _toBytes(exported));
+                    const result = ops.op_crypto_aes_cbc_encrypt(state.bytes, alg.iv, _wrappedKeyBytes(normalizedFormat, exported));
                     if (!result.ok) throw new DOMException('', 'OperationError');
                     return new Uint8Array(result.data).buffer;
                 });
@@ -5792,7 +5936,7 @@
             const { alg, state } = _checkAesGcmOperation(wrapAlgorithm, wrappingKey, 'wrapKey');
             return _SubtleProto.exportKey.call(this, normalizedFormat, key).then((exported) => {
                 const result = ops.op_crypto_aes_gcm_encrypt(
-                    state.bytes, alg.iv, alg.additionalData, _toBytes(exported), alg.tagLength / 8
+                    state.bytes, alg.iv, alg.additionalData, _wrappedKeyBytes(normalizedFormat, exported), alg.tagLength / 8
                 );
                 if (!result.ok) {
                     throw new DOMException("The operation failed for an operation-specific reason", "OperationError");
@@ -5830,8 +5974,9 @@
                 }
             }
             const raw = new Uint8Array(result.data);
+            const keyData = _unwrappedKeyData(normalizedFormat, raw);
             return _SubtleProto.importKey.call(
-                this, normalizedFormat, raw.buffer, unwrappedKeyAlgorithm, extractable, keyUsages
+                this, normalizedFormat, keyData, unwrappedKeyAlgorithm, extractable, keyUsages
             );
         } catch (e) { return Promise.reject(e); }
     });

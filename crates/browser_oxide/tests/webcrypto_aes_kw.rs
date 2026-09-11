@@ -94,6 +94,12 @@ async fn window_aes_kw_matches_rfc3394_and_webcrypto_semantics() {
         await capture('badKeyLength', () => crypto.subtle.importKey(
           'raw', new Uint8Array(15), 'AES-KW', true, ['wrapKey']
         ));
+        for (const [name, size] of [['tooSmallWrap', 8], ['unalignedWrap', 17]]) {
+          const shortTarget = await crypto.subtle.importKey(
+            'raw', new Uint8Array(size), { name: 'HMAC', hash: 'SHA-256' }, true, ['sign']
+          );
+          await capture(name, () => crypto.subtle.wrapKey('raw', shortTarget, wrappingKey, 'AES-KW'));
+        }
         await capture('directEncrypt', () => crypto.subtle.encrypt(
           'AES-KW', wrappingKey, targetBytes
         ));
@@ -179,6 +185,14 @@ async fn window_aes_kw_matches_rfc3394_and_webcrypto_semantics() {
         .as_str()
         .unwrap()
         .starts_with("DataError:"));
+    assert_eq!(
+        value["tooSmallWrap"],
+        "OperationError:The provided data is too small"
+    );
+    assert_eq!(
+        value["unalignedWrap"],
+        "DataError:The AES-KW input data length is invalid: not a multiple of 8 bytes"
+    );
     assert!(value["directEncrypt"]
         .as_str()
         .unwrap()
