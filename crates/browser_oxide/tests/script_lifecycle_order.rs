@@ -66,7 +66,13 @@ async fn spawn_fixture_server() -> (String, tokio::task::JoinHandle<()>) {
                         "__order.push('module-dep:' + document.readyState);",
                     ),
                     "/async-slow.js" => (
-                        300,
+                        // Keep the async entry decisively slower than the
+                        // parser-blocking + defer/module chain. `async`
+                        // scripts execute as soon as their fetch completes;
+                        // with only a ~70 ms margin this fixture could
+                        // legitimately flip order under host load and report
+                        // a false lifecycle regression.
+                        800,
                         "text/javascript; charset=utf-8",
                         "__order.push('async-slow:' + document.readyState);",
                     ),
