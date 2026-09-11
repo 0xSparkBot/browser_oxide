@@ -268,8 +268,16 @@
     function _queueRequestSuccess(request, result) {
         const state = _stateFor(_requestState, request);
         const tx = state.transaction;
-        if (tx) _txBegin(tx);
+        if (tx) {
+            _txBegin(tx);
+            _stateFor(_txState, tx).requests.add(request);
+        }
         queueMicrotask(() => {
+            if (tx) {
+                const txState = _stateFor(_txState, tx);
+                if (txState.aborted || state.readyState !== 'pending') return;
+                txState.requests.delete(request);
+            }
             _setRequestDone(request, result, null);
             _emit(request, new Event('success'));
             if (tx) _txEnd(tx);
@@ -279,8 +287,16 @@
     function _queueRequestError(request, error) {
         const state = _stateFor(_requestState, request);
         const tx = state.transaction;
-        if (tx) _txBegin(tx);
+        if (tx) {
+            _txBegin(tx);
+            _stateFor(_txState, tx).requests.add(request);
+        }
         queueMicrotask(() => {
+            if (tx) {
+                const txState = _stateFor(_txState, tx);
+                if (txState.aborted || state.readyState !== 'pending') return;
+                txState.requests.delete(request);
+            }
             _setRequestDone(request, undefined, error);
             const event = new Event('error', { bubbles: true, cancelable: true });
             const requestUncanceled = _emit(request, event);
@@ -450,6 +466,44 @@
         return store;
     }
 
+    function _cloneStoreRecord(record) {
+        const data = new Map();
+        for (const [key, value] of record.data.entries()) {
+            data.set(_clone(key), _clone(value));
+        }
+        const indexes = new Map();
+        for (const [name, index] of record.indexes.entries()) {
+            indexes.set(name, {
+                name: index.name,
+                keyPath: _clone(index.keyPath),
+                multiEntry: !!index.multiEntry,
+                unique: !!index.unique,
+            });
+        }
+        return {
+            name: record.name,
+            keyPath: _clone(record.keyPath),
+            autoIncrement: !!record.autoIncrement,
+            nextKey: record.nextKey,
+            data,
+            indexes,
+        };
+    }
+
+    function _snapshotDatabaseRecord(record) {
+        const stores = new Map();
+        for (const [name, store] of record.stores.entries()) {
+            stores.set(name, _cloneStoreRecord(store));
+        }
+        return { version: record.version, stores };
+    }
+
+    function _restoreDatabaseRecord(record, snapshot) {
+        if (!snapshot) return;
+        record.version = snapshot.version;
+        record.stores = snapshot.stores;
+    }
+
     // ---------------------------------------------------------------------
     // Transactions.
     // ---------------------------------------------------------------------
@@ -466,6 +520,8 @@
             state.checkScheduled = false;
             if (!state.active || state.pending !== 0) return;
             state.active = false;
+            state.snapshot = null;
+            state.requests.clear();
             _emit(transaction, new Event('complete'));
             for (const callback of state.completeCallbacks.splice(0)) {
                 try { callback(); } catch (_) {}
@@ -481,8 +537,35 @@
         const state = _stateFor(_txState, transaction);
         if (!state.active) return;
         state.active = false;
-        state.error = error || _domError('AbortError', 'The transaction was aborted.');
+        state.aborted = true;
+        state.error = error || null;
+        _restoreDatabaseRecord(_stateFor(_dbState, state.db).record, state.snapshot);
+        state.snapshot = null;
+        state.pending = 0;
+        state.checkScheduled = false;
+
+        // Requests that had been queued by this transaction but had not yet
+        // dispatched success/error are aborted before the transaction's abort
+        // event. Blink exposes AbortError on those requests and never lets a
+        // queued success callback run after IDBTransaction.abort().
+        const abortError = _domError('AbortError', 'The transaction was aborted.');
+        const pendingRequests = [...state.requests];
+        state.requests.clear();
+        for (const request of pendingRequests) {
+            const requestState = _stateFor(_requestState, request);
+            if (requestState.readyState !== 'pending') continue;
+            _setRequestDone(request, undefined, abortError);
+            const requestEvent = new Event('error', { bubbles: true, cancelable: true });
+            _emit(request, requestEvent);
+            if (_dispatchEventToParentTarget) {
+                _dispatchEventToParentTarget(requestEvent, transaction);
+            }
+        }
         _emit(transaction, new Event('abort'));
+        for (const callback of state.abortCallbacks.splice(0)) {
+            try { callback(state.error || abortError); } catch (_) {}
+        }
+        state.completeCallbacks.length = 0;
     }
     function _makeTransaction(database, names, mode = 'readonly', durability = 'default') {
         const transaction = Object.create(IDBTransactionProto);
@@ -499,9 +582,13 @@
             error: null,
             handlers: Object.create(null),
             active: true,
+            aborted: false,
             pending: 0,
             checkScheduled: false,
             completeCallbacks: [],
+            abortCallbacks: [],
+            requests: new Set(),
+            snapshot: mode === 'readonly' ? null : _snapshotDatabaseRecord(dbRecord),
         });
         _scheduleTxCheck(transaction);
         return transaction;
@@ -517,8 +604,7 @@
     _defineMethod(IDBTransactionProto, 'abort', function abort() {
         const state = _stateFor(_txState, this);
         if (!state.active) throw _domError('InvalidStateError', 'The transaction has finished.');
-        state.active = false;
-        _emit(this, new Event('abort'));
+        _abortTransaction(this, null);
     });
     _defineMethod(IDBTransactionProto, 'commit', function commit() {
         const state = _stateFor(_txState, this);
@@ -975,14 +1061,19 @@
                 return;
             }
             if (!record) {
-                record = { name, version: targetVersion, stores: new Map() };
+                // Keep the not-yet-created database at version 0 until the
+                // versionchange transaction has captured its rollback
+                // snapshot. If that transaction aborts, the registry entry is
+                // removed entirely below, matching Blink's failed initial-open
+                // semantics.
+                record = { name, version: 0, stores: new Map() };
                 _dbRegistry.set(name, record);
             }
             const database = _makeDatabase(record);
             const reqState = _stateFor(_requestState, request);
             if (oldVersion < targetVersion) {
-                record.version = targetVersion;
                 const transaction = _makeTransaction(database, [...record.stores.keys()], 'versionchange', 'default');
+                record.version = targetVersion;
                 _stateFor(_dbState, database).upgradeTransaction = transaction;
                 reqState.result = database;
                 reqState.readyState = 'done';
@@ -993,6 +1084,19 @@
                     reqState.transaction = null;
                     _setRequestDone(request, database, null);
                     queueMicrotask(() => _emit(request, new Event('success')));
+                });
+                txState.abortCallbacks.push((abortError) => {
+                    const dbState = _stateFor(_dbState, database);
+                    dbState.upgradeTransaction = null;
+                    dbState.closed = true;
+                    reqState.transaction = null;
+                    if (oldVersion === 0) {
+                        _dbRegistry.delete(name);
+                    }
+                    _setRequestDone(request, undefined, abortError);
+                    queueMicrotask(() => {
+                        _emit(request, new Event('error', { bubbles: true, cancelable: true }));
+                    });
                 });
                 _emit(request, new IDBVersionChangeEvent('upgradeneeded', {
                     oldVersion,

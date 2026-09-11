@@ -379,3 +379,223 @@ async fn indexeddb_transaction_cursor_and_error_lifecycle_matches_chrome_148() {
     assert_eq!(value["rows"][1]["key"], "b");
     assert_eq!(value["rows"][1]["primaryKey"], 2);
 }
+
+#[tokio::test]
+async fn indexeddb_aborted_readwrite_rolls_back_and_aborts_pending_request() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbAbortResult = null;
+        (() => {
+            const request = indexedDB.open('browser-oxide-idb-abort', 1);
+            request.onupgradeneeded = () => {
+                request.result.createObjectStore('items', { keyPath: 'id' });
+            };
+            request.onsuccess = () => {
+                const db = request.result;
+                const tx = db.transaction('items', 'readwrite');
+                const put = tx.objectStore('items').put({ id: 1, value: 'temporary' });
+                const out = {
+                    putSuccess: false,
+                    putError: null,
+                    txAbort: false,
+                    txComplete: false,
+                    storedAfterAbort: 'not-read',
+                };
+
+                put.onsuccess = () => { out.putSuccess = true; };
+                put.onerror = () => {
+                    out.putError = put.error && put.error.name;
+                };
+                tx.oncomplete = () => {
+                    out.txComplete = true;
+                    globalThis.__idbAbortResult = out;
+                };
+                tx.onabort = () => {
+                    out.txAbort = true;
+                    const verify = db.transaction('items').objectStore('items').get(1);
+                    verify.onsuccess = () => {
+                        out.storedAfterAbort = verify.result === undefined
+                            ? null
+                            : verify.result;
+                        // Let the already-queued put request callback run, if
+                        // the implementation incorrectly leaves it alive.
+                        queueMicrotask(() => { globalThis.__idbAbortResult = out; });
+                    };
+                };
+                tx.abort();
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbAbortResult)")
+        .expect("abort result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("abort json");
+
+    assert_eq!(value["txAbort"], true);
+    assert_eq!(value["txComplete"], false);
+    assert_eq!(value["putSuccess"], false);
+    assert_eq!(value["putError"], "AbortError");
+    assert_eq!(value["storedAfterAbort"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn indexeddb_uncanceled_request_error_aborts_and_rolls_back_entire_transaction() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbAutoAbortResult = null;
+        (() => {
+            const open = indexedDB.open('browser-oxide-idb-auto-abort', 1);
+            open.onupgradeneeded = () => {
+                const store = open.result.createObjectStore('items', { keyPath: 'id' });
+                store.put({ id: 1, value: 'original' });
+            };
+            open.onsuccess = () => {
+                const db = open.result;
+                const tx = db.transaction('items', 'readwrite');
+                const store = tx.objectStore('items');
+                const first = store.put({ id: 2, value: 'must-roll-back' });
+                const duplicate = store.add({ id: 1, value: 'duplicate' });
+                const out = {
+                    seq: [], duplicateError: null,
+                    txErrorDuringError: null, txErrorDuringAbort: null,
+                    id1: null, id2: 'not-read'
+                };
+                first.onsuccess = () => out.seq.push('first-success');
+                duplicate.onerror = () => {
+                    out.seq.push('duplicate-error');
+                    out.duplicateError = duplicate.error && duplicate.error.name;
+                    // Deliberately do not preventDefault(): IndexedDB must
+                    // abort the whole transaction.
+                };
+                tx.onerror = () => {
+                    out.seq.push('tx-error');
+                    out.txErrorDuringError = tx.error && tx.error.name;
+                };
+                tx.onabort = () => {
+                    out.seq.push('tx-abort');
+                    out.txErrorDuringAbort = tx.error && tx.error.name;
+                    const verify = db.transaction('items');
+                    const s = verify.objectStore('items');
+                    const r1 = s.get(1);
+                    const r2 = s.get(2);
+                    let remaining = 2;
+                    const done = () => {
+                        if (--remaining) return;
+                        globalThis.__idbAutoAbortResult = out;
+                    };
+                    r1.onsuccess = () => { out.id1 = r1.result; done(); };
+                    r2.onsuccess = () => {
+                        out.id2 = r2.result === undefined ? null : r2.result;
+                        done();
+                    };
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbAutoAbortResult)")
+        .expect("automatic abort result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("automatic abort json");
+
+    assert_eq!(value["duplicateError"], "ConstraintError");
+    assert_eq!(value["txErrorDuringError"], serde_json::Value::Null);
+    assert_eq!(value["txErrorDuringAbort"], "ConstraintError");
+    assert_eq!(
+        value["seq"],
+        serde_json::json!(["first-success", "duplicate-error", "tx-error", "tx-abort"])
+    );
+    assert_eq!(value["id1"], serde_json::json!({"id":1,"value":"original"}));
+    assert_eq!(value["id2"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn indexeddb_aborted_versionchange_restores_previous_schema_and_version() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbUpgradeAbortResult = null;
+        (() => {
+            const first = indexedDB.open('browser-oxide-idb-upgrade-abort', 1);
+            first.onupgradeneeded = () => first.result.createObjectStore('stable');
+            first.onsuccess = () => {
+                first.result.close();
+                const upgrade = indexedDB.open('browser-oxide-idb-upgrade-abort', 2);
+                const out = { seq: [], openError: null, version: null, stores: null };
+                upgrade.onupgradeneeded = () => {
+                    out.seq.push('upgrade');
+                    upgrade.result.deleteObjectStore('stable');
+                    upgrade.result.createObjectStore('temporary');
+                    upgrade.transaction.onabort = () => out.seq.push('tx-abort');
+                    upgrade.transaction.abort();
+                };
+                upgrade.onerror = () => {
+                    out.seq.push('open-error');
+                    out.openError = upgrade.error && upgrade.error.name;
+                    const verify = indexedDB.open('browser-oxide-idb-upgrade-abort');
+                    verify.onsuccess = () => {
+                        out.version = verify.result.version;
+                        out.stores = Array.from(verify.result.objectStoreNames);
+                        globalThis.__idbUpgradeAbortResult = out;
+                    };
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbUpgradeAbortResult)")
+        .expect("upgrade abort result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("upgrade abort json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!(["upgrade", "tx-abort", "open-error"])
+    );
+    assert_eq!(value["openError"], "AbortError");
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["stores"], serde_json::json!(["stable"]));
+}
+
+#[tokio::test]
+async fn indexeddb_aborted_initial_upgrade_does_not_leave_database_behind() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbInitialAbortResult = null;
+        (() => {
+            const name = 'browser-oxide-idb-initial-abort';
+            const first = indexedDB.open(name, 4);
+            const out = { firstError: null, oldVersion: null, newVersion: null, version: null, stores: null };
+            first.onupgradeneeded = () => {
+                first.result.createObjectStore('must-not-survive');
+                first.transaction.abort();
+            };
+            first.onerror = () => {
+                out.firstError = first.error && first.error.name;
+                const verify = indexedDB.open(name);
+                verify.onupgradeneeded = (event) => {
+                    out.oldVersion = event.oldVersion;
+                    out.newVersion = event.newVersion;
+                    verify.result.createObjectStore('fresh');
+                };
+                verify.onsuccess = () => {
+                    out.version = verify.result.version;
+                    out.stores = Array.from(verify.result.objectStoreNames);
+                    globalThis.__idbInitialAbortResult = out;
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbInitialAbortResult)")
+        .expect("initial upgrade abort result");
+    let value: serde_json::Value =
+        serde_json::from_str(&result).expect("initial upgrade abort json");
+
+    assert_eq!(value["firstError"], "AbortError");
+    assert_eq!(value["oldVersion"], 0);
+    assert_eq!(value["newVersion"], 1);
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["stores"], serde_json::json!(["fresh"]));
+}
