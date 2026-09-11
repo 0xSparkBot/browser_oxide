@@ -1,6 +1,7 @@
 use crate::dom::Dom;
 use crate::js_runtime::extensions::audio_ext::audio_extension;
 use crate::js_runtime::extensions::canvas_ext::{canvas_extension, CanvasState};
+use crate::js_runtime::extensions::compression_stream_ext::compression_stream_extension;
 use crate::js_runtime::extensions::console_ext::console_extension;
 use crate::js_runtime::extensions::crypto_ext::crypto_extension;
 use crate::js_runtime::extensions::dom_ext::dom_extension;
@@ -82,6 +83,7 @@ pub fn get_snapshot() -> &'static [u8] {
         let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
             extensions: vec![
                 console_extension::init(),
+                compression_stream_extension::init(),
                 crypto_extension::init(),
                 dom_extension::init(),
                 timer_extension::init(),
@@ -160,6 +162,8 @@ pub fn get_snapshot() -> &'static [u8] {
             include_str!("js/geometry_bootstrap.js"),
             "\n",
             include_str!("js/streams_bootstrap.js"),
+            "\n",
+            include_str!("js/compression_stream_bootstrap.js"),
             "\n",
             include_str!("js/webidl_arity_bootstrap.js"),
             "\n",

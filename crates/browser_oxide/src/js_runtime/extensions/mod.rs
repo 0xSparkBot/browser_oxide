@@ -1,5 +1,6 @@
 pub mod audio_ext;
 pub mod canvas_ext;
+pub mod compression_stream_ext;
 pub mod console_ext;
 pub mod crypto_ext;
 pub mod dom_ext;

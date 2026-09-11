@@ -1,6 +1,7 @@
 use crate::dom::Dom;
 use crate::js_runtime::extensions::audio_ext::audio_extension;
 use crate::js_runtime::extensions::canvas_ext::{canvas_extension, CanvasState};
+use crate::js_runtime::extensions::compression_stream_ext::compression_stream_extension;
 use crate::js_runtime::extensions::console_ext::console_extension;
 use crate::js_runtime::extensions::crypto_ext::crypto_extension;
 use crate::js_runtime::extensions::dom_ext::dom_extension;
@@ -272,6 +273,7 @@ pub fn create_runtime_with_signals(
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![
             console_extension::init(),
+            compression_stream_extension::init(),
             crypto_extension::init(),
             dom_extension::init(),
             timer_extension::init(),
@@ -405,6 +407,8 @@ pub fn create_runtime_with_signals(
             include_str!("js/geometry_bootstrap.js"),
             "\n",
             include_str!("js/streams_bootstrap.js"),
+            "\n",
+            include_str!("js/compression_stream_bootstrap.js"),
             "\n",
             include_str!("js/webidl_arity_bootstrap.js"),
             "\n",
@@ -659,6 +663,7 @@ pub fn create_worker_runtime(
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![
             console_extension::init(),
+            compression_stream_extension::init(),
             crypto_extension::init(),
             timer_extension::init(),
             fetch_extension::init(),
@@ -785,6 +790,13 @@ pub fn create_worker_runtime(
     runtime
         .execute_script("<anonymous>", include_str!("js/streams_bootstrap.js"))
         .expect("worker: streams bootstrap failed");
+
+    runtime
+        .execute_script(
+            "<anonymous>",
+            include_str!("js/compression_stream_bootstrap.js"),
+        )
+        .expect("worker: compression streams bootstrap failed");
 
     // event_bootstrap defines Event, MessageEvent, EventTarget, and wires
     // addEventListener / removeEventListener / dispatchEvent onto
