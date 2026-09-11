@@ -62,12 +62,13 @@ async fn async_reload_executes_multiple_inline_module_entries_as_modules() {
 
     page.reload_html_async(
         r#"<html><body>
-            <script>globalThis.__reloadOrder = ['classic'];</script>
             <script type="module">
+                globalThis.__reloadOrder = globalThis.__reloadOrder || [];
                 globalThis.__reloadOrder.push('module-1');
                 await Promise.resolve();
-                globalThis.__reloadOrder.push(import.meta.url.includes('oxide-reload-mod-1') ? 'tla' : 'bad-url');
+                globalThis.__reloadOrder.push(import.meta.url.includes('oxide-reload-mod-0') ? 'tla' : 'bad-url');
             </script>
+            <script>globalThis.__reloadOrder = ['classic'];</script>
             <script type="module">
                 globalThis.__reloadOrder.push('module-2');
             </script>
@@ -80,6 +81,27 @@ async fn async_reload_executes_multiple_inline_module_entries_as_modules() {
         page.evaluate("JSON.stringify(globalThis.__reloadOrder)")
             .unwrap(),
         r#"["classic","module-1","tla","module-2"]"#
+    );
+}
+
+#[tokio::test]
+async fn fast_builder_defers_non_async_modules_until_after_inline_classic_scripts() {
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let html = r#"<html><body>
+        <script type="module">
+            globalThis.__fastOrder = globalThis.__fastOrder || [];
+            globalThis.__fastOrder.push('module');
+        </script>
+        <script>globalThis.__fastOrder = ['classic'];</script>
+    </body></html>"#;
+
+    let mut page = Page::from_html_fast(html, "https://example.test/fast", profile)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.evaluate("JSON.stringify(globalThis.__fastOrder)")
+            .unwrap(),
+        r#"["classic","module"]"#
     );
 }
 

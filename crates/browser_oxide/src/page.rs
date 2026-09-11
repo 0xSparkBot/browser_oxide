@@ -802,38 +802,18 @@ impl Page {
             .map_err(|e| deno_core::error::AnyError::msg(e.to_string()))?;
         crate::js_runtime::extensions::fetch_ext::set_fetch_client(client.clone());
 
-        // Execute inline scripts (fast mode skips external scripts by default).
-        // Module scripts still use the ES-module loader: compiling them as
-        // classic scripts rejects valid `import`/top-level-await syntax and
-        // gives `document.currentScript` the wrong non-null value.
-        for (i, script) in scripts.iter().enumerate() {
-            if script.src.is_some() {
-                continue;
-            }
-            if !script.code.is_empty() {
-                // W2.7 — name inline scripts with document URL (Chrome
-                // parity) instead of letting V8 default to <anonymous>.
-                event_loop.note_executed_script(url, &script.code);
-                if script.is_module {
-                    event_loop.set_current_script(None);
-                    let spec = format!("{url}#oxide-fast-mod-{i}");
-                    if let Err(e) = event_loop
-                        .eval_module_code(&spec, script.code.clone())
-                        .await
-                    {
-                        tracing::warn!(script_index = i, error = %e, "Module script error in inline script");
-                    }
-                } else {
-                    // document.currentScript parity (see
-                    // build_page_with_scripts_init_and_storage).
-                    event_loop.set_current_script(Some(script.node_id));
-                    if let Err(e) = event_loop.execute_script_with_name(&script.code, url) {
-                        tracing::warn!(script_index = i, error = %e, "Script error in inline script");
-                    }
-                    event_loop.set_current_script(None);
-                }
-            }
-        }
+        // Execute inline scripts with parser scheduling semantics. Inline
+        // classic scripts are parser-blocking even when they carry async/defer;
+        // non-async module scripts are deferred until the parser pass finishes.
+        // The fast path skips external scripts, but must not make an earlier
+        // module run before a later parser-blocking classic script.
+        Self::execute_inline_synthetic_script_schedule(
+            &mut event_loop,
+            &scripts,
+            url,
+            "oxide-fast-mod",
+        )
+        .await;
 
         Ok(Self {
             event_loop,
@@ -934,32 +914,78 @@ impl Page {
             .ok();
         self.event_loop.reset_nav_pending();
 
-        for (i, script) in scripts.iter().enumerate() {
+        Self::execute_inline_synthetic_script_schedule(
+            &mut self.event_loop,
+            &scripts,
+            url,
+            "oxide-reload-mod",
+        )
+        .await;
+    }
+
+    async fn execute_inline_synthetic_script(
+        event_loop: &mut BrowserEventLoop,
+        script: &script_runner::ScriptInfo,
+        index: usize,
+        document_url: &str,
+        module_fragment_prefix: &str,
+    ) {
+        event_loop.note_executed_script(document_url, &script.code);
+        if script.is_module {
+            event_loop.set_current_script(None);
+            let specifier = format!("{document_url}#{module_fragment_prefix}-{index}");
+            if let Err(error) = event_loop
+                .eval_module_code(&specifier, script.code.clone())
+                .await
+            {
+                tracing::warn!(script_index = index, error = %error, "synthetic module script error");
+            }
+        } else {
+            event_loop.set_current_script(Some(script.node_id));
+            if let Err(error) = event_loop.execute_script_with_name(&script.code, document_url) {
+                tracing::warn!(script_index = index, error = %error, "synthetic classic script error");
+            }
+            event_loop.set_current_script(None);
+        }
+    }
+
+    async fn execute_inline_synthetic_script_schedule(
+        event_loop: &mut BrowserEventLoop,
+        scripts: &[script_runner::ScriptInfo],
+        document_url: &str,
+        module_fragment_prefix: &str,
+    ) {
+        use script_runner::ScriptScheduling;
+
+        let mut deferred = Vec::new();
+        for (index, script) in scripts.iter().enumerate() {
             if script.src.is_some() || script.code.trim().is_empty() {
                 continue;
             }
-            self.event_loop
-                .note_executed_script(&self.url, &script.code);
-            if script.is_module {
-                self.event_loop.set_current_script(None);
-                let specifier = format!("{url}#oxide-reload-mod-{i}");
-                if let Err(error) = self
-                    .event_loop
-                    .eval_module_code(&specifier, script.code.clone())
-                    .await
-                {
-                    tracing::warn!(script_index = i, error = %error, "reload module script error");
+            match script.scheduling() {
+                ScriptScheduling::Deferred => deferred.push(index),
+                ScriptScheduling::ParserBlocking | ScriptScheduling::Async => {
+                    Self::execute_inline_synthetic_script(
+                        event_loop,
+                        script,
+                        index,
+                        document_url,
+                        module_fragment_prefix,
+                    )
+                    .await;
                 }
-            } else {
-                self.event_loop.set_current_script(Some(script.node_id));
-                if let Err(error) = self
-                    .event_loop
-                    .execute_script_with_name(&script.code, &self.url)
-                {
-                    tracing::warn!(script_index = i, error = %error, "reload classic script error");
-                }
-                self.event_loop.set_current_script(None);
             }
+        }
+
+        for index in deferred {
+            Self::execute_inline_synthetic_script(
+                event_loop,
+                &scripts[index],
+                index,
+                document_url,
+                module_fragment_prefix,
+            )
+            .await;
         }
     }
 
