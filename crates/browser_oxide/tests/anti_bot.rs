@@ -386,8 +386,28 @@ async fn offset_width_positive() {
 }
 
 #[tokio::test]
-async fn offset_height_positive() {
-    assert_eq!(eval("document.body.offsetHeight > 0").await, "true");
+async fn offset_height_matches_chrome_for_empty_and_content_body() {
+    // Chrome 148: an otherwise empty body has zero content height even though
+    // its default margins are 8px. The viewport-sized width does not imply a
+    // positive offsetHeight.
+    assert_eq!(eval("document.body.offsetHeight").await, "0");
+
+    // Once in-flow content contributes height, both the child and the body's
+    // border-box height reflect it.
+    assert_eq!(
+        eval(
+            r#"
+            (() => {
+                const box = document.createElement('div');
+                box.style.height = '20px';
+                document.body.appendChild(box);
+                return JSON.stringify({ body: document.body.offsetHeight, box: box.offsetHeight });
+            })()
+            "#,
+        )
+        .await,
+        r#"{"body":20,"box":20}"#
+    );
 }
 
 #[tokio::test]
