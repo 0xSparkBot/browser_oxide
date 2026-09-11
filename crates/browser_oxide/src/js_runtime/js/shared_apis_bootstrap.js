@@ -1204,7 +1204,11 @@
         const _urlState = new WeakMap();
         const _resolveInput = (url, base) => {
             let full = String(url);
-            if (base && !full.match(/^[a-z]+:\/\//i)) {
+            // Any leading URL scheme makes the input absolute. The previous
+            // check only recognized hierarchical `scheme://` URLs, so opaque
+            // absolute URLs such as `blob:https://origin/id`, `data:...` and
+            // `about:blank` were incorrectly appended to the base pathname.
+            if (base && !full.match(/^[a-z][a-z0-9+.-]*:/i)) {
                 const b = String(base);
                 if (full.startsWith('//')) {
                     const proto = b.match(/^([a-z]+:)/i);

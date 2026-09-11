@@ -6,6 +6,11 @@
 
 ((globalThis) => {
     const ops = Deno.core.ops;
+    const _isSharedWorker = !!(ops.op_worker_self_is_shared && ops.op_worker_self_is_shared());
+    const _workerName = ops.op_worker_self_name
+        ? String(ops.op_worker_self_name())
+        : '';
+    let _sharedWorkerOnConnect = null;
     const _browser_oxide = globalThis.__browser_oxide;
     const _markTrustedEvent =
         (_browser_oxide && _browser_oxide._markTrustedEvent)
@@ -37,41 +42,67 @@
     // impersonation tell as on the main thread.
     const _isFirefox = () => /Firefox\//.test(_p("user_agent", ""));
 
-    // The global object doubles as WorkerGlobalScope / DedicatedWorkerGlobalScope / self.
+    // The global object doubles as WorkerGlobalScope and the concrete worker
+    // global (DedicatedWorkerGlobalScope or SharedWorkerGlobalScope).
     const self = globalThis;
     self.self = self;
     {
         const WorkerGlobalScope = function WorkerGlobalScope() {
             throw new TypeError('Illegal constructor');
         };
-        const DedicatedWorkerGlobalScope = function DedicatedWorkerGlobalScope() {
-            throw new TypeError('Illegal constructor');
-        };
-        DedicatedWorkerGlobalScope.prototype = Object.create(WorkerGlobalScope.prototype);
-        Object.defineProperty(DedicatedWorkerGlobalScope.prototype, 'constructor', {
-            value: DedicatedWorkerGlobalScope,
-            configurable: true,
-            writable: true,
-        });
         Object.defineProperty(WorkerGlobalScope, Symbol.hasInstance, {
-            value(candidate) { return candidate === globalThis; },
-            configurable: true,
-        });
-        Object.defineProperty(DedicatedWorkerGlobalScope, Symbol.hasInstance, {
             value(candidate) { return candidate === globalThis; },
             configurable: true,
         });
         Object.defineProperty(WorkerGlobalScope.prototype, Symbol.toStringTag, {
             value: 'WorkerGlobalScope', configurable: true,
         });
-        Object.defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, {
-            value: 'DedicatedWorkerGlobalScope', configurable: true,
-        });
         globalThis.WorkerGlobalScope = WorkerGlobalScope;
-        globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
         if (typeof _maskFunction === 'function') {
             _maskFunction(WorkerGlobalScope, 'WorkerGlobalScope');
-            _maskFunction(DedicatedWorkerGlobalScope, 'DedicatedWorkerGlobalScope');
+        }
+        if (_isSharedWorker) {
+            const SharedWorkerGlobalScope = function SharedWorkerGlobalScope() {
+                throw new TypeError('Illegal constructor');
+            };
+            SharedWorkerGlobalScope.prototype = Object.create(WorkerGlobalScope.prototype);
+            Object.defineProperty(SharedWorkerGlobalScope.prototype, 'constructor', {
+                value: SharedWorkerGlobalScope,
+                configurable: true,
+                writable: true,
+            });
+            Object.defineProperty(SharedWorkerGlobalScope, Symbol.hasInstance, {
+                value(candidate) { return candidate === globalThis; },
+                configurable: true,
+            });
+            Object.defineProperty(SharedWorkerGlobalScope.prototype, Symbol.toStringTag, {
+                value: 'SharedWorkerGlobalScope', configurable: true,
+            });
+            globalThis.SharedWorkerGlobalScope = SharedWorkerGlobalScope;
+            if (typeof _maskFunction === 'function') {
+                _maskFunction(SharedWorkerGlobalScope, 'SharedWorkerGlobalScope');
+            }
+        } else {
+            const DedicatedWorkerGlobalScope = function DedicatedWorkerGlobalScope() {
+                throw new TypeError('Illegal constructor');
+            };
+            DedicatedWorkerGlobalScope.prototype = Object.create(WorkerGlobalScope.prototype);
+            Object.defineProperty(DedicatedWorkerGlobalScope.prototype, 'constructor', {
+                value: DedicatedWorkerGlobalScope,
+                configurable: true,
+                writable: true,
+            });
+            Object.defineProperty(DedicatedWorkerGlobalScope, Symbol.hasInstance, {
+                value(candidate) { return candidate === globalThis; },
+                configurable: true,
+            });
+            Object.defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, {
+                value: 'DedicatedWorkerGlobalScope', configurable: true,
+            });
+            globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
+            if (typeof _maskFunction === 'function') {
+                _maskFunction(DedicatedWorkerGlobalScope, 'DedicatedWorkerGlobalScope');
+            }
         }
     }
 
@@ -392,7 +423,13 @@
             for (const message of queue) {
                 _deliverMessage(port, message.data, message.ports || []);
             }
-            if (_remotePorts.has(port)) _remoteActivePorts.add(port);
+            if (_remotePorts.has(port)) {
+                _remoteActivePorts.add(port);
+                // A transferred endpoint may already contain messages that
+                // arrived before this worker adopted it. No owner notify was
+                // attached at enqueue time, so start/adopt must drain once.
+                try { _pumpRemotePorts(); } catch (_) {}
+            }
         };
 
         function _pumpRemotePorts() {
@@ -714,6 +751,30 @@
                 portCache,
             )
             : [];
+        if (_isSharedWorker
+            && data
+            && typeof data === 'object'
+            && data.__browser_oxide_shared_connect === true) {
+            if (_diagnosticsEnabled) {
+                try {
+                    ops.op_worker_diag_note(
+                        'shared-connect ports=' + ports.length
+                        + ' onconnect=' + typeof self.onconnect
+                    );
+                } catch (_) {}
+            }
+            const connectEvent = _markTrustedEvent(new MessageEvent('connect', {
+                data: undefined,
+                origin: '',
+                source: null,
+                ports,
+            }));
+            self.dispatchEvent(connectEvent);
+            if (_diagnosticsEnabled) {
+                try { ops.op_worker_diag_note('shared-connect-dispatched'); } catch (_) {}
+            }
+            return;
+        }
         let shape = typeof data;
         try {
             if (data && typeof data === "object") {
@@ -1309,7 +1370,29 @@
             _workerRafs.delete(Number(id));
         };
     }
-    if (typeof globalThis.name !== 'string') globalThis.name = '';
+    // Worker globals expose `name` as an own accessor even though the IDL
+    // attribute is readonly. Chromium's global-exotic reflection includes a
+    // setter; assignment is therefore accepted but must not change the
+    // constructor-supplied worker name. Shared workers likewise expose
+    // `onconnect` as a global own accessor, not as a concrete-prototype member.
+    try {
+        Object.defineProperty(globalThis, 'name', {
+            enumerable: true,
+            configurable: true,
+            get() { return _workerName; },
+            set(_value) {},
+        });
+        if (_isSharedWorker) {
+            Object.defineProperty(globalThis, 'onconnect', {
+                enumerable: true,
+                configurable: true,
+                get() { return _sharedWorkerOnConnect; },
+                set(value) {
+                    _sharedWorkerOnConnect = typeof value === 'function' ? value : null;
+                },
+            });
+        }
+    } catch (_) {}
     if (!Object.prototype.hasOwnProperty.call(globalThis, 'onrtctransform')) {
         globalThis.onrtctransform = null;
     }
@@ -1350,7 +1433,9 @@
     // prototype descriptors provide the cross-check Chrome exposes.
     try {
         const workerGlobalProto = globalThis.WorkerGlobalScope.prototype;
-        const dedicatedProto = globalThis.DedicatedWorkerGlobalScope.prototype;
+        const concreteProto = _isSharedWorker
+            ? globalThis.SharedWorkerGlobalScope.prototype
+            : globalThis.DedicatedWorkerGlobalScope.prototype;
         if (globalThis.EventTarget && globalThis.EventTarget.prototype) {
             Object.setPrototypeOf(workerGlobalProto, globalThis.EventTarget.prototype);
         }
@@ -1400,11 +1485,29 @@
             }
             Object.defineProperty(workerGlobalProto, name, descriptor);
         }
-        Object.defineProperties(dedicatedProto, {
+        // Class construction installs constructor/@@toStringTag before this
+        // late WebIDL normalization. Blink exposes the concrete worker scope
+        // in the order constants, constructor, @@toStringTag, so temporarily
+        // remove the configurable entries and reinsert them after the two
+        // non-configurable constants.
+        const concreteCtor = Object.getOwnPropertyDescriptor(concreteProto, 'constructor');
+        const concreteTag = Object.getOwnPropertyDescriptor(concreteProto, Symbol.toStringTag);
+        try { delete concreteProto.constructor; } catch (_) {}
+        try { delete concreteProto[Symbol.toStringTag]; } catch (_) {}
+        Object.defineProperties(concreteProto, {
             TEMPORARY: { value: 0, writable: false, enumerable: true, configurable: false },
             PERSISTENT: { value: 1, writable: false, enumerable: true, configurable: false },
         });
-        Object.setPrototypeOf(globalThis, dedicatedProto);
+        if (concreteCtor) {
+            try { Object.defineProperty(concreteProto, 'constructor', concreteCtor); } catch (_) {}
+        }
+        try {
+            Object.defineProperty(concreteProto, Symbol.toStringTag, concreteTag || {
+                value: _isSharedWorker ? 'SharedWorkerGlobalScope' : 'DedicatedWorkerGlobalScope',
+                configurable: true,
+            });
+        } catch (_) {}
+        Object.setPrototypeOf(globalThis, concreteProto);
         if (typeof _maskAsNative === 'function') {
             _maskAsNative(workerGlobalProto, ...methodNames, ...valueNames);
         }

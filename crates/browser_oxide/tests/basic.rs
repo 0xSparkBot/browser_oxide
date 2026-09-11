@@ -260,6 +260,30 @@ async fn module_evaluation_does_not_wait_for_unrelated_refed_timer() {
     );
 }
 
+#[tokio::test]
+async fn url_with_base_preserves_absolute_opaque_schemes() {
+    let mut rt = create_test_runtime();
+    let result = rt
+        .execute_script(
+            r#"JSON.stringify((() => {
+                const blob = new URL('blob:https://a.example/id', 'https://a.example/base/page');
+                const data = new URL('data:text/plain,hello', 'https://a.example/base/page');
+                const about = new URL('about:blank', 'https://a.example/base/page');
+                return {
+                    blob: [blob.href, blob.origin, blob.protocol, blob.pathname],
+                    data: [data.href, data.origin, data.protocol],
+                    about: [about.href, about.origin, about.protocol],
+                };
+            })())"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"blob":["blob:https://a.example/id","https://a.example","blob:","https://a.example/id"],"data":["data:text/plain,hello","null","data:"],"about":["about:blank","null","about:"]}"#
+    );
+}
+
 fn runtime_at(url: &str) -> BrowserJsRuntime {
     let dom = browser_oxide::html_parser::parse_html(
         "<!doctype html><html><head></head><body></body></html>",

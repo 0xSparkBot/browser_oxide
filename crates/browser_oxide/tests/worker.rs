@@ -1122,6 +1122,54 @@ fn chrome_148_worker_namespace_and_prototype_shape() {
 }
 
 #[test]
+fn chrome_148_dedicated_worker_concrete_scope_order_and_name_descriptor() {
+    let code = r#"
+        const src = `
+            const d = Object.getOwnPropertyDescriptor(self, 'name');
+            self.postMessage(JSON.stringify({
+                name: self.name,
+                own: Reflect.ownKeys(DedicatedWorkerGlobalScope.prototype).map(k =>
+                    typeof k === 'symbol' ? '@@' + String(k.description) : k),
+                nameDesc: d ? {
+                    e: d.enumerable,
+                    c: d.configurable,
+                    w: 'writable' in d ? d.writable : null,
+                    g: typeof d.get === 'function',
+                    s: typeof d.set === 'function',
+                } : null,
+                tag: Object.prototype.toString.call(self),
+            }));
+        `;
+        const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        const worker = new Worker(url, { name: 'dedicated-probe' });
+        worker.onmessage = function(event) {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime_with_secure_context(code, 2000, true);
+    let value: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; raw={out}"));
+    assert_eq!(value["name"], "dedicated-probe", "{out}");
+    assert_eq!(
+        value["own"],
+        serde_json::json!([
+            "TEMPORARY",
+            "PERSISTENT",
+            "constructor",
+            "@@Symbol.toStringTag"
+        ]),
+        "{out}"
+    );
+    assert_eq!(
+        value["nameDesc"],
+        serde_json::json!({"e":true,"c":true,"w":null,"g":true,"s":true}),
+        "{out}"
+    );
+    assert_eq!(value["tag"], "[object DedicatedWorkerGlobalScope]", "{out}");
+}
+
+#[test]
 fn worker_indexeddb_transaction_round_trip() {
     let code = r#"
         const src = `

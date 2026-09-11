@@ -1386,6 +1386,421 @@ async fn worker_to_parent_message_port_transfer_round_trip() {
     assert_eq!(page.text_of("#out"), Some("ok".to_string()));
 }
 
+#[tokio::test]
+async fn shared_worker_reuses_global_for_same_key_and_isolates_by_name() {
+    let mut page = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    let nextConnection = 0;
+                    self.onconnect = (event) => {
+                        const ordinal = ++nextConnection;
+                        const port = event.ports[0];
+                        port.onmessage = (message) => {
+                            port.postMessage({
+                                ordinal,
+                                echo: message.data,
+                                name: self.name,
+                                scope: self instanceof SharedWorkerGlobalScope,
+                                tag: Object.prototype.toString.call(self),
+                            });
+                        };
+                        port.start();
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                const a = new SharedWorker(url, { name: 'same-name' });
+                const b = new SharedWorker(url, { name: 'same-name' });
+                const c = new SharedWorker(url, { name: 'other-name' });
+                const seen = [];
+                const finish = () => {
+                    if (seen.length !== 3) return;
+                    seen.sort((x, y) => String(x.echo).localeCompare(String(y.echo)));
+                    document.getElementById('out').textContent = JSON.stringify(seen);
+                    a.port.close();
+                    b.port.close();
+                    c.port.close();
+                    URL.revokeObjectURL(url);
+                };
+                for (const [worker, label] of [[a, 'a'], [b, 'b'], [c, 'c']]) {
+                    worker.port.onmessage = (event) => {
+                        seen.push(event.data);
+                        finish();
+                    };
+                    worker.port.start();
+                    worker.port.postMessage(label);
+                }
+            })();
+        </script></body></html>"#,
+        "https://shared.example/page",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..80 {
+        if page.text_of("#out").is_some_and(|value| !value.is_empty()) {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        page.text_of("#out"),
+        Some(
+            r#"[{"ordinal":1,"echo":"a","name":"same-name","scope":true,"tag":"[object SharedWorkerGlobalScope]"},{"ordinal":2,"echo":"b","name":"same-name","scope":true,"tag":"[object SharedWorkerGlobalScope]"},{"ordinal":1,"echo":"c","name":"other-name","scope":true,"tag":"[object SharedWorkerGlobalScope]"}]"#
+                .to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn shared_worker_last_port_close_releases_worker_instance() {
+    let mut page = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    let connectionCount = 0;
+                    self.onconnect = (event) => {
+                        const ordinal = ++connectionCount;
+                        const port = event.ports[0];
+                        port.onmessage = () => port.postMessage(ordinal);
+                        port.start();
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                const first = new SharedWorker(url, 'recreate');
+                first.port.onmessage = (event) => {
+                    if (event.data !== 1) return;
+                    first.port.close();
+                    const second = new SharedWorker(url, 'recreate');
+                    second.port.onmessage = (next) => {
+                        document.getElementById('out').textContent = String(next.data);
+                        second.port.close();
+                        URL.revokeObjectURL(url);
+                    };
+                    second.port.start();
+                    second.port.postMessage('go');
+                };
+                first.port.start();
+                first.port.postMessage('go');
+            })();
+        </script></body></html>"#,
+        "https://shared.example/page",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..80 {
+        if page.text_of("#out").as_deref() == Some("1") {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(page.text_of("#out"), Some("1".to_string()));
+}
+
+#[tokio::test]
+async fn shared_worker_webidl_surface_matches_chrome_148() {
+    let mut page = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                function desc(obj, key) {
+                    const d = Object.getOwnPropertyDescriptor(obj, key);
+                    if (!d) return null;
+                    return {
+                        e: d.enumerable,
+                        c: d.configurable,
+                        w: 'writable' in d ? d.writable : null,
+                        g: typeof d.get === 'function',
+                        s: typeof d.set === 'function',
+                        v: typeof d.value,
+                    };
+                }
+                const p = SharedWorker.prototype;
+                const result = {
+                    type: typeof SharedWorker,
+                    len: SharedWorker.length,
+                    name: SharedWorker.name,
+                    ctorParent: Object.getPrototypeOf(SharedWorker).name,
+                    protoParent: Object.getPrototypeOf(p).constructor.name,
+                    own: Reflect.ownKeys(p).map(k =>
+                        typeof k === 'symbol' ? '@@' + String(k.description) : k),
+                    constructor: desc(p, 'constructor'),
+                    port: desc(p, 'port'),
+                    onerror: desc(p, 'onerror'),
+                    tag: desc(p, Symbol.toStringTag),
+                    source: Function.prototype.toString.call(SharedWorker),
+                    call: (() => {
+                        try { SharedWorker('x'); return 'ok'; }
+                        catch (e) { return e.name + ':' + e.message; }
+                    })(),
+                    noarg: (() => {
+                        try { new SharedWorker(); return 'ok'; }
+                        catch (e) { return e.name + ':' + e.message; }
+                    })(),
+                };
+                document.getElementById('out').textContent = JSON.stringify(result);
+            })();
+        </script></body></html>"#,
+        "https://shared.example/page",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        page.text_of("#out"),
+        Some(
+            r#"{"type":"function","len":1,"name":"SharedWorker","ctorParent":"EventTarget","protoParent":"EventTarget","own":["port","constructor","onerror","@@Symbol.toStringTag"],"constructor":{"e":false,"c":true,"w":true,"g":false,"s":false,"v":"function"},"port":{"e":true,"c":true,"w":null,"g":true,"s":false,"v":"undefined"},"onerror":{"e":true,"c":true,"w":null,"g":true,"s":true,"v":"undefined"},"tag":{"e":false,"c":true,"w":false,"g":false,"s":false,"v":"string"},"source":"function SharedWorker() { [native code] }","call":"TypeError:Failed to construct 'SharedWorker': Please use the 'new' operator, this DOM object constructor cannot be called as a function.","noarg":"TypeError:Failed to construct 'SharedWorker': 1 argument required, but only 0 present."}"#
+                .to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn shared_worker_global_scope_shape_matches_chrome_148() {
+    let mut page = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    self.onconnect = (event) => {
+                        const desc = (obj, key) => {
+                            const d = Object.getOwnPropertyDescriptor(obj, key);
+                            if (!d) return null;
+                            return {
+                                e: d.enumerable,
+                                c: d.configurable,
+                                w: 'writable' in d ? d.writable : null,
+                                g: typeof d.get === 'function',
+                                s: typeof d.set === 'function',
+                                v: typeof d.value,
+                            };
+                        };
+                        const p = SharedWorkerGlobalScope.prototype;
+                        event.ports[0].postMessage({
+                            hasDedicated: typeof DedicatedWorkerGlobalScope,
+                            hasShared: typeof SharedWorkerGlobalScope,
+                            name: self.name,
+                            tag: Object.prototype.toString.call(self),
+                            instance: self instanceof SharedWorkerGlobalScope,
+                            parent: Object.getPrototypeOf(p).constructor.name,
+                            own: Reflect.ownKeys(p).map(k =>
+                                typeof k === 'symbol' ? '@@' + String(k.description) : k),
+                            selfName: desc(self, 'name'),
+                            selfConnect: desc(self, 'onconnect'),
+                            sharedName: desc(p, 'name'),
+                            sharedConnect: desc(p, 'onconnect'),
+                            constructor: desc(p, 'constructor'),
+                            tagDesc: desc(p, Symbol.toStringTag),
+                            source: Function.prototype.toString.call(SharedWorkerGlobalScope),
+                            call: (() => {
+                                try { SharedWorkerGlobalScope(); return 'ok'; }
+                                catch (e) { return e.name + ':' + e.message; }
+                            })(),
+                        });
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                const worker = new SharedWorker(url, { name: 'scope-probe' });
+                worker.port.onmessage = (event) => {
+                    document.getElementById('out').textContent = JSON.stringify(event.data);
+                    worker.port.close();
+                    URL.revokeObjectURL(url);
+                };
+                worker.port.start();
+            })();
+        </script></body></html>"#,
+        "https://shared.example/page",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..80 {
+        if page.text_of("#out").is_some_and(|value| !value.is_empty()) {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        page.text_of("#out"),
+        Some(
+            r#"{"hasDedicated":"undefined","hasShared":"function","name":"scope-probe","tag":"[object SharedWorkerGlobalScope]","instance":true,"parent":"WorkerGlobalScope","own":["TEMPORARY","PERSISTENT","constructor","@@Symbol.toStringTag"],"selfName":{"e":true,"c":true,"w":null,"g":true,"s":true,"v":"undefined"},"selfConnect":{"e":true,"c":true,"w":null,"g":true,"s":true,"v":"undefined"},"sharedName":null,"sharedConnect":null,"constructor":{"e":false,"c":true,"w":true,"g":false,"s":false,"v":"function"},"tagDesc":{"e":false,"c":true,"w":false,"g":false,"s":false,"v":"string"},"source":"function SharedWorkerGlobalScope() { [native code] }","call":"TypeError:Illegal constructor"}"#
+                .to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn module_shared_worker_connects_and_runs_top_level_await() {
+    let mut page = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    await Promise.resolve();
+                    const moduleReady = true;
+                    self.onconnect = (event) => {
+                        const port = event.ports[0];
+                        port.onmessage = (message) => {
+                            port.postMessage({
+                                echo: message.data,
+                                ready: moduleReady,
+                                name: self.name,
+                                tag: Object.prototype.toString.call(self),
+                            });
+                        };
+                        port.start();
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                const worker = new SharedWorker(url, { name: 'module-shared', type: 'module' });
+                worker.port.onmessage = (event) => {
+                    document.getElementById('out').textContent = JSON.stringify(event.data);
+                    worker.port.close();
+                    URL.revokeObjectURL(url);
+                };
+                worker.port.start();
+                worker.port.postMessage('module-ok');
+            })();
+        </script></body></html>"#,
+        "https://shared.example/page",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..80 {
+        if page.text_of("#out").is_some_and(|value| !value.is_empty()) {
+            break;
+        }
+        let _ = page
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        page.text_of("#out"),
+        Some(
+            r#"{"echo":"module-ok","ready":true,"name":"module-shared","tag":"[object SharedWorkerGlobalScope]"}"#
+                .to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn shared_worker_is_shared_across_same_origin_pages() {
+    let mut first = Page::from_html_with_url(
+        r#"<html><body><div id="out"></div><script>
+            (() => {
+                const src = `
+                    let connectionCount = 0;
+                    self.onconnect = (event) => {
+                        const ordinal = ++connectionCount;
+                        const port = event.ports[0];
+                        port.onmessage = (message) => port.postMessage({ ordinal, echo: message.data });
+                        port.start();
+                    };
+                `;
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                globalThis.__sharedWorkerURL = url;
+                globalThis.__sharedWorker = new SharedWorker(url, 'cross-page');
+                __sharedWorker.port.onmessage = (event) => {
+                    document.getElementById('out').textContent = JSON.stringify(event.data);
+                };
+                __sharedWorker.port.start();
+                __sharedWorker.port.postMessage('first');
+            })();
+        </script></body></html>"#,
+        "https://shared.example/first",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..60 {
+        if first.text_of("#out").is_some_and(|value| !value.is_empty()) {
+            break;
+        }
+        let _ = first
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        first.text_of("#out"),
+        Some(r#"{"ordinal":1,"echo":"first"}"#.to_string())
+    );
+    let shared_url = first
+        .evaluate("globalThis.__sharedWorkerURL")
+        .expect("shared worker blob URL");
+
+    let escaped_url = serde_json::to_string(&shared_url).unwrap();
+    let html = format!(
+        r#"<html><body><div id="out"></div><script>
+            (() => {{
+                const worker = new SharedWorker({escaped_url}, 'cross-page');
+                globalThis.__sharedWorker = worker;
+                worker.port.onmessage = (event) => {{
+                    document.getElementById('out').textContent = JSON.stringify(event.data);
+                }};
+                worker.port.start();
+                worker.port.postMessage('second');
+            }})();
+        </script></body></html>"#
+    );
+    let mut second = Page::from_html_with_url(
+        &html,
+        "https://shared.example/second",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..80 {
+        if second
+            .text_of("#out")
+            .is_some_and(|value| !value.is_empty())
+        {
+            break;
+        }
+        let _ = first
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(20))
+            .await;
+        let _ = second
+            .event_loop()
+            .run_until_settled(std::time::Duration::from_millis(50))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        second.text_of("#out"),
+        Some(r#"{"ordinal":2,"echo":"second"}"#.to_string())
+    );
+    let _ = first.evaluate("__sharedWorker.port.close(); URL.revokeObjectURL(__sharedWorkerURL)");
+    let _ = second.evaluate("__sharedWorker.port.close()");
+}
+
 // ============================================================================
 // B1 — Module workers
 // ============================================================================

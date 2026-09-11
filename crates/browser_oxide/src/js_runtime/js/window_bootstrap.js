@@ -3379,23 +3379,136 @@
         });
     }
     if (!globalThis.SharedWorker) {
-        globalThis.SharedWorker = class SharedWorker {
-            constructor(scriptURL, options) {
-                this.port = {
-                    onmessage: null,
-                    postMessage() {},
-                    start() {},
-                    close() {},
-                    addEventListener() {},
-                    removeEventListener() {},
-                };
-                this.onerror = null;
-                this._url = String(scriptURL);
+        const _sharedOps = Deno.core.ops;
+        const _sharedWorkerState = new WeakMap();
+
+        function _sharedWorkerScript(url) {
+            if (url.startsWith('blob:')) {
+                try { return _sharedOps.op_blob_fetch_text(url) || ''; } catch (_) { return ''; }
             }
-            addEventListener() {}
-            removeEventListener() {}
-            dispatchEvent() { return true; }
-        };
+            if (url.startsWith('http:') || url.startsWith('https:')) {
+                try { return _sharedOps.op_worker_sync_fetch(url) || ''; } catch (_) { return ''; }
+            }
+            return '';
+        }
+
+        class SharedWorkerImpl extends EventTarget {
+            constructor(scriptURL, options) {
+                super();
+                let name = '';
+                let type = 'classic';
+                if (typeof options === 'string') {
+                    name = options;
+                } else if (options && typeof options === 'object') {
+                    if (options.name !== undefined) name = String(options.name);
+                    if (options.type !== undefined) type = String(options.type);
+                }
+                if (type !== 'classic' && type !== 'module') {
+                    throw new TypeError("Failed to construct 'SharedWorker': The provided value '"
+                        + type + "' is not a valid enum value of type WorkerType.");
+                }
+
+                const resolved = new URL(String(scriptURL), location.href);
+                const ownerOrigin = String(location.origin || '');
+                if (resolved.origin !== ownerOrigin) {
+                    throw new DOMException(
+                        "Failed to construct 'SharedWorker': Script at '" + resolved.href
+                            + "' cannot be accessed from origin '" + ownerOrigin + "'.",
+                        'SecurityError',
+                    );
+                }
+                const script = _sharedWorkerScript(resolved.href);
+                const channel = new MessageChannel();
+                const hooks = _browser_oxide && _browser_oxide.messagePortHooks;
+                if (!hooks || typeof hooks.prepareTransfer !== 'function') {
+                    throw new DOMException('SharedWorker MessagePort transport is unavailable.', 'InvalidStateError');
+                }
+                const endpointId = hooks.prepareTransfer(channel.port2);
+                if (!endpointId || !hooks.commitTransfer(channel.port2)) {
+                    throw new DOMException('SharedWorker MessagePort transfer failed.', 'DataCloneError');
+                }
+                const connectionId = _sharedOps.op_shared_worker_connect(
+                    ownerOrigin,
+                    resolved.href,
+                    name,
+                    type === 'module',
+                    script,
+                    true,
+                    endpointId,
+                );
+                if (!connectionId) {
+                    channel.port1.close();
+                    throw new DOMException('SharedWorker could not be started.', 'NetworkError');
+                }
+                if (typeof hooks.setCloseHook === 'function') {
+                    hooks.setCloseHook(channel.port1, () => {
+                        try { _sharedOps.op_shared_worker_disconnect(connectionId); } catch (_) {}
+                    });
+                }
+                _sharedWorkerState.set(this, {
+                    port: channel.port1,
+                    onerror: null,
+                });
+            }
+        }
+
+        function SharedWorker(scriptURL, options) {
+            if (!new.target) {
+                throw new TypeError(
+                    "Failed to construct 'SharedWorker': Please use the 'new' operator, this DOM object constructor cannot be called as a function."
+                );
+            }
+            if (arguments.length < 1) {
+                throw new TypeError(
+                    "Failed to construct 'SharedWorker': 1 argument required, but only 0 present."
+                );
+            }
+            return Reflect.construct(SharedWorkerImpl, [scriptURL, options], new.target);
+        }
+        Object.setPrototypeOf(SharedWorker, EventTarget);
+        SharedWorker.prototype = SharedWorkerImpl.prototype;
+        // Class syntax creates `constructor` first on the prototype, while
+        // Chromium installs SharedWorker's WebIDL members in the observable
+        // order `port`, `constructor`, `onerror`, @@toStringTag. Delete the
+        // configurable class-created property before installing the WebIDL
+        // surface so Reflect.ownKeys() matches that order as well.
+        delete SharedWorker.prototype.constructor;
+        Object.defineProperty(SharedWorker.prototype, 'port', {
+            enumerable: true,
+            configurable: true,
+            get() {
+                const state = _sharedWorkerState.get(this);
+                if (!state) throw new TypeError('Illegal invocation');
+                return state.port;
+            },
+        });
+        Object.defineProperty(SharedWorker.prototype, 'constructor', {
+            value: SharedWorker,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(SharedWorker.prototype, 'onerror', {
+            enumerable: true,
+            configurable: true,
+            get() {
+                const state = _sharedWorkerState.get(this);
+                if (!state) throw new TypeError('Illegal invocation');
+                return state.onerror;
+            },
+            set(value) {
+                const state = _sharedWorkerState.get(this);
+                if (!state) throw new TypeError('Illegal invocation');
+                state.onerror = typeof value === 'function' ? value : null;
+            },
+        });
+        Object.defineProperty(SharedWorker.prototype, Symbol.toStringTag, {
+            value: 'SharedWorker', configurable: true,
+        });
+        Object.defineProperty(SharedWorker, 'length', { value: 1, configurable: true });
+        _maskFunction(SharedWorker, 'SharedWorker');
+        _maskAsNative(SharedWorker.prototype, 'port', 'onerror');
+        globalThis.SharedWorker = SharedWorker;
     }
     if (!globalThis.ServiceWorker) {
         globalThis.ServiceWorker = class ServiceWorker extends EventTarget {
@@ -3746,6 +3859,7 @@
         const _PortRemote = new WeakMap();   // port → {id,generation,pending}
         const _PortTransferred = new WeakSet();
         const _PortRemoteActive = new Set();
+        const _PortCloseHooks = new WeakMap();
         const _PortInternalToken = {};
 
         const _clone = (data) => {
@@ -3770,7 +3884,15 @@
                 // boundaries isn't reliable for this).
                 for (const msg of q) _deliver(port, msg.data, msg.ports);
             }
-            if (_PortRemote.has(port)) _PortRemoteActive.add(port);
+            if (_PortRemote.has(port)) {
+                _PortRemoteActive.add(port);
+                // A transferred endpoint can already have messages queued
+                // before this realm adopts/starts it. Those messages were
+                // enqueued while no owner wake target existed, so no later
+                // wake is guaranteed. Drain once on enable to match browser
+                // MessagePort task semantics instead of leaving them stuck.
+                try { _pumpRemotePorts(); } catch (_) {}
+            }
         };
 
         const _dispatchPortEvent = (port, data, ports = []) => {
@@ -3888,7 +4010,13 @@
             },
         );
         _defProtoMethod(MessagePort.prototype, 'close', function close() {
+                if (_PortClosed.get(this)) return;
                 _PortClosed.set(this, true);
+                const closeHook = _PortCloseHooks.get(this);
+                _PortCloseHooks.delete(this);
+                if (typeof closeHook === 'function') {
+                    try { closeHook(); } catch (_) {}
+                }
                 _PortRemoteActive.delete(this);
                 const remote = _PortRemote.get(this);
                 if (remote && !remote.pending && remote.generation) {
@@ -4018,6 +4146,11 @@
             adopt(endpointId) {
                 const port = this.createPlaceholder(endpointId);
                 return this.finalizePlaceholder(port);
+            },
+            setCloseHook(port, callback) {
+                if (!this.isMessagePort(port) || typeof callback !== 'function') return false;
+                _PortCloseHooks.set(port, callback);
+                return true;
             },
         };
         Object.defineProperty(_browser_oxide, 'messagePortHooks', {

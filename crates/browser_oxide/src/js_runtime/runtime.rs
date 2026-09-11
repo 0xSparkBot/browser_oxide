@@ -338,6 +338,10 @@ pub fn create_runtime_with_signals(
     runtime
         .op_state()
         .borrow_mut()
+        .put(crate::js_runtime::extensions::worker_ext::SharedWorkerOwnership::default());
+    runtime
+        .op_state()
+        .borrow_mut()
         .put(crate::js_runtime::extensions::worker_ext::WorkerOwnerWake::default());
 
     // Capture the GENUINE `Function.prototype.toString` before any

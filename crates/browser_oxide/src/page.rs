@@ -661,6 +661,9 @@ impl Drop for Page {
             let op_state = self.event_loop.runtime_mut().op_state();
             let mut state = op_state.borrow_mut();
             crate::js_runtime::extensions::worker_ext::drain_owned_workers(&mut state);
+            crate::js_runtime::extensions::worker_ext::drain_owned_shared_worker_connections(
+                &mut state,
+            );
         }
         // Release cross-frame mailboxes so the global registry doesn't grow.
         if self.top_frame_id != 0 {
@@ -2610,6 +2613,9 @@ impl Page {
             let op_state = self.event_loop.runtime_mut().op_state();
             let mut state = op_state.borrow_mut();
             crate::js_runtime::extensions::worker_ext::drain_owned_workers(&mut state);
+            crate::js_runtime::extensions::worker_ext::drain_owned_shared_worker_connections(
+                &mut state,
+            );
         }
         // Drain frame insertions queued by the outgoing document before its DOM
         // is replaced. Otherwise stale `<iframe src>` requests can materialize

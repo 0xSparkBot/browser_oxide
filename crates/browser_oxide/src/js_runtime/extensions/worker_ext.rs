@@ -131,6 +131,9 @@ fn worker_diag_log() -> &'static Mutex<Vec<String>> {
 }
 
 fn worker_diag_note(note: String) {
+    if std::env::var_os("BROWSER_OXIDE_WORKER_WIRE_TRACE").is_some() {
+        eprintln!("[worker-diag] {note}");
+    }
     let mut log = worker_diag_log().lock().unwrap_or_else(|e| e.into_inner());
     if log.len() >= WORKER_DIAG_CAP {
         log.remove(0);
@@ -373,6 +376,40 @@ fn worker_registry() -> &'static Mutex<HashMap<u32, WorkerSlot>> {
 }
 
 static NEXT_WORKER_ID: AtomicU32 = AtomicU32::new(1);
+
+// ============================================================================
+// SharedWorker registry — process-global worker identity keyed by
+// (origin, resolved script URL, name, module/classic type).
+//
+// A SharedWorker is not owned by the first Page that creates it. Each Page
+// owns only connection references; the worker thread is reaped when the last
+// connection is explicitly closed or its owning Page is dropped/reused.
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SharedWorkerKey {
+    origin: String,
+    url: String,
+    name: String,
+    is_module: bool,
+}
+
+struct SharedWorkerSlot {
+    worker_id: u32,
+    connections: usize,
+}
+
+fn shared_worker_registry() -> &'static Mutex<HashMap<SharedWorkerKey, SharedWorkerSlot>> {
+    static INST: OnceLock<Mutex<HashMap<SharedWorkerKey, SharedWorkerSlot>>> = OnceLock::new();
+    INST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn shared_worker_connections() -> &'static Mutex<HashMap<u32, SharedWorkerKey>> {
+    static INST: OnceLock<Mutex<HashMap<u32, SharedWorkerKey>>> = OnceLock::new();
+    INST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static NEXT_SHARED_WORKER_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
 // ============================================================================
 // MessagePort registry — process-global entangled endpoints.
@@ -707,6 +744,13 @@ struct WorkerSelf {
     /// loaded from an expected URL; an empty / missing `self.location`
     /// can leave a worker-dependent app stuck on a thin shell.
     url: String,
+    /// Shared workers reuse the dedicated-worker transport/thread machinery,
+    /// but expose SharedWorkerGlobalScope semantics and receive `connect`
+    /// events carrying transferred MessagePorts instead of parent `message`
+    /// events.
+    is_shared: bool,
+    /// `SharedWorkerGlobalScope.name` (empty for dedicated workers).
+    name: String,
 }
 
 thread_local! {
@@ -717,15 +761,15 @@ thread_local! {
 // Ops — parent side.
 // ============================================================================
 
-#[op2(fast)]
-#[smi]
-pub fn op_worker_spawn(
+fn spawn_worker_inner(
     op_state: &mut OpState,
-    #[string] script: String,
-    #[string] _name: String,
+    script: String,
+    name: String,
     is_module: bool,
-    #[string] url: String,
+    url: String,
     storage_directory_allowed: bool,
+    is_shared: bool,
+    track_owner: bool,
 ) -> i32 {
     record_worker_spawn(&url, &script);
     // 0.403: #[state] removed — borrow the three (immutable) states from OpState.
@@ -774,6 +818,7 @@ pub fn op_worker_spawn(
     tracing::debug!(
         worker_id,
         is_module,
+        is_shared,
         is_secure_context,
         url = %url,
         script_len = script.len(),
@@ -796,7 +841,9 @@ pub fn op_worker_spawn(
     // Track this worker as owned by the current isolate so
     // `drain_owned_workers` (called from `Page::drop`) can reap it
     // if the page never explicitly called `worker.terminate()`.
-    owned.spawned_ids.borrow_mut().push(worker_id);
+    if track_owner {
+        owned.spawned_ids.borrow_mut().push(worker_id);
+    }
 
     // 64 MB stack: V8's default stack guard isn't large enough for some
     // scripts that recurse deeply through wrapped natives.
@@ -818,6 +865,8 @@ pub fn op_worker_spawn(
                     owner_wake: owner_wake.clone(),
                     terminate: terminate.clone(),
                     url,
+                    is_shared,
+                    name,
                 });
             });
 
@@ -976,14 +1025,199 @@ pub fn op_worker_spawn(
 }
 
 #[op2(fast)]
-pub fn op_worker_post_to_worker(#[smi] worker_id: i32, #[string] data: String) {
-    trace_worker_wire("parent->worker", worker_id as u32, &data);
+#[smi]
+pub fn op_worker_spawn(
+    op_state: &mut OpState,
+    #[string] script: String,
+    #[string] name: String,
+    is_module: bool,
+    #[string] url: String,
+    storage_directory_allowed: bool,
+) -> i32 {
+    spawn_worker_inner(
+        op_state,
+        script,
+        name,
+        is_module,
+        url,
+        storage_directory_allowed,
+        false,
+        true,
+    )
+}
+
+fn shared_worker_is_live(worker_id: u32) -> bool {
+    worker_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&worker_id)
+}
+
+fn disconnect_shared_worker_connection_inner(connection_id: u32) {
+    let key = shared_worker_connections()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&connection_id);
+    let Some(key) = key else {
+        return;
+    };
+
+    let terminate_id = {
+        let mut registry = shared_worker_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = registry.get_mut(&key) else {
+            return;
+        };
+        slot.connections = slot.connections.saturating_sub(1);
+        if slot.connections == 0 {
+            let worker_id = slot.worker_id;
+            registry.remove(&key);
+            Some(worker_id)
+        } else {
+            None
+        }
+    };
+
+    if let Some(worker_id) = terminate_id {
+        terminate_worker_inner(worker_id);
+    }
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_shared_worker_connect(
+    op_state: &mut OpState,
+    #[string] origin: String,
+    #[string] url: String,
+    #[string] name: String,
+    is_module: bool,
+    #[string] script: String,
+    storage_directory_allowed: bool,
+    #[smi] endpoint_id: i32,
+) -> i32 {
+    let key = SharedWorkerKey {
+        origin,
+        url: url.clone(),
+        name: name.clone(),
+        is_module,
+    };
+
+    let existing_id = shared_worker_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .map(|slot| slot.worker_id);
+    let existing_id = existing_id.filter(|worker_id| shared_worker_is_live(*worker_id));
+
+    let worker_id = if let Some(worker_id) = existing_id {
+        worker_id
+    } else {
+        // Remove a stale registry entry before creating the replacement.
+        shared_worker_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        let spawned = spawn_worker_inner(
+            op_state,
+            script,
+            name,
+            is_module,
+            url,
+            storage_directory_allowed,
+            true,
+            false,
+        );
+        if spawned <= 0 {
+            return 0;
+        }
+        let spawned = spawned as u32;
+
+        // Another runtime can race the first connection. Keep one canonical
+        // worker for the storage key and terminate the redundant spawn.
+        let canonical = {
+            let mut registry = shared_worker_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match registry.get(&key) {
+                Some(slot) if shared_worker_is_live(slot.worker_id) => slot.worker_id,
+                _ => {
+                    registry.insert(
+                        key.clone(),
+                        SharedWorkerSlot {
+                            worker_id: spawned,
+                            connections: 0,
+                        },
+                    );
+                    spawned
+                }
+            }
+        };
+        if canonical != spawned {
+            terminate_worker_inner(spawned);
+        }
+        canonical
+    };
+
+    let connection_id = NEXT_SHARED_WORKER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut registry = shared_worker_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = registry.get_mut(&key) else {
+            return 0;
+        };
+        slot.connections += 1;
+    }
+    shared_worker_connections()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(connection_id, key);
+    op_state
+        .borrow::<SharedWorkerOwnership>()
+        .connection_ids
+        .borrow_mut()
+        .push(connection_id);
+
+    // The worker-side endpoint has already been transferred out of the page
+    // MessageChannel. Deliver it through the existing worker control channel;
+    // worker_bootstrap recognizes the marker and dispatches a trusted
+    // `connect` MessageEvent with ports[0].
+    let payload = serde_json::json!({
+        "data": { "__browser_oxide_shared_connect": true },
+        "ports": [endpoint_id],
+    })
+    .to_string();
+    post_to_worker_inner(worker_id, payload);
+
+    connection_id as i32
+}
+
+#[op2(fast)]
+pub fn op_shared_worker_disconnect(op_state: &mut OpState, #[smi] connection_id: i32) {
+    let connection_id = connection_id as u32;
+    if let Some(owned) = op_state.try_borrow::<SharedWorkerOwnership>() {
+        let mut ids = owned.connection_ids.borrow_mut();
+        if let Some(index) = ids.iter().position(|id| *id == connection_id) {
+            ids.swap_remove(index);
+        }
+    }
+    disconnect_shared_worker_connection_inner(connection_id);
+}
+
+fn post_to_worker_inner(worker_id: u32, data: String) {
+    trace_worker_wire("parent->worker", worker_id, &data);
     let reg = worker_registry().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(slot) = reg.get(&(worker_id as u32)) {
+    if let Some(slot) = reg.get(&worker_id) {
         let _ = slot.to_worker.send(data);
         // Wake the worker's parked pump / `op_worker_self_await_message`.
         slot.notify_worker.notify_one();
     }
+}
+
+#[op2(fast)]
+pub fn op_worker_post_to_worker(#[smi] worker_id: i32, #[string] data: String) {
+    post_to_worker_inner(worker_id as u32, data);
 }
 
 /// Return the next pending message from a worker, or the empty string if none.
@@ -1048,6 +1282,19 @@ pub fn drain_owned_workers(state: &mut OpState) {
     }
 }
 
+/// Release SharedWorker connection references owned by one Page/runtime.
+/// The shared worker thread itself survives while another runtime still has
+/// an open connection to the same (origin, URL, name, type) storage key.
+pub fn drain_owned_shared_worker_connections(state: &mut OpState) {
+    let ids: Vec<u32> = state
+        .try_borrow::<SharedWorkerOwnership>()
+        .map(|o| std::mem::take(&mut *o.connection_ids.borrow_mut()))
+        .unwrap_or_default();
+    for id in ids {
+        disconnect_shared_worker_connection_inner(id);
+    }
+}
+
 /// Per-`JsRuntime` set of worker IDs spawned by this isolate. Populated
 /// by `op_worker_spawn`; drained by `drain_owned_workers` at `Page::drop`.
 /// `RefCell` because deno_core's `#[op2]` macro requires all `#[state]`
@@ -1057,6 +1304,11 @@ pub fn drain_owned_workers(state: &mut OpState) {
 #[derive(Default)]
 pub struct WorkerOwnership {
     pub spawned_ids: RefCell<Vec<u32>>,
+}
+
+#[derive(Default)]
+pub struct SharedWorkerOwnership {
+    connection_ids: RefCell<Vec<u32>>,
 }
 
 /// Async op that returns the next worker→parent message,
@@ -1205,6 +1457,29 @@ pub fn op_worker_self_url() -> String {
     })
 }
 
+#[op2(fast)]
+pub fn op_worker_self_is_shared() -> bool {
+    WORKER_SELF.with(|worker| {
+        worker
+            .borrow()
+            .as_ref()
+            .map(|state| state.is_shared)
+            .unwrap_or(false)
+    })
+}
+
+#[op2]
+#[string]
+pub fn op_worker_self_name() -> String {
+    WORKER_SELF.with(|worker| {
+        worker
+            .borrow()
+            .as_ref()
+            .map(|state| state.name.clone())
+            .unwrap_or_default()
+    })
+}
+
 /// Whether the worker owner may use an origin-private filesystem. Chromium
 /// denies `navigator.storage.getDirectory()` in cross-site embedded frames
 /// even though the same origin can use it when loaded as the top-level page.
@@ -1225,12 +1500,16 @@ deno_core::extension!(
         op_blob_revoke,
         op_worker_sync_fetch,
         op_worker_spawn,
+        op_shared_worker_connect,
+        op_shared_worker_disconnect,
         op_worker_post_to_worker,
         op_worker_poll_from_worker,
         op_worker_await_message,
         op_worker_terminate,
         op_worker_self_post,
         op_worker_self_url,
+        op_worker_self_is_shared,
+        op_worker_self_name,
         op_worker_storage_directory_allowed,
         op_worker_self_recv,
         op_worker_self_await_message,
