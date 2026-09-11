@@ -22,54 +22,16 @@ const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 /// DNS cache TTL.
 const DNS_TTL: Duration = Duration::from_secs(300);
 
-/// Cloudflare deliberately serves some Turnstile telemetry shards as
-/// IPv6-only names (for example `brunhild.challenges.cloudflare.com`). A host
-/// with no working IPv6 route cannot use that answer, even though the same
-/// service is reachable through the dual-stack `challenges.cloudflare.com`
-/// anycast edge. Chrome transparently reaches the dual-stack edge through its
-/// network service; provide the same routing fallback while retaining the
-/// original TLS SNI and HTTP Host.
-const CHALLENGE_EDGE_HOST: &str = "challenges.cloudflare.com";
-
-fn challenge_edge_fallback(host: &str) -> Option<&'static str> {
-    (host != CHALLENGE_EDGE_HOST && host.ends_with(".challenges.cloudflare.com"))
-        .then_some(CHALLENGE_EDGE_HOST)
-}
-
 async fn resolve_system(host: &str, port: u16) -> Result<Vec<SocketAddr>, NetError> {
     let addr_str = format!("{host}:{port}");
-    match tokio::net::lookup_host(&addr_str).await {
-        Ok(addrs) => {
-            let addrs = addrs.collect::<Vec<_>>();
-            if !addrs.is_empty() {
-                return Ok(addrs);
-            }
-        }
-        Err(primary_error) => {
-            if challenge_edge_fallback(host).is_none() {
-                return Err(NetError::Tcp(format!(
-                    "DNS lookup failed for {host}: {primary_error}"
-                )));
-            }
-        }
+    let addrs = tokio::net::lookup_host(&addr_str)
+        .await
+        .map_err(|error| NetError::Tcp(format!("DNS lookup failed for {host}: {error}")))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(NetError::Tcp(format!("no addresses found for {host}")));
     }
-
-    if let Some(fallback_host) = challenge_edge_fallback(host) {
-        let fallback_addr = format!("{fallback_host}:{port}");
-        let addrs = tokio::net::lookup_host(&fallback_addr)
-            .await
-            .map_err(|fallback_error| {
-                NetError::Tcp(format!(
-                    "DNS lookup failed for {host} and fallback {fallback_host}: {fallback_error}"
-                ))
-            })?
-            .collect::<Vec<_>>();
-        if !addrs.is_empty() {
-            return Ok(addrs);
-        }
-    }
-
-    Err(NetError::Tcp(format!("no addresses found for {host}")))
+    Ok(addrs)
 }
 
 /// In-memory DNS cache to avoid repeated lookups for the same host.
@@ -185,35 +147,9 @@ pub async fn connect_with_cache(
         }
     }
 
-    let primary = tokio::time::timeout(timeout, happy_eyeballs(&ipv6, &ipv4)).await;
-    let stream = match primary {
-        Ok(Ok(stream)) => stream,
-        primary_failure => {
-            // A successful DNS lookup may still return only IPv6 addresses on
-            // an IPv4-only host. Retry the same origin/SNI against the
-            // dual-stack challenge edge before surfacing the connection error.
-            if let Some(fallback_host) = challenge_edge_fallback(host) {
-                let fallback_addrs = resolve_system(fallback_host, port).await?;
-                let (fallback_ipv6, fallback_ipv4): (Vec<_>, Vec<_>) =
-                    fallback_addrs.into_iter().partition(SocketAddr::is_ipv6);
-                tokio::time::timeout(timeout, happy_eyeballs(&fallback_ipv6, &fallback_ipv4))
-                    .await
-                    .map_err(|_| {
-                        NetError::Tcp(format!(
-                            "connection to {host}:{port} via {fallback_host} timed out"
-                        ))
-                    })??
-            } else {
-                return match primary_failure {
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err(NetError::Tcp(format!(
-                        "connection to {host}:{port} timed out"
-                    ))),
-                    Ok(Ok(_)) => unreachable!(),
-                };
-            }
-        }
-    };
+    let stream = tokio::time::timeout(timeout, happy_eyeballs(&ipv6, &ipv4))
+        .await
+        .map_err(|_| NetError::Tcp(format!("connection to {host}:{port} timed out")))??;
 
     // Enable TCP_NODELAY for lower latency and set TTL
     stream
@@ -305,15 +241,5 @@ mod tests {
         // environment-dependent and capable of connecting to a wildcard IP.
         let result = connect("not a valid host name", 443, Duration::from_secs(2)).await;
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn cloudflare_challenge_shards_use_dual_stack_edge_fallback() {
-        assert_eq!(
-            challenge_edge_fallback("brunhild.challenges.cloudflare.com"),
-            Some("challenges.cloudflare.com")
-        );
-        assert_eq!(challenge_edge_fallback("challenges.cloudflare.com"), None);
-        assert_eq!(challenge_edge_fallback("example.com"), None);
     }
 }
