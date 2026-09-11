@@ -51,6 +51,54 @@ async fn scope_selector_matches_document_and_element_semantics() {
 }
 
 #[tokio::test]
+async fn nth_child_of_selector_list_filters_the_subject_like_chrome() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<html><body><div id="root"><span id="s1" class="a"></span><span id="s2" class="b"></span><span id="s3" class="a"></span></div></body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    let result = rt
+        .execute_script(
+            r#"(() => {
+                const root = document.getElementById('root');
+                return JSON.stringify({
+                    secondA: Array.from(root.querySelectorAll(':scope > span:nth-child(2 of .a)'), e => e.id),
+                    lastA: Array.from(root.querySelectorAll(':scope > span:nth-last-child(1 of .a)'), e => e.id),
+                    bMatchesSecondA: document.getElementById('s2').matches(':nth-child(2 of .a)')
+                });
+            })()"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"secondA":["s3"],"lastA":["s3"],"bMatchesSecondA":false}"#
+    );
+}
+
+#[tokio::test]
+async fn attribute_selector_s_modifier_is_rejected_like_chrome() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<html><body><div data-x="Foo"></div></body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    assert_eq!(
+        rt.execute_script(
+            r#"(() => {
+                try {
+                    document.querySelectorAll('[data-x="Foo" s]');
+                    return 'NO_THROW';
+                } catch (e) {
+                    return e.name;
+                }
+            })()"#,
+            None,
+        )
+        .unwrap(),
+        "SyntaxError"
+    );
+}
+
+#[tokio::test]
 async fn has_relative_selectors_match_chrome_semantics() {
     let dom = browser_oxide::html_parser::parse_html(
         r#"<!doctype html><html><body>

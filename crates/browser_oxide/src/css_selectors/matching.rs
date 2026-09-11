@@ -316,20 +316,17 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass, scope: Option
         PseudoClass::LastOfType => element.sibling_type_index_from_end() == 1,
         PseudoClass::OnlyOfType => element.sibling_type_count() == 1,
 
-        PseudoClass::NthChild(nth, of_sel) => {
-            let index = match of_sel {
-                None => element.sibling_index(),
-                Some(sel_list) => nth_of_index(element, sel_list, false, scope),
-            };
-            nth.matches(index)
-        }
-        PseudoClass::NthLastChild(nth, of_sel) => {
-            let index = match of_sel {
-                None => element.sibling_index_from_end(),
-                Some(sel_list) => nth_of_index(element, sel_list, true, scope),
-            };
-            nth.matches(index)
-        }
+        PseudoClass::NthChild(nth, of_sel) => match of_sel {
+            None => nth.matches(element.sibling_index()),
+            Some(sel_list) => nth_of_index(element, sel_list, false, scope)
+                .is_some_and(|index| nth.matches(index)),
+        },
+        PseudoClass::NthLastChild(nth, of_sel) => match of_sel {
+            None => nth.matches(element.sibling_index_from_end()),
+            Some(sel_list) => {
+                nth_of_index(element, sel_list, true, scope).is_some_and(|index| nth.matches(index))
+            }
+        },
         PseudoClass::NthOfType(nth) => nth.matches(element.sibling_type_index()),
         PseudoClass::NthLastOfType(nth) => nth.matches(element.sibling_type_index_from_end()),
 
@@ -452,7 +449,14 @@ fn nth_of_index<E: Element>(
     sel_list: &SelectorList,
     from_end: bool,
     scope: Option<&E>,
-) -> i32 {
+) -> Option<i32> {
+    // The subject itself must be a member of the filtered sibling list.
+    // Otherwise it cannot match :nth-child(An+B of S), regardless of how
+    // many preceding/following siblings match S.
+    if !matches_any_with_optional_scope(element, sel_list, scope) {
+        return None;
+    }
+
     let mut index = 1;
     let sib_fn = if from_end {
         Element::next_sibling_element
@@ -466,7 +470,7 @@ fn nth_of_index<E: Element>(
         }
         sib = sib_fn(&s);
     }
-    index
+    Some(index)
 }
 
 fn has_matching_descendant<E: Element>(

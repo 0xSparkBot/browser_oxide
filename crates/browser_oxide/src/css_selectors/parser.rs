@@ -315,24 +315,34 @@ impl<'a> SelectorParser<'a> {
 
         self.skip_whitespace();
 
-        // Check for case sensitivity flag (i or s)
+        // Chromium accepts the ASCII case-insensitive `i` modifier in the
+        // Selectors API, but rejects the still-unimplemented `s` modifier as
+        // an invalid selector. Keep the parser strict instead of silently
+        // accepting syntax the target browser rejects.
         let case_sensitivity = match self.current_kind() {
             TokenKind::Ident(flag) if flag.eq_ignore_ascii_case("i") => {
                 self.advance();
                 self.skip_whitespace();
                 CaseSensitivity::CaseInsensitive
             }
-            TokenKind::Ident(flag) if flag.eq_ignore_ascii_case("s") => {
-                self.advance();
-                self.skip_whitespace();
-                CaseSensitivity::CaseSensitive
+            TokenKind::Ident(_) => {
+                return Err(SelectorParseError::UnexpectedToken {
+                    loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                    message: "unsupported attribute selector modifier".into(),
+                });
             }
             _ => CaseSensitivity::Default,
         };
 
-        // Consume ]
+        // A missing closing bracket is invalid selector syntax; do not return
+        // a partially parsed attribute selector and leave the trailing token.
         if matches!(self.current_kind(), TokenKind::CloseSquare) {
             self.advance();
+        } else {
+            return Err(SelectorParseError::UnexpectedToken {
+                loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                message: "expected ']' after attribute selector".into(),
+            });
         }
 
         Ok(SimpleSelector::Attribute {
@@ -890,6 +900,11 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parse_attribute_case_sensitive_modifier_rejected_like_chromium() {
+        assert!(parse_selector_list("[type=\"text\" s]").is_err());
     }
 
     #[test]
