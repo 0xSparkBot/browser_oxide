@@ -153,3 +153,85 @@ async fn scroll_into_view_options_and_child_realm_geometry() {
         "child scrollIntoView must use the child viewport: {c}"
     );
 }
+
+#[tokio::test]
+async fn scroll_into_view_if_needed_matches_chromium_alignment() {
+    let mut page = Page::from_html(HTML, Some(chrome_148_macos()))
+        .await
+        .expect("page");
+
+    let result = page
+        .evaluate(
+            r#"(() => {
+                const t = document.getElementById('target');
+                const snap = () => ({
+                    y: scrollY,
+                    top: t.getBoundingClientRect().top,
+                    bottom: t.getBoundingClientRect().bottom,
+                    height: t.getBoundingClientRect().height,
+                    viewport: innerHeight,
+                });
+
+                window.scrollTo(0, 0);
+                const initial = snap();
+                t.scrollIntoViewIfNeeded();
+                const centered = snap();
+
+                window.scrollTo(0, 0);
+                t.scrollIntoViewIfNeeded(false);
+                const nearest = snap();
+
+                const visibleY = initial.top - (innerHeight - initial.height) / 2;
+                window.scrollTo(0, visibleY);
+                const visibleBefore = scrollY;
+                t.scrollIntoViewIfNeeded();
+                const visibleAfter = scrollY;
+
+                window.scrollTo(0, initial.top + initial.height / 2);
+                const partialBefore = snap();
+                t.scrollIntoViewIfNeeded();
+                const partialAfter = snap();
+
+                return JSON.stringify({
+                    initial, centered, nearest,
+                    visibleBefore, visibleAfter,
+                    partialBefore, partialAfter,
+                    length: Element.prototype.scrollIntoViewIfNeeded.length,
+                    source: String(Element.prototype.scrollIntoViewIfNeeded),
+                });
+            })()"#,
+        )
+        .expect("evaluate");
+
+    let v: serde_json::Value = serde_json::from_str(&result).expect("json");
+    let centered_mid =
+        v["centered"]["top"].as_f64().unwrap() + v["centered"]["height"].as_f64().unwrap() / 2.0;
+    let viewport_mid = v["centered"]["viewport"].as_f64().unwrap() / 2.0;
+    assert!(
+        (centered_mid - viewport_mid).abs() < 0.01,
+        "default scrollIntoViewIfNeeded must center a fully off-screen target: {v}"
+    );
+    assert!(
+        (v["nearest"]["bottom"].as_f64().unwrap() - v["nearest"]["viewport"].as_f64().unwrap())
+            .abs()
+            < 0.01,
+        "false must use nearest-edge alignment: {v}"
+    );
+    assert_eq!(
+        v["visibleBefore"], v["visibleAfter"],
+        "a fully visible target must not scroll: {v}"
+    );
+    assert!(
+        v["partialBefore"]["top"].as_f64().unwrap() < 0.0,
+        "fixture must begin partially clipped: {v}"
+    );
+    assert!(
+        v["partialAfter"]["top"].as_f64().unwrap().abs() < 0.01,
+        "a partially visible target must use the minimum nearest-edge motion: {v}"
+    );
+    assert_eq!(v["length"], 0);
+    assert_eq!(
+        v["source"],
+        "function scrollIntoViewIfNeeded() { [native code] }"
+    );
+}

@@ -109,6 +109,38 @@
         _setViewScroll(view, nextX, nextY);
     }
 
+
+    // Chromium legacy API. Unlike scrollIntoView(), this only scrolls when
+    // some part of the target is outside the viewport. With the default
+    // centerIfNeeded=true a target that is completely off-screen is centered;
+    // a partially clipped target still uses the minimum nearest-edge motion.
+    // Passing false always uses nearest-edge alignment. This matches Chrome
+    // 148's Element.scrollIntoViewIfNeeded() behavior.
+    function scrollIntoViewIfNeeded() {
+        const centerIfNeeded = arguments.length === 0 ? true : Boolean(arguments[0]);
+        const rect = this.getBoundingClientRect();
+        const view = _viewFor(this);
+        const currentX = _number(view.scrollX);
+        const currentY = _number(view.scrollY);
+        const viewportWidth = _number(view.innerWidth);
+        const viewportHeight = _number(view.innerHeight);
+
+        const fullyVisibleX = rect.left >= 0 && rect.right <= viewportWidth;
+        const fullyVisibleY = rect.top >= 0 && rect.bottom <= viewportHeight;
+        if (fullyVisibleX && fullyVisibleY) return;
+
+        const documentLeft = rect.left + currentX;
+        const documentTop = rect.top + currentY;
+        const fullyOutsideX = rect.right <= 0 || rect.left >= viewportWidth;
+        const fullyOutsideY = rect.bottom <= 0 || rect.top >= viewportHeight;
+
+        const horizontalMode = centerIfNeeded && fullyOutsideX ? 'center' : 'nearest';
+        const verticalMode = centerIfNeeded && fullyOutsideY ? 'center' : 'nearest';
+        const nextX = Math.max(0, _align(documentLeft, rect.width, viewportWidth, currentX, horizontalMode));
+        const nextY = Math.max(0, _align(documentTop, rect.height, viewportHeight, currentY, verticalMode));
+        _setViewScroll(view, nextX, nextY);
+    }
+
     Object.defineProperty(proto, 'getBoundingClientRect', {
         value: getBoundingClientRect,
         writable: true,
@@ -121,9 +153,16 @@
         enumerable: true,
         configurable: true,
     });
+    Object.defineProperty(proto, 'scrollIntoViewIfNeeded', {
+        value: scrollIntoViewIfNeeded,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    });
 
     if (typeof globalThis._maskFunction === 'function') {
         globalThis._maskFunction(getBoundingClientRect, 'getBoundingClientRect');
         globalThis._maskFunction(scrollIntoView, 'scrollIntoView');
+        globalThis._maskFunction(scrollIntoViewIfNeeded, 'scrollIntoViewIfNeeded');
     }
 })();
