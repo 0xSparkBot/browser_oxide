@@ -1,13 +1,15 @@
 use crate::dom::Dom;
 use crate::js_runtime::extensions::audio_ext::audio_extension;
-use crate::js_runtime::extensions::canvas_ext::{canvas_extension, CanvasState};
 use crate::js_runtime::extensions::cache_storage_ext::cache_storage_extension;
+use crate::js_runtime::extensions::canvas_ext::{canvas_extension, CanvasState};
 use crate::js_runtime::extensions::compression_stream_ext::compression_stream_extension;
 use crate::js_runtime::extensions::console_ext::console_extension;
 use crate::js_runtime::extensions::crypto_ext::crypto_extension;
 use crate::js_runtime::extensions::dom_ext::dom_extension;
 use crate::js_runtime::extensions::fetch_ext::{fetch_extension, FetchState};
 use crate::js_runtime::extensions::layout_ext::layout_extension;
+use crate::js_runtime::extensions::opfs_ext::opfs_extension;
+use crate::js_runtime::extensions::service_worker_ext::service_worker_extension;
 use crate::js_runtime::extensions::sse_ext::{sse_extension, SseState};
 use crate::js_runtime::extensions::stealth_ext::{stealth_extension, StealthState};
 use crate::js_runtime::extensions::timer_ext::{timer_extension, TimerState};
@@ -104,6 +106,8 @@ pub fn get_snapshot() -> &'static [u8] {
                 // restore with extra/missing ops segfaults on deno_core 0.403.
                 crate::js_runtime::extensions::perf_ext::perf_extension::init(),
                 crate::js_runtime::extensions::nav_ext::nav_extension::init(),
+                opfs_extension::init(),
+                service_worker_extension::init(),
             ],
             // Match runtime.rs's heap config so the snapshot deserializes into an
             // identically-configured V8 heap (candidate fix for the V8-149
@@ -160,6 +164,8 @@ pub fn get_snapshot() -> &'static [u8] {
             include_str!("js/canvas_bootstrap.js"),
             "\n",
             include_str!("js/window_bootstrap.js"),
+            "\n",
+            include_str!("js/service_worker_bootstrap.js"),
             "\n",
             include_str!("js/cache_storage_bootstrap.js"),
             "\n",

@@ -48,6 +48,7 @@ serde_yaml_ng = "0.10"
 html5ever = "0.39"
 markup5ever = "0.39"
 url = "2"
+urlpattern = "0.3"
 percent-encoding = "2"
 httparse = "1"
 # --- HTTP / TLS / net ---

@@ -433,6 +433,21 @@ pub fn op_dom_matches(state: &mut OpState, #[smi] node_id: i32, #[string] select
     }
 }
 
+/// Synchronize browser-internal form-control live value state for selector
+/// matching (for example `:placeholder-shown`) without reflecting that value
+/// into the element's content attributes.
+#[op2(fast)]
+pub fn op_dom_set_form_control_value(
+    state: &mut OpState,
+    #[smi] node_id: i32,
+    #[string] value: &str,
+) {
+    let state = state.borrow_mut::<DomState>();
+    state
+        .dom
+        .set_form_control_value(NodeId::from_raw(node_id as u32), value.to_string());
+}
+
 #[op2(fast)]
 #[smi]
 pub fn op_dom_closest(state: &mut OpState, #[smi] node_id: i32, #[string] selector: &str) -> i32 {
@@ -2879,6 +2894,7 @@ deno_core::extension!(
         op_dom_get_elements_by_class_name,
         op_dom_collect_insert_targets,
         op_dom_matches,
+        op_dom_set_form_control_value,
         op_dom_closest,
         op_dom_contains,
         op_dom_is_connected,

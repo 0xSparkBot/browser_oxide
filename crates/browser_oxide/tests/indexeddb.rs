@@ -1230,3 +1230,64 @@ async fn indexeddb_cursor_iteration_methods_reject_pending_or_exhausted_cursor()
         assert_eq!(value["errors"][field], "InvalidStateError", "{field}");
     }
 }
+
+#[tokio::test]
+async fn indexeddb_unique_index_rejects_duplicate_key_without_aborting_when_canceled() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbUniqueIndex = null;
+        (() => {
+            const name = 'browser-oxide-idb-unique-index';
+            const out = { seq: [], errors: {} };
+            const open = indexedDB.open(name, 1);
+            open.onupgradeneeded = () => {
+                const store = open.result.createObjectStore('items', { keyPath: 'id' });
+                store.createIndex('email', 'email', { unique: true });
+            };
+            open.onsuccess = () => {
+                const db = open.result;
+                const tx = db.transaction('items', 'readwrite');
+                const store = tx.objectStore('items');
+                const first = store.add({ id: 1, email: 'a@example.test' });
+                const duplicate = store.add({ id: 2, email: 'a@example.test' });
+                first.onsuccess = () => out.seq.push('first-ok');
+                duplicate.onerror = event => {
+                    out.errors.duplicate = duplicate.error && duplicate.error.name;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    out.seq.push('duplicate-error');
+                };
+                tx.oncomplete = () => {
+                    const verifyTx = db.transaction('items');
+                    const verify = verifyTx.objectStore('items').getAll();
+                    verify.onsuccess = () => { out.rows = verify.result; };
+                    verifyTx.oncomplete = () => {
+                        out.seq.push('complete');
+                        globalThis.__idbUniqueIndex = out;
+                        db.close();
+                        indexedDB.deleteDatabase(name);
+                    };
+                };
+                tx.onabort = () => {
+                    out.seq.push('abort');
+                    globalThis.__idbUniqueIndex = out;
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbUniqueIndex)")
+        .expect("unique index result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("unique index json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!(["first-ok", "duplicate-error", "complete"])
+    );
+    assert_eq!(value["errors"]["duplicate"], "ConstraintError");
+    assert_eq!(
+        value["rows"],
+        serde_json::json!([{ "id": 1, "email": "a@example.test" }])
+    );
+}

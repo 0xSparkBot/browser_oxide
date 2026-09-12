@@ -94,13 +94,26 @@
     const HTMLElementOriginal = globalThis.HTMLElement;
     const DivOriginal = globalThis.HTMLDivElement;
     const InputOriginal = globalThis.HTMLInputElement;
+    const TextAreaOriginal = globalThis.HTMLTextAreaElement;
     const IFrameOriginal = globalThis.HTMLIFrameElement;
     const ep = ElementOriginal?.prototype;
     const hp = HTMLElementOriginal?.prototype;
     const dp = DivOriginal?.prototype;
     const ip = InputOriginal?.prototype;
+    const tp = TextAreaOriginal?.prototype;
     const fp = IFrameOriginal?.prototype;
     if (!ep || !hp) return;
+
+    const syncSelectorFormValue = (self, value) => {
+        try {
+            if (typeof getNodeIdForInnerText !== 'function'
+                || typeof domOps.op_dom_set_form_control_value !== 'function') return;
+            const id = getNodeIdForInnerText(self);
+            if (Number.isInteger(id) && id >= 0) {
+                domOps.op_dom_set_form_control_value(id, String(value));
+            }
+        } catch (_) {}
+    };
 
     // Capture the historically over-broad Element members before relocating.
     const elementDescriptors = Object.create(null);
@@ -649,10 +662,13 @@
         for (const [prop,attr,def] of [
             ['height','height',0],['width','width',0],['size','size',20],['maxLength','maxlength',-1],['minLength','minlength',-1],
         ]) reflectNumber(ip,prop,attr,def);
-        getter(ip,'value',function value(){ return state(this).value; },function value(v){ const s=state(this); s.value=String(v); s.valueDirty=true; });
+        getter(ip,'value',function value(){ return state(this).value; },function value(v){
+            const s=state(this); s.value=String(v); s.valueDirty=true; syncSelectorFormValue(this,s.value);
+        });
         getter(ip,'checked',function checked(){ return state(this).checked; },function checked(v){ const s=state(this); s.checked=!!v; s.checkedDirty=true; });
         getter(ip,'defaultValue',function defaultValue(){ return this.getAttribute('value')||''; },function defaultValue(v){
-            const text=String(v); const s=state(this); this.setAttribute('value',text); if(!s.valueDirty)s.value=text;
+            const text=String(v); const s=state(this); this.setAttribute('value',text);
+            if(!s.valueDirty){s.value=text;syncSelectorFormValue(this,s.value);}
         });
         getter(ip,'defaultChecked',function defaultChecked(){ return this.hasAttribute('checked'); },function defaultChecked(v){
             const s=state(this); if(v)this.setAttribute('checked','');else this.removeAttribute('checked'); if(!s.checkedDirty)s.checked=!!v;
@@ -701,6 +717,29 @@
         method(ip,'stepUp',function stepUp(n=1){ const step=Number(this.step)||1; const cur=Number(this.value)||0; this.value=String(cur+step*(Number(n)||1)); },0);
         method(ip,'stepDown',function stepDown(n=1){ const step=Number(this.step)||1; const cur=Number(this.value)||0; this.value=String(cur-step*(Number(n)||1)); },0);
         makeEnumerable(ip);
+    }
+
+    // ---------------------------------------------------------------
+    // HTMLTextAreaElement live value/defaultValue state
+    // ---------------------------------------------------------------
+    if (tp) {
+        const textAreaState = new WeakMap();
+        const state = self => {
+            let s = textAreaState.get(self);
+            if (!s) {
+                s = { value: String(self.textContent || ''), valueDirty: false };
+                textAreaState.set(self, s);
+            }
+            return s;
+        };
+        getter(tp,'value',function value(){ return state(this).value; },function value(v){
+            const s=state(this); s.value=String(v); s.valueDirty=true; syncSelectorFormValue(this,s.value);
+        });
+        getter(tp,'defaultValue',function defaultValue(){ return String(this.textContent || ''); },function defaultValue(v){
+            const text=String(v); const s=state(this); this.textContent=text;
+            if(!s.valueDirty){s.value=text;syncSelectorFormValue(this,s.value);}
+        });
+        makeEnumerable(tp);
     }
 
     // ---------------------------------------------------------------

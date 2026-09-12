@@ -15,6 +15,10 @@ pub struct Dom {
     /// wrapper because wrappers are WeakRef-cached and may be recreated while
     /// the underlying DOM node is still alive.
     dialog_return_values: HashMap<NodeId, String>,
+    /// Live `.value` state for form controls. This is browser-internal state,
+    /// deliberately separate from content attributes so changing input.value
+    /// does not mutate input.defaultValue / getAttribute / serialized HTML.
+    form_control_values: HashMap<NodeId, String>,
 }
 
 /// Tripwire for tree-walking helpers. A correct DOM tree never has cycles
@@ -42,6 +46,7 @@ impl Dom {
             free_list: Vec::new(),
             modal_dialogs: HashSet::new(),
             dialog_return_values: HashMap::new(),
+            form_control_values: HashMap::new(),
         }
     }
 
@@ -71,6 +76,16 @@ impl Dom {
             self.dialog_return_values.remove(&id);
         } else {
             self.dialog_return_values.insert(id, value);
+        }
+    }
+
+    pub fn form_control_value(&self, id: NodeId) -> Option<&str> {
+        self.form_control_values.get(&id).map(String::as_str)
+    }
+
+    pub fn set_form_control_value(&mut self, id: NodeId, value: String) {
+        if self.get(id).is_some() {
+            self.form_control_values.insert(id, value);
         }
     }
 
@@ -323,6 +338,7 @@ impl Dom {
     pub fn remove(&mut self, id: NodeId) {
         self.detach(id);
         self.dialog_return_values.remove(&id);
+        self.form_control_values.remove(&id);
         if id.0 < self.nodes.len() {
             self.nodes[id.0] = None;
             self.free_list.push(id.0);

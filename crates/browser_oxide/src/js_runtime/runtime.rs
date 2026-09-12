@@ -1,7 +1,7 @@
 use crate::dom::Dom;
 use crate::js_runtime::extensions::audio_ext::audio_extension;
-use crate::js_runtime::extensions::canvas_ext::{canvas_extension, CanvasState};
 use crate::js_runtime::extensions::cache_storage_ext::cache_storage_extension;
+use crate::js_runtime::extensions::canvas_ext::{canvas_extension, CanvasState};
 use crate::js_runtime::extensions::compression_stream_ext::compression_stream_extension;
 use crate::js_runtime::extensions::console_ext::console_extension;
 use crate::js_runtime::extensions::crypto_ext::crypto_extension;
@@ -13,6 +13,7 @@ use crate::js_runtime::extensions::layout_ext::layout_extension;
 use crate::js_runtime::extensions::nav_ext::{nav_extension, NavSignal};
 use crate::js_runtime::extensions::opfs_ext::opfs_extension;
 use crate::js_runtime::extensions::perf_ext::{perf_extension, PerfState};
+use crate::js_runtime::extensions::service_worker_ext::service_worker_extension;
 use crate::js_runtime::extensions::sse_ext::{sse_extension, SseState};
 use crate::js_runtime::extensions::stealth_ext::{stealth_extension, StealthState};
 use crate::js_runtime::extensions::timer_ext::{timer_extension, TimerState};
@@ -294,6 +295,7 @@ pub fn create_runtime_with_signals(
             perf_extension::init(),
             nav_extension::init(),
             opfs_extension::init(),
+            service_worker_extension::init(),
             frame_extension::init(),
             readiness_extension::init(),
         ],
@@ -412,6 +414,8 @@ pub fn create_runtime_with_signals(
             include_str!("js/canvas_bootstrap.js"),
             "\n",
             include_str!("js/window_bootstrap.js"),
+            "\n",
+            include_str!("js/service_worker_bootstrap.js"),
             "\n",
             include_str!("js/cache_storage_bootstrap.js"),
             "\n",
@@ -891,10 +895,7 @@ pub fn create_worker_runtime(
     // `caches` into the WorkerGlobalScope prototype; installing it afterwards
     // would leave the captured legacy empty-store object observable.
     runtime
-        .execute_script(
-            "<anonymous>",
-            include_str!("js/cache_storage_bootstrap.js"),
-        )
+        .execute_script("<anonymous>", include_str!("js/cache_storage_bootstrap.js"))
         .expect("worker: CacheStorage bootstrap failed");
 
     runtime

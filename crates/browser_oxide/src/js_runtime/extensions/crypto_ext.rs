@@ -9,6 +9,7 @@ use boring2::ec::{EcGroup, EcKey, EcPoint, PointConversionForm};
 use boring2::ecdsa::EcdsaSig;
 use boring2::nid::Nid;
 use boring2::pkey::{PKey, Private, Public};
+use boring2::rsa::{Padding, Rsa};
 use boring2::symm::{decrypt, decrypt_aead, encrypt, encrypt_aead, Cipher};
 use deno_core::op2;
 use serde::Serialize;
@@ -24,6 +25,54 @@ pub struct EcKeyMaterial {
     pub x: Vec<u8>,
     pub y: Vec<u8>,
     pub d: Vec<u8>,
+}
+
+#[derive(Serialize, Default)]
+pub struct RsaKeyMaterial {
+    pub ok: bool,
+    pub public_spki: Vec<u8>,
+    pub private_pkcs8: Vec<u8>,
+    pub modulus_length: u32,
+    pub public_exponent: Vec<u8>,
+}
+
+fn rsa_material_private(pkey: PKey<Private>) -> Option<RsaKeyMaterial> {
+    let rsa = pkey.rsa().ok()?;
+    Some(RsaKeyMaterial {
+        ok: true,
+        public_spki: pkey.public_key_to_der().ok()?,
+        private_pkcs8: pkey.private_key_to_der_pkcs8().ok()?,
+        modulus_length: rsa.n().num_bits() as u32,
+        public_exponent: rsa.e().to_vec(),
+    })
+}
+
+fn rsa_material_public(pkey: PKey<Public>) -> Option<RsaKeyMaterial> {
+    let rsa = pkey.rsa().ok()?;
+    Some(RsaKeyMaterial {
+        ok: true,
+        public_spki: pkey.public_key_to_der().ok()?,
+        private_pkcs8: Vec::new(),
+        modulus_length: rsa.n().num_bits() as u32,
+        public_exponent: rsa.e().to_vec(),
+    })
+}
+
+fn rsa_generate(modulus_length: u32, public_exponent: &[u8]) -> Option<RsaKeyMaterial> {
+    if modulus_length < 256 || public_exponent.is_empty() {
+        return None;
+    }
+    let exponent = BigNum::from_slice(public_exponent).ok()?;
+    let rsa = Rsa::generate_with_e(modulus_length, &exponent).ok()?;
+    rsa_material_private(PKey::from_rsa(rsa).ok()?)
+}
+
+fn rsa_import_spki(der: &[u8]) -> Option<RsaKeyMaterial> {
+    rsa_material_public(PKey::public_key_from_der(der).ok()?)
+}
+
+fn rsa_import_pkcs8(der: &[u8]) -> Option<RsaKeyMaterial> {
+    rsa_material_private(PKey::private_key_from_pkcs8(der).ok()?)
 }
 
 fn ec_curve(name: &str) -> Option<(Nid, usize)> {
@@ -297,6 +346,132 @@ fn digest_bytes(algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(out)
+}
+
+fn mgf1(hash: &str, seed: &[u8], output_len: usize) -> Option<Vec<u8>> {
+    let digest_len = digest_bytes(hash, &[])?.len();
+    if digest_len == 0 {
+        return None;
+    }
+    let block_count = output_len.div_ceil(digest_len);
+    if block_count > u32::MAX as usize {
+        return None;
+    }
+    let mut output = Vec::with_capacity(block_count * digest_len);
+    for counter in 0..block_count {
+        let mut input = Vec::with_capacity(seed.len() + 4);
+        input.extend_from_slice(seed);
+        input.extend_from_slice(&(counter as u32).to_be_bytes());
+        output.extend_from_slice(&digest_bytes(hash, &input)?);
+    }
+    output.truncate(output_len);
+    Some(output)
+}
+
+fn rsa_oaep_encode(hash: &str, label: &[u8], message: &[u8], k: usize) -> Option<Vec<u8>> {
+    let label_hash = digest_bytes(hash, label)?;
+    let hash_len = label_hash.len();
+    if k < 2 * hash_len + 2 || message.len() > k - 2 * hash_len - 2 {
+        return None;
+    }
+
+    let padding_len = k - message.len() - 2 * hash_len - 2;
+    let mut db = Vec::with_capacity(k - hash_len - 1);
+    db.extend_from_slice(&label_hash);
+    db.resize(hash_len + padding_len, 0);
+    db.push(1);
+    db.extend_from_slice(message);
+
+    let mut seed = vec![0u8; hash_len];
+    {
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut seed);
+    }
+    let db_mask = mgf1(hash, &seed, db.len())?;
+    let masked_db: Vec<u8> = db.iter().zip(&db_mask).map(|(a, b)| a ^ b).collect();
+    let seed_mask = mgf1(hash, &masked_db, hash_len)?;
+    let masked_seed: Vec<u8> = seed.iter().zip(&seed_mask).map(|(a, b)| a ^ b).collect();
+
+    let mut encoded = Vec::with_capacity(k);
+    encoded.push(0);
+    encoded.extend_from_slice(&masked_seed);
+    encoded.extend_from_slice(&masked_db);
+    Some(encoded)
+}
+
+fn rsa_oaep_decode(hash: &str, label: &[u8], encoded: &[u8]) -> Option<Vec<u8>> {
+    let label_hash = digest_bytes(hash, label)?;
+    let hash_len = label_hash.len();
+    if encoded.len() < 2 * hash_len + 2 || encoded.first().copied()? != 0 {
+        return None;
+    }
+
+    let masked_seed = &encoded[1..1 + hash_len];
+    let masked_db = &encoded[1 + hash_len..];
+    let seed_mask = mgf1(hash, masked_db, hash_len)?;
+    let seed: Vec<u8> = masked_seed
+        .iter()
+        .zip(&seed_mask)
+        .map(|(a, b)| a ^ b)
+        .collect();
+    let db_mask = mgf1(hash, &seed, masked_db.len())?;
+    let db: Vec<u8> = masked_db.iter().zip(&db_mask).map(|(a, b)| a ^ b).collect();
+    if db.len() < hash_len || db[..hash_len] != label_hash[..] {
+        return None;
+    }
+
+    let mut index = hash_len;
+    while index < db.len() && db[index] == 0 {
+        index += 1;
+    }
+    if index >= db.len() || db[index] != 1 {
+        return None;
+    }
+    Some(db[index + 1..].to_vec())
+}
+
+fn rsa_oaep_encrypt_bytes(
+    hash: &str,
+    public_spki: &[u8],
+    label: &[u8],
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let pkey = PKey::public_key_from_der(public_spki).ok()?;
+    let rsa = pkey.rsa().ok()?;
+    let key_len = rsa.size() as usize;
+    let encoded = rsa_oaep_encode(hash, label, data, key_len)?;
+    let mut output = vec![0u8; key_len];
+    let written = rsa
+        .public_encrypt(&encoded, &mut output, Padding::NONE)
+        .ok()?;
+    output.truncate(written);
+    Some(output)
+}
+
+fn rsa_oaep_decrypt_bytes(
+    hash: &str,
+    private_pkcs8: &[u8],
+    label: &[u8],
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let pkey = PKey::private_key_from_pkcs8(private_pkcs8).ok()?;
+    let rsa = pkey.rsa().ok()?;
+    let key_len = rsa.size() as usize;
+    if data.len() != key_len {
+        return None;
+    }
+    let mut encoded = vec![0u8; key_len];
+    let written = rsa
+        .private_decrypt(data, &mut encoded, Padding::NONE)
+        .ok()?;
+    if written > key_len {
+        return None;
+    }
+    if written < key_len {
+        encoded.copy_within(..written, key_len - written);
+        encoded[..key_len - written].fill(0);
+    }
+    rsa_oaep_decode(hash, label, &encoded)
 }
 
 fn hmac_bytes(algorithm: &str, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
@@ -597,6 +772,60 @@ pub fn op_crypto_ecdh_derive(
     ec_derive(private_pkcs8, public_spki).unwrap_or_default()
 }
 
+#[op2]
+#[serde]
+pub fn op_crypto_rsa_generate(
+    modulus_length: u32,
+    #[buffer] public_exponent: &[u8],
+) -> RsaKeyMaterial {
+    rsa_generate(modulus_length, public_exponent).unwrap_or_default()
+}
+
+#[op2]
+#[serde]
+pub fn op_crypto_rsa_import(#[string] format: String, #[buffer] data: &[u8]) -> RsaKeyMaterial {
+    let material = match format.as_str() {
+        "spki" => rsa_import_spki(data),
+        "pkcs8" => rsa_import_pkcs8(data),
+        _ => None,
+    };
+    material.unwrap_or_default()
+}
+
+#[op2]
+#[serde]
+pub fn op_crypto_rsa_oaep_encrypt(
+    #[string] hash: String,
+    #[buffer] public_spki: &[u8],
+    #[buffer] label: &[u8],
+    #[buffer] data: &[u8],
+) -> AesGcmResult {
+    match rsa_oaep_encrypt_bytes(&hash, public_spki, label, data) {
+        Some(data) => AesGcmResult { ok: true, data },
+        None => AesGcmResult {
+            ok: false,
+            data: Vec::new(),
+        },
+    }
+}
+
+#[op2]
+#[serde]
+pub fn op_crypto_rsa_oaep_decrypt(
+    #[string] hash: String,
+    #[buffer] private_pkcs8: &[u8],
+    #[buffer] label: &[u8],
+    #[buffer] data: &[u8],
+) -> AesGcmResult {
+    match rsa_oaep_decrypt_bytes(&hash, private_pkcs8, label, data) {
+        Some(data) => AesGcmResult { ok: true, data },
+        None => AesGcmResult {
+            ok: false,
+            data: Vec::new(),
+        },
+    }
+}
+
 #[op2(fast)]
 pub fn op_crypto_random_fill(#[buffer] out: &mut [u8]) {
     use rand::Rng;
@@ -622,6 +851,10 @@ deno_core::extension!(
         op_crypto_ecdsa_sign,
         op_crypto_ecdsa_verify,
         op_crypto_ecdh_derive,
+        op_crypto_rsa_generate,
+        op_crypto_rsa_import,
+        op_crypto_rsa_oaep_encrypt,
+        op_crypto_rsa_oaep_decrypt,
         op_crypto_random_fill
     ],
 );

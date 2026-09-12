@@ -1,11 +1,115 @@
 use crate::js_runtime::state::DomState;
 use deno_core::op2;
 use deno_core::OpState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use url::Url;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UrlPatternCompileRequest {
+    input: urlpattern::quirks::StringOrInit,
+    base_url: Option<String>,
+    ignore_case: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UrlPatternMatchRequest {
+    input: urlpattern::quirks::StringOrInit,
+    base_url: Option<String>,
+}
+
+fn url_pattern_error_kind(error: &urlpattern::Error) -> &'static str {
+    match error {
+        urlpattern::Error::BaseUrlRequired => "baseUrlRequired",
+        urlpattern::Error::BaseUrlWithInit => "baseUrlWithInit",
+        urlpattern::Error::Tokenizer(..) => "tokenizer",
+        urlpattern::Error::Parser(..) => "parser",
+        urlpattern::Error::Url(..) => "url",
+        urlpattern::Error::RegExp(..) => "regexp",
+    }
+}
+
+fn url_pattern_error_json(error: &urlpattern::Error) -> String {
+    serde_json::json!({
+        "ok": false,
+        "errorKind": url_pattern_error_kind(error),
+        "error": error.to_string(),
+    })
+    .to_string()
+}
+
+/// Compile a WHATWG URLPattern into ECMAScript-compatible component regexps.
+///
+/// Keep the compiled object on the JS side rather than retaining Rust handles:
+/// URLPattern instances are cheap to construct, while a handle registry would
+/// create cross-realm lifetime/reset complexity. `urlpattern::quirks` is the
+/// Deno browser-integration layer and intentionally emits ECMAScript regexp
+/// source strings for the JS wrapper to execute with V8's RegExp engine.
+#[op2]
+#[string]
+pub fn op_url_pattern_compile(#[string] request: String) -> String {
+    let request: UrlPatternCompileRequest = match serde_json::from_str(&request) {
+        Ok(request) => request,
+        Err(error) => {
+            return serde_json::json!({
+                "ok": false,
+                "errorKind": "request",
+                "error": error.to_string(),
+            })
+            .to_string();
+        }
+    };
+
+    let init = match urlpattern::quirks::process_construct_pattern_input(
+        request.input,
+        request.base_url.as_deref(),
+    ) {
+        Ok(init) => init,
+        Err(error) => return url_pattern_error_json(&error),
+    };
+    let pattern = match urlpattern::quirks::parse_pattern(
+        init,
+        urlpattern::UrlPatternOptions {
+            ignore_case: request.ignore_case,
+        },
+    ) {
+        Ok(pattern) => pattern,
+        Err(error) => return url_pattern_error_json(&error),
+    };
+
+    serde_json::json!({ "ok": true, "pattern": pattern }).to_string()
+}
+
+/// Canonicalize a URLPattern match input exactly like the browser algorithm.
+/// Matching itself remains in JS so the generated ECMAScript regexp runs in
+/// V8 rather than Rust's regexp engine.
+#[op2]
+#[string]
+pub fn op_url_pattern_match_input(#[string] request: String) -> String {
+    let request: UrlPatternMatchRequest = match serde_json::from_str(&request) {
+        Ok(request) => request,
+        Err(error) => {
+            return serde_json::json!({
+                "ok": false,
+                "errorKind": "request",
+                "error": error.to_string(),
+            })
+            .to_string();
+        }
+    };
+
+    let processed =
+        match urlpattern::quirks::process_match_input(request.input, request.base_url.as_deref()) {
+            Ok(processed) => processed,
+            Err(error) => return url_pattern_error_json(&error),
+        };
+    let matched = processed.and_then(|(input, _)| urlpattern::quirks::parse_match_input(input));
+    serde_json::json!({ "ok": true, "matched": matched }).to_string()
+}
 
 /// Per-page sync-fetch chain ceiling. Without this, sites like
 /// delta.com and taobao.com cascade nested document.write(<script src>)
@@ -1077,6 +1181,8 @@ deno_core::extension!(
         op_net_fetch_frame_sync,
         op_net_fetch_script_async,
         op_net_xhr_sync,
-        op_drain_csp_violations
+        op_drain_csp_violations,
+        op_url_pattern_compile,
+        op_url_pattern_match_input
     ],
 );

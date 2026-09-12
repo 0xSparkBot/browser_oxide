@@ -121,6 +121,13 @@
         ? { name: state.name }
         : (state.name === 'AES-GCM' || state.name === 'AES-CBC' || state.name === 'AES-KW')
             ? { name: state.name, length: state.length }
+            : (state.name === 'RSA-OAEP')
+                ? {
+                    name: state.name,
+                    modulusLength: state.modulusLength,
+                    publicExponent: state.publicExponent.slice(),
+                    hash: { name: state.hash },
+                }
             : (state.name === 'ECDSA' || state.name === 'ECDH')
                 ? { name: state.name, namedCurve: state.namedCurve }
                 : {
@@ -815,6 +822,98 @@
         }
         return _canonicalEcdhUsages(requested);
     };
+
+    const _normalizeRsaOaepAlgorithm = (algorithm, requireGenerationParams) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'RSA-OAEP') {
+            throw new DOMException('Unrecognized name.', 'NotSupportedError');
+        }
+        const hash = _normalizeHashName(algorithm && algorithm.hash);
+        const result = { name: 'RSA-OAEP', hash };
+        if (requireGenerationParams) {
+            const modulusLength = Number(algorithm && algorithm.modulusLength);
+            if (!Number.isInteger(modulusLength) || modulusLength < 256) {
+                throw new DOMException(
+                    'The operation failed for an operation-specific reason',
+                    'OperationError'
+                );
+            }
+            const publicExponent = algorithm && algorithm.publicExponent;
+            if (!(publicExponent instanceof Uint8Array) || publicExponent.byteLength === 0) {
+                throw new TypeError(
+                    "Failed to execute 'generateKey' on 'SubtleCrypto': RsaHashedKeyGenParams: publicExponent: The provided value is not of type 'Uint8Array'."
+                );
+            }
+            result.modulusLength = modulusLength;
+            result.publicExponent = publicExponent.slice();
+        }
+        return result;
+    };
+    const _normalizeRsaOaepGenerateUsages = (keyUsages) => {
+        const requested = Array.from(keyUsages || [], String);
+        const allowed = new Set(['encrypt', 'decrypt', 'wrapKey', 'unwrapKey']);
+        if (requested.some((usage) => !allowed.has(usage))) {
+            throw new DOMException('Cannot create a key using the specified key usages.', 'SyntaxError');
+        }
+        if (requested.length === 0) {
+            throw new DOMException('Usages cannot be empty when creating a key.', 'SyntaxError');
+        }
+        return {
+            publicUsages: ['encrypt', 'wrapKey'].filter((usage) => requested.includes(usage)),
+            privateUsages: ['decrypt', 'unwrapKey'].filter((usage) => requested.includes(usage)),
+        };
+    };
+    const _normalizeRsaOaepImportUsages = (type, keyUsages) => {
+        const requested = Array.from(keyUsages || [], String);
+        const allowed = type === 'public'
+            ? new Set(['encrypt', 'wrapKey'])
+            : new Set(['decrypt', 'unwrapKey']);
+        if (requested.some((usage) => !allowed.has(usage))) {
+            throw new DOMException('Cannot create a key using the specified key usages.', 'SyntaxError');
+        }
+        if (type === 'private' && requested.length === 0) {
+            throw new DOMException('Usages cannot be empty when creating a key.', 'SyntaxError');
+        }
+        return requested;
+    };
+    const _makeRsaOaepKey = (material, type, hash, extractable, usages) => {
+        if (!material || !material.ok) throw new DOMException('', 'OperationError');
+        const key = Object.create(_CryptoKeyProto);
+        _cryptoKeyState.set(key, {
+            name: 'RSA-OAEP',
+            type,
+            hash,
+            modulusLength: Number(material.modulus_length),
+            publicExponent: new Uint8Array(material.public_exponent || []),
+            publicSpki: new Uint8Array(material.public_spki || []),
+            privatePkcs8: new Uint8Array(material.private_pkcs8 || []),
+            extractable: type === 'public' ? true : !!extractable,
+            usages: usages.slice(),
+        });
+        return key;
+    };
+    const _makeRsaOaepKeyPair = (material, hash, extractable, usages) => ({
+        publicKey: _makeRsaOaepKey(material, 'public', hash, true, usages.publicUsages),
+        privateKey: _makeRsaOaepKey(material, 'private', hash, extractable, usages.privateUsages),
+    });
+    const _normalizeRsaOaepOperation = (algorithm) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'RSA-OAEP') {
+            throw new DOMException('Unrecognized name.', 'NotSupportedError');
+        }
+        if (algorithm && typeof algorithm === 'object' && algorithm.label !== undefined
+            && !(algorithm.label instanceof ArrayBuffer)
+            && !ArrayBuffer.isView(algorithm.label)) {
+            throw new TypeError('RSA-OAEP label is not a BufferSource');
+        }
+        return {
+            name: 'RSA-OAEP',
+            label: algorithm && typeof algorithm === 'object' && algorithm.label !== undefined
+                ? _toBytes(algorithm.label).slice()
+                : new Uint8Array(0),
+        };
+    };
+
     const _makeEcdhKey = (material, type, namedCurve, extractable, usages) => {
         if (!material || !material.ok) throw new DOMException('', 'DataError');
         const key = Object.create(_CryptoKeyProto);
@@ -903,6 +1002,13 @@
     _defProtoMethod(_SubtleProto, 'generateKey', function generateKey(algorithm, extractable, keyUsages) {
         try {
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'RSA-OAEP') {
+                const alg = _normalizeRsaOaepAlgorithm(algorithm, true);
+                const usages = _normalizeRsaOaepGenerateUsages(keyUsages);
+                const material = ops.op_crypto_rsa_generate(alg.modulusLength, alg.publicExponent);
+                if (!material || !material.ok) throw new DOMException('', 'OperationError');
+                return Promise.resolve(_makeRsaOaepKeyPair(material, alg.hash, extractable, usages));
+            }
             if (String(rawName || '').toUpperCase() === 'ECDH') {
                 const alg = _normalizeEcdhKeyAlgorithm(algorithm, 'generateKey');
                 const usages = _normalizeEcdhGenerateUsages(keyUsages);
@@ -952,6 +1058,20 @@
         try {
             const normalizedFormat = String(format).toLowerCase();
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'RSA-OAEP') {
+                const alg = _normalizeRsaOaepAlgorithm(algorithm, false);
+                if (normalizedFormat !== 'spki' && normalizedFormat !== 'pkcs8') {
+                    throw new DOMException('The requested operation is not supported', 'NotSupportedError');
+                }
+                if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+                    throw new TypeError('keyData is not a BufferSource');
+                }
+                const type = normalizedFormat === 'spki' ? 'public' : 'private';
+                const usages = _normalizeRsaOaepImportUsages(type, keyUsages);
+                const material = ops.op_crypto_rsa_import(normalizedFormat, _toBytes(keyData));
+                if (!material || !material.ok) throw new DOMException('', 'DataError');
+                return Promise.resolve(_makeRsaOaepKey(material, type, alg.hash, extractable, usages));
+            }
             if (String(rawName || '').toUpperCase() === 'ECDH') {
                 const alg = _normalizeEcdhKeyAlgorithm(algorithm, 'importKey');
                 if (!['raw', 'spki', 'pkcs8', 'jwk'].includes(normalizedFormat)) {
@@ -1072,6 +1192,14 @@
                 throw new DOMException("Failed to execute 'exportKey' on 'SubtleCrypto': key is not extractable", "InvalidAccessError");
             }
             const normalizedFormat = String(format).toLowerCase();
+            if (state.name === 'RSA-OAEP') {
+                let bytes;
+                if (state.type === 'public' && normalizedFormat === 'spki') bytes = state.publicSpki;
+                else if (state.type === 'private' && normalizedFormat === 'pkcs8') bytes = state.privatePkcs8;
+                else throw new DOMException('The requested operation is not supported', 'NotSupportedError');
+                const copy = bytes.slice();
+                return Promise.resolve(copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength));
+            }
             if (state.name === 'ECDSA' || state.name === 'ECDH') {
                 if (normalizedFormat === 'jwk') return Promise.resolve(_exportEcdsaJwk(state));
                 let bytes;
@@ -1304,6 +1432,20 @@
                 throw new TypeError("data is not a BufferSource");
             }
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'RSA-OAEP') {
+                const alg = _normalizeRsaOaepOperation(algorithm);
+                const state = _requireCryptoKey(key);
+                if (state.name !== 'RSA-OAEP' || state.type !== 'public' || !state.usages.includes('encrypt')) {
+                    throw new DOMException('key.usages does not permit this operation', 'InvalidAccessError');
+                }
+                const result = ops.op_crypto_rsa_oaep_encrypt(
+                    state.hash, state.publicSpki, alg.label, _toBytes(data)
+                );
+                if (!result.ok) {
+                    throw new DOMException('The operation failed for an operation-specific reason', 'OperationError');
+                }
+                return Promise.resolve(new Uint8Array(result.data).buffer);
+            }
             if (String(rawName || '').toUpperCase() === 'AES-CBC') {
                 const { alg, state } = _checkAesCbcOperation(algorithm, key, 'encrypt', 'encrypt');
                 const result = ops.op_crypto_aes_cbc_encrypt(state.bytes, alg.iv, _toBytes(data));
@@ -1327,6 +1469,20 @@
                 throw new TypeError("data is not a BufferSource");
             }
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'RSA-OAEP') {
+                const alg = _normalizeRsaOaepOperation(algorithm);
+                const state = _requireCryptoKey(key);
+                if (state.name !== 'RSA-OAEP' || state.type !== 'private' || !state.usages.includes('decrypt')) {
+                    throw new DOMException('key.usages does not permit this operation', 'InvalidAccessError');
+                }
+                const result = ops.op_crypto_rsa_oaep_decrypt(
+                    state.hash, state.privatePkcs8, alg.label, _toBytes(data)
+                );
+                if (!result.ok) {
+                    throw new DOMException('The operation failed for an operation-specific reason', 'OperationError');
+                }
+                return Promise.resolve(new Uint8Array(result.data).buffer);
+            }
             if (String(rawName || '').toUpperCase() === 'AES-CBC') {
                 const { alg, state } = _checkAesCbcOperation(algorithm, key, 'decrypt', 'decrypt');
                 const result = ops.op_crypto_aes_cbc_decrypt(state.bytes, alg.iv, _toBytes(data));

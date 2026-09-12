@@ -33,6 +33,141 @@ impl<'a> DomElement<'a> {
     fn element_data(&self) -> &crate::dom::node::ElementData {
         self.node().as_element().unwrap()
     }
+
+    fn tag_is(&self, names: &[&str]) -> bool {
+        names
+            .iter()
+            .any(|name| self.local_name().eq_ignore_ascii_case(name))
+    }
+
+    fn input_type(&self) -> &str {
+        self.attribute_value("type")
+            .filter(|value| !value.is_empty())
+            .unwrap_or("text")
+    }
+
+    fn is_descendant_of_or_self(&self, ancestor: NodeId) -> bool {
+        let mut current = Some(self.id);
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            current = self.dom.get(id).and_then(|node| node.parent);
+        }
+        false
+    }
+
+    fn disabled_by_fieldset(&self) -> bool {
+        // HTML disabled-fieldset inheritance has one important exception:
+        // descendants of the fieldset's first legend element remain enabled.
+        // Walk every disabled fieldset ancestor because nested fieldsets may
+        // independently disable the element.
+        let mut current = self.node().parent;
+        while let Some(id) = current {
+            let Some(node) = self.dom.get(id) else {
+                break;
+            };
+            if let Some(data) = node.as_element() {
+                if data.name.local.eq_ignore_ascii_case("fieldset")
+                    && data
+                        .attrs
+                        .iter()
+                        .any(|a| a.name.local.eq_ignore_ascii_case("disabled"))
+                {
+                    let first_legend = self.dom.child_elements(id).into_iter().find(|child| {
+                        self.dom
+                            .get(*child)
+                            .and_then(|n| n.as_element())
+                            .is_some_and(|e| e.name.local.eq_ignore_ascii_case("legend"))
+                    });
+                    let exempt =
+                        first_legend.is_some_and(|legend| self.is_descendant_of_or_self(legend));
+                    if !exempt {
+                        return true;
+                    }
+                }
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    fn content_editable_state(&self) -> bool {
+        // contenteditable is inherited. Invalid values behave like the
+        // missing-value state, so keep walking until a valid token is found.
+        let mut current = Some(self.id);
+        while let Some(id) = current {
+            let Some(node) = self.dom.get(id) else {
+                break;
+            };
+            if let Some(data) = node.as_element() {
+                if let Some(attr) = data
+                    .attrs
+                    .iter()
+                    .find(|a| a.name.local.eq_ignore_ascii_case("contenteditable"))
+                {
+                    let value = attr.value.trim();
+                    if value.is_empty()
+                        || value.eq_ignore_ascii_case("true")
+                        || value.eq_ignore_ascii_case("plaintext-only")
+                    {
+                        return true;
+                    }
+                    if value.eq_ignore_ascii_case("false") {
+                        return false;
+                    }
+                }
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    fn input_supports_required(&self) -> bool {
+        matches!(
+            self.input_type().to_ascii_lowercase().as_str(),
+            "text"
+                | "search"
+                | "url"
+                | "tel"
+                | "email"
+                | "password"
+                | "date"
+                | "month"
+                | "week"
+                | "time"
+                | "datetime-local"
+                | "number"
+                | "checkbox"
+                | "radio"
+                | "file"
+        )
+    }
+
+    fn input_is_text_editable(&self) -> bool {
+        matches!(
+            self.input_type().to_ascii_lowercase().as_str(),
+            "text"
+                | "search"
+                | "url"
+                | "tel"
+                | "email"
+                | "password"
+                | "date"
+                | "month"
+                | "week"
+                | "time"
+                | "datetime-local"
+                | "number"
+        )
+    }
+
+    fn input_supports_placeholder(&self) -> bool {
+        matches!(
+            self.input_type().to_ascii_lowercase().as_str(),
+            "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+        )
+    }
 }
 
 impl<'a> std::fmt::Debug for DomElement<'a> {
@@ -217,6 +352,102 @@ impl<'a> Element for DomElement<'a> {
     fn is_link(&self) -> bool {
         let name = self.local_name();
         (name == "a" || name == "area") && self.has_attribute("href")
+    }
+
+    fn is_enabled(&self) -> bool {
+        // Chromium exposes :enabled/:disabled only on controls with an HTML
+        // disabled state. Generic elements (including legend/form/output) are
+        // neither enabled nor disabled.
+        if !self.tag_is(&[
+            "button", "fieldset", "input", "optgroup", "option", "select", "textarea",
+        ]) {
+            return false;
+        }
+        !self.is_disabled()
+    }
+
+    fn is_disabled(&self) -> bool {
+        if !self.tag_is(&[
+            "button", "fieldset", "input", "optgroup", "option", "select", "textarea",
+        ]) {
+            return false;
+        }
+
+        if self.has_attribute("disabled") {
+            return true;
+        }
+
+        // An option inherits :disabled from a disabled optgroup, but notably
+        // not from a disabled select (Chrome 148 behavior).
+        if self.local_name().eq_ignore_ascii_case("option") {
+            if let Some(parent) = self.parent_element() {
+                if parent.local_name().eq_ignore_ascii_case("optgroup") && parent.is_disabled() {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Form controls inside a disabled fieldset inherit disabled state,
+        // except when they are descendants of the fieldset's first legend.
+        self.disabled_by_fieldset()
+    }
+
+    fn is_required(&self) -> bool {
+        if !self.has_attribute("required") {
+            return false;
+        }
+        if self.local_name().eq_ignore_ascii_case("input") {
+            return self.input_supports_required();
+        }
+        self.tag_is(&["select", "textarea"])
+    }
+
+    fn is_optional(&self) -> bool {
+        // Chromium applies :optional to input/select/textarea and button.
+        // It does not apply it to option/fieldset/generic elements.
+        self.tag_is(&["button", "input", "select", "textarea"]) && !self.is_required()
+    }
+
+    fn is_read_write(&self) -> bool {
+        if self.is_disabled() {
+            return false;
+        }
+
+        if self.local_name().eq_ignore_ascii_case("textarea") {
+            return !self.has_attribute("readonly");
+        }
+
+        if self.local_name().eq_ignore_ascii_case("input") {
+            return self.input_is_text_editable() && !self.has_attribute("readonly");
+        }
+
+        self.content_editable_state()
+    }
+
+    fn is_placeholder_shown(&self) -> bool {
+        if !self.has_attribute("placeholder") {
+            return false;
+        }
+
+        if self.local_name().eq_ignore_ascii_case("input") {
+            let value = self
+                .dom
+                .form_control_value(self.id)
+                .unwrap_or_else(|| self.attribute_value("value").unwrap_or_default());
+            return self.input_supports_placeholder() && value.is_empty();
+        }
+
+        if self.local_name().eq_ignore_ascii_case("textarea") {
+            let value = self
+                .dom
+                .form_control_value(self.id)
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.text_content());
+            return value.is_empty();
+        }
+
+        false
     }
 
     fn is_modal(&self) -> bool {
