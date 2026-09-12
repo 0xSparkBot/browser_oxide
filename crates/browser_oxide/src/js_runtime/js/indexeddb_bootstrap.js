@@ -507,16 +507,28 @@
     // ---------------------------------------------------------------------
     // Transactions.
     // ---------------------------------------------------------------------
-    function _txBegin(transaction) {
+    function _assertTxAccepting(transaction) {
         const state = _stateFor(_txState, transaction);
-        if (!state.active) throw _domError('TransactionInactiveError', 'The transaction is not active.');
+        if (!state.active || state.committing) {
+            throw _domError('TransactionInactiveError', 'The transaction is not active.');
+        }
+        return state;
+    }
+    function _txBegin(transaction) {
+        const state = _assertTxAccepting(transaction);
         state.pending++;
     }
     function _scheduleTxCheck(transaction) {
         const state = _stateFor(_txState, transaction);
         if (!state.active || state.checkScheduled) return;
         state.checkScheduled = true;
-        queueMicrotask(() => {
+        // IndexedDB transactions remain active through the microtask checkpoint
+        // of the task that created/used them. Blink therefore allows a request
+        // first issued from Promise.resolve().then(...) in the same task, while
+        // a request from the next task observes TransactionInactiveError.
+        // Scheduling auto-commit itself as a microtask races ahead of page-authored
+        // Promise jobs, so defer the idle check to the next task instead.
+        setTimeout(() => {
             state.checkScheduled = false;
             if (!state.active || state.pending !== 0) return;
             state.active = false;
@@ -526,7 +538,7 @@
             for (const callback of state.completeCallbacks.splice(0)) {
                 try { callback(); } catch (_) {}
             }
-        });
+        }, 0);
     }
     function _txEnd(transaction) {
         const state = _stateFor(_txState, transaction);
@@ -582,6 +594,7 @@
             error: null,
             handlers: Object.create(null),
             active: true,
+            committing: false,
             aborted: false,
             pending: 0,
             checkScheduled: false,
@@ -603,17 +616,21 @@
     for (const name of ['onabort', 'oncomplete', 'onerror']) _defineHandler(IDBTransactionProto, name, _txState);
     _defineMethod(IDBTransactionProto, 'abort', function abort() {
         const state = _stateFor(_txState, this);
-        if (!state.active) throw _domError('InvalidStateError', 'The transaction has finished.');
+        if (!state.active || state.committing) throw _domError('InvalidStateError', 'The transaction has finished.');
         _abortTransaction(this, null);
     });
     _defineMethod(IDBTransactionProto, 'commit', function commit() {
         const state = _stateFor(_txState, this);
-        if (!state.active) throw _domError('InvalidStateError', 'The transaction has finished.');
+        if (!state.active || state.committing) throw _domError('InvalidStateError', 'The transaction has finished.');
+        // Explicit commit stops the transaction from accepting new requests
+        // immediately, but already-queued requests are still allowed to drain
+        // before the asynchronous complete event.
+        state.committing = true;
         _scheduleTxCheck(this);
     });
     _defineMethod(IDBTransactionProto, 'objectStore', function objectStore(name) {
         const state = _stateFor(_txState, this);
-        if (!state.active) throw _domError('InvalidStateError', 'The transaction has finished.');
+        if (!state.active || state.committing) throw _domError('InvalidStateError', 'The transaction has finished.');
         name = String(name);
         if (!state.names.includes(name) && state.mode !== 'versionchange') {
             throw _domError('NotFoundError', `The object store '${name}' is not in this transaction.`);
@@ -664,7 +681,7 @@
     function _storeWrite(store, value, explicitKey, overwrite) {
         const state = _stateFor(_storeState, store);
         const tx = state.transaction;
-        const txs = _stateFor(_txState, tx);
+        const txs = _assertTxAccepting(tx);
         if (txs.mode === 'readonly') throw _domError('ReadOnlyError', 'The transaction is read-only.');
         const cloned = _clone(value);
         let key;
@@ -686,7 +703,8 @@
     });
     _defineMethod(IDBObjectStoreProto, 'clear', function clear() {
         const state = _stateFor(_storeState, this), tx = state.transaction;
-        if (_stateFor(_txState, tx).mode === 'readonly') throw _domError('ReadOnlyError', 'The transaction is read-only.');
+        const txs = _assertTxAccepting(tx);
+        if (txs.mode === 'readonly') throw _domError('ReadOnlyError', 'The transaction is read-only.');
         state.record.data.clear();
         return _queueRequestSuccess(_makeRequest(this, tx), undefined);
     });
@@ -708,7 +726,8 @@
     });
     _defineMethod(IDBObjectStoreProto, 'delete', function del(query) {
         const state = _stateFor(_storeState, this), tx = state.transaction;
-        if (_stateFor(_txState, tx).mode === 'readonly') throw _domError('ReadOnlyError', 'The transaction is read-only.');
+        const txs = _assertTxAccepting(tx);
+        if (txs.mode === 'readonly') throw _domError('ReadOnlyError', 'The transaction is read-only.');
         if (query instanceof IDBKeyRange) {
             for (const [key] of _queryEntries(state.record, query)) _deleteEntry(state.record, key);
         } else _deleteEntry(state.record, query);
@@ -845,11 +864,37 @@
         }
         _cursorStep(this, 1);
     });
+    function _cursorTupleCmp(aKey, aPrimaryKey, bKey, bPrimaryKey) {
+        const keyCmp = _keyCmp(aKey, bKey);
+        return keyCmp || _keyCmp(aPrimaryKey, bPrimaryKey);
+    }
     _defineMethod(IDBCursorProto, 'continuePrimaryKey', function continuePrimaryKey(key, primaryKey) {
-        void primaryKey;
         const state = _stateFor(_cursorState, this);
+        if (!_indexState.has(state.source) || state.direction === 'nextunique' || state.direction === 'prevunique') {
+            throw _domError('InvalidAccessError', 'continuePrimaryKey is only valid for non-unique index cursors.');
+        }
+        if (state.key === undefined || state.primaryKey === undefined) {
+            throw _domError('InvalidStateError', 'The cursor has no current value.');
+        }
+
+        // Validate both target keys using the same IndexedDB key ordering used
+        // by stores/indexes, then require the requested tuple to move strictly
+        // forward in the cursor's direction.
+        _keyCmp(key, key);
+        _keyCmp(primaryKey, primaryKey);
+        const targetVsCurrent = _cursorTupleCmp(key, primaryKey, state.key, state.primaryKey);
+        const forward = state.direction === 'next';
+        if ((forward && targetVsCurrent <= 0) || (!forward && targetVsCurrent >= 0)) {
+            throw _domError('DataError', 'The requested key and primary key do not advance the cursor.');
+        }
+
         let next = state.index + 1;
-        while (next < state.entries.length && _keyCmp(state.entries[next].key, key) < 0) next++;
+        while (next < state.entries.length) {
+            const entry = state.entries[next];
+            const entryVsTarget = _cursorTupleCmp(entry.key, entry.primaryKey, key, primaryKey);
+            if ((forward && entryVsTarget >= 0) || (!forward && entryVsTarget <= 0)) break;
+            next++;
+        }
         _cursorStep(this, Math.max(1, next - state.index));
     });
     _defineMethod(IDBCursorProto, 'delete', function deleteCursor() {

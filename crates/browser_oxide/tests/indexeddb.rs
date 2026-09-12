@@ -889,3 +889,201 @@ async fn indexeddb_open_queued_behind_blocked_delete_recreates_database() {
     assert_eq!(value["reopenNewVersion"], 1);
     assert_eq!(value["stores"], serde_json::json!(["new-store"]));
 }
+
+#[tokio::test]
+async fn indexeddb_transaction_stays_active_through_current_task_microtasks() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbTaskActivity = null;
+        (() => {
+            const name = 'browser-oxide-idb-task-activity';
+            const out = { seq: [], errors: {} };
+            const open = indexedDB.open(name, 1);
+            open.onupgradeneeded = () => open.result.createObjectStore('items');
+            open.onsuccess = () => {
+                const db = open.result;
+                const tx = db.transaction('items', 'readwrite');
+                const store = tx.objectStore('items');
+
+                Promise.resolve().then(() => {
+                    try {
+                        store.put('microtask', 1);
+                        out.seq.push('microtask-put');
+                    } catch (error) {
+                        out.errors.microtask = error.name;
+                    }
+                });
+
+                setTimeout(() => {
+                    try {
+                        store.put('next-task', 2);
+                        out.seq.push('timer-put');
+                    } catch (error) {
+                        out.errors.timer = error.name;
+                    }
+                }, 0);
+
+                tx.oncomplete = () => {
+                    out.seq.push('complete');
+                    const verifyTx = db.transaction('items');
+                    const verify = verifyTx.objectStore('items').getAll();
+                    verify.onsuccess = () => { out.values = verify.result; };
+                    verifyTx.oncomplete = () => setTimeout(() => {
+                        globalThis.__idbTaskActivity = out;
+                        db.close();
+                        indexedDB.deleteDatabase(name);
+                    }, 20);
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbTaskActivity)")
+        .expect("task activity result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("task activity json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!(["microtask-put", "complete"])
+    );
+    assert_eq!(value["errors"]["timer"], "TransactionInactiveError");
+    assert!(value["errors"].get("microtask").is_none());
+    assert_eq!(value["values"], serde_json::json!(["microtask"]));
+}
+
+#[tokio::test]
+async fn indexeddb_explicit_commit_rejects_new_requests_immediately() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbExplicitCommit = null;
+        (() => {
+            const name = 'browser-oxide-idb-explicit-commit';
+            const out = { seq: [], errors: {} };
+            const open = indexedDB.open(name, 1);
+            open.onupgradeneeded = () => open.result.createObjectStore('items');
+            open.onsuccess = () => {
+                const db = open.result;
+                const tx = db.transaction('items', 'readwrite');
+                const store = tx.objectStore('items');
+                tx.commit();
+                out.seq.push('commit-called');
+
+                try {
+                    store.put('sync', 1);
+                    out.seq.push('sync-put');
+                } catch (error) {
+                    out.errors.sync = error.name;
+                }
+
+                Promise.resolve().then(() => {
+                    try {
+                        store.put('microtask', 2);
+                        out.seq.push('microtask-put');
+                    } catch (error) {
+                        out.errors.microtask = error.name;
+                    }
+                });
+
+                tx.oncomplete = () => {
+                    out.seq.push('complete');
+                    const verifyTx = db.transaction('items');
+                    const verify = verifyTx.objectStore('items').getAll();
+                    verify.onsuccess = () => { out.values = verify.result; };
+                    verifyTx.oncomplete = () => setTimeout(() => {
+                        globalThis.__idbExplicitCommit = out;
+                        db.close();
+                        indexedDB.deleteDatabase(name);
+                    }, 20);
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbExplicitCommit)")
+        .expect("explicit commit result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("explicit commit json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!(["commit-called", "complete"])
+    );
+    assert_eq!(value["errors"]["sync"], "TransactionInactiveError");
+    assert_eq!(value["errors"]["microtask"], "TransactionInactiveError");
+    assert_eq!(value["values"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn indexeddb_continue_primary_key_matches_chrome_tuple_seek() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbContinuePrimaryKey = null;
+        (() => {
+            const name = 'browser-oxide-idb-continue-primary-key';
+            const out = { rows: [], errors: {} };
+            const open = indexedDB.open(name, 1);
+            open.onupgradeneeded = () => {
+                const store = open.result.createObjectStore('items', { keyPath: 'id' });
+                store.createIndex('by-kind', 'kind');
+                store.put({ id: 1, kind: 'a' });
+                store.put({ id: 2, kind: 'a' });
+                store.put({ id: 4, kind: 'a' });
+                store.put({ id: 5, kind: 'b' });
+            };
+            open.onsuccess = () => {
+                const db = open.result;
+                const tx = db.transaction('items');
+                const index = tx.objectStore('items').index('by-kind');
+                const request = index.openCursor();
+                let step = 0;
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return;
+                    out.rows.push([cursor.key, cursor.primaryKey]);
+                    if (step++ === 0) {
+                        cursor.continuePrimaryKey('a', 4);
+                    } else if (step === 2) {
+                        try { cursor.continuePrimaryKey('a', 4); }
+                        catch (error) { out.errors.nonForward = error.name; }
+                        cursor.continue();
+                    }
+                };
+                tx.oncomplete = () => {
+                    const tx2 = db.transaction('items');
+                    const store = tx2.objectStore('items');
+                    const storeCursor = store.openCursor();
+                    storeCursor.onsuccess = () => {
+                        if (!storeCursor.result) return;
+                        try { storeCursor.result.continuePrimaryKey('a', 4); }
+                        catch (error) { out.errors.store = error.name; }
+                    };
+                    const uniqueCursor = store.index('by-kind').openCursor(null, 'nextunique');
+                    uniqueCursor.onsuccess = () => {
+                        if (!uniqueCursor.result) return;
+                        try { uniqueCursor.result.continuePrimaryKey('b', 5); }
+                        catch (error) { out.errors.unique = error.name; }
+                    };
+                    tx2.oncomplete = () => {
+                        globalThis.__idbContinuePrimaryKey = out;
+                        db.close();
+                        indexedDB.deleteDatabase(name);
+                    };
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbContinuePrimaryKey)")
+        .expect("continuePrimaryKey result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("continuePrimaryKey json");
+
+    assert_eq!(
+        value["rows"],
+        serde_json::json!([["a", 1], ["a", 4], ["b", 5]])
+    );
+    assert_eq!(value["errors"]["nonForward"], "DataError");
+    assert_eq!(value["errors"]["store"], "InvalidAccessError");
+    assert_eq!(value["errors"]["unique"], "InvalidAccessError");
+}
