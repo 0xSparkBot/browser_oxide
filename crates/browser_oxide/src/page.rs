@@ -5443,6 +5443,45 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    fn spawn_page_fixture_server(body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut served = 0usize;
+            while served < 4 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let mut buf = [0u8; 8192];
+                        let n = socket.read(&mut buf).unwrap_or(0);
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = socket.write_all(response.as_bytes());
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                        served += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("http://{addr}/"), requests)
+    }
 
     #[tokio::test]
     async fn named_form_control_values_reads_async_populated_controls() {
@@ -6117,68 +6156,69 @@ mod tests {
         assert_eq!(dom.text_content(ps[0]), "test");
     }
 
-    // --- Network integration tests (require internet) ---
+    // --- Hermetic HTTP integration tests ---
 
     #[tokio::test]
-    #[ignore]
     async fn navigate_httpbin() {
+        let (url, _requests) = spawn_page_fixture_server(
+            "<!doctype html><html><head><title>Fixture Page</title></head><body><p>Herman Melville fixture excerpt</p></body></html>",
+        );
         let profile = crate::stealth::presets::chrome_148_linux();
         let client = crate::net::HttpClient::new(&profile).unwrap();
-        let mut page = Page::navigate_simple(
-            "https://httpbin.org/html",
-            &client,
-            crate::stealth::presets::chrome_148_ru(),
-        )
-        .await
-        .expect("navigate to httpbin failed");
+        let mut page =
+            Page::navigate_simple(&url, &client, crate::stealth::presets::chrome_148_ru())
+                .await
+                .expect("navigate to local HTML fixture failed");
         let title = page.title();
-        println!("[httpbin] title: {title:?}");
+        assert_eq!(title, "Fixture Page");
         let text = page.text_content();
-        println!("[httpbin] body length: {}", text.len());
         assert!(!text.is_empty(), "body should not be empty");
-        assert!(
-            text.contains("Herman Melville"),
-            "expected Moby Dick excerpt"
-        );
+        assert!(text.contains("Herman Melville"), "expected fixture excerpt");
     }
 
     #[tokio::test]
-    #[ignore]
     async fn navigate_httpbin_user_agent() {
+        let (url, requests) = spawn_page_fixture_server(
+            "<!doctype html><html><body><p>user-agent fixture</p></body></html>",
+        );
         let profile = crate::stealth::presets::chrome_148_windows();
         let client = crate::net::HttpClient::new(&profile).unwrap();
-        let mut page = Page::navigate_simple(
-            "https://httpbin.org/user-agent",
-            &client,
-            crate::stealth::presets::chrome_148_ru(),
-        )
-        .await
-        .expect("navigate to httpbin/user-agent failed");
-        let text = page.text_content();
-        println!("[user-agent] response: {text}");
+        let _page = Page::navigate_simple(&url, &client, crate::stealth::presets::chrome_148_ru())
+            .await
+            .expect("navigate to local user-agent fixture failed");
+        let request = requests.lock().unwrap().join("\n");
+        let lower = request.to_ascii_lowercase();
         assert!(
-            text.contains("Chrome"),
-            "expected Chrome in user-agent response"
+            lower.contains("user-agent:") && request.contains("Chrome/148"),
+            "expected Chrome 148 User-Agent in raw request: {request}"
         );
     }
 
     #[tokio::test]
-    #[ignore]
     async fn navigate_stealth_headers_check() {
+        let (url, requests) = spawn_page_fixture_server(
+            "<!doctype html><html><body><p>headers fixture</p></body></html>",
+        );
         let profile = crate::stealth::presets::chrome_148_linux();
         let client = crate::net::HttpClient::new(&profile).unwrap();
-        let mut page = Page::navigate_simple(
-            "https://httpbin.org/headers",
-            &client,
-            crate::stealth::presets::chrome_148_ru(),
-        )
-        .await
-        .expect("navigate to httpbin/headers failed");
-        let text = page.text_content();
-        println!("[headers] response: {}", &text[..text.len().min(500)]);
-        // httpbin returns JSON with the request headers — verify UA was sent
-        assert!(text.contains("User-Agent"), "expected User-Agent header");
-        assert!(text.contains("Chrome"), "expected Chrome in UA string");
+        let _page = Page::navigate_simple(&url, &client, crate::stealth::presets::chrome_148_ru())
+            .await
+            .expect("navigate to local headers fixture failed");
+        let request = requests.lock().unwrap().join("\n");
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("user-agent:"),
+            "missing User-Agent: {request}"
+        );
+        assert!(lower.contains("sec-ch-ua:"), "missing Sec-CH-UA: {request}");
+        assert!(
+            lower.contains("accept-language:"),
+            "missing Accept-Language: {request}"
+        );
+        assert!(
+            request.contains("Chrome/148"),
+            "wrong UA version: {request}"
+        );
     }
 
     #[tokio::test]
