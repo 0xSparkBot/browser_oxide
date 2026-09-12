@@ -1201,6 +1201,123 @@
         _getWebGLExtensionPrototype(extensionName);
     }
 
+    // WebGL object state is host-managed. Real WebGLShader/WebGLProgram/
+    // WebGLUniformLocation wrappers expose no implementation fields of their
+    // own, so keep every bit of lifecycle state out-of-band.
+    const _webglShaderState = new WeakMap();
+    const _webglProgramState = new WeakMap();
+    const _webglUniformLocationState = new WeakMap();
+    const _webglContextState = new WeakMap();
+    const _webglContextErrors = new WeakMap();
+    const _webglCurrentProgram = new WeakMap();
+
+    function _webglState(ctx) {
+        return _webglContextState.get(ctx) || null;
+    }
+
+    function _configureWebGLContext(ctx, options = {}) {
+        let state = _webglContextState.get(ctx);
+        if (!state) {
+            const width = options.width === undefined ? 300 : Number(options.width);
+            const height = options.height === undefined ? 150 : Number(options.height);
+            state = {
+                canvasId: options.canvasId,
+                width: Number.isFinite(width) ? width : 300,
+                height: Number.isFinite(height) ? height : 150,
+                clearColor: [0, 0, 0, 0],
+                viewport: [0, 0, Number.isFinite(width) ? width : 300, Number.isFinite(height) ? height : 150],
+                canvas: options.canvas || null,
+                isWebGL2: !!options.isWebGL2,
+            };
+            _webglContextState.set(ctx, state);
+        } else {
+            if (options.canvasId !== undefined) state.canvasId = options.canvasId;
+            if (options.width !== undefined && Number.isFinite(Number(options.width))) state.width = Number(options.width);
+            if (options.height !== undefined && Number.isFinite(Number(options.height))) state.height = Number(options.height);
+            if (options.canvas !== undefined) state.canvas = options.canvas;
+            if (options.isWebGL2 !== undefined) state.isWebGL2 = !!options.isWebGL2;
+            if (options.resetViewport) state.viewport = [0, 0, state.width, state.height];
+        }
+        return ctx;
+    }
+
+    function _webglDrawingWidth(ctx) {
+        const state = _webglState(ctx);
+        if (!state) return 0;
+        const value = state.canvas && Number(state.canvas.width);
+        return Number.isFinite(value) ? value : state.width;
+    }
+
+    function _webglDrawingHeight(ctx) {
+        const state = _webglState(ctx);
+        if (!state) return 0;
+        const value = state.canvas && Number(state.canvas.height);
+        return Number.isFinite(value) ? value : state.height;
+    }
+
+    function _setWebGLError(ctx, code) {
+        // WebGL records the first outstanding error until getError() consumes
+        // it. Later errors do not replace an earlier unconsumed one.
+        if ((_webglContextErrors.get(ctx) || 0) === 0) {
+            _webglContextErrors.set(ctx, code >>> 0);
+        }
+    }
+
+    function _newWebGLObject(name, stateMap, state) {
+        const Ctor = globalThis[name];
+        const proto = Ctor && Ctor.prototype ? Ctor.prototype : Object.prototype;
+        const object = Object.create(proto);
+        stateMap.set(object, state);
+        return object;
+    }
+
+    function _requireWebGLObject(name, stateMap, value, nullable = false, operation = 'WebGL operation') {
+        if (nullable && value == null) return null;
+        const Ctor = globalThis[name];
+        if (!value || !Ctor || !Ctor.prototype || !Ctor.prototype.isPrototypeOf(value)) {
+            throw new TypeError(`Failed to execute '${operation}' on 'WebGLRenderingContext': parameter 1 is not of type '${name}'.`);
+        }
+        return stateMap.get(value) || null;
+    }
+
+    function _compileWebGLShaderSource(source) {
+        const text = String(source || '');
+        // This is a validation model rather than a renderer/compiler. Cover the
+        // structural failures browser code relies on while accepting the broad
+        // GLSL ES syntax used by real sites. Pixel rendering remains handled by
+        // the existing Canvas/WebGL backend.
+        if (!/\bvoid\s+main\s*\(/.test(text)) {
+            return { ok: false, log: "ERROR: 0:1: 'main' : function is not defined\n\0" };
+        }
+        if (/\bthis\b/.test(text)) {
+            return { ok: false, log: "ERROR: 0:1: syntax error\n\0" };
+        }
+        let depth = 0;
+        for (const ch of text) {
+            if (ch === '{') depth++;
+            else if (ch === '}') {
+                depth--;
+                if (depth < 0) return { ok: false, log: "ERROR: 0:1: syntax error\n\0" };
+            }
+        }
+        if (depth !== 0) return { ok: false, log: "ERROR: 0:1: syntax error\n\0" };
+        return { ok: true, log: '' };
+    }
+
+    function _webGLDeclaredNames(source, keyword) {
+        const names = [];
+        const seen = new Set();
+        const re = new RegExp(`\\b${keyword}\\s+(?:(?:lowp|mediump|highp)\\s+)?[A-Za-z_]\\w*\\s+([A-Za-z_]\\w*)`, 'g');
+        let match;
+        while ((match = re.exec(source || ''))) {
+            if (!seen.has(match[1])) {
+                seen.add(match[1]);
+                names.push(match[1]);
+            }
+        }
+        return names;
+    }
+
     // WebGL — routes through Canvas2D backend for real pixel output.
     // Some scripts call readPixels() after clearColor()+clear() and expect real data.
     class WebGLRenderingContext {
@@ -1221,8 +1338,19 @@
         static ELEMENT_ARRAY_BUFFER = 0x8893;
         static FRAGMENT_SHADER = 0x8B30;
         static VERTEX_SHADER = 0x8B31;
+        static DELETE_STATUS = 0x8B80;
         static COMPILE_STATUS = 0x8B81;
         static LINK_STATUS = 0x8B82;
+        static VALIDATE_STATUS = 0x8B83;
+        static ATTACHED_SHADERS = 0x8B85;
+        static ACTIVE_UNIFORMS = 0x8B86;
+        static ACTIVE_ATTRIBUTES = 0x8B89;
+        static SHADER_TYPE = 0x8B4F;
+        static CURRENT_PROGRAM = 0x8B8D;
+        static NO_ERROR = 0;
+        static INVALID_ENUM = 0x0500;
+        static INVALID_VALUE = 0x0501;
+        static INVALID_OPERATION = 0x0502;
         // Parameter pname constants — scripts call e.g. gl.getParameter(gl.MAX_TEXTURE_SIZE).
         static VENDOR = 0x1F00;
         static RENDERER = 0x1F01;
@@ -1255,44 +1383,47 @@
         static HIGH_INT = 0x8DF5;
 
         constructor(canvasId, width, height) {
-            this._canvasId = canvasId;
-            this._width = width || 300;
-            this._height = height || 150;
-            this._clearColor = [0, 0, 0, 0];
-            this.canvas = null;
-            this.drawingBufferWidth = this._width;
-            this.drawingBufferHeight = this._height;
-            // Copy constants to instance
-            for (const k of Object.getOwnPropertyNames(WebGLRenderingContext)) {
-                if (typeof WebGLRenderingContext[k] === 'number') this[k] = WebGLRenderingContext[k];
-            }
+            _configureWebGLContext(this, {
+                canvasId,
+                width: width === undefined ? 300 : width,
+                height: height === undefined ? 150 : height,
+            });
         }
+
+        get canvas() { return (_webglState(this) || {}).canvas || null; }
+        get drawingBufferWidth() { return _webglDrawingWidth(this); }
+        get drawingBufferHeight() { return _webglDrawingHeight(this); }
 
         // --- Real operations via Canvas2D backend ---
         clearColor(r, g, b, a) {
-            this._clearColor = [Math.round(r*255), Math.round(g*255), Math.round(b*255), a];
+            const state = _webglState(this);
+            if (state) state.clearColor = [Math.round(r*255), Math.round(g*255), Math.round(b*255), a];
         }
         clear(mask) {
-            if (mask & 0x4000 && this._canvasId !== undefined) { // COLOR_BUFFER_BIT
-                const [r, g, b, a] = this._clearColor;
-                _debugCanvas({ op: 'webglClear', width: this._width, height: this._height, rgba: [r, g, b, a] });
+            const state = _webglState(this);
+            if (mask & 0x4000 && state && state.canvasId !== undefined) { // COLOR_BUFFER_BIT
+                const [r, g, b, a] = state.clearColor;
+                const width = _webglDrawingWidth(this);
+                const height = _webglDrawingHeight(this);
+                _debugCanvas({ op: 'webglClear', width, height, rgba: [r, g, b, a] });
                 const color = `rgba(${r},${g},${b},${a})`;
-                ops.op_canvas_set_fill_style(this._canvasId, color);
-                ops.op_canvas_fill_rect(this._canvasId, 0, 0, this._width, this._height);
+                ops.op_canvas_set_fill_style(state.canvasId, color);
+                ops.op_canvas_fill_rect(state.canvasId, 0, 0, width, height);
             }
         }
         readPixels(x, y, w, h, format, type, pixels) {
-            if (this._canvasId === undefined || !pixels) return;
+            const state = _webglState(this);
+            if (!state || state.canvasId === undefined || !pixels) return;
             // Canvas2D stores pixels top-down, WebGL is bottom-up — flip Y
-            const flippedY = this._height - y - h;
-            const data = ops.op_canvas_get_image_data(this._canvasId, x, Math.max(0, flippedY), w, h);
+            const flippedY = _webglDrawingHeight(this) - y - h;
+            const data = ops.op_canvas_get_image_data(state.canvasId, x, Math.max(0, flippedY), w, h);
             for (let i = 0; i < data.length && i < pixels.length; i++) {
                 pixels[i] = data[i];
             }
         }
         viewport(x, y, w, h) {
-            this._width = w || this._width;
-            this._height = h || this._height;
+            const state = _webglState(this);
+            if (state) state.viewport = [Number(x), Number(y), Number(w), Number(h)];
         }
 
         // --- Parameter queries (fingerprint-relevant values) ---
@@ -1444,7 +1575,8 @@
         // Anything else (incl. `getParameter.call(notACtx)`) → WebGL 2 surface,
         // preserving the pre-FIX-D2 default.
         static _surfaceFor(ctx) {
-            return (ctx && ctx._isWebGL2 === false)
+            const state = ctx && _webglState(ctx);
+            return (state && state.isWebGL2 === false)
                 ? WebGLRenderingContext._g1()
                 : WebGLRenderingContext._g();
         }
@@ -1457,8 +1589,14 @@
             if (pname === 0x8B8C) return gpu.shadingLang;           // SHADING_LANGUAGE_VERSION
             if (pname === 0x9245) return gpu.unmaskedVendor;        // UNMASKED_VENDOR_WEBGL
             if (pname === 0x9246) return gpu.unmaskedRenderer;      // UNMASKED_RENDERER_WEBGL
+            if (pname === WebGLRenderingContext.CURRENT_PROGRAM) {
+                return _webglCurrentProgram.get(this) || null;
+            }
             // Runtime-dependent values (not from the catalog)
-            if (pname === 0x0BA2) return [0, 0, this._width, this._height]; // VIEWPORT
+            if (pname === 0x0BA2) {
+                const state = _webglState(this);
+                return state ? state.viewport.slice() : [0, 0, 0, 0]; // VIEWPORT
+            }
             // Catalog-sourced numeric/array parameters
             if (gpu.params[pname] !== undefined) return gpu.params[pname];
             return null;
@@ -1470,7 +1608,8 @@
             // the WebGL-1 list (extensions promoted to core in WebGL 2 reappear;
             // WebGL-2-only ones absent); WebGL 2 contexts get the 36-ext list.
             if (!gpu.extensions.length) {
-                if (this && this._isWebGL2 === false) {
+                const state = this && _webglState(this);
+                if (state && state.isWebGL2 === false) {
                     return [
                         "ANGLE_instanced_arrays","EXT_blend_minmax","EXT_clip_control",
                         "EXT_color_buffer_half_float","EXT_depth_clamp","EXT_disjoint_timer_query",
@@ -1539,20 +1678,267 @@
             return { rangeMin: 127, rangeMax: 127, precision: 23 };
         }
 
-        // --- Shader/program stubs (needed for API surface) ---
-        createShader() { return { _id: 1 }; }
-        shaderSource() {}
-        compileShader() {}
-        getShaderInfoLog() { return ""; }
-        getShaderParameter() { return true; }
-        createProgram() { return { _id: 1 }; }
-        attachShader() {}
-        linkProgram() {}
-        getProgramInfoLog() { return ""; }
-        getProgramParameter() { return true; }
-        useProgram() {}
-        getUniformLocation() { return { _id: 0 }; }
-        getAttribLocation() { return 0; }
+        // --- Shader/program lifecycle ---
+        createShader(type) {
+            type = Number(type) >>> 0;
+            if (type !== WebGLRenderingContext.VERTEX_SHADER && type !== WebGLRenderingContext.FRAGMENT_SHADER) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return null;
+            }
+            return _newWebGLObject('WebGLShader', _webglShaderState, {
+                context: this,
+                type,
+                source: '',
+                compiled: false,
+                deleted: false,
+                attachments: new Set(),
+                infoLog: '',
+            });
+        }
+        shaderSource(shader, source) {
+            const state = _requireWebGLObject('WebGLShader', _webglShaderState, shader);
+            if (!state || state.context !== this || (state.deleted && state.attachments.size === 0)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            state.source = String(source);
+            state.compiled = false;
+            state.infoLog = '';
+        }
+        getShaderSource(shader) {
+            const state = _requireWebGLObject('WebGLShader', _webglShaderState, shader);
+            if (!state || state.context !== this || (state.deleted && state.attachments.size === 0)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return null;
+            }
+            return state.source;
+        }
+        compileShader(shader) {
+            const state = _requireWebGLObject('WebGLShader', _webglShaderState, shader);
+            if (!state || state.context !== this || (state.deleted && state.attachments.size === 0)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            const result = _compileWebGLShaderSource(state.source);
+            state.compiled = result.ok;
+            state.infoLog = result.log;
+        }
+        getShaderInfoLog(shader) {
+            const state = _requireWebGLObject('WebGLShader', _webglShaderState, shader);
+            if (!state || state.context !== this || (state.deleted && state.attachments.size === 0)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return null;
+            }
+            return state.infoLog;
+        }
+        getShaderParameter(shader, pname) {
+            const state = _requireWebGLObject('WebGLShader', _webglShaderState, shader);
+            if (!state || state.context !== this || (state.deleted && state.attachments.size === 0)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return null;
+            }
+            switch (Number(pname) >>> 0) {
+                case WebGLRenderingContext.DELETE_STATUS: return state.deleted;
+                case WebGLRenderingContext.COMPILE_STATUS: return state.compiled;
+                case WebGLRenderingContext.SHADER_TYPE: return state.type;
+                default:
+                    _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                    return null;
+            }
+        }
+        isShader(shader) {
+            const state = _requireWebGLObject('WebGLShader', _webglShaderState, shader, false, 'isShader');
+            return !!state && state.context === this && (!state.deleted || state.attachments.size > 0);
+        }
+        createProgram() {
+            return _newWebGLObject('WebGLProgram', _webglProgramState, {
+                context: this,
+                attached: new Set(),
+                linked: false,
+                validated: false,
+                deleted: false,
+                infoLog: '',
+                attribBindings: new Map(),
+                attribLocations: new Map(),
+                uniforms: new Set(),
+            });
+        }
+        attachShader(program, shader) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            const s = _requireWebGLObject('WebGLShader', _webglShaderState, shader);
+            if (!p || !s || p.context !== this || s.context !== this || p.deleted || (s.deleted && s.attachments.size === 0)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            if (p.attached.has(shader)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            p.attached.add(shader);
+            s.attachments.add(program);
+            p.linked = false;
+            p.validated = false;
+        }
+        detachShader(program, shader) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            const s = _requireWebGLObject('WebGLShader', _webglShaderState, shader);
+            if (!p || !s || p.context !== this || s.context !== this || p.deleted || !p.attached.has(shader)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            p.attached.delete(shader);
+            s.attachments.delete(program);
+            p.linked = false;
+            p.validated = false;
+        }
+        getAttachedShaders(program) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            if (!p || p.context !== this || p.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return null;
+            }
+            return Array.from(p.attached);
+        }
+        bindAttribLocation(program, index, name) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            if (!p || p.context !== this || p.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            index = Number(index) >>> 0;
+            name = String(name);
+            if (index >= Number(this.getParameter(WebGLRenderingContext.MAX_VERTEX_ATTRIBS) || 0)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            p.attribBindings.set(name, index);
+        }
+        linkProgram(program) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            if (!p || p.context !== this || p.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            const shaders = Array.from(p.attached).map((shader) => [shader, _webglShaderState.get(shader)]);
+            const vertex = shaders.find(([, s]) => s && s.type === WebGLRenderingContext.VERTEX_SHADER);
+            const fragment = shaders.find(([, s]) => s && s.type === WebGLRenderingContext.FRAGMENT_SHADER);
+            if (!vertex && !fragment) {
+                p.linked = false;
+                p.infoLog = 'No compiled shaders.\n\0';
+                return;
+            }
+            if (!vertex || !fragment) {
+                p.linked = false;
+                p.infoLog = 'The program must contain objects to form both a vertex and fragment shader.\n\0';
+                return;
+            }
+            if (!vertex[1].compiled || !fragment[1].compiled) {
+                p.linked = false;
+                p.infoLog = 'Attached shaders must be successfully compiled.\n\0';
+                return;
+            }
+            p.linked = true;
+            p.validated = false;
+            p.infoLog = '';
+            p.attribLocations.clear();
+            const attributes = _webGLDeclaredNames(vertex[1].source, '(?:attribute|in)');
+            const used = new Set();
+            for (const name of attributes) {
+                if (p.attribBindings.has(name)) {
+                    const index = p.attribBindings.get(name);
+                    p.attribLocations.set(name, index);
+                    used.add(index);
+                }
+            }
+            let next = 0;
+            for (const name of attributes) {
+                if (p.attribLocations.has(name)) continue;
+                while (used.has(next)) next++;
+                p.attribLocations.set(name, next);
+                used.add(next++);
+            }
+            p.uniforms = new Set([
+                ..._webGLDeclaredNames(vertex[1].source, 'uniform'),
+                ..._webGLDeclaredNames(fragment[1].source, 'uniform'),
+            ]);
+        }
+        validateProgram(program) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            if (!p || p.context !== this || p.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            p.validated = p.linked;
+        }
+        getProgramInfoLog(program) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            const retained = p && p.deleted && _webglCurrentProgram.get(this) === program;
+            if (!p || p.context !== this || (p.deleted && !retained)) return null;
+            return p.infoLog;
+        }
+        getProgramParameter(program, pname) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            const retained = p && p.deleted && _webglCurrentProgram.get(this) === program;
+            if (!p || p.context !== this || (p.deleted && !retained)) return null;
+            switch (Number(pname) >>> 0) {
+                case WebGLRenderingContext.DELETE_STATUS: return p.deleted;
+                case WebGLRenderingContext.LINK_STATUS: return p.linked;
+                case WebGLRenderingContext.VALIDATE_STATUS: return p.validated;
+                case WebGLRenderingContext.ATTACHED_SHADERS: return p.attached.size;
+                case WebGLRenderingContext.ACTIVE_ATTRIBUTES: return p.linked ? p.attribLocations.size : 0;
+                case WebGLRenderingContext.ACTIVE_UNIFORMS: return p.linked ? p.uniforms.size : 0;
+                default:
+                    _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                    return null;
+            }
+        }
+        isProgram(program) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program, false, 'isProgram');
+            return !!p && p.context === this && (!p.deleted || _webglCurrentProgram.get(this) === program);
+        }
+        useProgram(program) {
+            if (program == null) {
+                _webglCurrentProgram.set(this, null);
+                return;
+            }
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            if (!p || p.context !== this || p.deleted || !p.linked) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            _webglCurrentProgram.set(this, program);
+        }
+        getUniformLocation(program, name) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            if (!p || p.context !== this || p.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return null;
+            }
+            if (!p.linked) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return null;
+            }
+            name = String(name);
+            if (!p.uniforms.has(name)) return null;
+            return _newWebGLObject('WebGLUniformLocation', _webglUniformLocationState, {
+                context: this,
+                program,
+                name,
+            });
+        }
+        getAttribLocation(program, name) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            if (!p || p.context !== this || p.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return -1;
+            }
+            if (!p.linked) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return -1;
+            }
+            name = String(name);
+            return p.attribLocations.has(name) ? p.attribLocations.get(name) : -1;
+        }
         uniform1f() {}
         uniform1i() {}
         uniform2f() {}
@@ -1590,11 +1976,31 @@
         colorMask() {}
         scissor() {}
         pixelStorei() {}
-        getError() { return 0; }
+        getError() {
+            const error = _webglContextErrors.get(this) || WebGLRenderingContext.NO_ERROR;
+            _webglContextErrors.set(this, WebGLRenderingContext.NO_ERROR);
+            return error;
+        }
         flush() {}
         finish() {}
-        deleteShader() {}
-        deleteProgram() {}
+        deleteShader(shader) {
+            if (shader == null) return;
+            const state = _requireWebGLObject('WebGLShader', _webglShaderState, shader);
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            state.deleted = true;
+        }
+        deleteProgram(program) {
+            if (program == null) return;
+            const state = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            state.deleted = true;
+        }
         deleteBuffer() {}
         deleteTexture() {}
         deleteFramebuffer() {}
@@ -1629,6 +2035,40 @@
             return new Int32Array(multisampled.has(internalformat) ? [4, 2] : []);
         }
     }
+
+    // JavaScript class syntax does not use Web IDL descriptor defaults.
+    // Normalize the public WebGL surface after defining the implementation
+    // classes: operations are enumerable prototype members, while interface
+    // constants are enumerable but immutable/non-configurable on both the
+    // interface object and its prototype. Context instances therefore inherit
+    // constants instead of leaking a private copy of every GLenum.
+    const _finalizeWebGLIDL = (Ctor) => {
+        const proto = Ctor.prototype;
+        for (const key of Reflect.ownKeys(proto)) {
+            if (key === 'constructor' || key === Symbol.toStringTag) continue;
+            const desc = Object.getOwnPropertyDescriptor(proto, key);
+            if (desc && !desc.enumerable &&
+                (typeof desc.value === 'function' || typeof desc.get === 'function' || typeof desc.set === 'function')) {
+                Object.defineProperty(proto, key, { ...desc, enumerable: true });
+            }
+        }
+        for (const key of Object.getOwnPropertyNames(Ctor)) {
+            const desc = Object.getOwnPropertyDescriptor(Ctor, key);
+            if (!desc || typeof desc.value !== 'number') continue;
+            const constant = {
+                value: desc.value,
+                writable: false,
+                enumerable: true,
+                configurable: false,
+            };
+            Object.defineProperty(Ctor, key, constant);
+            if (!Object.prototype.hasOwnProperty.call(proto, key)) {
+                Object.defineProperty(proto, key, constant);
+            }
+        }
+    };
+    _finalizeWebGLIDL(WebGLRenderingContext);
+    _finalizeWebGLIDL(WebGL2RenderingContext);
 
     // WebAudio. Keep the existing native-rendering fingerprint path, but model
     // the public objects as actual WebIDL objects. The old implementation put
@@ -2250,12 +2690,17 @@
                 // WebGL 2 surface); webgl/experimental-webgl → WebGLRenderingContext
                 // with the WebGL 1 surface (_isWebGL2 = false).
                 const isV2 = (type === "webgl2");
-                const gl = isV2 ? new WebGL2RenderingContext() : new WebGLRenderingContext();
-                gl._isWebGL2 = isV2;
-                gl.canvas = this;
-                gl.drawingBufferWidth = this.width;
-                gl.drawingBufferHeight = this.height;
-                return gl;
+                const gl = isV2
+                    ? new WebGL2RenderingContext(this.#canvasId, this.width, this.height)
+                    : new WebGLRenderingContext(this.#canvasId, this.width, this.height);
+                return _configureWebGLContext(gl, {
+                    canvasId: this.#canvasId,
+                    width: this.width,
+                    height: this.height,
+                    canvas: this,
+                    isWebGL2: isV2,
+                    resetViewport: true,
+                });
             }
             return null;
         }
@@ -2424,9 +2869,14 @@
                     const gl = isV2
                         ? new WebGL2RenderingContext(canvasId, w, h)
                         : new WebGLRenderingContext(canvasId, w, h);
-                    gl._isWebGL2 = isV2;
-                    gl.canvas = this;
-                    return gl;
+                    return _configureWebGLContext(gl, {
+                        canvasId,
+                        width: w,
+                        height: h,
+                        canvas: this,
+                        isWebGL2: isV2,
+                        resetViewport: true,
+                    });
                 }
                 return null;
             },
@@ -2579,9 +3029,14 @@
                     const gl = isV2
                         ? new WebGL2RenderingContext(state.canvasId, state.width, state.height)
                         : new WebGLRenderingContext(state.canvasId, state.width, state.height);
-                    gl._isWebGL2 = isV2;
-                    gl.canvas = this;
-                    state[key] = gl;
+                    state[key] = _configureWebGLContext(gl, {
+                        canvasId: state.canvasId,
+                        width: state.width,
+                        height: state.height,
+                        canvas: this,
+                        isWebGL2: isV2,
+                        resetViewport: true,
+                    });
                 }
                 return state[key];
             }
