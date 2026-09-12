@@ -1216,6 +1216,15 @@
     const _webglFramebufferObjects = new WeakMap();
     const _webglRenderbufferState = new WeakMap();
     const _webglRenderbufferBinding = new WeakMap();
+    const _webglVertexArrayState = new WeakMap();
+    const _webglVertexArrayBinding = new WeakMap();
+    const _webglQueryState = new WeakMap();
+    const _webglQueryBindings = new WeakMap();
+    const _webglSamplerState = new WeakMap();
+    const _webglSamplerBindings = new WeakMap();
+    const _webglTransformFeedbackState = new WeakMap();
+    const _webglTransformFeedbackBinding = new WeakMap();
+    const _webglSyncState = new WeakMap();
     const _webglContextState = new WeakMap();
     const _webglContextErrors = new WeakMap();
     const _webglCurrentProgram = new WeakMap();
@@ -1356,6 +1365,47 @@
         return stateMap.get(value) || null;
     }
 
+    function _requireWebGL2Object(name, stateMap, value, nullable = false, operation = 'WebGL2 operation') {
+        if (nullable && value == null) return null;
+        const Ctor = globalThis[name];
+        if (!value || !Ctor || !Ctor.prototype || !Ctor.prototype.isPrototypeOf(value)) {
+            throw new TypeError(`Failed to execute '${operation}' on 'WebGL2RenderingContext': parameter 1 is not of type '${name}'.`);
+        }
+        return stateMap.get(value) || null;
+    }
+
+    function _webgl2QueryBindingsFor(ctx) {
+        let bindings = _webglQueryBindings.get(ctx);
+        if (!bindings) {
+            bindings = new Map();
+            _webglQueryBindings.set(ctx, bindings);
+        }
+        return bindings;
+    }
+
+    function _webgl2SamplerBindingsFor(ctx) {
+        let bindings = _webglSamplerBindings.get(ctx);
+        if (!bindings) {
+            bindings = new Map();
+            _webglSamplerBindings.set(ctx, bindings);
+        }
+        return bindings;
+    }
+
+    function _setWebGL2SamplerParameter(ctx, sampler, pname, param, operation) {
+        const state = _requireWebGL2Object('WebGLSampler', _webglSamplerState, sampler, false, operation);
+        if (!state || state.context !== ctx || state.deleted) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_OPERATION);
+            return;
+        }
+        pname = Number(pname) >>> 0;
+        if (!state.parameters.has(pname) || !Number.isFinite(param)) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_ENUM);
+            return;
+        }
+        state.parameters.set(pname, param);
+    }
+
     function _compileWebGLShaderSource(source) {
         const text = String(source || '');
         // This is a validation model rather than a renderer/compiler. Cover the
@@ -1432,6 +1482,37 @@
         static TEXTURE_CUBE_MAP_NEGATIVE_Z = 0x851A;
         static ACTIVE_TEXTURE = 0x84E0;
         static TEXTURE0 = 0x84C0;
+        static TEXTURE1 = 0x84C1;
+        static TEXTURE2 = 0x84C2;
+        static TEXTURE3 = 0x84C3;
+        static TEXTURE4 = 0x84C4;
+        static TEXTURE5 = 0x84C5;
+        static TEXTURE6 = 0x84C6;
+        static TEXTURE7 = 0x84C7;
+        static TEXTURE8 = 0x84C8;
+        static TEXTURE9 = 0x84C9;
+        static TEXTURE10 = 0x84CA;
+        static TEXTURE11 = 0x84CB;
+        static TEXTURE12 = 0x84CC;
+        static TEXTURE13 = 0x84CD;
+        static TEXTURE14 = 0x84CE;
+        static TEXTURE15 = 0x84CF;
+        static TEXTURE16 = 0x84D0;
+        static TEXTURE17 = 0x84D1;
+        static TEXTURE18 = 0x84D2;
+        static TEXTURE19 = 0x84D3;
+        static TEXTURE20 = 0x84D4;
+        static TEXTURE21 = 0x84D5;
+        static TEXTURE22 = 0x84D6;
+        static TEXTURE23 = 0x84D7;
+        static TEXTURE24 = 0x84D8;
+        static TEXTURE25 = 0x84D9;
+        static TEXTURE26 = 0x84DA;
+        static TEXTURE27 = 0x84DB;
+        static TEXTURE28 = 0x84DC;
+        static TEXTURE29 = 0x84DD;
+        static TEXTURE30 = 0x84DE;
+        static TEXTURE31 = 0x84DF;
         static TEXTURE_MAG_FILTER = 0x2800;
         static TEXTURE_MIN_FILTER = 0x2801;
         static TEXTURE_WRAP_S = 0x2802;
@@ -2687,7 +2768,427 @@
     // carry `_isWebGL2 = true` (set in getContext) so the surface selector
     // returns the WebGL 2 surface. Static `_g/_g1/_surfaceFor/_gpuCache*` are
     // inherited and resolve to the same shared caches.
-    class WebGL2RenderingContext extends WebGLRenderingContext {
+    class WebGL2RenderingContext {
+        // WebGL2 is a distinct WebIDL interface in Blink. In particular,
+        // `webgl2Context instanceof WebGLRenderingContext` is false and both
+        // interface prototypes inherit directly from Object.prototype. Shared
+        // WebGL1 operations are copied onto this prototype below rather than
+        // represented as JavaScript inheritance.
+        constructor(canvasId, width, height) {
+            _configureWebGLContext(this, {
+                canvasId,
+                width: width === undefined ? 300 : width,
+                height: height === undefined ? 150 : height,
+                isWebGL2: true,
+            });
+        }
+
+        // WebGL2 lifecycle/query constants used by the APIs below.
+        static VERTEX_ARRAY_BINDING = 0x85B5;
+        static CURRENT_QUERY = 0x8865;
+        static QUERY_RESULT = 0x8866;
+        static QUERY_RESULT_AVAILABLE = 0x8867;
+        static ANY_SAMPLES_PASSED = 0x8C2F;
+        static ANY_SAMPLES_PASSED_CONSERVATIVE = 0x8D6A;
+        static TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN = 0x8C88;
+        static SAMPLER_BINDING = 0x8919;
+        static TEXTURE_WRAP_R = 0x8072;
+        static TEXTURE_MIN_LOD = 0x813A;
+        static TEXTURE_MAX_LOD = 0x813B;
+        static TEXTURE_COMPARE_MODE = 0x884C;
+        static TEXTURE_COMPARE_FUNC = 0x884D;
+        static TRANSFORM_FEEDBACK = 0x8E22;
+        static TRANSFORM_FEEDBACK_PAUSED = 0x8E23;
+        static TRANSFORM_FEEDBACK_ACTIVE = 0x8E24;
+        static TRANSFORM_FEEDBACK_BINDING = 0x8E25;
+        static MAX_SERVER_WAIT_TIMEOUT = 0x9111;
+        static OBJECT_TYPE = 0x9112;
+        static SYNC_CONDITION = 0x9113;
+        static SYNC_STATUS = 0x9114;
+        static SYNC_FLAGS = 0x9115;
+        static SYNC_FENCE = 0x9116;
+        static SYNC_GPU_COMMANDS_COMPLETE = 0x9117;
+        static UNSIGNALED = 0x9118;
+        static SIGNALED = 0x9119;
+        static ALREADY_SIGNALED = 0x911A;
+        static TIMEOUT_EXPIRED = 0x911B;
+        static CONDITION_SATISFIED = 0x911C;
+        static WAIT_FAILED = 0x911D;
+        static SYNC_FLUSH_COMMANDS_BIT = 0x00000001;
+        static TIMEOUT_IGNORED = -1;
+        static MAX_CLIENT_WAIT_TIMEOUT_WEBGL = 0x9247;
+
+        getParameter(pname) {
+            pname = Number(pname) >>> 0;
+            if (pname === WebGL2RenderingContext.VERTEX_ARRAY_BINDING) {
+                return _webglVertexArrayBinding.get(this) || null;
+            }
+            if (pname === WebGL2RenderingContext.SAMPLER_BINDING) {
+                const unit = _webglTextureBindingState(this).activeUnit;
+                return _webgl2SamplerBindingsFor(this).get(unit) || null;
+            }
+            if (pname === WebGL2RenderingContext.TRANSFORM_FEEDBACK_BINDING) {
+                return _webglTransformFeedbackBinding.get(this) || null;
+            }
+            if (pname === WebGL2RenderingContext.TRANSFORM_FEEDBACK_ACTIVE ||
+                pname === WebGL2RenderingContext.TRANSFORM_FEEDBACK_PAUSED) {
+                const object = _webglTransformFeedbackBinding.get(this);
+                const state = object && _webglTransformFeedbackState.get(object);
+                if (pname === WebGL2RenderingContext.TRANSFORM_FEEDBACK_ACTIVE) return !!(state && state.active);
+                return !!(state && state.paused);
+            }
+            return WebGLRenderingContext.prototype.getParameter.call(this, pname);
+        }
+
+        createVertexArray() {
+            return _newWebGLObject('WebGLVertexArrayObject', _webglVertexArrayState, {
+                context: this, deleted: false, everBound: false,
+            });
+        }
+        bindVertexArray(vertexArray) {
+            if (vertexArray == null) {
+                _webglVertexArrayBinding.set(this, null);
+                return;
+            }
+            const state = _requireWebGL2Object('WebGLVertexArrayObject', _webglVertexArrayState, vertexArray, false, 'bindVertexArray');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.everBound = true;
+            _webglVertexArrayBinding.set(this, vertexArray);
+        }
+        deleteVertexArray(vertexArray) {
+            if (vertexArray == null) return;
+            const state = _requireWebGL2Object('WebGLVertexArrayObject', _webglVertexArrayState, vertexArray, false, 'deleteVertexArray');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.deleted = true;
+            if (_webglVertexArrayBinding.get(this) === vertexArray) _webglVertexArrayBinding.set(this, null);
+        }
+        isVertexArray(vertexArray) {
+            const state = _requireWebGL2Object('WebGLVertexArrayObject', _webglVertexArrayState, vertexArray, false, 'isVertexArray');
+            return !!state && state.context === this && !state.deleted && state.everBound;
+        }
+
+        createQuery() {
+            return _newWebGLObject('WebGLQuery', _webglQueryState, {
+                context: this, deleted: false, everUsed: false, active: false,
+                target: null, result: 0, available: false,
+            });
+        }
+        beginQuery(target, query) {
+            target = Number(target) >>> 0;
+            const valid = target === WebGL2RenderingContext.ANY_SAMPLES_PASSED ||
+                target === WebGL2RenderingContext.ANY_SAMPLES_PASSED_CONSERVATIVE ||
+                target === WebGL2RenderingContext.TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN;
+            if (!valid) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const state = _requireWebGL2Object('WebGLQuery', _webglQueryState, query, false, 'beginQuery');
+            if (!state || state.context !== this || state.deleted || state.active || _webgl2QueryBindingsFor(this).get(target)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.everUsed = true;
+            state.active = true;
+            state.available = false;
+            state.target = target;
+            _webgl2QueryBindingsFor(this).set(target, query);
+        }
+        endQuery(target) {
+            target = Number(target) >>> 0;
+            const bindings = _webgl2QueryBindingsFor(this);
+            const query = bindings.get(target);
+            const state = query && _webglQueryState.get(query);
+            if (!state || !state.active) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.active = false;
+            // GPU query completion is asynchronous. Chrome still reports
+            // QUERY_RESULT_AVAILABLE=false immediately after endQuery() on a
+            // fresh context; without a real GPU queue keep it pending rather
+            // than claiming a result is already ready.
+            state.available = false;
+            state.result = 0;
+            bindings.delete(target);
+        }
+        getQuery(target, pname) {
+            target = Number(target) >>> 0;
+            pname = Number(pname) >>> 0;
+            if (pname !== WebGL2RenderingContext.CURRENT_QUERY) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return null;
+            }
+            return _webgl2QueryBindingsFor(this).get(target) || null;
+        }
+        getQueryParameter(query, pname) {
+            const state = _requireWebGL2Object('WebGLQuery', _webglQueryState, query, false, 'getQueryParameter');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return null;
+            }
+            pname = Number(pname) >>> 0;
+            if (pname === WebGL2RenderingContext.QUERY_RESULT_AVAILABLE) return !!state.available;
+            if (pname === WebGL2RenderingContext.QUERY_RESULT) return state.result;
+            _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+            return null;
+        }
+        deleteQuery(query) {
+            if (query == null) return;
+            const state = _requireWebGL2Object('WebGLQuery', _webglQueryState, query, false, 'deleteQuery');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            if (state.active && state.target !== null) _webgl2QueryBindingsFor(this).delete(state.target);
+            state.active = false;
+            state.deleted = true;
+        }
+        isQuery(query) {
+            const state = _requireWebGL2Object('WebGLQuery', _webglQueryState, query, false, 'isQuery');
+            return !!state && state.context === this && !state.deleted && state.everUsed;
+        }
+
+        createSampler() {
+            return _newWebGLObject('WebGLSampler', _webglSamplerState, {
+                context: this,
+                deleted: false,
+                parameters: new Map([
+                    [WebGLRenderingContext.TEXTURE_MIN_FILTER, WebGLRenderingContext.NEAREST_MIPMAP_LINEAR],
+                    [WebGLRenderingContext.TEXTURE_MAG_FILTER, WebGLRenderingContext.LINEAR],
+                    [WebGLRenderingContext.TEXTURE_WRAP_S, WebGLRenderingContext.REPEAT],
+                    [WebGLRenderingContext.TEXTURE_WRAP_T, WebGLRenderingContext.REPEAT],
+                    [WebGL2RenderingContext.TEXTURE_WRAP_R, WebGLRenderingContext.REPEAT],
+                    [WebGL2RenderingContext.TEXTURE_MIN_LOD, -1000],
+                    [WebGL2RenderingContext.TEXTURE_MAX_LOD, 1000],
+                    [WebGL2RenderingContext.TEXTURE_COMPARE_MODE, 0],
+                    [WebGL2RenderingContext.TEXTURE_COMPARE_FUNC, 0x0203],
+                ]),
+            });
+        }
+        bindSampler(unit, sampler) {
+            unit = Number(unit) >>> 0;
+            if (unit >= 32) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            if (sampler == null) {
+                _webgl2SamplerBindingsFor(this).delete(unit);
+                return;
+            }
+            const state = _requireWebGL2Object('WebGLSampler', _webglSamplerState, sampler, false, 'bindSampler');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            _webgl2SamplerBindingsFor(this).set(unit, sampler);
+        }
+        samplerParameteri(sampler, pname, param) {
+            _setWebGL2SamplerParameter(this, sampler, pname, Number(param) | 0, 'samplerParameteri');
+        }
+        samplerParameterf(sampler, pname, param) {
+            _setWebGL2SamplerParameter(this, sampler, pname, Number(param), 'samplerParameterf');
+        }
+        getSamplerParameter(sampler, pname) {
+            const state = _requireWebGL2Object('WebGLSampler', _webglSamplerState, sampler, false, 'getSamplerParameter');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return null;
+            }
+            pname = Number(pname) >>> 0;
+            if (!state.parameters.has(pname)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return null;
+            }
+            return state.parameters.get(pname);
+        }
+        deleteSampler(sampler) {
+            if (sampler == null) return;
+            const state = _requireWebGL2Object('WebGLSampler', _webglSamplerState, sampler, false, 'deleteSampler');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.deleted = true;
+            const bindings = _webgl2SamplerBindingsFor(this);
+            for (const [unit, bound] of bindings) if (bound === sampler) bindings.delete(unit);
+        }
+        isSampler(sampler) {
+            const state = _requireWebGL2Object('WebGLSampler', _webglSamplerState, sampler, false, 'isSampler');
+            return !!state && state.context === this && !state.deleted;
+        }
+
+        createTransformFeedback() {
+            return _newWebGLObject('WebGLTransformFeedback', _webglTransformFeedbackState, {
+                context: this, deleted: false, everBound: false, active: false, paused: false, primitiveMode: null,
+            });
+        }
+        bindTransformFeedback(target, transformFeedback) {
+            target = Number(target) >>> 0;
+            if (target !== WebGL2RenderingContext.TRANSFORM_FEEDBACK) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            if (transformFeedback == null) {
+                _webglTransformFeedbackBinding.set(this, null);
+                return;
+            }
+            const state = _requireWebGL2Object('WebGLTransformFeedback', _webglTransformFeedbackState, transformFeedback, false, 'bindTransformFeedback');
+            if (!state || state.context !== this || state.deleted || state.active) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.everBound = true;
+            _webglTransformFeedbackBinding.set(this, transformFeedback);
+        }
+        beginTransformFeedback(primitiveMode) {
+            primitiveMode = Number(primitiveMode) >>> 0;
+            if (![WebGLRenderingContext.POINTS, WebGLRenderingContext.LINES, WebGLRenderingContext.TRIANGLES].includes(primitiveMode)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const object = _webglTransformFeedbackBinding.get(this);
+            const state = object && _webglTransformFeedbackState.get(object);
+            const program = _webglCurrentProgram.get(this);
+            const programState = program && _webglProgramState.get(program);
+            // Blink rejects beginTransformFeedback when there is no current
+            // successfully-linked program. Keep the object inactive in that
+            // case (the common no-program probe) instead of fabricating an
+            // active transform-feedback session.
+            if (!state || state.deleted || state.active || !programState || !programState.linked) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.active = true;
+            state.paused = false;
+            state.primitiveMode = primitiveMode;
+        }
+        endTransformFeedback() {
+            const object = _webglTransformFeedbackBinding.get(this);
+            const state = object && _webglTransformFeedbackState.get(object);
+            if (!state || !state.active) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.active = false;
+            state.paused = false;
+            state.primitiveMode = null;
+        }
+        pauseTransformFeedback() {
+            const object = _webglTransformFeedbackBinding.get(this);
+            const state = object && _webglTransformFeedbackState.get(object);
+            if (!state || !state.active || state.paused) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.paused = true;
+        }
+        resumeTransformFeedback() {
+            const object = _webglTransformFeedbackBinding.get(this);
+            const state = object && _webglTransformFeedbackState.get(object);
+            if (!state || !state.active || !state.paused) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.paused = false;
+        }
+        deleteTransformFeedback(transformFeedback) {
+            if (transformFeedback == null) return;
+            const state = _requireWebGL2Object('WebGLTransformFeedback', _webglTransformFeedbackState, transformFeedback, false, 'deleteTransformFeedback');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.deleted = true;
+            state.active = false;
+            state.paused = false;
+            if (_webglTransformFeedbackBinding.get(this) === transformFeedback) _webglTransformFeedbackBinding.set(this, null);
+        }
+        isTransformFeedback(transformFeedback) {
+            const state = _requireWebGL2Object('WebGLTransformFeedback', _webglTransformFeedbackState, transformFeedback, false, 'isTransformFeedback');
+            return !!state && state.context === this && !state.deleted && state.everBound;
+        }
+
+        fenceSync(condition, flags) {
+            condition = Number(condition) >>> 0;
+            flags = Number(flags) >>> 0;
+            if (condition !== WebGL2RenderingContext.SYNC_GPU_COMMANDS_COMPLETE) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return null;
+            }
+            if (flags !== 0) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return null;
+            }
+            return _newWebGLObject('WebGLSync', _webglSyncState, {
+                context: this, deleted: false, condition, flags, status: WebGL2RenderingContext.UNSIGNALED,
+            });
+        }
+        clientWaitSync(sync, flags, timeout) {
+            const state = _requireWebGL2Object('WebGLSync', _webglSyncState, sync, false, 'clientWaitSync');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return WebGL2RenderingContext.WAIT_FAILED;
+            }
+            flags = Number(flags) >>> 0;
+            timeout = Number(timeout);
+            if ((flags & ~WebGL2RenderingContext.SYNC_FLUSH_COMMANDS_BIT) !== 0 || !Number.isFinite(timeout) || timeout < 0) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return WebGL2RenderingContext.WAIT_FAILED;
+            }
+            if (state.status === WebGL2RenderingContext.SIGNALED) return WebGL2RenderingContext.ALREADY_SIGNALED;
+            // With no real GPU command queue, zero-time polling mirrors the
+            // observable initial Chrome state. A positive bounded wait is
+            // treated as the command queue reaching the fence.
+            if (timeout === 0) return WebGL2RenderingContext.TIMEOUT_EXPIRED;
+            state.status = WebGL2RenderingContext.SIGNALED;
+            return WebGL2RenderingContext.CONDITION_SATISFIED;
+        }
+        waitSync(sync, flags, timeout) {
+            const state = _requireWebGL2Object('WebGLSync', _webglSyncState, sync, false, 'waitSync');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            if ((Number(flags) >>> 0) !== 0 || Number(timeout) !== WebGL2RenderingContext.TIMEOUT_IGNORED) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            state.status = WebGL2RenderingContext.SIGNALED;
+        }
+        getSyncParameter(sync, pname) {
+            const state = _requireWebGL2Object('WebGLSync', _webglSyncState, sync, false, 'getSyncParameter');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return null;
+            }
+            pname = Number(pname) >>> 0;
+            if (pname === WebGL2RenderingContext.OBJECT_TYPE) return WebGL2RenderingContext.SYNC_FENCE;
+            if (pname === WebGL2RenderingContext.SYNC_CONDITION) return state.condition;
+            if (pname === WebGL2RenderingContext.SYNC_STATUS) return state.status;
+            if (pname === WebGL2RenderingContext.SYNC_FLAGS) return state.flags;
+            _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+            return null;
+        }
+        deleteSync(sync) {
+            if (sync == null) return;
+            const state = _requireWebGL2Object('WebGLSync', _webglSyncState, sync, false, 'deleteSync');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            state.deleted = true;
+        }
+        isSync(sync) {
+            const state = _requireWebGL2Object('WebGLSync', _webglSyncState, sync, false, 'isSync');
+            return !!state && state.context === this && !state.deleted;
+        }
+
         getInternalformatParameter(target, internalformat, pname) {
             // WebGL 2 exposes this method only for RENDERBUFFER/SAMPLES.
             // Chrome returns an Int32Array, including an empty typed array for
@@ -2703,6 +3204,29 @@
                 0x88F0, // DEPTH24_STENCIL8
             ]);
             return new Int32Array(multisampled.has(internalformat) ? [4, 2] : []);
+        }
+    }
+
+    // Blink exposes WebGLRenderingContext and WebGL2RenderingContext as
+    // sibling WebIDL interfaces (both prototypes directly inherit Object),
+    // while the shared operations/constants appear as own properties on each
+    // interface. Reuse the implementation descriptors without introducing a
+    // JavaScript inheritance relationship.
+    for (const key of Reflect.ownKeys(WebGLRenderingContext.prototype)) {
+        if (key === 'constructor' || key === Symbol.toStringTag ||
+            Object.prototype.hasOwnProperty.call(WebGL2RenderingContext.prototype, key)) continue;
+        Object.defineProperty(
+            WebGL2RenderingContext.prototype,
+            key,
+            Object.getOwnPropertyDescriptor(WebGLRenderingContext.prototype, key),
+        );
+    }
+    for (const key of Object.getOwnPropertyNames(WebGLRenderingContext)) {
+        if (key === 'length' || key === 'name' || key === 'prototype' ||
+            Object.prototype.hasOwnProperty.call(WebGL2RenderingContext, key)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(WebGLRenderingContext, key);
+        if (descriptor && typeof descriptor.value === 'number') {
+            Object.defineProperty(WebGL2RenderingContext, key, descriptor);
         }
     }
 
