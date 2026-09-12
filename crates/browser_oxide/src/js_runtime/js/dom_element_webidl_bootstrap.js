@@ -132,6 +132,19 @@
         }
     }
 
+    // HTML hypertext/link elements reflect `hreflang` as a DOMString.
+    // This is deliberately installed on the concrete interfaces rather than
+    // HTMLElement/Element: Chrome exposes an own WebIDL accessor on each of
+    // HTMLAnchorElement, HTMLAreaElement and HTMLLinkElement. Without it,
+    // assigning `el.hreflang` merely creates an unrelated instance property
+    // while the `hreflang` content attribute stays unchanged.
+    for (const targetName of ['HTMLAnchorElement', 'HTMLAreaElement', 'HTMLLinkElement']) {
+        const proto = globalThis[targetName]?.prototype;
+        if (proto && !Object.prototype.hasOwnProperty.call(proto, 'hreflang')) {
+            reflectString(proto, 'hreflang', 'hreflang');
+        }
+    }
+
     // Iframe set/removeAttribute carry the navigation hooks but belong on
     // Element.prototype in Chrome. Lift their behavior into an iframe-aware
     // base wrapper, then remove the iframe-own methods.
