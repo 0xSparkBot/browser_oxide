@@ -526,20 +526,13 @@ pub async fn op_fetch(
     };
 
     let ok = resp.ok();
-    // A generic `fetch()` can still be used to retrieve an image and consume
-    // it through `response.arrayBuffer()`. Preserve those bytes even without
-    // the internal image-loader hint: round-tripping an image through
-    // `String::from_utf8_lossy` + TextEncoder corrupts every non-UTF-8 byte.
-    // Binary payloads must not depend on how the request was initiated.
-    let response_is_image = resp.headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("content-type")
-            && value
-                .split(';')
-                .next()
-                .is_some_and(|mime| mime.trim().to_ascii_lowercase().starts_with("image/"))
-    });
-    let response_body_bytes = (request_type_hint.as_deref() == Some("image") || response_is_image)
-        .then(|| resp.body.clone());
+    // Fetch bodies are byte sequences regardless of MIME type. Keep an
+    // authoritative copy for Response.arrayBuffer()/blob() before producing
+    // the decoded text view. Restricting raw-byte preservation to images
+    // corrupts arbitrary application/octet-stream payloads through the lossy
+    // UTF-8 text path (for example 0xff becomes the three-byte replacement
+    // character sequence when re-encoded in JavaScript).
+    let response_body_bytes = Some(resp.body.clone());
     let body_text = resp.text();
     if fetch_meta_trace {
         eprintln!(

@@ -7462,10 +7462,14 @@
             console.log(`[XHR] send ${this._method} ${this._url}`);
             const xhr = this;
             if (xhr._aborted) return;
-            const fireEvent = (type) => {
+            const fireEvent = (type, progress = null) => {
                 try {
-                    const ev = new Event(type);
-                    if (typeof xhr.dispatchEvent === 'function') xhr.dispatchEvent(ev);
+                    const ev = progress && typeof ProgressEvent === 'function'
+                        ? new ProgressEvent(type, progress)
+                        : new Event(type);
+                    if (typeof xhr.dispatchEvent === 'function') {
+                        xhr.dispatchEvent(_markTrustedEvent(ev));
+                    }
                 } catch {}
             };
 
@@ -7569,7 +7573,7 @@
             }
 
             // Fallback: async fetch() path (used only when op_net_xhr_sync is unavailable).
-            fireEvent('loadstart');
+            fireEvent('loadstart', { lengthComputable: false, loaded: 0, total: 0 });
             fetch(xhr._url, {
                 method: xhr._method,
                 headers: xhr._headers,
@@ -7594,19 +7598,69 @@
                     fireEvent('readystatechange');
                     xhr.readyState = 3;
                     fireEvent('readystatechange');
-                    xhr.responseText = await resp.text();
-                    xhr.response = xhr.responseText;
+
+                    const responseType = String(xhr.responseType || '');
+                    const declaredLength = Number(
+                        resp.headers && typeof resp.headers.get === 'function'
+                            ? resp.headers.get('content-length')
+                            : NaN
+                    );
+                    const lengthComputable = Number.isFinite(declaredLength) && declaredLength >= 0;
+                    const total = lengthComputable ? declaredLength : 0;
+                    let loaded = 0;
+
+                    if (responseType === 'arraybuffer') {
+                        const value = await resp.arrayBuffer();
+                        xhr.response = value;
+                        loaded = value ? value.byteLength : 0;
+                    } else if (responseType === 'blob') {
+                        const value = await resp.blob();
+                        xhr.response = value;
+                        loaded = value && typeof value.size === 'number' ? value.size : 0;
+                    } else {
+                        const text = await resp.text();
+                        xhr.responseText = text;
+                        loaded = typeof TextEncoder === 'function'
+                            ? new TextEncoder().encode(text).byteLength
+                            : text.length;
+
+                        if (responseType === 'json') {
+                            try { xhr.response = JSON.parse(text); }
+                            catch (_) { xhr.response = null; }
+                        } else if (responseType === 'document') {
+                            let parsed = null;
+                            try {
+                                const contentType = resp.headers && typeof resp.headers.get === 'function'
+                                    ? String(resp.headers.get('content-type') || '').toLowerCase()
+                                    : '';
+                                const mime = contentType.includes('html')
+                                    ? 'text/html'
+                                    : (contentType.includes('xml') ? 'application/xml' : null);
+                                if (mime && typeof DOMParser === 'function') {
+                                    parsed = new DOMParser().parseFromString(text, mime);
+                                }
+                            } catch (_) {}
+                            xhr.responseXML = parsed;
+                            xhr.response = parsed;
+                        } else {
+                            xhr.response = text;
+                        }
+                    }
+
+                    const progress = { lengthComputable, loaded, total };
+                    fireEvent('progress', progress);
                     xhr.readyState = 4;
                     fireEvent('readystatechange');
-                    fireEvent('load');
-                    fireEvent('loadend');
+                    fireEvent('load', progress);
+                    fireEvent('loadend', progress);
                 })
                 .catch((e) => {
                     if (xhr._aborted) return;
                     xhr.readyState = 4;
                     fireEvent('readystatechange');
-                    fireEvent('error');
-                    fireEvent('loadend');
+                    const progress = { lengthComputable: false, loaded: 0, total: 0 };
+                    fireEvent('error', progress);
+                    fireEvent('loadend', progress);
                 });
         }
         abort() {

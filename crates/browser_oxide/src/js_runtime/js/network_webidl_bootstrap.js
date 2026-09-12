@@ -36,6 +36,19 @@
                     }
                     return eventMethodCache.get(key);
                 }
+                if (hidden.has(key)) {
+                    let proto = Object.getPrototypeOf(obj);
+                    while (proto) {
+                        const descriptor = _reflectGetOwnPropertyDescriptorRaw(proto, key);
+                        if (descriptor) {
+                            if (typeof descriptor.get === 'function') {
+                                return descriptor.get.call(receiver);
+                            }
+                            break;
+                        }
+                        proto = Object.getPrototypeOf(proto);
+                    }
+                }
                 return Reflect.get(obj, key, receiver);
             },
             set(obj, key, value, receiver) {
@@ -353,9 +366,26 @@
         ]) _constant(Impl, P, name, value);
 
         for (const name of [
-            'readyState','response','responseText','responseURL','responseXML',
+            'readyState','response','responseURL','responseXML',
             'status','statusText','upload',
         ]) _accessor(P, name, false);
+        Object.defineProperty(P, 'responseText', {
+            get: _native(function() {
+                const raw = _raw(this);
+                const responseType = String(raw.responseType || '');
+                if (responseType !== '' && responseType !== 'text') {
+                    throw new DOMException(
+                        `Failed to read the 'responseText' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'text' (was '${responseType}').`,
+                        'InvalidStateError',
+                    );
+                }
+                const own = Object.getOwnPropertyDescriptor(raw, 'responseText');
+                return own && 'value' in own ? own.value : '';
+            }, 'get responseText'),
+            set: undefined,
+            enumerable: true,
+            configurable: true,
+        });
         for (const name of ['responseType','timeout','withCredentials']) _accessor(P, name, true);
         _handler(P, 'onreadystatechange');
 
