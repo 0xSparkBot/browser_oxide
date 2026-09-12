@@ -2212,8 +2212,58 @@
     // but make its Web-IDL surface and inheritance match Chromium.
     (() => {
         const _ET = globalThis.EventTarget;
+        const _Event = globalThis.Event;
         const _entryState = new WeakMap();
         const _navState = new WeakMap();
+        const _entryChangeState = new WeakMap();
+        const _markNavigationEventTrusted = (() => {
+            try {
+                const fn = globalThis.__browser_oxide && globalThis.__browser_oxide._markTrustedEvent;
+                return typeof fn === 'function' ? fn : (event) => event;
+            } catch (_) {
+                return (event) => event;
+            }
+        })();
+
+        function NavigationCurrentEntryChangeEvent(type, init) {
+            if (!new.target) {
+                throw new TypeError("Failed to construct 'NavigationCurrentEntryChangeEvent': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+            }
+            if (arguments.length < 2) {
+                throw new TypeError("Failed to construct 'NavigationCurrentEntryChangeEvent': 2 arguments required, but only " + arguments.length + " present.");
+            }
+            const event = Reflect.construct(_Event, [type], new.target);
+            _entryChangeState.set(event, {
+                navigationType: init && init.navigationType != null ? String(init.navigationType) : null,
+                from: init && init.from !== undefined ? init.from : null,
+            });
+            return event;
+        }
+        Object.setPrototypeOf(NavigationCurrentEntryChangeEvent, _Event);
+        NavigationCurrentEntryChangeEvent.prototype = Object.create(_Event.prototype);
+        const _EntryChangeProto = NavigationCurrentEntryChangeEvent.prototype;
+        const _getEntryChange = (self) => {
+            const state = _entryChangeState.get(self);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state;
+        };
+        _defProtoGetter(_EntryChangeProto, 'navigationType', function navigationType() {
+            return _getEntryChange(this).navigationType;
+        });
+        _defProtoGetter(_EntryChangeProto, 'from', function from() {
+            return _getEntryChange(this).from;
+        });
+        Object.defineProperty(_EntryChangeProto, 'constructor', {
+            value: NavigationCurrentEntryChangeEvent,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(_EntryChangeProto, Symbol.toStringTag, {
+            value: 'NavigationCurrentEntryChangeEvent',
+            configurable: true,
+        });
+        _maskFunction(NavigationCurrentEntryChangeEvent, 'NavigationCurrentEntryChangeEvent');
 
         function NavigationHistoryEntry() {
             throw new TypeError("Failed to construct 'NavigationHistoryEntry': Illegal constructor");
@@ -2222,15 +2272,37 @@
         NavigationHistoryEntry.prototype = Object.create(_ET.prototype);
         const _EntryProto = NavigationHistoryEntry.prototype;
         const _entry = Object.create(_EntryProto);
-        _entryState.set(_entry, { state: undefined });
+        const _cloneNavigationState = (value) => {
+            if (value === undefined) return undefined;
+            if (typeof globalThis.structuredClone === 'function') {
+                return globalThis.structuredClone(value);
+            }
+            return value;
+        };
+        const _newNavigationOpaqueId = () => {
+            try {
+                if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+                    return globalThis.crypto.randomUUID();
+                }
+            } catch (_) {}
+            // The values are opaque to page code; preserve the UUID shape even
+            // when the runtime profile does not expose randomUUID().
+            const hex = () => Math.floor(Math.random() * 0x10000).toString(16).padStart(4, '0');
+            return `${hex()}${hex()}-${hex()}-4${hex().slice(1)}-8${hex().slice(1)}-${hex()}${hex()}${hex()}`;
+        };
+        _entryState.set(_entry, {
+            state: undefined,
+            key: _newNavigationOpaqueId(),
+            id: _newNavigationOpaqueId(),
+        });
 
         const _getEntry = (self) => {
             const state = _entryState.get(self);
             if (!state) throw new TypeError('Illegal invocation');
             return state;
         };
-        _defProtoGetter(_EntryProto, 'key', function key() { _getEntry(this); return '0'; });
-        _defProtoGetter(_EntryProto, 'id', function id() { _getEntry(this); return '0'; });
+        _defProtoGetter(_EntryProto, 'key', function key() { return _getEntry(this).key; });
+        _defProtoGetter(_EntryProto, 'id', function id() { return _getEntry(this).id; });
         _defProtoGetter(_EntryProto, 'url', function url() { _getEntry(this); return _locationData.href; });
         _defProtoGetter(_EntryProto, 'index', function index() { _getEntry(this); return 0; });
         _defProtoGetter(_EntryProto, 'sameDocument', function sameDocument() { _getEntry(this); return true; });
@@ -2241,7 +2313,9 @@
             function ondispose() { _getEntry(this); return _entryOnDispose; },
             function ondispose(value) { _getEntry(this); _entryOnDispose = typeof value === 'function' ? value : null; },
         );
-        _defProtoMethod(_EntryProto, 'getState', function getState() { return _getEntry(this).state; });
+        _defProtoMethod(_EntryProto, 'getState', function getState() {
+            return _cloneNavigationState(_getEntry(this).state);
+        });
         Object.defineProperty(_EntryProto, 'constructor', {
             value: NavigationHistoryEntry,
             writable: true,
@@ -2312,7 +2386,17 @@
         _defProtoMethod(_NavigationProto, 'traverseTo', function traverseTo() { _getNavigation(this); return _navigationResult(); });
         _defProtoMethod(_NavigationProto, 'updateCurrentEntry', function updateCurrentEntry(options) {
             _getNavigation(this);
-            _getEntry(_entry).state = options && options.state;
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to execute 'updateCurrentEntry' on 'Navigation': 1 argument required, but only 0 present.");
+            }
+            const nextState = _cloneNavigationState(options && options.state);
+            _getEntry(_entry).state = nextState;
+            const event = new NavigationCurrentEntryChangeEvent('currententrychange', {
+                navigationType: null,
+                from: _entry,
+            });
+            _markNavigationEventTrusted(event);
+            _navigation.dispatchEvent(event);
         });
         Object.defineProperty(_NavigationProto, 'constructor', {
             value: Navigation,
@@ -2328,6 +2412,12 @@
 
         Object.defineProperty(globalThis, 'NavigationHistoryEntry', {
             value: NavigationHistoryEntry,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        Object.defineProperty(globalThis, 'NavigationCurrentEntryChangeEvent', {
+            value: NavigationCurrentEntryChangeEvent,
             writable: true,
             enumerable: false,
             configurable: true,

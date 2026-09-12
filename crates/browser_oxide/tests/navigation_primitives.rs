@@ -154,3 +154,88 @@ async fn meta_refresh_sets_pending_navigation() {
     assert_eq!(kind, "assign", "expected kind=assign for meta-refresh");
     assert_eq!(url, "https://target.example/");
 }
+
+#[tokio::test]
+async fn navigation_entry_state_matches_chrome_148_clone_and_event_semantics() {
+    let mut page = Page::from_html_with_url(
+        "<html><body></body></html>",
+        "https://example.com/navigation-state",
+        Some(browser_oxide::stealth::presets::chrome_148_macos()),
+    )
+    .await
+    .expect("build page");
+
+    let result = page
+        .evaluate(
+            r#"
+            (() => {
+                const entry = navigation.currentEntry;
+                let seen = null;
+                navigation.addEventListener('currententrychange', event => {
+                    seen = {
+                        brand: Object.prototype.toString.call(event),
+                        fromSame: event.from === entry,
+                        navigationType: event.navigationType,
+                        isTrusted: event.isTrusted,
+                    };
+                });
+
+                const source = { a: 1, nested: { b: 2 } };
+                navigation.updateCurrentEntry({ state: source });
+                source.a = 9;
+                source.nested.b = 8;
+
+                const first = navigation.currentEntry.getState();
+                const beforeReturnedMutation = JSON.stringify(first);
+                first.a = 7;
+                first.nested.b = 6;
+                const afterReturnedMutation = JSON.stringify(navigation.currentEntry.getState());
+
+                let cloneError = null;
+                try {
+                    navigation.updateCurrentEntry({ state: { bad() {} } });
+                } catch (error) {
+                    cloneError = error.name;
+                }
+
+                return JSON.stringify({
+                    beforeReturnedMutation,
+                    afterReturnedMutation,
+                    cloneError,
+                    event: seen,
+                    sameEntry: navigation.currentEntry === entry,
+                    keyLooksOpaque: typeof entry.key === 'string' && entry.key.length > 10,
+                    idLooksOpaque: typeof entry.id === 'string' && entry.id.length > 10,
+                    keyDiffersFromId: entry.key !== entry.id,
+                    eventCtorLength: NavigationCurrentEntryChangeEvent.length,
+                    eventProtoParent: Object.getPrototypeOf(NavigationCurrentEntryChangeEvent.prototype) === Event.prototype,
+                });
+            })()
+            "#,
+        )
+        .expect("evaluate navigation state fixture");
+
+    let value: serde_json::Value = serde_json::from_str(&result).expect("json result");
+    assert_eq!(
+        value["beforeReturnedMutation"],
+        r#"{"a":1,"nested":{"b":2}}"#
+    );
+    assert_eq!(
+        value["afterReturnedMutation"],
+        r#"{"a":1,"nested":{"b":2}}"#
+    );
+    assert_eq!(value["cloneError"], "DataCloneError");
+    assert_eq!(
+        value["event"]["brand"],
+        "[object NavigationCurrentEntryChangeEvent]"
+    );
+    assert_eq!(value["event"]["fromSame"], true);
+    assert!(value["event"]["navigationType"].is_null());
+    assert_eq!(value["event"]["isTrusted"], true);
+    assert_eq!(value["sameEntry"], true);
+    assert_eq!(value["keyLooksOpaque"], true);
+    assert_eq!(value["idLooksOpaque"], true);
+    assert_eq!(value["keyDiffersFromId"], true);
+    assert_eq!(value["eventCtorLength"], 2);
+    assert_eq!(value["eventProtoParent"], true);
+}
