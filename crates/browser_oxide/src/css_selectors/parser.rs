@@ -747,6 +747,91 @@ impl<'a> SelectorParser<'a> {
                 };
                 Ok(SimpleSelector::PseudoElement(pe))
             }
+            TokenKind::Function(name) => {
+                let name_lower = name.to_ascii_lowercase();
+                self.advance();
+
+                let pe = match name_lower.as_str() {
+                    "part" => {
+                        self.skip_whitespace();
+                        let mut names = Vec::new();
+                        loop {
+                            match self.current_kind() {
+                                TokenKind::Ident(name) => {
+                                    names.push(resolve_escapes(name).to_string());
+                                    self.advance();
+                                    match self.current_kind() {
+                                        TokenKind::Whitespace => self.skip_whitespace(),
+                                        TokenKind::CloseParen => break,
+                                        _ => {
+                                            return Err(SelectorParseError::UnexpectedToken {
+                                                loc: self
+                                                    .current_token()
+                                                    .map(|t| t.loc)
+                                                    .unwrap_or_default(),
+                                                message: "expected whitespace or ')' in ::part()"
+                                                    .into(),
+                                            });
+                                        }
+                                    }
+                                }
+                                TokenKind::CloseParen => break,
+                                _ => {
+                                    return Err(SelectorParseError::UnexpectedToken {
+                                        loc: self
+                                            .current_token()
+                                            .map(|t| t.loc)
+                                            .unwrap_or_default(),
+                                        message: "expected part name in ::part()".into(),
+                                    });
+                                }
+                            }
+                        }
+                        if names.is_empty() {
+                            return Err(SelectorParseError::EmptySelector);
+                        }
+                        PseudoElement::Part(names)
+                    }
+                    "slotted" => {
+                        let inner_tokens = self.collect_until_close_paren();
+                        if inner_tokens.is_empty() {
+                            return Err(SelectorParseError::EmptySelector);
+                        }
+                        let mut inner_parser = SelectorParser::from_tokens(inner_tokens);
+                        let mut list = inner_parser.parse_selector_list()?;
+                        if list.len() != 1 {
+                            return Err(SelectorParseError::UnexpectedToken {
+                                loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                                message: "::slotted() requires one compound selector".into(),
+                            });
+                        }
+                        let selector = list.remove(0);
+                        if selector.components().iter().any(|component| {
+                            matches!(
+                                component,
+                                Component::Combinator(_)
+                                    | Component::Simple(SimpleSelector::PseudoElement(_))
+                            )
+                        }) {
+                            return Err(SelectorParseError::UnexpectedToken {
+                                loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                                message: "::slotted() requires one compound selector".into(),
+                            });
+                        }
+                        PseudoElement::Slotted(Box::new(selector))
+                    }
+                    _ => return Err(SelectorParseError::UnsupportedPseudoElement(name_lower)),
+                };
+
+                if !matches!(self.current_kind(), TokenKind::CloseParen) {
+                    return Err(SelectorParseError::UnexpectedToken {
+                        loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                        message: "expected ')' after functional pseudo-element".into(),
+                    });
+                }
+                self.advance();
+                Ok(SimpleSelector::PseudoElement(pe))
+            }
             _ => Err(SelectorParseError::UnexpectedToken {
                 loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
                 message: "expected pseudo-element name".into(),
@@ -1065,6 +1150,38 @@ mod tests {
             &comps[0],
             Component::Simple(SimpleSelector::PseudoElement(PseudoElement::Before))
         ));
+    }
+
+    #[test]
+    fn parse_functional_pseudo_elements() {
+        let part = parse_selector_list("x-card::part(label icon)").unwrap();
+        assert!(matches!(
+            &part[0].components()[0],
+            Component::Simple(SimpleSelector::PseudoElement(PseudoElement::Part(names)))
+                if names == &["label".to_string(), "icon".to_string()]
+        ));
+
+        let slotted = parse_selector_list("slot::slotted(.item.active)").unwrap();
+        assert!(matches!(
+            &slotted[0].components()[0],
+            Component::Simple(SimpleSelector::PseudoElement(PseudoElement::Slotted(_)))
+        ));
+    }
+
+    #[test]
+    fn reject_invalid_functional_pseudo_elements() {
+        for selector in [
+            "x::part()",
+            "x::part(foo,bar)",
+            "slot::slotted()",
+            "slot::slotted(.a,.b)",
+            "slot::slotted(div > span)",
+        ] {
+            assert!(
+                parse_selector_list(selector).is_err(),
+                "invalid functional pseudo-element must be rejected: {selector}"
+            );
+        }
     }
 
     #[test]

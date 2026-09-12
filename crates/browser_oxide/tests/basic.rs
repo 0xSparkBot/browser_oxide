@@ -302,6 +302,49 @@ async fn pseudo_elements_parse_but_never_match_dom_elements() {
 }
 
 #[tokio::test]
+async fn functional_pseudo_elements_match_chrome_selector_semantics() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<html><body><div id="host"></div><slot></slot></body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    let result = rt
+        .execute_script(
+            r#"(() => {
+                const valid = [
+                    '#host::part(foo)',
+                    '#host::part(foo bar)',
+                    'slot::slotted(*)',
+                    'slot::slotted(.a.b)'
+                ];
+                const invalid = [
+                    '#host::part()',
+                    '#host::part(foo,bar)',
+                    'slot::slotted()',
+                    'slot::slotted(.a,.b)',
+                    'slot::slotted(div > span)'
+                ];
+                return JSON.stringify({
+                    valid: valid.map(selector => document.querySelector(selector) === null),
+                    invalid: invalid.map(selector => {
+                        try {
+                            document.querySelector(selector);
+                            return 'NO_THROW';
+                        } catch (e) {
+                            return e.name;
+                        }
+                    })
+                });
+            })()"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"valid":[true,true,true,true],"invalid":["SyntaxError","SyntaxError","SyntaxError","SyntaxError","SyntaxError"]}"#
+    );
+}
+
+#[tokio::test]
 async fn module_evaluation_does_not_wait_for_unrelated_refed_timer() {
     let mut rt = create_test_runtime();
     let started = Instant::now();
