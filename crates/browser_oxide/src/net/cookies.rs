@@ -11,6 +11,27 @@ pub struct CookieJar {
     cookies: HashMap<String, HashMap<String, Cookie>>,
 }
 
+/// Read-only cookie metadata exposed to browser-protocol adapters.
+///
+/// `CookieJar` intentionally keeps its storage representation private; this
+/// snapshot carries only the observable RFC6265 fields needed by CDP and
+/// diagnostics without allowing callers to mutate buckets directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CookieSnapshot {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub expires: Option<u64>,
+    pub host_only: bool,
+    pub source_scheme: String,
+    pub source_port: i32,
+    pub same_site: Option<String>,
+    pub priority: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Cookie {
     name: String,
@@ -34,6 +55,60 @@ struct Cookie {
         reason = "parsed cookie expires attribute retained for completeness; not yet read"
     )]
     expires: Option<u64>,
+    /// Scheme/port of the response or CDP URL that created the cookie.
+    /// Optional for backward compatibility with persisted jars written before
+    /// these fields existed.
+    #[serde(default)]
+    source_scheme: Option<String>,
+    #[serde(default)]
+    source_port: Option<u16>,
+    #[serde(default)]
+    same_site: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+}
+
+fn snapshot_cookie(stored_domain: &str, cookie: &Cookie, now: u64) -> Option<CookieSnapshot> {
+    if cookie.expires.is_some_and(|expires| expires <= now) {
+        return None;
+    }
+    let host_only = cookie.domain.is_none();
+    Some(CookieSnapshot {
+        name: cookie.name.clone(),
+        value: cookie.value.clone(),
+        domain: if host_only {
+            stored_domain.to_string()
+        } else {
+            format!(".{stored_domain}")
+        },
+        path: cookie.path.clone(),
+        secure: cookie.secure,
+        http_only: cookie.http_only,
+        expires: cookie.expires,
+        host_only,
+        source_scheme: cookie
+            .source_scheme
+            .clone()
+            .unwrap_or_else(|| if cookie.secure { "Secure" } else { "NonSecure" }.to_string()),
+        source_port: cookie
+            .source_port
+            .map(i32::from)
+            .unwrap_or(if cookie.secure { 443 } else { 80 }),
+        same_site: cookie.same_site.clone(),
+        priority: cookie
+            .priority
+            .clone()
+            .unwrap_or_else(|| "Medium".to_string()),
+    })
+}
+
+fn sort_snapshots(out: &mut [CookieSnapshot]) {
+    out.sort_by(|a, b| {
+        a.domain
+            .cmp(&b.domain)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 impl CookieJar {
@@ -62,7 +137,13 @@ impl CookieJar {
 
         let now = unix_now().max(0) as u64;
         for header in set_cookie_headers {
-            if let Some(cookie) = parse_set_cookie(header, &request_domain, url.path()) {
+            if let Some(cookie) = parse_set_cookie(
+                header,
+                &request_domain,
+                url.path(),
+                url.scheme(),
+                url.port_or_known_default(),
+            ) {
                 // Use the cookie's domain (Domain= attribute) if it's a
                 // host-suffix-match of the request URL. Otherwise fall
                 // back to the request domain (host-only cookie per spec).
@@ -129,6 +210,107 @@ impl CookieJar {
         } else {
             Some(pairs.join("; "))
         }
+    }
+
+    /// Return the cookies visible to a request for `url`, with CDP metadata.
+    pub fn snapshots_for(&self, url: &Url) -> Vec<CookieSnapshot> {
+        let Some(request_domain) = url.host_str().map(str::to_lowercase) else {
+            return Vec::new();
+        };
+        let path = url.path();
+        let is_secure = url.scheme() == "https";
+        let now = unix_now().max(0) as u64;
+        let mut out = Vec::new();
+        for (stored_domain, cookies) in &self.cookies {
+            if !domain_matches(&request_domain, stored_domain) {
+                continue;
+            }
+            for cookie in cookies.values() {
+                if (cookie.domain.is_none() && request_domain != *stored_domain)
+                    || (cookie.secure && !is_secure)
+                    || !path.starts_with(&cookie.path)
+                {
+                    continue;
+                }
+                if let Some(snapshot) = snapshot_cookie(stored_domain, cookie, now) {
+                    out.push(snapshot);
+                }
+            }
+        }
+        sort_snapshots(&mut out);
+        out
+    }
+
+    /// Snapshot every non-expired cookie in this browser context.
+    pub fn snapshots_all(&self) -> Vec<CookieSnapshot> {
+        let now = unix_now().max(0) as u64;
+        let mut out = self
+            .cookies
+            .iter()
+            .flat_map(|(domain, cookies)| {
+                cookies
+                    .values()
+                    .filter_map(move |cookie| snapshot_cookie(domain, cookie, now))
+            })
+            .collect::<Vec<_>>();
+        sort_snapshots(&mut out);
+        out
+    }
+
+    /// Delete cookies matching a CDP-style name plus optional URL/domain/path.
+    pub fn delete_matching(
+        &mut self,
+        name: &str,
+        url: Option<&Url>,
+        domain: Option<&str>,
+        path: Option<&str>,
+    ) -> usize {
+        let explicit_domain =
+            domain.map(|value| value.trim_start_matches('.').to_ascii_lowercase());
+        let mut removed = 0usize;
+        self.cookies.retain(|stored_domain, bucket| {
+            bucket.retain(|cookie_name, cookie| {
+                if cookie_name != name {
+                    return true;
+                }
+                if let Some(expected) = explicit_domain.as_deref() {
+                    if stored_domain != expected {
+                        return true;
+                    }
+                }
+                if let Some(expected_path) = path {
+                    if cookie.path != expected_path {
+                        return true;
+                    }
+                }
+                if let Some(url) = url {
+                    let Some(request_domain) = url.host_str().map(str::to_ascii_lowercase) else {
+                        return true;
+                    };
+                    if !domain_matches(&request_domain, stored_domain) {
+                        return true;
+                    }
+                    if cookie.domain.is_none() && request_domain != *stored_domain {
+                        return true;
+                    }
+                    if !url.path().starts_with(&cookie.path) {
+                        return true;
+                    }
+                    if cookie.secure && url.scheme() != "https" {
+                        return true;
+                    }
+                }
+                removed += 1;
+                false
+            });
+            !bucket.is_empty()
+        });
+        removed
+    }
+
+    /// Clear the entire browser-context cookie jar.
+    pub fn clear(&mut self) {
+        self.cookies.clear();
     }
 
     /// Persist the jar to a JSON file. Atomic via tempfile + rename.
@@ -234,7 +416,13 @@ fn parse_http_date(s: &str) -> Option<u64> {
 
 /// Parse a Set-Cookie header value into a Cookie. Honors `Domain=`,
 /// `Path=`, `Secure`, `HttpOnly`, `Max-Age`, and `Expires` attributes.
-fn parse_set_cookie(header: &str, request_domain: &str, default_path: &str) -> Option<Cookie> {
+fn parse_set_cookie(
+    header: &str,
+    request_domain: &str,
+    default_path: &str,
+    source_scheme: &str,
+    source_port: Option<u16>,
+) -> Option<Cookie> {
     let mut parts = header.split(';');
 
     // First part is name=value
@@ -259,6 +447,8 @@ fn parse_set_cookie(header: &str, request_domain: &str, default_path: &str) -> O
     // so AWS read an empty token and re-served the 202 stub. Verified on imdb.
     let mut max_age: Option<i64> = None;
     let mut expires_str: Option<String> = None;
+    let mut same_site: Option<String> = None;
+    let mut priority: Option<String> = None;
 
     for attr in parts {
         let attr = attr.trim();
@@ -302,6 +492,26 @@ fn parse_set_cookie(header: &str, request_domain: &str, default_path: &str) -> O
                     }
                 }
             }
+            "samesite" => {
+                if let Some(value) = attr_value {
+                    same_site = match value.to_ascii_lowercase().as_str() {
+                        "strict" => Some("Strict".to_string()),
+                        "lax" => Some("Lax".to_string()),
+                        "none" => Some("None".to_string()),
+                        _ => None,
+                    };
+                }
+            }
+            "priority" => {
+                if let Some(value) = attr_value {
+                    priority = match value.to_ascii_lowercase().as_str() {
+                        "low" => Some("Low".to_string()),
+                        "medium" => Some("Medium".to_string()),
+                        "high" => Some("High".to_string()),
+                        _ => None,
+                    };
+                }
+            }
             "secure" => secure = true,
             "httponly" => http_only = true,
             _ => {}
@@ -328,6 +538,14 @@ fn parse_set_cookie(header: &str, request_domain: &str, default_path: &str) -> O
         secure,
         http_only,
         expires,
+        source_scheme: Some(if source_scheme.eq_ignore_ascii_case("https") {
+            "Secure".to_string()
+        } else {
+            "NonSecure".to_string()
+        }),
+        source_port,
+        same_site,
+        priority,
     })
 }
 
@@ -552,6 +770,55 @@ mod tests {
     // This is the AWS-WAF imdb bug: challenge.js deletes stale `aws-waf-token`
     // before setting the real one; the empty `aws-waf-token=` poisoned the
     // Cookie header so AWS read an empty token and re-served the 202 stub.
+    #[test]
+    fn snapshots_preserve_cookie_metadata_and_url_visibility() {
+        let mut jar = CookieJar::new();
+        let host = Url::parse("https://sub.example.test/app/index").unwrap();
+        jar.set_cookies(
+            &host,
+            &[
+                "host=one; Path=/app; Secure; HttpOnly".to_string(),
+                "shared=two; Domain=.example.test; Path=/".to_string(),
+            ],
+        );
+
+        let https = jar.snapshots_for(&Url::parse("https://sub.example.test/app/page").unwrap());
+        assert_eq!(https.len(), 2);
+        let host_cookie = https.iter().find(|cookie| cookie.name == "host").unwrap();
+        assert_eq!(host_cookie.domain, "sub.example.test");
+        assert!(host_cookie.host_only);
+        assert!(host_cookie.secure);
+        assert!(host_cookie.http_only);
+        assert_eq!(host_cookie.path, "/app");
+        assert_eq!(host_cookie.source_scheme, "Secure");
+        assert_eq!(host_cookie.source_port, 443);
+        let shared = https.iter().find(|cookie| cookie.name == "shared").unwrap();
+        assert_eq!(shared.domain, ".example.test");
+        assert!(!shared.host_only);
+        assert_eq!(shared.source_scheme, "Secure");
+        assert_eq!(shared.source_port, 443);
+
+        let http = jar.snapshots_for(&Url::parse("http://sub.example.test/app/page").unwrap());
+        assert_eq!(
+            http.iter()
+                .map(|cookie| cookie.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared"]
+        );
+
+        let sibling = jar.snapshots_for(&Url::parse("https://other.example.test/").unwrap());
+        assert_eq!(
+            sibling
+                .iter()
+                .map(|cookie| cookie.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared"]
+        );
+
+        jar.clear();
+        assert_eq!(jar.cookie_count(), 0);
+    }
+
     #[test]
     fn expired_set_cookie_deletes_instead_of_storing_empty() {
         let imdb = url::Url::parse("https://www.imdb.com/").unwrap();

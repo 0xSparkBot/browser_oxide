@@ -18,6 +18,168 @@ struct CachedResponseBody {
     mime_type: String,
 }
 
+fn cookie_to_cdp_json(cookie: crate::net::cookies::CookieSnapshot) -> serde_json::Value {
+    let expires = cookie.expires.map(|value| value as f64).unwrap_or(-1.0);
+    let size = cookie.name.len() + cookie.value.len();
+    let same_site = cookie.same_site.clone();
+    let mut value = serde_json::json!({
+        "name": cookie.name,
+        "value": cookie.value,
+        "domain": cookie.domain,
+        "path": cookie.path,
+        "expires": expires,
+        "size": size,
+        "httpOnly": cookie.http_only,
+        "secure": cookie.secure,
+        "session": cookie.expires.is_none(),
+        "priority": cookie.priority,
+        "sourceScheme": cookie.source_scheme,
+        "sourcePort": cookie.source_port,
+    });
+    if let Some(same_site) = same_site {
+        value
+            .as_object_mut()
+            .expect("CDP cookie JSON is an object")
+            .insert("sameSite".to_string(), serde_json::Value::String(same_site));
+    }
+    value
+}
+
+fn cdp_cookie_param(
+    page_url: &str,
+    cookie: &serde_json::Value,
+) -> Result<(url::Url, String), String> {
+    let name = cookie
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Cookie name is required".to_string())?;
+    let value = cookie
+        .get("value")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Cookie value is required".to_string())?;
+    if name.is_empty()
+        || name
+            .bytes()
+            .any(|byte| byte <= 0x20 || byte == b';' || byte == b'=')
+        || value.contains(['\r', '\n', ';'])
+    {
+        return Err("Invalid cookie name or value".to_string());
+    }
+
+    let requested_secure = cookie.get("secure").and_then(|value| value.as_bool());
+    let path = cookie
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("/");
+    let explicit_domain = cookie
+        .get("domain")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let raw_url = cookie
+        .get("url")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let source_url = raw_url
+        .map(url::Url::parse)
+        .transpose()
+        .map_err(|error| format!("Invalid cookie URL: {error}"))?;
+    let target_url = if let Some(domain) = explicit_domain {
+        // CDP is a privileged browser-control API: Chrome permits callers to
+        // provide a storage domain that does not suffix-match the optional
+        // `url`. Keep the URL's scheme/port as source metadata, but route the
+        // CookieJar parser through the explicitly requested storage host so
+        // its normal HTTP Set-Cookie cross-domain guard remains intact for
+        // non-CDP callers.
+        let host = domain.trim_start_matches('.');
+        let scheme = source_url.as_ref().map(url::Url::scheme).unwrap_or(
+            if requested_secure.unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            },
+        );
+        let port = source_url.as_ref().and_then(url::Url::port);
+        let authority = match port {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        url::Url::parse(&format!("{scheme}://{authority}{path}"))
+            .map_err(|error| format!("Invalid cookie domain: {error}"))?
+    } else if let Some(source_url) = source_url {
+        source_url
+    } else {
+        url::Url::parse(page_url)
+            .map_err(|error| format!("Cookie requires url or domain: {error}"))?
+    };
+    let secure = requested_secure.unwrap_or(target_url.scheme() == "https");
+
+    let same_site = cookie
+        .get("sameSite")
+        .and_then(|value| value.as_str())
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "strict" => Ok("Strict"),
+            "lax" => Ok("Lax"),
+            "none" => Ok("None"),
+            _ => Err(format!("Invalid cookie sameSite value: {value}")),
+        })
+        .transpose()?;
+    let priority = cookie
+        .get("priority")
+        .and_then(|value| value.as_str())
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "low" => Ok("Low"),
+            "medium" => Ok("Medium"),
+            "high" => Ok("High"),
+            _ => Err(format!("Invalid cookie priority value: {value}")),
+        })
+        .transpose()?;
+
+    let mut raw = format!("{name}={value}; Path={path}");
+    if let Some(domain) = explicit_domain {
+        raw.push_str("; Domain=");
+        raw.push_str(domain);
+    }
+    if secure {
+        raw.push_str("; Secure");
+    }
+    if cookie
+        .get("httpOnly")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        raw.push_str("; HttpOnly");
+    }
+    if let Some(same_site) = same_site {
+        raw.push_str("; SameSite=");
+        raw.push_str(same_site);
+    }
+    if let Some(priority) = priority {
+        raw.push_str("; Priority=");
+        raw.push_str(priority);
+    }
+    if let Some(expires) = cookie.get("expires").and_then(|value| value.as_f64()) {
+        if expires >= 0.0 {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+            let max_age = (expires.floor() as i64).saturating_sub(now);
+            raw.push_str(&format!("; Max-Age={max_age}"));
+        }
+    }
+    Ok((target_url, raw))
+}
+
+async fn set_cdp_cookie(
+    client: &crate::net::HttpClient,
+    page_url: &str,
+    cookie: &serde_json::Value,
+) -> Result<(), String> {
+    let (target_url, raw) = cdp_cookie_param(page_url, cookie)?;
+    client.set_cookie_str(&target_url, &raw).await;
+    Ok(())
+}
+
 /// Per-connection CDP session state.
 pub struct CdpSession {
     pub enabled_domains: HashSet<String>,
@@ -501,8 +663,130 @@ impl CdpSession {
                 self.enable_domain("Network");
                 Ok(serde_json::json!({}))
             }
-            "Network.getCookies" => Ok(serde_json::json!({ "cookies": [] })),
-            "Network.setCookies" => Ok(serde_json::json!({})),
+            "Network.getCookies" => {
+                async {
+                    let client = http_client
+                        .ok_or_else(|| "Network.getCookies requires an HTTP client".to_string())?;
+                    let mut urls: Vec<String> = req
+                        .params
+                        .get("urls")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if urls.is_empty() {
+                        urls.push(page.url().to_string());
+                    }
+
+                    let cookie_jar = client.cookies();
+                    let jar = cookie_jar.lock().await;
+                    let mut visible = std::collections::BTreeMap::new();
+                    for raw_url in urls {
+                        let Ok(url) = url::Url::parse(&raw_url) else {
+                            continue;
+                        };
+                        for cookie in jar.snapshots_for(&url) {
+                            visible.insert(
+                                (
+                                    cookie.domain.clone(),
+                                    cookie.path.clone(),
+                                    cookie.name.clone(),
+                                ),
+                                cookie,
+                            );
+                        }
+                    }
+                    let cookies: Vec<serde_json::Value> =
+                        visible.into_values().map(cookie_to_cdp_json).collect();
+                    Ok(serde_json::json!({ "cookies": cookies }))
+                }
+                .await
+            }
+            "Network.setCookies" => {
+                async {
+                    let client = http_client
+                        .ok_or_else(|| "Network.setCookies requires an HTTP client".to_string())?;
+                    let cookies = req
+                        .params
+                        .get("cookies")
+                        .and_then(|value| value.as_array())
+                        .ok_or_else(|| "Network.setCookies requires a cookies array".to_string())?;
+                    for cookie in cookies {
+                        set_cdp_cookie(client, page.url(), cookie).await?;
+                    }
+                    Ok(serde_json::json!({}))
+                }
+                .await
+            }
+            "Network.setCookie" => {
+                async {
+                    let client = http_client
+                        .ok_or_else(|| "Network.setCookie requires an HTTP client".to_string())?;
+                    set_cdp_cookie(client, page.url(), &req.params).await?;
+                    Ok(serde_json::json!({ "success": true }))
+                }
+                .await
+            }
+            "Network.getAllCookies" => {
+                async {
+                    let client = http_client.ok_or_else(|| {
+                        "Network.getAllCookies requires an HTTP client".to_string()
+                    })?;
+                    let cookie_jar = client.cookies();
+                    let jar = cookie_jar.lock().await;
+                    let cookies: Vec<serde_json::Value> = jar
+                        .snapshots_all()
+                        .into_iter()
+                        .map(cookie_to_cdp_json)
+                        .collect();
+                    Ok(serde_json::json!({ "cookies": cookies }))
+                }
+                .await
+            }
+            "Network.deleteCookies" => {
+                async {
+                    let client = http_client.ok_or_else(|| {
+                        "Network.deleteCookies requires an HTTP client".to_string()
+                    })?;
+                    let name = req
+                        .params
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            "Network.deleteCookies requires a cookie name".to_string()
+                        })?;
+                    let url = req
+                        .params
+                        .get("url")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                        .map(url::Url::parse)
+                        .transpose()
+                        .map_err(|error| format!("Invalid cookie URL: {error}"))?;
+                    let domain = req
+                        .params
+                        .get("domain")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty());
+                    if url.is_none() && domain.is_none() {
+                        return Err(
+                            "Network.deleteCookies requires either url or domain".to_string()
+                        );
+                    }
+                    let path = req.params.get("path").and_then(|value| value.as_str());
+                    let cookie_jar = client.cookies();
+                    cookie_jar
+                        .lock()
+                        .await
+                        .delete_matching(name, url.as_ref(), domain, path);
+                    Ok(serde_json::json!({}))
+                }
+                .await
+            }
             "Network.disable" => {
                 self.enabled_domains.remove("Network");
                 Ok(serde_json::json!({}))
@@ -564,7 +848,17 @@ impl CdpSession {
                 }
             }
             "Network.clearBrowserCache" => Ok(serde_json::json!({})),
-            "Network.clearBrowserCookies" => Ok(serde_json::json!({})),
+            "Network.clearBrowserCookies" => {
+                async {
+                    let client = http_client.ok_or_else(|| {
+                        "Network.clearBrowserCookies requires an HTTP client".to_string()
+                    })?;
+                    let cookie_jar = client.cookies();
+                    cookie_jar.lock().await.clear();
+                    Ok(serde_json::json!({}))
+                }
+                .await
+            }
             "Network.setCacheDisabled" => Ok(serde_json::json!({})),
             "Network.emulateNetworkConditions" => Ok(serde_json::json!({})),
 
@@ -1023,6 +1317,162 @@ mod tests {
         let (_, events) = session.handle_request(&mut page, &req, None).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].method, "Runtime.executionContextCreated");
+    }
+
+    #[tokio::test]
+    async fn network_cookie_commands_match_chrome_148() {
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let client = crate::net::HttpClient::new(&profile).unwrap();
+        let mut session = CdpSession::new();
+        let mut page = Page::from_html_with_url(
+            "<html><body></body></html>",
+            "https://sub.example.test/app/index",
+            Some(profile),
+        )
+        .await
+        .unwrap();
+
+        let batch = CdpRequest {
+            id: 20,
+            method: "Network.setCookies".to_string(),
+            params: serde_json::json!({"cookies": [
+                {"name":"host","value":"one","url":"https://sub.example.test/app/index","path":"/app","secure":true,"httpOnly":true},
+                {"name":"shared","value":"two","domain":".example.test","path":"/"}
+            ]}),
+        };
+        let (response, _) = session
+            .handle_request(&mut page, &batch, Some(&client))
+            .await;
+        assert!(serde_json::from_str::<serde_json::Value>(&response).unwrap()["error"].is_null());
+
+        let get_https = CdpRequest {
+            id: 21,
+            method: "Network.getCookies".to_string(),
+            params: serde_json::json!({"urls":["https://sub.example.test/app/page"]}),
+        };
+        let (response, _) = session
+            .handle_request(&mut page, &get_https, Some(&client))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let visible = json["result"]["cookies"].as_array().unwrap();
+        assert_eq!(visible.len(), 2, "{response}");
+        let host = visible.iter().find(|c| c["name"] == "host").unwrap();
+        assert_eq!(host["domain"], "sub.example.test");
+        assert_eq!(host["path"], "/app");
+        assert_eq!(host["secure"], true);
+        assert_eq!(host["httpOnly"], true);
+        assert_eq!(host["sourceScheme"], "Secure");
+        assert_eq!(host["sourcePort"], 443);
+
+        let get_http = CdpRequest {
+            id: 22,
+            method: "Network.getCookies".to_string(),
+            params: serde_json::json!({"urls":["http://sub.example.test/app/page"]}),
+        };
+        let (response, _) = session
+            .handle_request(&mut page, &get_http, Some(&client))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let visible = json["result"]["cookies"].as_array().unwrap();
+        assert_eq!(visible.len(), 1, "{response}");
+        assert_eq!(visible[0]["name"], "shared");
+
+        for (id, params) in [
+            (
+                30,
+                serde_json::json!({"name":"attrs","value":"v","url":"https://sub.example.test/","sameSite":"Lax","priority":"High"}),
+            ),
+            (
+                31,
+                serde_json::json!({"name":"plain","value":"p","url":"https://sub.example.test/"}),
+            ),
+            (
+                32,
+                serde_json::json!({"name":"cross","value":"x","url":"https://sub.example.test/","domain":"evil.test"}),
+            ),
+        ] {
+            let request = CdpRequest {
+                id,
+                method: "Network.setCookie".to_string(),
+                params,
+            };
+            let (response, _) = session
+                .handle_request(&mut page, &request, Some(&client))
+                .await;
+            let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(json["result"]["success"], true, "{response}");
+        }
+
+        let all = CdpRequest {
+            id: 33,
+            method: "Network.getAllCookies".to_string(),
+            params: serde_json::json!({}),
+        };
+        let (response, _) = session.handle_request(&mut page, &all, Some(&client)).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let all_cookies = json["result"]["cookies"].as_array().unwrap();
+        assert_eq!(all_cookies.len(), 5, "{response}");
+        let attrs = all_cookies.iter().find(|c| c["name"] == "attrs").unwrap();
+        assert_eq!(attrs["secure"], true); // Chrome defaults HTTPS CDP cookies to Secure.
+        assert_eq!(attrs["sameSite"], "Lax");
+        assert_eq!(attrs["priority"], "High");
+        let plain = all_cookies.iter().find(|c| c["name"] == "plain").unwrap();
+        assert_eq!(plain["secure"], true);
+        assert_eq!(plain["priority"], "Medium");
+        assert!(plain.get("sameSite").is_none());
+        let cross = all_cookies.iter().find(|c| c["name"] == "cross").unwrap();
+        assert_eq!(cross["domain"], ".evil.test");
+        assert_eq!(cross["sourceScheme"], "Secure");
+        assert_eq!(cross["sourcePort"], 443);
+        assert!(cross.get("sameParty").is_none());
+
+        for (id, params) in [
+            (
+                40,
+                serde_json::json!({"name":"host","url":"https://sub.example.test/app"}),
+            ),
+            (
+                41,
+                serde_json::json!({"name":"shared","domain":".example.test","path":"/"}),
+            ),
+        ] {
+            let request = CdpRequest {
+                id,
+                method: "Network.deleteCookies".to_string(),
+                params,
+            };
+            let (response, _) = session
+                .handle_request(&mut page, &request, Some(&client))
+                .await;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response).unwrap()["result"],
+                serde_json::json!({})
+            );
+        }
+        let (response, _) = session.handle_request(&mut page, &all, Some(&client)).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["result"]["cookies"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let clear = CdpRequest {
+            id: 42,
+            method: "Network.clearBrowserCookies".to_string(),
+            params: serde_json::json!({}),
+        };
+        let _ = session
+            .handle_request(&mut page, &clear, Some(&client))
+            .await;
+        let (response, _) = session.handle_request(&mut page, &all, Some(&client)).await;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["result"]["cookies"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
