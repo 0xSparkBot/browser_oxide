@@ -3250,12 +3250,12 @@ impl Page {
         } else {
             host_budget_default_ms
         };
-        let mut nav_budget = Duration::from_millis(
-            std::env::var("BROWSER_OXIDE_NAV_BUDGET_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(host_budget_default_ms),
-        );
+        let explicit_nav_budget_ms = std::env::var("BROWSER_OXIDE_NAV_BUDGET_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        let nav_budget_is_explicit = explicit_nav_budget_ms.is_some();
+        let mut nav_budget =
+            Duration::from_millis(explicit_nav_budget_ms.unwrap_or(host_budget_default_ms));
         let nav_budget_extend = Duration::from_millis(
             std::env::var("BROWSER_OXIDE_NAV_BUDGET_EXTEND_MS")
                 .ok()
@@ -3329,15 +3329,21 @@ impl Page {
             )
             .await?;
 
-            // Install the V8 deadline watcher for the remainder of the
-            // wall-clock budget — but always with a minimum 5s floor so
-            // even iterations past the nominal budget have a safety net.
-            // Without the floor, a budget-exhausted iteration could spin
-            // forever in V8 (no watcher → tokio::time::timeout can't
-            // preempt CPU-bound JS).
-            let remaining = nav_budget
-                .saturating_sub(nav_t0.elapsed())
-                .max(Duration::from_secs(5));
+            // Install the V8 deadline watcher for exactly the remaining
+            // wall-clock budget. Do not invent a 5s floor here: a floor makes
+            // an exhausted navigation budget non-binding and lets a single
+            // page overrun batch navigation by many seconds. The build phase
+            // has its own V8 watchdog; once the loop budget is gone, return the
+            // page we already built instead of starting more work.
+            let remaining = nav_budget.saturating_sub(nav_t0.elapsed());
+            if remaining.is_zero() {
+                eprintln!(
+                    "[navigate] budget exhausted after build ({}ms / {}ms) — returning current page",
+                    nav_t0.elapsed().as_millis(),
+                    nav_budget.as_millis()
+                );
+                return Ok(page);
+            }
             eprintln!(
                 "[navigate] iter={} installing V8DeadlineWatcher with {}ms remaining",
                 iter,
@@ -3346,16 +3352,14 @@ impl Page {
             let _watcher =
                 V8DeadlineWatcher::new(page.event_loop().runtime_mut().isolate_handle(), remaining);
 
-            // Drain the event loop. Use the remaining nav budget (floored at 8s)
-            // so that heavy PoW challenges (the VM can take 30+ seconds) can
-            // complete their /tl POST AFTER the PoW finishes. The V8DeadlineWatcher
-            // installed above provides the hard kill for analytics loops that never
-            // reach idle on their own — once V8 is terminated, run_event_loop()
-            // returns and the drain exits naturally.
-            let drain_timeout = {
-                let remaining = nav_budget.saturating_sub(nav_t0.elapsed());
-                remaining.max(Duration::from_secs(8))
-            };
+            // Drain only for the remaining navigation budget. The watcher
+            // above handles CPU-bound JS while run_until_idle bounds async work.
+            // Using an 8s minimum here used to make a 0ms remaining budget run
+            // for at least another 8s.
+            let drain_timeout = nav_budget.saturating_sub(nav_t0.elapsed());
+            if drain_timeout.is_zero() {
+                return Ok(page);
+            }
             if let Err(e) = page.event_loop().run_until_idle(drain_timeout).await {
                 tracing::warn!(error = %e, "navigate event loop error");
             }
@@ -3456,7 +3460,7 @@ impl Page {
                         );
                         return Ok(page);
                     }
-                    if !budget_extended {
+                    if !budget_extended && !nav_budget_is_explicit {
                         nav_budget += nav_budget_extend;
                         budget_extended = true;
                         eprintln!(
@@ -3536,7 +3540,13 @@ impl Page {
                     || started_as_managed_challenge
                     || started_as_awswaf_challenge)
             {
-                let deadline = std::time::Instant::now() + Duration::from_secs(90);
+                // The deferred-work poll is subordinate to the navigation
+                // budget. A fixed 90s deadline here previously let a 15–25s
+                // navigation budget turn into a multi-minute wall-clock job.
+                let poll_budget = nav_budget
+                    .saturating_sub(nav_t0.elapsed())
+                    .min(Duration::from_secs(90));
+                let deadline = std::time::Instant::now() + poll_budget;
                 loop {
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     if remaining.is_zero() {
@@ -3628,7 +3638,7 @@ impl Page {
                                 // Arm +45 s here, once. Gated by
                                 // `started_as_seccpt_challenge` ⇒ zero non-sec-cpt
                                 // regression.
-                                if !budget_extended {
+                                if !budget_extended && !nav_budget_is_explicit {
                                     nav_budget += Duration::from_secs(45);
                                     budget_extended = true;
                                 }
@@ -3879,9 +3889,15 @@ impl Page {
                                 }
                             })();
                         "#;
+                        let refetch_budget = nav_budget
+                            .saturating_sub(nav_t0.elapsed())
+                            .min(Duration::from_secs(15));
+                        if refetch_budget.is_zero() {
+                            return Ok(page);
+                        }
                         let _ = page
                             .event_loop()
-                            .execute_and_run(refetch_js, Duration::from_secs(15))
+                            .execute_and_run(refetch_js, refetch_budget)
                             .await;
                         let status_str = page
                             .event_loop()
@@ -4063,6 +4079,12 @@ impl Page {
             // nav, then iter=1 bails before producing anything usable).
             const MIN_PENDING_NAV_BUDGET: Duration = Duration::from_secs(15);
             if nav_budget.saturating_sub(nav_t0.elapsed()) < MIN_PENDING_NAV_BUDGET {
+                if nav_budget_is_explicit {
+                    // An explicit operator budget is a hard wall-clock cap.
+                    // Do not silently turn a 200ms/5s caller budget into an
+                    // extra 45s just because the page requested navigation.
+                    return Ok(page);
+                }
                 nav_budget += Duration::from_secs(45);
             }
 
@@ -4128,7 +4150,13 @@ impl Page {
                 // + small jitter mimics the natural human-action gap.
                 let jitter_ms =
                     250 + (std::time::Instant::now().elapsed().as_nanos() & 0xFF) as u64;
-                crate::stealth::stealth_delay(Duration::from_millis(jitter_ms)).await;
+                let jitter_budget = nav_budget
+                    .saturating_sub(nav_t0.elapsed())
+                    .min(Duration::from_millis(jitter_ms));
+                if jitter_budget.is_zero() {
+                    return Ok(page);
+                }
+                crate::stealth::stealth_delay(jitter_budget).await;
                 // "Let the bundle self-solve": this vendor's `rt:'i'` nav
                 // sets a reload __pendingNavigation EARLY, so the flow
                 // lands here and would otherwise reload after ~250 ms —
@@ -4152,12 +4180,13 @@ impl Page {
                 // branches; the poll-entry invariant is
                 // `started_as_interstitial_challenge == is_challenge_doc(initial html)`.
                 if started_as_interstitial_challenge {
-                    // Drive the self-solve bundle to completion; returns when work
-                    // is done, on a JS-raised nav, or at the 45 s give-up deadline.
-                    let _ = page
-                        .event_loop()
-                        .run_until_idle(Duration::from_secs(45))
-                        .await;
+                    let self_solve_budget = nav_budget
+                        .saturating_sub(nav_t0.elapsed())
+                        .min(Duration::from_secs(45));
+                    if self_solve_budget.is_zero() {
+                        return Ok(page);
+                    }
+                    let _ = page.event_loop().run_until_idle(self_solve_budget).await;
                 }
                 let refetch_js = format!(
                     r#"
@@ -4183,9 +4212,15 @@ impl Page {
                     url_js = deno_core::serde_json::to_string(&next_url)
                         .unwrap_or_else(|_| "''".to_string())
                 );
+                let refetch_budget = nav_budget
+                    .saturating_sub(nav_t0.elapsed())
+                    .min(Duration::from_secs(15));
+                if refetch_budget.is_zero() {
+                    return Ok(page);
+                }
                 let _ = page
                     .event_loop()
-                    .execute_and_run(&refetch_js, Duration::from_secs(15))
+                    .execute_and_run(&refetch_js, refetch_budget)
                     .await;
                 let status = page
                     .event_loop()
@@ -6162,6 +6197,48 @@ mod tests {
         let platform = page.evaluate("navigator.platform").unwrap();
         println!("[stealth] platform: {platform}");
         assert!(platform.contains("Linux"), "profile is Linux");
+    }
+
+    #[test]
+    fn explicit_nav_budget_is_hard_for_pending_navigation() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let previous = std::env::var_os("BROWSER_OXIDE_NAV_BUDGET_MS");
+        std::env::set_var("BROWSER_OXIDE_NAV_BUDGET_MS", "250");
+
+        let result = crate::js_runtime::block_on_v8_thread("explicit-nav-budget-test", || async {
+            let started = std::time::Instant::now();
+            let mut page = Page::navigate_with_html(
+                r#"<!doctype html><html><body>
+                        <script>location.href = '/next';</script>
+                    </body></html>"#,
+                "https://example.test/start",
+                crate::stealth::presets::chrome_148_macos(),
+                2,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let body_tag = page
+                .evaluate("document.body.tagName")
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((started.elapsed(), page.url().to_string(), body_tag))
+        });
+
+        match previous {
+            Some(v) => std::env::set_var("BROWSER_OXIDE_NAV_BUDGET_MS", v),
+            None => std::env::remove_var("BROWSER_OXIDE_NAV_BUDGET_MS"),
+        }
+
+        let (elapsed, url, body_tag) =
+            result.expect("navigation should return the current page at budget boundary");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "explicit 250ms budget was silently extended: {elapsed:?}"
+        );
+        assert_eq!(url, "https://example.test/start");
+        assert_eq!(body_tag, "BODY");
     }
 
     #[test]
