@@ -258,6 +258,7 @@
     const perf = globalThis.performance;
     if (perf) {
         const proto = Object.getPrototypeOf(perf);
+        const isWorkerRealm = typeof globalThis.document === 'undefined';
         const oldGetEntries = typeof perf.getEntries === 'function' ? perf.getEntries.bind(perf) : () => [];
         const oldGetEntriesByType = typeof perf.getEntriesByType === 'function'
             ? perf.getEntriesByType.bind(perf) : null;
@@ -265,6 +266,7 @@
             ? perf.getEntriesByName.bind(perf) : null;
         const marks = [];
         const measures = [];
+        const workerResources = [];
 
         const installPerfMethod = (name, fn, length) => {
             if (!proto) return;
@@ -277,19 +279,21 @@
 
         installPerfMethod('getEntries', function getEntries() {
             const base = Array.from(oldGetEntries() || []).map(wrapEntry);
-            return [...base, ...marks, ...measures].sort((a, b) => a.startTime - b.startTime);
+            return [...base, ...workerResources, ...marks, ...measures]
+                .sort((a, b) => a.startTime - b.startTime);
         }, 0);
         installPerfMethod('getEntriesByType', function getEntriesByType(type) {
             const wanted = String(type);
             if (wanted === 'mark') return marks.slice();
             if (wanted === 'measure') return measures.slice();
+            if (isWorkerRealm && wanted === 'resource') return workerResources.slice();
             if (oldGetEntriesByType) return Array.from(oldGetEntriesByType(wanted) || []).map(wrapEntry);
             return this.getEntries().filter((entry) => entry.entryType === wanted);
         }, 1);
         installPerfMethod('getEntriesByName', function getEntriesByName(name) {
             const wanted = String(name);
             const type = arguments.length > 1 ? String(arguments[1]) : '';
-            const stored = [...marks, ...measures].filter(
+            const stored = [...workerResources, ...marks, ...measures].filter(
                 (entry) => entry.name === wanted && (!type || entry.entryType === type),
             );
             if (oldGetEntriesByName) {
@@ -353,6 +357,265 @@
                 if (name === null || measures[i].name === name) measures.splice(i, 1);
             }
         }, 0);
+
+        // Dedicated/Shared workers expose a fully functional
+        // PerformanceObserver too.  worker_bootstrap installs a WebIDL-shaped
+        // placeholder early so namespace probes are correct before this layer
+        // exists; replace that placeholder here, after PerformanceMark,
+        // PerformanceMeasure and PerformanceResourceTiming are available.
+        // Window owns a richer observer implementation in window_bootstrap and
+        // deliberately does not enter this worker-only branch.
+        if (isWorkerRealm) {
+            const observerState = new WeakMap();
+            const observers = new Set();
+            const entryListState = new WeakMap();
+            const supportedTypes = Object.freeze(['mark', 'measure', 'resource']);
+
+            function PerformanceObserverEntryList() {
+                throw new TypeError(
+                    "Failed to construct 'PerformanceObserverEntryList': Illegal constructor"
+                );
+            }
+            const entryListProto = PerformanceObserverEntryList.prototype;
+            delete entryListProto.constructor;
+            const entryListEntries = (self) => {
+                const entries = entryListState.get(self);
+                if (!entries) throw new TypeError('Illegal invocation');
+                return entries;
+            };
+            defineMethod(entryListProto, 'getEntries', function getEntries() {
+                return entryListEntries(this).slice();
+            }, 0);
+            defineMethod(entryListProto, 'getEntriesByName', function getEntriesByName(name) {
+                const wanted = String(name);
+                const type = arguments.length > 1 ? String(arguments[1]) : '';
+                return entryListEntries(this).filter(
+                    (entry) => entry.name === wanted && (!type || entry.entryType === type),
+                );
+            }, 1);
+            defineMethod(entryListProto, 'getEntriesByType', function getEntriesByType(type) {
+                const wanted = String(type);
+                return entryListEntries(this).filter((entry) => entry.entryType === wanted);
+            }, 1);
+            Object.defineProperty(entryListProto, 'constructor', {
+                value: PerformanceObserverEntryList,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            });
+            defineTag(entryListProto, 'PerformanceObserverEntryList');
+            mask(PerformanceObserverEntryList, 'PerformanceObserverEntryList');
+
+            const newEntryList = (entries) => {
+                const list = Object.create(entryListProto);
+                entryListState.set(list, entries);
+                return list;
+            };
+
+            const scheduleDelivery = (observer, state) => {
+                if (state.queued) return;
+                state.queued = true;
+                queueMicrotask(() => {
+                    state.queued = false;
+                    if (!observers.has(observer)) return;
+                    const records = state.records.splice(0);
+                    if (!records.length) return;
+                    try {
+                        state.callback(newEntryList(records), observer);
+                    } catch (error) {
+                        setTimeout(() => { throw error; }, 0);
+                    }
+                });
+            };
+            const queueEntry = (entry) => {
+                for (const observer of observers) {
+                    const state = observerState.get(observer);
+                    if (!state || !state.types.has(entry.entryType)) continue;
+                    state.records.push(entry);
+                    scheduleDelivery(observer, state);
+                }
+            };
+
+            const invalidModification = (message) => {
+                if (typeof globalThis.DOMException === 'function') {
+                    return new DOMException(message, 'InvalidModificationError');
+                }
+                const error = new Error(message);
+                error.name = 'InvalidModificationError';
+                return error;
+            };
+
+            function PerformanceObserver(callback) {
+                if (!new.target) {
+                    throw new TypeError(
+                        "Failed to construct 'PerformanceObserver': Please use the 'new' operator, this DOM object constructor cannot be called as a function."
+                    );
+                }
+                if (arguments.length < 1) {
+                    throw new TypeError(
+                        "Failed to construct 'PerformanceObserver': 1 argument required, but only 0 present."
+                    );
+                }
+                if (typeof callback !== 'function') {
+                    throw new TypeError(
+                        "Failed to construct 'PerformanceObserver': parameter 1 is not of type 'Function'."
+                    );
+                }
+                observerState.set(this, {
+                    callback,
+                    mode: null,
+                    types: new Set(),
+                    records: [],
+                    queued: false,
+                });
+            }
+            setLength(PerformanceObserver, 1);
+            mask(PerformanceObserver, 'PerformanceObserver');
+            const observerProto = PerformanceObserver.prototype;
+            delete observerProto.constructor;
+
+            defineMethod(observerProto, 'disconnect', function disconnect() {
+                const state = observerState.get(this);
+                if (!state) throw new TypeError('Illegal invocation');
+                state.types.clear();
+                state.records.length = 0;
+                observers.delete(this);
+            }, 0);
+
+            defineMethod(observerProto, 'observe', function observe(options) {
+                const state = observerState.get(this);
+                if (!state) throw new TypeError('Illegal invocation');
+                if (options === undefined || options === null) {
+                    options = {};
+                } else if (typeof options !== 'object') {
+                    throw new TypeError(
+                        "Failed to execute 'observe' on 'PerformanceObserver': parameter 1 is not of type 'Object'."
+                    );
+                }
+                const hasEntryTypes = options.entryTypes !== undefined;
+                const hasType = options.type !== undefined;
+                if (!hasEntryTypes && !hasType) {
+                    throw new TypeError(
+                        "Failed to execute 'observe' on 'PerformanceObserver': An observe() call must include either entryTypes or type arguments."
+                    );
+                }
+                if (hasEntryTypes && hasType) {
+                    throw new TypeError(
+                        "Failed to execute 'observe' on 'PerformanceObserver': An observe() call must not include both entryTypes and type arguments."
+                    );
+                }
+
+                if (hasType) {
+                    if (state.mode === 'entryTypes') {
+                        throw invalidModification(
+                            "Failed to execute 'observe' on 'PerformanceObserver': This PerformanceObserver has performed observe({entryTypes:...}, therefore it cannot perform observe({type:...})"
+                        );
+                    }
+                    state.mode = 'type';
+                    const type = String(options.type);
+                    if (supportedTypes.includes(type)) {
+                        state.types.add(type);
+                        observers.add(this);
+                        if (options.buffered === true) {
+                            for (const entry of globalThis.performance.getEntriesByType(type)) {
+                                state.records.push(entry);
+                            }
+                            if (state.records.length) scheduleDelivery(this, state);
+                        }
+                    }
+                    return;
+                }
+
+                if (state.mode === 'type') {
+                    throw invalidModification(
+                        "Failed to execute 'observe' on 'PerformanceObserver': This PerformanceObserver has performed observe({type:...}, therefore it cannot perform observe({entryTypes:...})"
+                    );
+                }
+                state.mode = 'entryTypes';
+                const requested = Array.from(options.entryTypes, String);
+                state.types = new Set(requested.filter((type) => supportedTypes.includes(type)));
+                if (state.types.size) observers.add(this);
+                else observers.delete(this);
+            }, 0);
+
+            defineMethod(observerProto, 'takeRecords', function takeRecords() {
+                const state = observerState.get(this);
+                if (!state) throw new TypeError('Illegal invocation');
+                return state.records.splice(0);
+            }, 0);
+            Object.defineProperty(observerProto, 'constructor', {
+                value: PerformanceObserver,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            });
+            defineTag(observerProto, 'PerformanceObserver');
+            Object.defineProperty(PerformanceObserver, 'supportedEntryTypes', {
+                get() { return supportedTypes; },
+                enumerable: true,
+                configurable: true,
+            });
+            const supportedGetter = Object.getOwnPropertyDescriptor(
+                PerformanceObserver, 'supportedEntryTypes'
+            )?.get;
+            if (supportedGetter) mask(supportedGetter, 'get supportedEntryTypes');
+
+            const originalMark = globalThis.performance.mark.bind(globalThis.performance);
+            const originalMeasure = globalThis.performance.measure.bind(globalThis.performance);
+            installPerfMethod('mark', function mark(name) {
+                const entry = originalMark(...arguments);
+                queueEntry(entry);
+                return entry;
+            }, 1);
+            installPerfMethod('measure', function measure(name) {
+                const entry = originalMeasure(...arguments);
+                queueEntry(entry);
+                return entry;
+            }, 1);
+
+            // fetch_bootstrap records resource timing through the engine bridge.
+            // Keep a hidden alias alive after cleanup so worker fetches can use
+            // the same path as Window without exposing an engine-owned global.
+            const bridge = globalThis._browser_oxide || globalThis.__browser_oxide || null;
+            if (bridge) {
+                if (!Array.isArray(bridge.__perfResourceEntries)) {
+                    Object.defineProperty(bridge, '__perfResourceEntries', {
+                        value: [], writable: true, configurable: true,
+                    });
+                }
+                if (!globalThis._browser_oxide) {
+                    Object.defineProperty(globalThis, '_browser_oxide', {
+                        value: bridge, writable: true, configurable: true, enumerable: false,
+                    });
+                }
+            }
+            Object.defineProperty(globalThis, Symbol.for('__browser_oxide_performance_resource__'), {
+                value(raw) {
+                    const entry = wrapEntry({
+                        name: String(raw?.url || ''),
+                        entryType: 'resource',
+                        startTime: numberOr(raw?.startTime),
+                        duration: numberOr(raw?.duration),
+                        initiatorType: String(raw?.type || 'fetch'),
+                        fetchStart: numberOr(raw?.startTime),
+                        requestStart: numberOr(raw?.startTime),
+                        responseStart: numberOr(raw?.startTime) + numberOr(raw?.duration),
+                        responseEnd: numberOr(raw?.startTime) + numberOr(raw?.duration),
+                        transferSize: numberOr(raw?.transferSize),
+                        encodedBodySize: numberOr(raw?.encodedBodySize),
+                        decodedBodySize: numberOr(raw?.decodedBodySize),
+                    });
+                    workerResources.push(entry);
+                    queueEntry(entry);
+                },
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+
+            globalThis.PerformanceObserver = PerformanceObserver;
+            globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
+        }
     }
 
     globalThis.PerformanceEntry = PerformanceEntry;

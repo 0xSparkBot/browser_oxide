@@ -1124,6 +1124,339 @@ fn chrome_148_worker_namespace_and_prototype_shape() {
 }
 
 #[test]
+fn worker_performance_observer_mark_delivery_matches_chrome_148() {
+    let code = r#"
+        const src = `
+            (async () => {
+                const capture = fn => {
+                    try { return { ok: true, value: fn() }; }
+                    catch (error) { return { ok: false, error: error.name + ':' + error.message }; }
+                };
+                const result = {
+                    supported: Array.from(PerformanceObserver.supportedEntryTypes || []),
+                    supportedSame: PerformanceObserver.supportedEntryTypes === PerformanceObserver.supportedEntryTypes,
+                    supportedFrozen: Object.isFrozen(PerformanceObserver.supportedEntryTypes),
+                    proto: Reflect.ownKeys(PerformanceObserver.prototype).map(String),
+                    ctorLength: PerformanceObserver.length,
+                    ctorSource: Function.prototype.toString.call(PerformanceObserver),
+                };
+                let calls = [];
+                let observer;
+                result.direct = capture(() => PerformanceObserver(() => {}));
+                result.noarg = capture(() => new PerformanceObserver());
+                result.badCallback = capture(() => new PerformanceObserver(1));
+                observer = new PerformanceObserver((list, current) => {
+                    calls.push({
+                        same: current === observer,
+                        entries: list.getEntries().map(entry => ({
+                            name: entry.name,
+                            type: entry.entryType,
+                            start: entry.startTime,
+                            duration: entry.duration,
+                            tag: Object.prototype.toString.call(entry),
+                        })),
+                    });
+                });
+                result.instance = {
+                    tag: Object.prototype.toString.call(observer),
+                    own: Reflect.ownKeys(observer).map(String),
+                };
+                result.observe = capture(() => {
+                    observer.observe({ type: 'mark' });
+                    return 'ok';
+                });
+                const mark = performance.mark('worker-mark', { startTime: 7, detail: { x: 1 } });
+                result.mark = {
+                    tag: Object.prototype.toString.call(mark),
+                    name: mark.name,
+                    start: mark.startTime,
+                    detail: mark.detail,
+                };
+                await Promise.resolve();
+                await new Promise(resolve => setTimeout(resolve, 0));
+                result.calls = calls;
+                result.take = observer.takeRecords().map(entry => entry.name);
+                observer.disconnect();
+                performance.mark('after-disconnect');
+                await Promise.resolve();
+                await new Promise(resolve => setTimeout(resolve, 0));
+                result.callsAfterDisconnect = calls.length;
+                self.postMessage(JSON.stringify(result));
+            })().catch(error => self.postMessage(JSON.stringify({ error: String(error && error.stack || error) })));
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = event => {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+
+    let out = drive_runtime(code, 2000);
+    let value: serde_json::Value = serde_json::from_str(&out).expect("worker observer JSON");
+    assert!(
+        value.get("error").is_none(),
+        "worker observer failed: {value}"
+    );
+    assert_eq!(
+        value["supported"],
+        serde_json::json!(["mark", "measure", "resource"])
+    );
+    assert_eq!(value["supportedSame"], true);
+    assert_eq!(value["supportedFrozen"], true);
+    assert_eq!(
+        value["proto"],
+        serde_json::json!([
+            "disconnect",
+            "observe",
+            "takeRecords",
+            "constructor",
+            "Symbol(Symbol.toStringTag)"
+        ])
+    );
+    assert_eq!(value["ctorLength"], 1);
+    assert_eq!(
+        value["ctorSource"],
+        "function PerformanceObserver() { [native code] }"
+    );
+    assert_eq!(
+        value["direct"]["error"],
+        "TypeError:Failed to construct 'PerformanceObserver': Please use the 'new' operator, this DOM object constructor cannot be called as a function."
+    );
+    assert_eq!(
+        value["noarg"]["error"],
+        "TypeError:Failed to construct 'PerformanceObserver': 1 argument required, but only 0 present."
+    );
+    assert_eq!(
+        value["badCallback"]["error"],
+        "TypeError:Failed to construct 'PerformanceObserver': parameter 1 is not of type 'Function'."
+    );
+    assert_eq!(value["instance"]["tag"], "[object PerformanceObserver]");
+    assert_eq!(value["instance"]["own"], serde_json::json!([]));
+    assert_eq!(value["observe"]["ok"], true);
+    assert_eq!(value["observe"]["value"], "ok");
+    assert_eq!(value["mark"]["tag"], "[object PerformanceMark]");
+    assert_eq!(value["mark"]["name"], "worker-mark");
+    assert_eq!(value["mark"]["start"], 7);
+    assert_eq!(value["mark"]["detail"], serde_json::json!({ "x": 1 }));
+    assert_eq!(value["calls"].as_array().map(Vec::len), Some(1));
+    assert_eq!(value["calls"][0]["same"], true);
+    assert_eq!(
+        value["calls"][0]["entries"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(value["calls"][0]["entries"][0]["name"], "worker-mark");
+    assert_eq!(value["calls"][0]["entries"][0]["type"], "mark");
+    assert_eq!(value["calls"][0]["entries"][0]["start"], 7);
+    assert_eq!(
+        value["calls"][0]["entries"][0]["tag"],
+        "[object PerformanceMark]"
+    );
+    assert_eq!(value["take"], serde_json::json!([]));
+    assert_eq!(value["callsAfterDisconnect"], 1);
+}
+
+#[test]
+fn worker_performance_observer_observe_modes_match_chrome_148() {
+    let code = r#"
+        const src = `
+            const capture = fn => {
+                try { fn(); return ''; }
+                catch (error) { return error.name + ':' + error.message; }
+            };
+            const supportedDescriptor = Object.getOwnPropertyDescriptor(
+                PerformanceObserver, 'supportedEntryTypes'
+            );
+            const methodShape = Object.fromEntries(
+                ['disconnect', 'observe', 'takeRecords'].map(name => {
+                    const descriptor = Object.getOwnPropertyDescriptor(PerformanceObserver.prototype, name);
+                    return [name, {
+                        enumerable: descriptor.enumerable,
+                        configurable: descriptor.configurable,
+                        writable: descriptor.writable,
+                        length: descriptor.value.length,
+                        source: Function.prototype.toString.call(descriptor.value),
+                    }];
+                })
+            );
+            const typed = new PerformanceObserver(() => {});
+            const typedResults = {
+                none: capture(() => typed.observe()),
+                empty: capture(() => typed.observe({})),
+                both: capture(() => typed.observe({ type: 'mark', entryTypes: ['mark'] })),
+                badType: capture(() => typed.observe({ type: 'bogus' })),
+                thenEntryTypes: capture(() => typed.observe({ entryTypes: ['mark'] })),
+            };
+            const listed = new PerformanceObserver(() => {});
+            const listedResults = {
+                entryTypes: capture(() => listed.observe({ entryTypes: ['mark', 'bogus'] })),
+                thenType: capture(() => listed.observe({ type: 'mark' })),
+            };
+            self.postMessage(JSON.stringify({
+                supportedDescriptor: {
+                    enumerable: supportedDescriptor.enumerable,
+                    configurable: supportedDescriptor.configurable,
+                    getter: typeof supportedDescriptor.get,
+                    setter: typeof supportedDescriptor.set,
+                    source: Function.prototype.toString.call(supportedDescriptor.get),
+                },
+                methodShape,
+                typedResults,
+                listedResults,
+            }));
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = event => {
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        };
+    "#;
+    let out = drive_runtime(code, 1500);
+    let value: serde_json::Value = serde_json::from_str(&out).expect("worker observer mode JSON");
+    assert_eq!(value["supportedDescriptor"]["enumerable"], true);
+    assert_eq!(value["supportedDescriptor"]["configurable"], true);
+    assert_eq!(value["supportedDescriptor"]["getter"], "function");
+    assert_eq!(value["supportedDescriptor"]["setter"], "undefined");
+    assert_eq!(
+        value["supportedDescriptor"]["source"],
+        "function get supportedEntryTypes() { [native code] }"
+    );
+    for method in ["disconnect", "observe", "takeRecords"] {
+        assert_eq!(value["methodShape"][method]["enumerable"], true, "{out}");
+        assert_eq!(value["methodShape"][method]["configurable"], true, "{out}");
+        assert_eq!(value["methodShape"][method]["writable"], true, "{out}");
+        assert_eq!(value["methodShape"][method]["length"], 0, "{out}");
+        assert_eq!(
+            value["methodShape"][method]["source"],
+            format!("function {method}() {{ [native code] }}"),
+            "{out}"
+        );
+    }
+    assert_eq!(
+        value["typedResults"]["none"],
+        "TypeError:Failed to execute 'observe' on 'PerformanceObserver': An observe() call must include either entryTypes or type arguments."
+    );
+    assert_eq!(
+        value["typedResults"]["empty"],
+        value["typedResults"]["none"]
+    );
+    assert_eq!(
+        value["typedResults"]["both"],
+        "TypeError:Failed to execute 'observe' on 'PerformanceObserver': An observe() call must not include both entryTypes and type arguments."
+    );
+    assert_eq!(value["typedResults"]["badType"], "");
+    assert_eq!(
+        value["typedResults"]["thenEntryTypes"],
+        "InvalidModificationError:Failed to execute 'observe' on 'PerformanceObserver': This PerformanceObserver has performed observe({type:...}, therefore it cannot perform observe({entryTypes:...})"
+    );
+    assert_eq!(value["listedResults"]["entryTypes"], "");
+    assert_eq!(
+        value["listedResults"]["thenType"],
+        "InvalidModificationError:Failed to execute 'observe' on 'PerformanceObserver': This PerformanceObserver has performed observe({entryTypes:...}, therefore it cannot perform observe({type:...})"
+    );
+}
+
+#[test]
+fn worker_performance_observer_receives_fetch_resource_entry() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind resource server");
+    let addr = listener.local_addr().expect("resource addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept resource request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("resource read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = stream.read(&mut buf).expect("read resource request");
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let body = "worker-resource";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write resource response");
+        let _ = stream.flush();
+    });
+
+    let url = format!("http://{addr}/resource.txt");
+    let code = format!(
+        r#"
+        const src = `
+            (async () => {{
+                try {{
+                    const seen = [];
+                    const observer = new PerformanceObserver((list) => {{
+                        for (const entry of list.getEntries()) {{
+                            seen.push({{
+                                name: entry.name,
+                                type: entry.entryType,
+                                initiatorType: entry.initiatorType,
+                                tag: Object.prototype.toString.call(entry),
+                            }});
+                        }}
+                    }});
+                    observer.observe({{ type: 'resource' }});
+                    const text = await fetch('__URL__').then(response => response.text());
+                    await Promise.resolve();
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                    const timeline = performance.getEntriesByType('resource').map(entry => ({{
+                        name: entry.name,
+                        type: entry.entryType,
+                        initiatorType: entry.initiatorType,
+                        tag: Object.prototype.toString.call(entry),
+                    }}));
+                    self.postMessage(JSON.stringify({{ text, seen, timeline }}));
+                }} catch (error) {{
+                    self.postMessage(JSON.stringify({{ error: String(error && error.stack || error) }}));
+                }}
+            }})();
+        `.replace('__URL__', {url:?});
+        const worker = new Worker(URL.createObjectURL(new Blob([src], {{ type: 'text/javascript' }})));
+        worker.onmessage = event => {{
+            document.querySelector('#out').textContent = event.data;
+            worker.terminate();
+        }};
+        "#,
+    );
+
+    let out = drive_runtime(&code, 2500);
+    server.join().expect("resource server");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("worker resource JSON");
+    assert!(
+        value.get("error").is_none(),
+        "worker resource observer failed: {value}"
+    );
+    assert_eq!(value["text"], "worker-resource");
+    assert_eq!(value["seen"].as_array().map(Vec::len), Some(1), "{value}");
+    assert_eq!(
+        value["timeline"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    for key in ["seen", "timeline"] {
+        assert_eq!(value[key][0]["name"], url, "{value}");
+        assert_eq!(value[key][0]["type"], "resource", "{value}");
+        assert_eq!(value[key][0]["initiatorType"], "fetch", "{value}");
+        assert_eq!(
+            value[key][0]["tag"], "[object PerformanceResourceTiming]",
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn chrome_148_dedicated_worker_concrete_scope_order_and_name_descriptor() {
     let code = r#"
         const src = `
