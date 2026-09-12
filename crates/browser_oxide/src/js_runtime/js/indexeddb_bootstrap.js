@@ -348,7 +348,29 @@
         if (Array.isArray(value)) return 4;
         return 99;
     }
+    function _isValidKey(value, seen = new Set()) {
+        if (typeof value === 'number') return !Number.isNaN(value);
+        if (value instanceof Date) return !Number.isNaN(value.getTime());
+        if (typeof value === 'string') return true;
+        if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
+        if (Array.isArray(value)) {
+            if (seen.has(value)) return false;
+            seen.add(value);
+            for (let i = 0; i < value.length; i++) {
+                if (!(i in value) || !_isValidKey(value[i], seen)) {
+                    seen.delete(value);
+                    return false;
+                }
+            }
+            seen.delete(value);
+            return true;
+        }
+        return false;
+    }
     function _keyCmp(a, b) {
+        if (!_isValidKey(a) || !_isValidKey(b)) {
+            throw _domError('DataError', 'The parameter is not a valid key.');
+        }
         const ra = _rankKey(a), rb = _rankKey(b);
         if (ra !== rb) return ra < rb ? -1 : 1;
         if (ra === 0) return a === b ? 0 : (a < b ? -1 : 1);
@@ -678,6 +700,42 @@
         const record = _stateFor(_storeState, value).record;
         return _makeNameList(() => [...record.indexes.keys()].sort());
     });
+    function _indexKeys(record, value) {
+        const key = _extractKey(value, record.keyPath);
+        if (key === undefined) return [];
+        const candidates = record.multiEntry && Array.isArray(key) ? key : [key];
+        const out = [];
+        for (const candidate of candidates) {
+            if (!_isValidKey(candidate)) {
+                // Invalid index keys do not make the object-store write fail;
+                // the record simply contributes no entry for that index key.
+                continue;
+            }
+            if (!out.some(existing => _keyCmp(existing, candidate) === 0)) {
+                out.push(candidate);
+            }
+        }
+        return out;
+    }
+    function _violatesUniqueIndex(storeRecord, primaryKey, value) {
+        for (const index of storeRecord.indexes.values()) {
+            if (!index.unique) continue;
+            const nextKeys = _indexKeys(index, value);
+            if (nextKeys.length === 0) continue;
+            for (const [storedPrimaryKey, storedValue] of storeRecord.data.entries()) {
+                // `put()` may replace an existing record in place. Its old index
+                // entries must not conflict with the replacement value itself.
+                if (_keyCmp(storedPrimaryKey, primaryKey) === 0) continue;
+                const storedKeys = _indexKeys(index, storedValue);
+                for (const nextKey of nextKeys) {
+                    for (const storedKey of storedKeys) {
+                        if (_keyCmp(nextKey, storedKey) === 0) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
     function _storeWrite(store, value, explicitKey, overwrite) {
         const state = _stateFor(_storeState, store);
         const tx = state.transaction;
@@ -690,6 +748,9 @@
         const existing = _findEntry(state.record, key);
         if (!overwrite && existing) {
             return _queueRequestError(_makeRequest(store, tx), _domError('ConstraintError', 'The key already exists.'));
+        }
+        if (_violatesUniqueIndex(state.record, key, cloned)) {
+            return _queueRequestError(_makeRequest(store, tx), _domError('ConstraintError', 'A mutation operation in the transaction failed because a constraint was not satisfied.'));
         }
         if (existing) state.record.data.delete(existing[0]);
         state.record.data.set(_clone(key), cloned);
