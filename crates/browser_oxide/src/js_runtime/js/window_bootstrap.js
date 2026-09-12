@@ -1365,11 +1365,14 @@
     StorageManager.prototype.persisted = ({ persisted() { return Promise.resolve(false); } }).persisted;
     _maskFunction(StorageManager.prototype.persisted, 'persisted');
 
-    // Minimal origin-private file system. Chrome exposes getDirectory() on
-    // Window's StorageManager even though synchronous access handles remain
-    // worker-only. Keep real FileSystemHandle-shaped objects here so feature
-    // probes do not branch away from the Chrome path before starting a worker.
+    // Origin-private file system. The backing directory tree lives in a
+    // process-wide, origin-scoped Rust registry so Window and Worker realms see
+    // the same entries and bytes. Realm-local JS objects are only WebIDL handle
+    // wrappers around stable host entry ids.
     const _opfsWindowState = new WeakMap();
+    const _opfsWindowOrigin = () => String(
+        (globalThis.location && globalThis.location.origin) || 'null'
+    );
     const _opfsWindowDefine = (prototype, name, value) => {
         Object.defineProperty(prototype, name, {
             value, configurable: true, enumerable: true, writable: true,
@@ -1387,71 +1390,127 @@
     const _FileSystemFileHandle = globalThis.FileSystemFileHandle;
     Object.setPrototypeOf(_FileSystemDirectoryHandle.prototype, _FileSystemHandle.prototype);
     Object.setPrototypeOf(_FileSystemFileHandle.prototype, _FileSystemHandle.prototype);
-    const _opfsWindowDirectory = (name = '') => {
-        const handle = Object.create(_FileSystemDirectoryHandle.prototype);
-        _opfsWindowState.set(handle, { kind: 'directory', name, entries: new Map() });
+
+    const _opfsWindowWrap = (snapshot, origin) => {
+        if (!snapshot || snapshot.status !== 1) return null;
+        const prototype = snapshot.kind === 'directory'
+            ? _FileSystemDirectoryHandle.prototype
+            : _FileSystemFileHandle.prototype;
+        const handle = Object.create(prototype);
+        _opfsWindowState.set(handle, {
+            origin,
+            id: snapshot.id,
+            parentId: snapshot.parentId,
+            kind: snapshot.kind,
+            name: snapshot.name,
+        });
         return handle;
     };
-    const _opfsWindowFile = (name) => {
-        const handle = Object.create(_FileSystemFileHandle.prototype);
-        _opfsWindowState.set(handle, { kind: 'file', name, bytes: new Uint8Array(0) });
-        return handle;
+    const _opfsWindowStat = (handle) => {
+        const state = _opfsWindowState.get(handle);
+        if (!state) return null;
+        const snapshot = ops.op_opfs_stat(state.origin, state.id);
+        if (snapshot && snapshot.status === 1) {
+            state.parentId = snapshot.parentId;
+            state.kind = snapshot.kind;
+            state.name = snapshot.name;
+            return { state, snapshot };
+        }
+        return { state, snapshot: null };
     };
+    const _opfsWindowResult = (snapshot, origin) => {
+        if (snapshot && snapshot.status === 1) return Promise.resolve(_opfsWindowWrap(snapshot, origin));
+        if (snapshot && snapshot.status === -1) {
+            return Promise.reject(new DOMException(
+                'The path exists but is not an entry of the requested type.',
+                'TypeMismatchError',
+            ));
+        }
+        return Promise.reject(new DOMException(
+            'A requested file or directory could not be found',
+            'NotFoundError',
+        ));
+    };
+
     _opfsWindowGetter(_FileSystemHandle.prototype, 'kind', function kind() {
-        return _opfsWindowState.get(this)?.kind || '';
+        const current = _opfsWindowStat(this);
+        return current?.snapshot?.kind || current?.state?.kind || '';
     });
     _opfsWindowGetter(_FileSystemHandle.prototype, 'name', function name() {
-        return _opfsWindowState.get(this)?.name || '';
+        const current = _opfsWindowStat(this);
+        return current?.snapshot?.name || current?.state?.name || '';
     });
     _opfsWindowDefine(_FileSystemHandle.prototype, 'isSameEntry', function isSameEntry(other) {
-        return Promise.resolve(this === other);
+        const a = _opfsWindowState.get(this);
+        const b = _opfsWindowState.get(other);
+        return Promise.resolve(!!a && !!b && a.origin === b.origin && a.id === b.id);
     });
     _opfsWindowDefine(_FileSystemHandle.prototype, 'queryPermission', function queryPermission() {
         return Promise.resolve('granted');
     });
-    _opfsWindowDefine(_FileSystemHandle.prototype, 'remove', function remove() { return Promise.resolve(); });
+    _opfsWindowDefine(_FileSystemHandle.prototype, 'remove', function remove(options = {}) {
+        const current = _opfsWindowStat(this);
+        if (!current?.snapshot || current.snapshot.parentId === 0) return Promise.resolve();
+        const status = ops.op_opfs_remove_child(
+            current.state.origin,
+            current.snapshot.parentId,
+            current.snapshot.name,
+            !!options.recursive,
+        );
+        if (status === -1) {
+            return Promise.reject(new DOMException('The directory is not empty.', 'InvalidModificationError'));
+        }
+        return Promise.resolve();
+    });
     _opfsWindowDefine(_FileSystemHandle.prototype, 'requestPermission', function requestPermission() {
         return Promise.resolve('granted');
     });
     _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'getDirectoryHandle', function getDirectoryHandle(name, options = {}) {
         const state = _opfsWindowState.get(this);
-        const key = String(name);
-        let handle = state?.entries.get(key);
-        if (!handle && options.create) {
-            handle = _opfsWindowDirectory(key);
-            state.entries.set(key, handle);
-        }
-        return handle
-            ? Promise.resolve(handle)
-            : Promise.reject(new DOMException('A requested file or directory could not be found', 'NotFoundError'));
+        if (!state) return Promise.reject(new TypeError('Illegal invocation'));
+        return _opfsWindowResult(
+            ops.op_opfs_get_child(state.origin, state.id, String(name), 'directory', !!options.create),
+            state.origin,
+        );
     });
     _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'getFileHandle', function getFileHandle(name, options = {}) {
         const state = _opfsWindowState.get(this);
-        const key = String(name);
-        let handle = state?.entries.get(key);
-        if (!handle && options.create) {
-            handle = _opfsWindowFile(key);
-            state.entries.set(key, handle);
-        }
-        return handle
-            ? Promise.resolve(handle)
-            : Promise.reject(new DOMException('A requested file or directory could not be found', 'NotFoundError'));
+        if (!state) return Promise.reject(new TypeError('Illegal invocation'));
+        return _opfsWindowResult(
+            ops.op_opfs_get_child(state.origin, state.id, String(name), 'file', !!options.create),
+            state.origin,
+        );
     });
-    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'removeEntry', function removeEntry(name) {
-        _opfsWindowState.get(this)?.entries.delete(String(name));
+    _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'removeEntry', function removeEntry(name, options = {}) {
+        const state = _opfsWindowState.get(this);
+        if (!state) return Promise.reject(new TypeError('Illegal invocation'));
+        const status = ops.op_opfs_remove_child(state.origin, state.id, String(name), !!options.recursive);
+        if (status === 0) {
+            return Promise.reject(new DOMException(
+                'A requested file or directory could not be found',
+                'NotFoundError',
+            ));
+        }
+        if (status === -1) {
+            return Promise.reject(new DOMException('The directory is not empty.', 'InvalidModificationError'));
+        }
         return Promise.resolve();
     });
     _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'resolve', function resolve(handle) {
-        for (const [name, candidate] of _opfsWindowState.get(this)?.entries || []) {
-            if (candidate === handle) return Promise.resolve([name]);
-        }
-        return Promise.resolve(null);
+        const state = _opfsWindowState.get(this);
+        const target = _opfsWindowState.get(handle);
+        if (!state || !target || state.origin !== target.origin) return Promise.resolve(null);
+        return Promise.resolve(ops.op_opfs_resolve(state.origin, state.id, target.id));
     });
     const _opfsWindowIterator = (kind) => async function* iterator() {
-        const entries = _opfsWindowState.get(this)?.entries || new Map();
-        if (kind === 'keys') yield* entries.keys();
-        else if (kind === 'values') yield* entries.values();
-        else yield* entries.entries();
+        const state = _opfsWindowState.get(this);
+        if (!state) return;
+        for (const snapshot of ops.op_opfs_list(state.origin, state.id)) {
+            const handle = _opfsWindowWrap(snapshot, state.origin);
+            if (kind === 'keys') yield snapshot.name;
+            else if (kind === 'values') yield handle;
+            else yield [snapshot.name, handle];
+        }
     };
     _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'entries', _opfsWindowIterator('entries'));
     _opfsWindowDefine(_FileSystemDirectoryHandle.prototype, 'keys', _opfsWindowIterator('keys'));
@@ -1462,20 +1521,28 @@
         writable: true,
     });
     _opfsWindowDefine(_FileSystemFileHandle.prototype, 'getFile', function getFile() {
-        const state = _opfsWindowState.get(this);
-        return Promise.resolve(new File([state?.bytes || new Uint8Array(0)], state?.name || ''));
+        const current = _opfsWindowStat(this);
+        if (!current?.snapshot) {
+            return Promise.reject(new DOMException('The file no longer exists.', 'NotFoundError'));
+        }
+        const bytes = ops.op_opfs_read(current.state.origin, current.state.id);
+        return Promise.resolve(new File([bytes], current.snapshot.name));
     });
     _opfsWindowDefine(_FileSystemFileHandle.prototype, 'createWritable', function createWritable() {
         return Promise.resolve(Object.create(FileSystemWritableFileStream.prototype));
     });
     _opfsWindowDefine(_FileSystemFileHandle.prototype, 'move', function move(name) {
         const state = _opfsWindowState.get(this);
-        if (state) state.name = String(name);
+        if (!state || !ops.op_opfs_move(state.origin, state.id, String(name))) {
+            return Promise.reject(new DOMException('The entry could not be moved.', 'InvalidModificationError'));
+        }
         return Promise.resolve();
     });
-    const _opfsWindowRoot = _opfsWindowDirectory('');
     StorageManager.prototype.getDirectory = ({
-        getDirectory() { return Promise.resolve(_opfsWindowRoot); }
+        getDirectory() {
+            const origin = _opfsWindowOrigin();
+            return Promise.resolve(_opfsWindowWrap(ops.op_opfs_root(origin), origin));
+        }
     }).getDirectory;
     _maskFunction(StorageManager.prototype.getDirectory, 'getDirectory');
 

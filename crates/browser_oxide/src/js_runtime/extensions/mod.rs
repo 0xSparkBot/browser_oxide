@@ -10,6 +10,7 @@ pub mod frame_ext;
 pub mod input_ext;
 pub mod layout_ext;
 pub mod nav_ext;
+pub mod opfs_ext;
 pub mod perf_ext;
 pub mod sse_ext;
 pub mod stealth_ext;

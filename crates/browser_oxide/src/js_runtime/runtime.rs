@@ -11,6 +11,7 @@ use crate::js_runtime::extensions::frame_ext::{frame_extension, IframeSignal};
 use crate::js_runtime::extensions::input_ext::input_extension;
 use crate::js_runtime::extensions::layout_ext::layout_extension;
 use crate::js_runtime::extensions::nav_ext::{nav_extension, NavSignal};
+use crate::js_runtime::extensions::opfs_ext::opfs_extension;
 use crate::js_runtime::extensions::perf_ext::{perf_extension, PerfState};
 use crate::js_runtime::extensions::sse_ext::{sse_extension, SseState};
 use crate::js_runtime::extensions::stealth_ext::{stealth_extension, StealthState};
@@ -292,6 +293,7 @@ pub fn create_runtime_with_signals(
             audio_extension::init(),
             perf_extension::init(),
             nav_extension::init(),
+            opfs_extension::init(),
             frame_extension::init(),
             readiness_extension::init(),
         ],
@@ -708,6 +710,7 @@ pub fn create_worker_runtime(
             canvas_extension::init(),
             stealth_extension::init(),
             perf_extension::init(),
+            opfs_extension::init(),
         ],
         // Dedicated workers support the same ArrayBuffer transfer semantics
         // as the owning window. deno_core's V8 serializer only detaches and
