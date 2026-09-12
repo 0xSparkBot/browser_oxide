@@ -904,7 +904,10 @@ mod tests {
     #[test]
     fn bench_page_creation_overhead() {
         // Measure pure V8 isolate + DOM creation time (no network)
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let html = "<html><head><title>Test</title></head><body><p>Hello</p></body></html>";
 
         // Warm up

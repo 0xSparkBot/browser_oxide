@@ -312,6 +312,14 @@ fn main() {
 Runnable: `cargo run --release -p browser_oxide --example getting_started -- https://example.com`.
 Full walkthrough: [docs/getting-started-rust.md](docs/getting-started-rust.md).
 
+If your application already uses Tokio's default **multi-thread** runtime, do not
+construct or drive a V8 `Page` directly on that executor: deno_core's local async
+ops require a current-thread scheduler on the same OS thread as the isolate. Run
+the complete browser future with `browser_oxide::js_runtime::block_on_v8_thread`,
+or dedicate your own current-thread Tokio runtime to BrowserOxide. Direct
+multi-thread construction fails fast with this guidance instead of reaching a
+process-aborting deno_unsync assertion.
+
 ### Configurable browser identity
 
 The browser identity (UA string, Chrome version, screen, locale, TLS

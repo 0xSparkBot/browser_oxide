@@ -5,8 +5,8 @@
 //! `deno_unsync::spawn`, which requires an ambient **current-thread** runtime
 //! context (debug-asserted) and aborts the process when the context is
 //! missing — the op fn ptr is reached through C++ frames Rust cannot unwind
-//! through. Page runs inside a caller-provided runtime, but the synchronous
-//! `BrowserJsRuntime` API is also reachable from plain threads, and page
+//! through. Page runs inside a caller-provided **current-thread** runtime, but
+//! the synchronous `BrowserJsRuntime` API is also reachable from plain threads, and page
 //! scripts schedule timers (bootstrap code calls `setTimeout`) during plain
 //! `execute_script` calls.
 //!
@@ -39,31 +39,49 @@ fn fallback_handle() -> &'static tokio::runtime::Handle {
     })
 }
 
-/// Enter the caller's tokio context when there is one, otherwise the shared
-/// fallback. Hold the returned guard for the duration of any JS execution or
-/// event-loop poll that can reach an async op.
+const MULTI_THREAD_RUNTIME_ERROR: &str = "BrowserOxide V8 runtimes require a current-thread Tokio runtime; direct use from a multi-thread Tokio runtime is unsupported because deno_core async ops are !Send. Use browser_oxide::js_runtime::block_on_v8_thread(...) or tokio::runtime::Builder::new_current_thread().";
+
+#[cold]
+#[track_caller]
+fn reject_multithread_runtime() -> ! {
+    panic!("{MULTI_THREAD_RUNTIME_ERROR}");
+}
+
+/// Enter the caller's current-thread Tokio context when there is one, otherwise
+/// enter the shared fallback for plain synchronous embedding threads.
+///
+/// A Tokio multi-thread runtime is deliberately rejected. `deno_unsync` masks
+/// local (`!Send`) op futures as `Send` under the invariant that the scheduler
+/// is current-thread and co-located with the V8 isolate. Merely entering a
+/// different current-thread runtime's handle while V8 remains on this thread
+/// violates that invariant and can produce non-unwinding RefCell aborts.
+/// Multi-thread applications should put the complete BrowserOxide future inside
+/// [`crate::js_runtime::block_on_v8_thread`].
 pub(crate) fn ensure_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread => {
-            None
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                None
+            } else {
+                reject_multithread_runtime()
+            }
         }
-        // deno_unsync async ops are !Send and may only be spawned on a
-        // current-thread Tokio executor. A caller-provided multi-thread runtime
-        // is therefore just as unsuitable as having no Tokio context at all:
-        // enter the process-lifetime current-thread fallback for the duration
-        // of the V8/deno_core call instead of letting deno_unsync abort.
-        _ => Some(fallback_handle().enter()),
+        Err(_) => Some(fallback_handle().enter()),
     }
 }
 
-/// Reactor for spots that bind onto tokio without entering (e.g. creating a
-/// `tokio::time::Sleep` inside an op): reuse the caller only when it is a
-/// current-thread runtime; otherwise use the shared current-thread fallback.
+/// Reactor for spots that bind onto Tokio without entering (for example,
+/// creating a `tokio::time::Sleep` inside an op). The same current-thread
+/// contract as [`ensure_tokio_context`] applies.
 pub(crate) fn reactor_handle() -> tokio::runtime::Handle {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread => {
-            handle
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                handle
+            } else {
+                reject_multithread_runtime()
+            }
         }
-        _ => fallback_handle().clone(),
+        Err(_) => fallback_handle().clone(),
     }
 }
