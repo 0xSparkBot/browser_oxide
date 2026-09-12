@@ -5,13 +5,62 @@
 //! the way a real browser would process a real web page.
 
 use browser_oxide::Page;
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::time::{Duration, Instant};
 
 fn html(body: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head></head><body>{}</body></html>",
         body
     )
+}
+
+fn spawn_linked_stylesheet_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut served = 0usize;
+        while served < 8 && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (content_type, body) = if path.starts_with("/style.css") {
+                        (
+                            "text/css",
+                            "body { font-family: Verdana, Geneva, sans-serif; font-size: 10pt; color: #828282; }",
+                        )
+                    } else {
+                        (
+                            "text/html",
+                            "<!doctype html><html><head><title>Linked CSS Fixture</title><link rel='stylesheet' href='/style.css'></head><body><main>fixture</main></body></html>",
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes());
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                    served += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    format!("http://{addr}/")
 }
 
 // ================================================================
@@ -1357,25 +1406,20 @@ async fn e2e_websocket_tls_connects() {
 }
 
 // ================================================================
-// NEW: Linked stylesheet via build_page_with_scripts (network)
+// NEW: Linked stylesheet via build_page_with_scripts
 // ================================================================
 
 #[tokio::test]
-#[ignore] // requires network
 async fn e2e_linked_stylesheet_fetched() {
-    // Navigate to a real page that uses <link rel="stylesheet">
-    // and verify getComputedStyle picks up external CSS
+    // Navigate through the real HTTP pipeline and verify an external
+    // stylesheet is fetched, parsed, and participates in the cascade.
+    let url = spawn_linked_stylesheet_server();
     let profile = browser_oxide::stealth::chrome_148_linux();
-    let mut page = Page::navigate("https://news.ycombinator.com", profile, 0)
+    let mut page = Page::navigate(&url, profile, 0)
         .await
-        .expect("Hacker News navigation must succeed for linked stylesheet smoke");
-    // HN uses <link rel="stylesheet" href="news.css">
-    // The CSS sets body font, size, and color.  Assert those concrete
-    // values instead of merely printing backgroundColor (HN's body
-    // background is transparent, so that old smoke could pass even if
-    // the linked stylesheet was never applied).
+        .expect("local linked stylesheet fixture navigation must succeed");
     let title = page.title();
-    assert_eq!(title, "Hacker News");
+    assert_eq!(title, "Linked CSS Fixture");
     let font_family = page
         .evaluate("getComputedStyle(document.body).fontFamily")
         .unwrap();
