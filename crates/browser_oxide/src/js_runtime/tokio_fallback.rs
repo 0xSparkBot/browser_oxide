@@ -43,15 +43,27 @@ fn fallback_handle() -> &'static tokio::runtime::Handle {
 /// fallback. Hold the returned guard for the duration of any JS execution or
 /// event-loop poll that can reach an async op.
 pub(crate) fn ensure_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return None;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread => {
+            None
+        }
+        // deno_unsync async ops are !Send and may only be spawned on a
+        // current-thread Tokio executor. A caller-provided multi-thread runtime
+        // is therefore just as unsuitable as having no Tokio context at all:
+        // enter the process-lifetime current-thread fallback for the duration
+        // of the V8/deno_core call instead of letting deno_unsync abort.
+        _ => Some(fallback_handle().enter()),
     }
-    Some(fallback_handle().enter())
 }
 
 /// Reactor for spots that bind onto tokio without entering (e.g. creating a
-/// `tokio::time::Sleep` inside an op): the caller's runtime when present,
-/// otherwise the shared fallback.
+/// `tokio::time::Sleep` inside an op): reuse the caller only when it is a
+/// current-thread runtime; otherwise use the shared current-thread fallback.
 pub(crate) fn reactor_handle() -> tokio::runtime::Handle {
-    tokio::runtime::Handle::try_current().unwrap_or_else(|_| fallback_handle().clone())
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread => {
+            handle
+        }
+        _ => fallback_handle().clone(),
+    }
 }
