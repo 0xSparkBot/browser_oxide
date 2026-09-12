@@ -651,6 +651,453 @@ fn broadcast_channel_registry() -> &'static Mutex<HashMap<u32, BroadcastChannelE
 
 static NEXT_BROADCAST_CHANNEL_ID: AtomicU32 = AtomicU32::new(1);
 
+// ============================================================================
+// Web Locks registry — process-global, origin-scoped lock coordination.
+//
+// The Web Locks API coordinates same-origin windows and workers, so a realm-local
+// JS queue is observably wrong: a worker and its owner would both believe they
+// held the same exclusive lock. Keep the scheduler in Rust beside the existing
+// cross-runtime BroadcastChannel registry and let each realm run only its own
+// granted callback.
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebLockMode {
+    Exclusive,
+    Shared,
+}
+
+impl WebLockMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WebLockHeld {
+    lock_id: u32,
+    client_id: String,
+    mode: WebLockMode,
+}
+
+struct WebLockBreakState {
+    broken: bool,
+    released: bool,
+    notify: Arc<Notify>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebLockRequestState {
+    Pending,
+    Granted(u32),
+    Unavailable,
+    Canceled,
+}
+
+struct WebLockRequest {
+    origin: String,
+    name: String,
+    client_id: String,
+    mode: WebLockMode,
+    state: WebLockRequestState,
+    notify: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct WebLockQueue {
+    held: Vec<WebLockHeld>,
+    pending: VecDeque<u32>,
+}
+
+#[derive(Default)]
+struct WebLockRegistry {
+    queues: HashMap<(String, String), WebLockQueue>,
+    requests: HashMap<u32, WebLockRequest>,
+    lock_index: HashMap<u32, (String, String)>,
+    break_states: HashMap<u32, WebLockBreakState>,
+}
+
+fn web_lock_registry() -> &'static Mutex<WebLockRegistry> {
+    static INST: OnceLock<Mutex<WebLockRegistry>> = OnceLock::new();
+    INST.get_or_init(|| Mutex::new(WebLockRegistry::default()))
+}
+
+static NEXT_WEB_LOCK_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_WEB_LOCK_ID: AtomicU32 = AtomicU32::new(1);
+
+fn web_lock_grant(registry: &mut WebLockRegistry, key: &(String, String), request_id: u32) {
+    let Some(request) = registry.requests.get(&request_id) else {
+        return;
+    };
+    if request.state != WebLockRequestState::Pending {
+        return;
+    }
+    let client_id = request.client_id.clone();
+    let mode = request.mode;
+    let notify = request.notify.clone();
+    let lock_id = NEXT_WEB_LOCK_ID.fetch_add(1, Ordering::Relaxed);
+
+    if let Some(request) = registry.requests.get_mut(&request_id) {
+        request.state = WebLockRequestState::Granted(lock_id);
+    }
+    registry
+        .queues
+        .entry(key.clone())
+        .or_default()
+        .held
+        .push(WebLockHeld {
+            lock_id,
+            client_id,
+            mode,
+        });
+    registry.lock_index.insert(lock_id, key.clone());
+    registry.break_states.insert(
+        lock_id,
+        WebLockBreakState {
+            broken: false,
+            released: false,
+            notify: Arc::new(Notify::new()),
+        },
+    );
+    notify.notify_waiters();
+}
+
+fn web_lock_process_queue(registry: &mut WebLockRegistry, key: &(String, String)) {
+    loop {
+        // Drop stale/canceled request ids from the front before making the
+        // fairness decision. Requests are otherwise FIFO per (origin, name).
+        loop {
+            let front = registry
+                .queues
+                .get(key)
+                .and_then(|queue| queue.pending.front().copied());
+            let Some(front) = front else {
+                return;
+            };
+            let is_pending = registry
+                .requests
+                .get(&front)
+                .map(|request| request.state == WebLockRequestState::Pending)
+                .unwrap_or(false);
+            if is_pending {
+                break;
+            }
+            if let Some(queue) = registry.queues.get_mut(key) {
+                queue.pending.pop_front();
+            }
+        }
+
+        let (has_held, has_exclusive) = registry
+            .queues
+            .get(key)
+            .map(|queue| {
+                (
+                    !queue.held.is_empty(),
+                    queue
+                        .held
+                        .iter()
+                        .any(|held| held.mode == WebLockMode::Exclusive),
+                )
+            })
+            .unwrap_or((false, false));
+        if has_exclusive {
+            return;
+        }
+
+        let request_id = registry
+            .queues
+            .get(key)
+            .and_then(|queue| queue.pending.front().copied())
+            .unwrap();
+        let mode = registry
+            .requests
+            .get(&request_id)
+            .map(|request| request.mode)
+            .unwrap_or(WebLockMode::Exclusive);
+
+        // Shared locks may join existing shared holders only while they remain
+        // at the head of the queue. Once an exclusive request reaches the head,
+        // later shared requests cannot bypass it.
+        if has_held && mode == WebLockMode::Exclusive {
+            return;
+        }
+
+        if let Some(queue) = registry.queues.get_mut(key) {
+            queue.pending.pop_front();
+        }
+        web_lock_grant(registry, key, request_id);
+        if mode == WebLockMode::Exclusive {
+            return;
+        }
+    }
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_web_lock_enqueue(
+    #[string] origin: String,
+    #[string] name: String,
+    #[string] client_id: String,
+    shared: bool,
+    if_available: bool,
+    steal: bool,
+) -> i32 {
+    let request_id = NEXT_WEB_LOCK_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let mode = if shared {
+        WebLockMode::Shared
+    } else {
+        WebLockMode::Exclusive
+    };
+    let key = (origin.clone(), name.clone());
+    let notify = Arc::new(Notify::new());
+    let mut registry = web_lock_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    registry.requests.insert(
+        request_id,
+        WebLockRequest {
+            origin,
+            name,
+            client_id,
+            mode,
+            state: WebLockRequestState::Pending,
+            notify: notify.clone(),
+        },
+    );
+
+    let immediately_available = registry
+        .queues
+        .get(&key)
+        .map(|queue| {
+            queue.pending.is_empty()
+                && !queue
+                    .held
+                    .iter()
+                    .any(|held| held.mode == WebLockMode::Exclusive)
+                && (queue.held.is_empty() || mode == WebLockMode::Shared)
+        })
+        .unwrap_or(true);
+
+    if if_available && !immediately_available {
+        if let Some(request) = registry.requests.get_mut(&request_id) {
+            request.state = WebLockRequestState::Unavailable;
+        }
+        notify.notify_waiters();
+        return request_id as i32;
+    }
+
+    if steal {
+        // A stealing exclusive request is placed ahead of queued requests and
+        // immediately releases the resource from current holders. Existing
+        // callbacks continue running, but their later release becomes a no-op.
+        let stolen_ids = registry
+            .queues
+            .entry(key.clone())
+            .or_default()
+            .held
+            .drain(..)
+            .map(|held| held.lock_id)
+            .collect::<Vec<_>>();
+        for lock_id in stolen_ids {
+            registry.lock_index.remove(&lock_id);
+            if let Some(state) = registry.break_states.get_mut(&lock_id) {
+                state.broken = true;
+                state.notify.notify_waiters();
+            }
+        }
+        registry
+            .queues
+            .entry(key.clone())
+            .or_default()
+            .pending
+            .push_front(request_id);
+    } else {
+        registry
+            .queues
+            .entry(key.clone())
+            .or_default()
+            .pending
+            .push_back(request_id);
+    }
+    web_lock_process_queue(&mut registry, &key);
+    request_id as i32
+}
+
+#[op2(async(lazy), fast)]
+#[string]
+pub async fn op_web_lock_wait(#[smi] request_id: i32) -> String {
+    let request_id = request_id as u32;
+    loop {
+        let (state, notified) = {
+            let registry = web_lock_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(request) = registry.requests.get(&request_id) else {
+                return "c".to_string();
+            };
+            // Construct the notification future while the registry mutex still
+            // protects the state check. `notified_owned()` snapshots the
+            // notify_waiters generation here, so a grant that happens after we
+            // drop the mutex but before the future is first polled cannot be
+            // lost.
+            (request.state, request.notify.clone().notified_owned())
+        };
+
+        match state {
+            WebLockRequestState::Pending => notified.await,
+            WebLockRequestState::Granted(lock_id) => {
+                web_lock_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .requests
+                    .remove(&request_id);
+                return format!("g:{lock_id}");
+            }
+            WebLockRequestState::Unavailable => {
+                web_lock_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .requests
+                    .remove(&request_id);
+                return "u".to_string();
+            }
+            WebLockRequestState::Canceled => {
+                web_lock_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .requests
+                    .remove(&request_id);
+                return "c".to_string();
+            }
+        }
+    }
+}
+
+#[op2(fast)]
+pub fn op_web_lock_cancel(#[smi] request_id: i32) -> bool {
+    let request_id = request_id as u32;
+    let mut registry = web_lock_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(request) = registry.requests.get(&request_id) else {
+        return false;
+    };
+    if request.state != WebLockRequestState::Pending {
+        return false;
+    }
+    let key = (request.origin.clone(), request.name.clone());
+    let notify = request.notify.clone();
+    if let Some(request) = registry.requests.get_mut(&request_id) {
+        request.state = WebLockRequestState::Canceled;
+    }
+    if let Some(queue) = registry.queues.get_mut(&key) {
+        queue.pending.retain(|id| *id != request_id);
+    }
+    notify.notify_waiters();
+    web_lock_process_queue(&mut registry, &key);
+    true
+}
+
+#[op2(fast)]
+pub fn op_web_lock_release(#[smi] lock_id: i32) {
+    let lock_id = lock_id as u32;
+    let mut registry = web_lock_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(key) = registry.lock_index.remove(&lock_id) else {
+        return;
+    };
+    if let Some(queue) = registry.queues.get_mut(&key) {
+        queue.held.retain(|held| held.lock_id != lock_id);
+    }
+    if let Some(state) = registry.break_states.get_mut(&lock_id) {
+        state.released = true;
+        state.notify.notify_waiters();
+    }
+    web_lock_process_queue(&mut registry, &key);
+}
+
+#[op2(async(lazy), fast)]
+pub async fn op_web_lock_wait_break(#[smi] lock_id: i32) -> bool {
+    let lock_id = lock_id as u32;
+    loop {
+        let (broken, released, notified) = {
+            let registry = web_lock_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(state) = registry.break_states.get(&lock_id) else {
+                return false;
+            };
+            (
+                state.broken,
+                state.released,
+                state.notify.clone().notified_owned(),
+            )
+        };
+
+        if broken || released {
+            web_lock_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .break_states
+                .remove(&lock_id);
+            return broken;
+        }
+        notified.await;
+    }
+}
+
+#[op2]
+#[string]
+pub fn op_web_lock_query(#[string] origin: String) -> String {
+    let registry = web_lock_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut held = Vec::new();
+    let mut pending = Vec::new();
+
+    for ((queue_origin, name), queue) in &registry.queues {
+        if *queue_origin != origin {
+            continue;
+        }
+        for lock in &queue.held {
+            held.push((
+                lock.lock_id,
+                serde_json::json!({
+                    "clientId": lock.client_id,
+                    "mode": lock.mode.as_str(),
+                    "name": name,
+                }),
+            ));
+        }
+        for request_id in &queue.pending {
+            if let Some(request) = registry.requests.get(request_id) {
+                if request.state == WebLockRequestState::Pending {
+                    pending.push((
+                        *request_id,
+                        serde_json::json!({
+                            "clientId": request.client_id,
+                            "mode": request.mode.as_str(),
+                            "name": name,
+                        }),
+                    ));
+                }
+            }
+        }
+    }
+    held.sort_by_key(|(id, _)| *id);
+    pending.sort_by_key(|(id, _)| *id);
+    serde_json::json!({
+        "held": held.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
+        "pending": pending.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
 #[op2(fast)]
 #[smi]
 pub fn op_broadcast_channel_register(
@@ -1645,5 +2092,11 @@ deno_core::extension!(
         op_broadcast_channel_post,
         op_broadcast_channel_try_recv,
         op_broadcast_channel_close,
+        op_web_lock_enqueue,
+        op_web_lock_wait,
+        op_web_lock_cancel,
+        op_web_lock_release,
+        op_web_lock_wait_break,
+        op_web_lock_query,
     ],
 );
