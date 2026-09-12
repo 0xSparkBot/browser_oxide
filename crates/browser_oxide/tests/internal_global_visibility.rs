@@ -136,8 +136,20 @@ fn engine_bridge_names_are_not_globally_enumerable() {
     assert_eq!(
         value["lateWindowTypes"],
         serde_json::json!([
-            "object", "object", "object", "object", "object", "object", "object", "function",
-            "function", "function", "function", "function", "object", "object"
+            "object",
+            "object",
+            "object",
+            "object",
+            "object",
+            "object",
+            "undefined",
+            "function",
+            "function",
+            "function",
+            "function",
+            "function",
+            "object",
+            "object"
         ]),
         "{result}"
     );

@@ -106,9 +106,9 @@
         "DOMException", "DOMMatrix", "DOMPoint",
         // Performance + observers
         "PerformanceEntry", "PerformanceObserver",
-        "ReportingObserver", "PressureObserver",
+        "ReportingObserver", "PressureObserver", "PressureRecord",
         // Misc real-implementations
-        "CloseEvent", "CloseWatcher", "EventSource",
+        "CloseEvent", "CloseWatcher", "EventSource", "MediaSourceHandle",
         "OffscreenCanvas", "ImageBitmap",
         "Touch", "TouchEvent", "TouchList",
         // URL pair (real impls in shared_apis_bootstrap.js)
