@@ -322,7 +322,7 @@ async fn cookie_store_round_trips_with_document_cookie() {
     );
 
     page.evaluate(
-        r#"cookieStore.getAll({ url: '/app/child' }).then(cookies => {
+        r#"cookieStore.getAll({ url: '/app/page' }).then(cookies => {
             globalThis.__cookieStoreAll = JSON.stringify(cookies);
         })"#,
     )
@@ -408,6 +408,88 @@ async fn cookie_store_set_validates_webidl_overloads() {
     assert!(values[3].contains("'value' property"), "{values:?}");
     assert!(
         values[3].contains("Required member is undefined"),
+        "{values:?}"
+    );
+}
+
+#[tokio::test]
+async fn cookie_store_query_url_matches_creation_url() {
+    let mut page = Page::from_html_with_url(
+        "<!DOCTYPE html><html><body></body></html>",
+        "https://example.com/app/page?mode=1#initial",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    page.evaluate(
+        r#"Promise.all([
+            cookieStore.getAll({ url: '/app/page?mode=1#other' }).then(
+                () => 'same-ok',
+                e => e.name + ':' + e.message,
+            ),
+            cookieStore.getAll({ url: '/app/other?mode=1' }).then(
+                () => 'different-ok',
+                e => e.name + ':' + e.message,
+            ),
+        ]).then(values => {
+            globalThis.__cookieStoreUrlValidation = JSON.stringify(values);
+        })"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    let raw = page
+        .evaluate("globalThis.__cookieStoreUrlValidation")
+        .unwrap();
+    let values: Vec<String> = serde_json::from_str(&raw).unwrap();
+    assert_eq!(values[0], "same-ok", "{values:?}");
+    assert!(values[1].starts_with("TypeError:"), "{values:?}");
+    assert!(values[1].contains("document URL"), "{values:?}");
+}
+
+#[tokio::test]
+async fn cookie_store_delete_requires_valid_options() {
+    let mut page = Page::from_html_with_url(
+        "<!DOCTYPE html><html><body></body></html>",
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    page.evaluate(
+        r#"Promise.all([
+            cookieStore.delete(null).then(
+                () => 'ok',
+                e => e.name + ':' + e.message,
+            ),
+            cookieStore.delete({}).then(
+                () => 'ok',
+                e => e.name + ':' + e.message,
+            ),
+        ]).then(values => {
+            globalThis.__cookieStoreDeleteValidation = JSON.stringify(values);
+        })"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    let raw = page
+        .evaluate("globalThis.__cookieStoreDeleteValidation")
+        .unwrap();
+    let values: Vec<String> = serde_json::from_str(&raw).unwrap();
+    assert!(
+        values[0].contains("not of type 'CookieStoreDeleteOptions'"),
+        "{values:?}"
+    );
+    assert!(values[1].contains("'name' property"), "{values:?}");
+    assert!(
+        values[1].contains("Required member is undefined"),
         "{values:?}"
     );
 }

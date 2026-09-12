@@ -11525,9 +11525,11 @@
                 if (raw.url !== undefined) {
                     const parsed = new URL(String(raw.url), requestedUrl);
                     const current = new URL(requestedUrl);
-                    if (parsed.origin !== current.origin) {
+                    parsed.hash = '';
+                    current.hash = '';
+                    if (parsed.href !== current.href || parsed.origin !== current.origin) {
                         throw new TypeError(
-                            "Failed to execute 'getAll' on 'CookieStore': URL must match the document origin"
+                            "Failed to execute 'getAll' on 'CookieStore': URL must match the document URL"
                         );
                     }
                     requestedUrl = parsed.href;
@@ -11619,10 +11621,23 @@
                     "Failed to execute 'delete' on 'CookieStore': 1 argument required, but only 0 present."
                 );
             }
-            const options = (typeof optionsOrName === 'string')
-                ? { name: optionsOrName }
-                : Object.assign({}, optionsOrName || {});
-            if (options.name === undefined) options.name = '';
+            let options;
+            if (typeof optionsOrName === 'string') {
+                options = { name: optionsOrName };
+            } else {
+                if (optionsOrName === null ||
+                    (typeof optionsOrName !== 'object' && typeof optionsOrName !== 'function')) {
+                    throw new TypeError(
+                        "Failed to execute 'delete' on 'CookieStore': The provided value is not of type 'CookieStoreDeleteOptions'."
+                    );
+                }
+                options = Object.assign({}, optionsOrName);
+                if (options.name === undefined) {
+                    throw new TypeError(
+                        "Failed to execute 'delete' on 'CookieStore': Failed to read the 'name' property from 'CookieStoreDeleteOptions': Required member is undefined."
+                    );
+                }
+            }
             ops.op_cookie_set_sync(_cookieStoreCurrentUrl(), _cookieStoreSerialize(options, true));
             await _cookieStoreSyncDocumentMirror();
         });
