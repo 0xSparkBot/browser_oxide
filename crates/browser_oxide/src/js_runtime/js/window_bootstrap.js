@@ -5615,11 +5615,13 @@
         ? { name: state.name }
         : (state.name === 'AES-GCM' || state.name === 'AES-CBC' || state.name === 'AES-KW')
             ? { name: state.name, length: state.length }
-            : {
-                name: "HMAC",
-                hash: { name: state.hash },
-                length: state.length,
-            };
+            : state.name === 'ECDSA'
+                ? { name: 'ECDSA', namedCurve: state.namedCurve }
+                : {
+                    name: "HMAC",
+                    hash: { name: state.hash },
+                    length: state.length,
+                };
     _defProtoGetter(_CryptoKeyProto, 'type', function type() {
         return _requireCryptoKey(this).type;
     });
@@ -5662,6 +5664,20 @@
         let binary = '';
         for (const byte of bytes) binary += String.fromCharCode(byte);
         return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    };
+    const _base64urlDecode = (value, memberName) => {
+        const encoded = String(value);
+        if (encoded.includes('=') || !/^[A-Za-z0-9_-]*$/.test(encoded) || encoded.length % 4 === 1) {
+            throw _jwkDataError(`The JWK member "${memberName}" could not be base64url decoded or contained padding`);
+        }
+        const padded = encoded.replace(/-/g, '+').replace(/_/g, '/')
+            + '='.repeat((4 - (encoded.length % 4)) % 4);
+        let binary;
+        try { binary = atob(padded); }
+        catch (_) { throw _jwkDataError(`The JWK member "${memberName}" could not be base64url decoded or contained padding`); }
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return out;
     };
     const _base64urlDecodeJwkK = (jwk) => {
         if (!Object.prototype.hasOwnProperty.call(jwk, 'k')) {
@@ -6144,9 +6160,129 @@
         return state;
     };
 
+    const _ecdsaCurves = new Map([
+        ['P-256', { bytes: 32, jwkAlg: 'ES256' }],
+        ['P-384', { bytes: 48, jwkAlg: 'ES384' }],
+        ['P-521', { bytes: 66, jwkAlg: 'ES512' }],
+    ]);
+    const _normalizeEcdsaKeyAlgorithm = (algorithm, operationName) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'ECDSA') {
+            throw new DOMException('Unrecognized name.', 'NotSupportedError');
+        }
+        const namedCurve = String(algorithm && algorithm.namedCurve || '');
+        if (!_ecdsaCurves.has(namedCurve)) {
+            throw new DOMException(
+                `Failed to execute '${operationName}' on 'SubtleCrypto': EcKeyGenParams: Unrecognized namedCurve`,
+                'NotSupportedError'
+            );
+        }
+        return { name: 'ECDSA', namedCurve };
+    };
+    const _normalizeEcdsaGenerateUsages = (keyUsages) => {
+        const requested = Array.from(keyUsages || [], String);
+        if (requested.some((usage) => usage !== 'sign' && usage !== 'verify')) {
+            throw new DOMException('Cannot create a key using the specified key usages.', 'SyntaxError');
+        }
+        const privateUsages = requested.includes('sign') ? ['sign'] : [];
+        if (privateUsages.length === 0) {
+            throw new DOMException('Usages cannot be empty when creating a key.', 'SyntaxError');
+        }
+        return {
+            publicUsages: requested.includes('verify') ? ['verify'] : [],
+            privateUsages,
+        };
+    };
+    const _normalizeEcdsaImportUsages = (type, keyUsages) => {
+        const usages = Array.from(keyUsages || [], String);
+        const allowed = type === 'private' ? 'sign' : 'verify';
+        if (usages.some((usage) => usage !== allowed)) {
+            throw new DOMException('Cannot create a key using the specified key usages.', 'SyntaxError');
+        }
+        if (type === 'private' && usages.length === 0) {
+            throw new DOMException('Usages cannot be empty when creating a key.', 'SyntaxError');
+        }
+        return usages;
+    };
+    const _ecMaterialBytes = (value) => new Uint8Array(value || []);
+    const _makeEcdsaKey = (material, type, namedCurve, extractable, usages) => {
+        if (!material || !material.ok) throw new DOMException('', 'DataError');
+        const key = Object.create(_CryptoKeyProto);
+        _cryptoKeyState.set(key, {
+            name: 'ECDSA', type, namedCurve,
+            extractable: type === 'public' ? true : !!extractable,
+            usages: usages.slice(),
+            publicSpki: _ecMaterialBytes(material.public_spki),
+            privatePkcs8: _ecMaterialBytes(material.private_pkcs8),
+            rawPublic: _ecMaterialBytes(material.raw_public),
+            x: _ecMaterialBytes(material.x),
+            y: _ecMaterialBytes(material.y),
+            d: _ecMaterialBytes(material.d),
+        });
+        return key;
+    };
+    const _makeEcdsaKeyPair = (material, namedCurve, extractable, usages) => ({
+        publicKey: _makeEcdsaKey(material, 'public', namedCurve, true, usages.publicUsages),
+        privateKey: _makeEcdsaKey(material, 'private', namedCurve, extractable, usages.privateUsages),
+    });
+    const _ecdsaJwkMember = (jwk, name, expectedLength) => {
+        if (!Object.prototype.hasOwnProperty.call(jwk, name)) {
+            throw _jwkDataError(`The required JWK member "${name}" was missing`);
+        }
+        const bytes = _base64urlDecode(jwk[name], name);
+        if (bytes.byteLength !== expectedLength) throw new DOMException('', 'DataError');
+        return bytes;
+    };
+    const _importEcdsaJwk = (jwk, namedCurve, extractable, keyUsages) => {
+        if (!jwk || typeof jwk !== 'object' || ArrayBuffer.isView(jwk) || jwk instanceof ArrayBuffer) {
+            throw new TypeError("Failed to execute 'importKey' on 'SubtleCrypto': The provided value is not of type '(ArrayBuffer or ArrayBufferView or JsonWebKey)'.");
+        }
+        if (jwk.kty !== 'EC' || String(jwk.crv || '') !== namedCurve) throw new DOMException('', 'DataError');
+        const curve = _ecdsaCurves.get(namedCurve);
+        const type = Object.prototype.hasOwnProperty.call(jwk, 'd') ? 'private' : 'public';
+        const usages = _normalizeEcdsaImportUsages(type, keyUsages);
+        if (jwk.use !== undefined && String(jwk.use) !== 'sig') throw new DOMException('', 'DataError');
+        if (jwk.key_ops !== undefined) {
+            const keyOps = Array.from(jwk.key_ops, String);
+            if (usages.some((usage) => !keyOps.includes(usage))) throw new DOMException('', 'DataError');
+        }
+        if (jwk.ext === false && extractable) throw new DOMException('', 'DataError');
+        if (jwk.alg !== undefined && String(jwk.alg) !== curve.jwkAlg) throw new DOMException('', 'DataError');
+        const x = _ecdsaJwkMember(jwk, 'x', curve.bytes);
+        const y = _ecdsaJwkMember(jwk, 'y', curve.bytes);
+        const d = type === 'private' ? _ecdsaJwkMember(jwk, 'd', curve.bytes) : new Uint8Array(0);
+        const material = ops.op_crypto_ec_import_jwk(namedCurve, x, y, d);
+        return _makeEcdsaKey(material, type, namedCurve, extractable, usages);
+    };
+    const _exportEcdsaJwk = (state) => {
+        const base = state.type === 'private'
+            ? { crv: state.namedCurve, d: _base64urlEncode(state.d), ext: state.extractable, key_ops: state.usages.slice(), kty: 'EC', x: _base64urlEncode(state.x), y: _base64urlEncode(state.y) }
+            : { crv: state.namedCurve, ext: state.extractable, key_ops: state.usages.slice(), kty: 'EC', x: _base64urlEncode(state.x), y: _base64urlEncode(state.y) };
+        return base;
+    };
+    const _normalizeEcdsaSignAlgorithm = (algorithm, operationName) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'ECDSA') throw new DOMException('Unrecognized name.', 'NotSupportedError');
+        let hash;
+        try { hash = _normalizeHashName(algorithm && algorithm.hash); }
+        catch (_) {
+            throw new DOMException(
+                `Failed to execute '${operationName}' on 'SubtleCrypto': EcdsaParams: hash: Algorithm: Unrecognized name`,
+                'NotSupportedError'
+            );
+        }
+        return { name: 'ECDSA', hash };
+    };
     _defProtoMethod(_SubtleProto, 'generateKey', function generateKey(algorithm, extractable, keyUsages) {
         try {
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'ECDSA') {
+                const alg = _normalizeEcdsaKeyAlgorithm(algorithm, 'generateKey');
+                const usages = _normalizeEcdsaGenerateUsages(keyUsages);
+                const material = ops.op_crypto_ec_generate(alg.namedCurve);
+                if (!material || !material.ok) throw new DOMException('', 'OperationError');
+                return Promise.resolve(_makeEcdsaKeyPair(material, alg.namedCurve, extractable, usages));
+            }
             if (String(rawName || '').toUpperCase() === 'AES-GCM') {
                 const alg = _normalizeAesGcmKeyAlgorithm(algorithm, true);
                 const usages = _normalizeAesGcmUsages(keyUsages);
@@ -6181,10 +6317,27 @@
     _defProtoMethod(_SubtleProto, 'importKey', function importKey(format, keyData, algorithm, extractable, keyUsages) {
         try {
             const normalizedFormat = String(format).toLowerCase();
+            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'ECDSA') {
+                const alg = _normalizeEcdsaKeyAlgorithm(algorithm, 'importKey');
+                if (!['raw', 'spki', 'pkcs8', 'jwk'].includes(normalizedFormat)) {
+                    throw new DOMException("The requested operation is not supported", "NotSupportedError");
+                }
+                if (normalizedFormat === 'jwk') {
+                    return Promise.resolve(_importEcdsaJwk(keyData, alg.namedCurve, extractable, keyUsages));
+                }
+                if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+                    throw new TypeError("keyData is not a BufferSource");
+                }
+                const type = normalizedFormat === 'pkcs8' ? 'private' : 'public';
+                const usages = _normalizeEcdsaImportUsages(type, keyUsages);
+                if (type === 'private' && normalizedFormat !== 'pkcs8') throw new DOMException('', 'DataError');
+                const material = ops.op_crypto_ec_import(alg.namedCurve, normalizedFormat, _toBytes(keyData));
+                return Promise.resolve(_makeEcdsaKey(material, type, alg.namedCurve, extractable, usages));
+            }
             if (normalizedFormat !== 'raw' && normalizedFormat !== 'jwk') {
                 throw new DOMException("The requested operation is not supported", "NotSupportedError");
             }
-            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
             if (String(rawName || '').toUpperCase() === 'HKDF') {
                 if (normalizedFormat !== 'raw') {
                     throw new DOMException("The requested operation is not supported", "NotSupportedError");
@@ -6269,6 +6422,16 @@
                 throw new DOMException("Failed to execute 'exportKey' on 'SubtleCrypto': key is not extractable", "InvalidAccessError");
             }
             const normalizedFormat = String(format).toLowerCase();
+            if (state.name === 'ECDSA') {
+                if (normalizedFormat === 'jwk') return Promise.resolve(_exportEcdsaJwk(state));
+                let bytes;
+                if (state.type === 'public' && normalizedFormat === 'raw') bytes = state.rawPublic;
+                else if (state.type === 'public' && normalizedFormat === 'spki') bytes = state.publicSpki;
+                else if (state.type === 'private' && normalizedFormat === 'pkcs8') bytes = state.privatePkcs8;
+                else throw new DOMException("The requested operation is not supported", "NotSupportedError");
+                const copy = bytes.slice();
+                return Promise.resolve(copy.buffer);
+            }
             if (normalizedFormat === 'jwk') {
                 return Promise.resolve(_exportSecretJwk(state));
             }
@@ -6281,6 +6444,17 @@
     });
     _defProtoMethod(_SubtleProto, 'sign', function sign(algorithm, key, data) {
         try {
+            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'ECDSA') {
+                const alg = _normalizeEcdsaSignAlgorithm(algorithm, 'sign');
+                const state = _requireCryptoKey(key);
+                if (state.name !== 'ECDSA' || state.type !== 'private' || !state.usages.includes('sign')) {
+                    throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+                }
+                const out = ops.op_crypto_ecdsa_sign(state.namedCurve, alg.hash, state.privatePkcs8, _toBytes(data));
+                if (!out || out.byteLength === 0) throw new DOMException('', 'OperationError');
+                return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+            }
             const state = _checkHmacOperation(algorithm, key, 'sign');
             const out = ops.op_crypto_hmac_sign(state.hash, state.bytes, _toBytes(data));
             return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
@@ -6288,6 +6462,17 @@
     });
     _defProtoMethod(_SubtleProto, 'verify', function verify(algorithm, key, signature, data) {
         try {
+            const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'ECDSA') {
+                const alg = _normalizeEcdsaSignAlgorithm(algorithm, 'verify');
+                const state = _requireCryptoKey(key);
+                if (state.name !== 'ECDSA' || state.type !== 'public' || !state.usages.includes('verify')) {
+                    throw new DOMException("key.usages does not permit this operation", "InvalidAccessError");
+                }
+                return Promise.resolve(ops.op_crypto_ecdsa_verify(
+                    state.namedCurve, alg.hash, state.publicSpki, _toBytes(signature), _toBytes(data)
+                ));
+            }
             const state = _checkHmacOperation(algorithm, key, 'verify');
             const expected = ops.op_crypto_hmac_sign(state.hash, state.bytes, _toBytes(data));
             const actual = _toBytes(signature);

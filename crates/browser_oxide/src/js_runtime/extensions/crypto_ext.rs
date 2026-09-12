@@ -3,11 +3,169 @@
 //! `crypto.subtle.digest("SHA-256", ...)` see a real result.
 
 use boring2::aes::{unwrap_key, wrap_key, AesKey};
+use boring2::bn::{BigNum, BigNumContext};
+use boring2::ec::{EcGroup, EcKey, EcPoint, PointConversionForm};
+use boring2::ecdsa::EcdsaSig;
+use boring2::nid::Nid;
+use boring2::pkey::{PKey, Private, Public};
 use boring2::symm::{decrypt, decrypt_aead, encrypt, encrypt_aead, Cipher};
 use deno_core::op2;
 use serde::Serialize;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
+
+#[derive(Serialize, Default)]
+pub struct EcKeyMaterial {
+    pub ok: bool,
+    pub public_spki: Vec<u8>,
+    pub private_pkcs8: Vec<u8>,
+    pub raw_public: Vec<u8>,
+    pub x: Vec<u8>,
+    pub y: Vec<u8>,
+    pub d: Vec<u8>,
+}
+
+fn ec_curve(name: &str) -> Option<(Nid, usize)> {
+    match name {
+        "P-256" => Some((Nid::X9_62_PRIME256V1, 32)),
+        "P-384" => Some((Nid::SECP384R1, 48)),
+        "P-521" => Some((Nid::SECP521R1, 66)),
+        _ => None,
+    }
+}
+
+fn ec_public_parts<T>(ec: &EcKey<T>, coord_len: usize) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)>
+where
+    T: boring2::pkey::HasPublic,
+{
+    let group = ec.group();
+    let mut ctx = BigNumContext::new().ok()?;
+    let raw = ec
+        .public_key()
+        .to_bytes(group, PointConversionForm::UNCOMPRESSED, &mut ctx)
+        .ok()?;
+    let mut x = BigNum::new().ok()?;
+    let mut y = BigNum::new().ok()?;
+    ec.public_key()
+        .affine_coordinates_gfp(group, &mut x, &mut y, &mut ctx)
+        .ok()?;
+    Some((
+        raw,
+        x.to_vec_padded(coord_len).ok()?,
+        y.to_vec_padded(coord_len).ok()?,
+    ))
+}
+
+fn ec_material_private(curve: &str, pkey: PKey<Private>) -> Option<EcKeyMaterial> {
+    let (nid, coord_len) = ec_curve(curve)?;
+    let ec = pkey.ec_key().ok()?;
+    if ec.group().curve_name()? != nid || ec.check_key().is_err() {
+        return None;
+    }
+    let (raw_public, x, y) = ec_public_parts(&ec, coord_len)?;
+    let d = ec.private_key().to_vec_padded(coord_len).ok()?;
+    Some(EcKeyMaterial {
+        ok: true,
+        public_spki: pkey.public_key_to_der().ok()?,
+        private_pkcs8: pkey.private_key_to_der_pkcs8().ok()?,
+        raw_public,
+        x,
+        y,
+        d,
+    })
+}
+
+fn ec_material_public(curve: &str, pkey: PKey<Public>) -> Option<EcKeyMaterial> {
+    let (nid, coord_len) = ec_curve(curve)?;
+    let ec = pkey.ec_key().ok()?;
+    if ec.group().curve_name()? != nid || ec.check_key().is_err() {
+        return None;
+    }
+    let (raw_public, x, y) = ec_public_parts(&ec, coord_len)?;
+    Some(EcKeyMaterial {
+        ok: true,
+        public_spki: pkey.public_key_to_der().ok()?,
+        private_pkcs8: Vec::new(),
+        raw_public,
+        x,
+        y,
+        d: Vec::new(),
+    })
+}
+
+fn ec_generate(curve: &str) -> Option<EcKeyMaterial> {
+    let (nid, _) = ec_curve(curve)?;
+    let group = EcGroup::from_curve_name(nid).ok()?;
+    let ec = EcKey::generate(&group).ok()?;
+    let pkey = PKey::from_ec_key(ec).ok()?;
+    ec_material_private(curve, pkey)
+}
+
+fn ec_import_raw(curve: &str, raw: &[u8]) -> Option<EcKeyMaterial> {
+    let (nid, _) = ec_curve(curve)?;
+    let group = EcGroup::from_curve_name(nid).ok()?;
+    let mut ctx = BigNumContext::new().ok()?;
+    let point = EcPoint::from_bytes(&group, raw, &mut ctx).ok()?;
+    let ec = EcKey::from_public_key(&group, &point).ok()?;
+    let pkey = PKey::from_ec_key(ec).ok()?;
+    ec_material_public(curve, pkey)
+}
+
+fn ec_import_spki(curve: &str, der: &[u8]) -> Option<EcKeyMaterial> {
+    ec_material_public(curve, PKey::public_key_from_der(der).ok()?)
+}
+
+fn ec_import_pkcs8(curve: &str, der: &[u8]) -> Option<EcKeyMaterial> {
+    ec_material_private(curve, PKey::private_key_from_pkcs8(der).ok()?)
+}
+
+fn ec_import_jwk(curve: &str, x: &[u8], y: &[u8], d: &[u8]) -> Option<EcKeyMaterial> {
+    let (nid, coord_len) = ec_curve(curve)?;
+    if x.len() != coord_len || y.len() != coord_len || (!d.is_empty() && d.len() != coord_len) {
+        return None;
+    }
+    let group = EcGroup::from_curve_name(nid).ok()?;
+    let mut raw = Vec::with_capacity(1 + coord_len * 2);
+    raw.push(4);
+    raw.extend_from_slice(x);
+    raw.extend_from_slice(y);
+    let mut ctx = BigNumContext::new().ok()?;
+    let point = EcPoint::from_bytes(&group, &raw, &mut ctx).ok()?;
+    if d.is_empty() {
+        let ec = EcKey::from_public_key(&group, &point).ok()?;
+        return ec_material_public(curve, PKey::from_ec_key(ec).ok()?);
+    }
+    let private = BigNum::from_slice(d).ok()?;
+    let ec = EcKey::from_private_components(&group, &private, &point).ok()?;
+    ec_material_private(curve, PKey::from_ec_key(ec).ok()?)
+}
+
+fn ec_sign(curve: &str, hash: &str, pkcs8: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    let (_, coord_len) = ec_curve(curve)?;
+    let pkey = PKey::private_key_from_pkcs8(pkcs8).ok()?;
+    let ec = pkey.ec_key().ok()?;
+    let digest = digest_bytes(hash, data)?;
+    let sig = EcdsaSig::sign(&digest, &ec).ok()?;
+    let mut out = sig.r().to_vec_padded(coord_len).ok()?;
+    out.extend_from_slice(&sig.s().to_vec_padded(coord_len).ok()?);
+    Some(out)
+}
+
+fn ec_verify(curve: &str, hash: &str, spki: &[u8], signature: &[u8], data: &[u8]) -> Option<bool> {
+    let (_, coord_len) = ec_curve(curve)?;
+    if signature.len() != coord_len * 2 {
+        return Some(false);
+    }
+    let pkey = PKey::public_key_from_der(spki).ok()?;
+    let ec = pkey.ec_key().ok()?;
+    let digest = digest_bytes(hash, data)?;
+    let r = BigNum::from_slice(&signature[..coord_len]).ok()?;
+    let s = BigNum::from_slice(&signature[coord_len..]).ok()?;
+    EcdsaSig::from_private_components(r, s)
+        .ok()?
+        .verify(&digest, &ec)
+        .ok()
+}
 
 #[derive(Serialize)]
 pub struct AesGcmResult {
@@ -366,6 +524,61 @@ pub fn op_crypto_aes_kw_unwrap(#[buffer] key: &[u8], #[buffer] data: &[u8]) -> A
     }
 }
 
+#[op2]
+#[serde]
+pub fn op_crypto_ec_generate(#[string] curve: String) -> EcKeyMaterial {
+    ec_generate(&curve).unwrap_or_default()
+}
+
+#[op2]
+#[serde]
+pub fn op_crypto_ec_import(
+    #[string] curve: String,
+    #[string] format: String,
+    #[buffer] data: &[u8],
+) -> EcKeyMaterial {
+    let material = match format.as_str() {
+        "raw" => ec_import_raw(&curve, data),
+        "spki" => ec_import_spki(&curve, data),
+        "pkcs8" => ec_import_pkcs8(&curve, data),
+        _ => None,
+    };
+    material.unwrap_or_default()
+}
+
+#[op2]
+#[serde]
+pub fn op_crypto_ec_import_jwk(
+    #[string] curve: String,
+    #[buffer] x: &[u8],
+    #[buffer] y: &[u8],
+    #[buffer] d: &[u8],
+) -> EcKeyMaterial {
+    ec_import_jwk(&curve, x, y, d).unwrap_or_default()
+}
+
+#[op2]
+#[buffer]
+pub fn op_crypto_ecdsa_sign(
+    #[string] curve: String,
+    #[string] hash: String,
+    #[buffer] pkcs8: &[u8],
+    #[buffer] data: &[u8],
+) -> Vec<u8> {
+    ec_sign(&curve, &hash, pkcs8, data).unwrap_or_default()
+}
+
+#[op2(fast)]
+pub fn op_crypto_ecdsa_verify(
+    #[string] curve: String,
+    #[string] hash: String,
+    #[buffer] spki: &[u8],
+    #[buffer] signature: &[u8],
+    #[buffer] data: &[u8],
+) -> bool {
+    ec_verify(&curve, &hash, spki, signature, data).unwrap_or(false)
+}
+
 #[op2(fast)]
 pub fn op_crypto_random_fill(#[buffer] out: &mut [u8]) {
     use rand::Rng;
@@ -385,6 +598,11 @@ deno_core::extension!(
         op_crypto_aes_cbc_decrypt,
         op_crypto_aes_kw_wrap,
         op_crypto_aes_kw_unwrap,
+        op_crypto_ec_generate,
+        op_crypto_ec_import,
+        op_crypto_ec_import_jwk,
+        op_crypto_ecdsa_sign,
+        op_crypto_ecdsa_verify,
         op_crypto_random_fill
     ],
 );
@@ -393,7 +611,8 @@ deno_core::extension!(
 mod tests {
     use super::{
         aes_cbc_decrypt_bytes, aes_cbc_encrypt_bytes, aes_gcm_decrypt_bytes, aes_gcm_encrypt_bytes,
-        aes_kw_unwrap_bytes, aes_kw_wrap_bytes, hkdf_bytes, hmac_bytes, pbkdf2_bytes,
+        aes_kw_unwrap_bytes, aes_kw_wrap_bytes, ec_generate, ec_import_jwk, ec_import_pkcs8,
+        ec_import_raw, ec_import_spki, ec_sign, ec_verify, hkdf_bytes, hmac_bytes, pbkdf2_bytes,
     };
 
     #[test]
@@ -551,5 +770,28 @@ mod tests {
         assert!(aes_cbc_decrypt_bytes(&key, &iv, &[0u8; 15]).is_none());
         assert!(aes_cbc_encrypt_bytes(&[0u8; 24], &iv, b"hello").is_none());
         assert!(aes_cbc_encrypt_bytes(&key, &[0u8; 15], b"hello").is_none());
+    }
+
+    #[test]
+    fn ecdsa_all_chrome_curves_round_trip_raw_signature() {
+        for (curve, hash, sig_len) in [
+            ("P-256", "SHA-256", 64usize),
+            ("P-384", "SHA-384", 96usize),
+            ("P-521", "SHA-512", 132usize),
+        ] {
+            let material = ec_generate(curve).expect("generate EC key");
+            assert!(material.ok);
+            let message = b"browser-oxide-ecdsa";
+            let signature = ec_sign(curve, hash, &material.private_pkcs8, message).expect("sign");
+            assert_eq!(signature.len(), sig_len);
+            assert_eq!(
+                ec_verify(curve, hash, &material.public_spki, &signature, message),
+                Some(true)
+            );
+            assert!(ec_import_raw(curve, &material.raw_public).is_some());
+            assert!(ec_import_spki(curve, &material.public_spki).is_some());
+            assert!(ec_import_pkcs8(curve, &material.private_pkcs8).is_some());
+            assert!(ec_import_jwk(curve, &material.x, &material.y, &material.d).is_some());
+        }
     }
 }
