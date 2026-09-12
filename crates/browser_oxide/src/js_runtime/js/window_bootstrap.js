@@ -1854,7 +1854,6 @@
                     if (data.type) init.headers = { 'content-type': data.type };
                 } else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
                     init.body = data;
-                    init.headers = { 'content-type': 'application/octet-stream' };
                 } else if (typeof FormData !== 'undefined' && data instanceof FormData) {
                     init.body = data;
                 } else if (typeof URLSearchParams !== 'undefined' && data instanceof URLSearchParams) {
