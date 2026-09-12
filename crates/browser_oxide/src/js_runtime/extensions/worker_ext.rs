@@ -1368,6 +1368,15 @@ fn spawn_worker_inner(
                     cross_origin_isolated,
                     storage_directory_allowed,
                 );
+                // Nested DedicatedWorkers use this runtime as their owner. Their
+                // receive op is unref'ed after startup so an idle child does not
+                // pin this worker's V8 event loop, but an actual child->owner
+                // message still has to wake the parked outer worker loop.
+                let nested_worker_wake = runtime
+                    .op_state()
+                    .borrow()
+                    .borrow::<WorkerOwnerWake>()
+                    .notify_handle();
 
                 // Capture-and-delete the privileged message-pump starter
                 // before page-authored worker code runs. worker_bootstrap has
@@ -1465,13 +1474,26 @@ fn spawn_worker_inner(
                             if terminate.load(Ordering::Acquire) {
                                 break;
                             }
-                            notify_worker.notified().await;
+                            tokio::select! {
+                                _ = notify_worker.notified() => {}
+                                _ = nested_worker_wake.notified() => {}
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(worker_id = worker_id, error = %e, "worker event loop error");
                             break;
                         }
                     }
+                }
+
+                // Reap workers spawned by this worker realm before dropping its
+                // JsRuntime. Page::drop only sees top-level worker ownership;
+                // without this, terminating an outer worker could orphan its
+                // nested worker threads.
+                {
+                    let op_state = runtime.op_state();
+                    let mut op_state = op_state.borrow_mut();
+                    drain_owned_workers(&mut op_state);
                 }
 
                 // Clear thread-local worker state.

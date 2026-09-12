@@ -1398,21 +1398,249 @@
     }
 
     if (typeof globalThis.Worker !== 'function') {
-        // Nested workers are exposed by Chromium. Keep the WebIDL surface
-        // coherent even though recursive worker spawning is not wired yet.
-        globalThis.Worker = class Worker extends EventTarget {
-            constructor() {
-                super();
-                this.onerror = null;
-                this.onmessage = null;
-                throw new DOMException('Nested worker spawning is unavailable', 'NetworkError');
+        // Chromium exposes nested DedicatedWorkers. The worker runtime already
+        // installs the same Rust worker ops as the owning Window runtime, so a
+        // nested worker can reuse the process-global worker registry and wire
+        // format instead of inventing a second transport.
+        const _nestedWorkerState = new WeakMap();
+        const _refNestedWorkerOp = Deno.core.refOpPromise;
+        const _unrefNestedWorkerOp = Deno.core.unrefOpPromise;
+
+        function _nestedStateFor(worker) {
+            const state = _nestedWorkerState.get(worker);
+            if (!state) throw new TypeError('Illegal invocation');
+            return state;
+        }
+
+        function _resolveNestedWorker(rawUrl) {
+            let resolved;
+            try {
+                resolved = new URL(
+                    String(rawUrl),
+                    self.location && self.location.href || undefined,
+                ).href;
+            } catch (_) {
+                resolved = String(rawUrl);
             }
-            postMessage() {}
-            terminate() {}
+            if (resolved.startsWith('blob:')) {
+                try {
+                    return { url: resolved, source: ops.op_blob_fetch_text(resolved) || '' };
+                } catch (_) {
+                    return { url: resolved, source: '' };
+                }
+            }
+            if (resolved.startsWith('data:')) {
+                const comma = resolved.indexOf(',');
+                if (comma < 0) return { url: resolved, source: '' };
+                try {
+                    const meta = resolved.slice(5, comma);
+                    const body = resolved.slice(comma + 1);
+                    return {
+                        url: resolved,
+                        source: meta.endsWith(';base64')
+                            ? atob(decodeURIComponent(body))
+                            : decodeURIComponent(body),
+                    };
+                } catch (_) {
+                    return { url: resolved, source: '' };
+                }
+            }
+            try {
+                return { url: resolved, source: ops.op_worker_sync_fetch(resolved) || '' };
+            } catch (_) {
+                return { url: resolved, source: '' };
+            }
+        }
+
+        function _deliverNestedWorkerRaw(worker, state, raw) {
+            if (!raw || !state.id) return;
+            if (raw === '__browser_oxide_worker_ready__') {
+                state.initializing = false;
+                if (state.pendingReceive && state.refNextReceive) {
+                    state.refNextReceive = false;
+                } else if (_unrefNestedWorkerOp && state.pendingReceive) {
+                    try { _unrefNestedWorkerOp(state.pendingReceive); } catch (_) {}
+                }
+                return;
+            }
+            let payload;
+            try { payload = JSON.parse(raw); }
+            catch (_) { return; }
+            const deserializer = _browser_oxide && _browser_oxide.deserializeFromWire;
+            const portCache = new Map();
+            const data = deserializer
+                ? deserializer(payload && payload.data, portCache)
+                : payload && payload.data;
+            const ports = _browser_oxide && _browser_oxide.adoptTransferredPorts
+                ? _browser_oxide.adoptTransferredPorts(
+                    (payload && payload.ports) || [],
+                    portCache,
+                )
+                : [];
+            worker.dispatchEvent(_markTrustedEvent(new MessageEvent('message', {
+                data,
+                origin: '',
+                lastEventId: '',
+                source: null,
+                ports,
+            })));
+        }
+
+        globalThis.Worker = class Worker extends EventTarget {
+            constructor(scriptURL, options) {
+                super();
+                const type = options && options.type !== undefined
+                    ? String(options.type)
+                    : 'classic';
+                if (type !== 'classic' && type !== 'module') {
+                    throw new TypeError(
+                        "Failed to construct 'Worker': Failed to read the 'type' property from 'WorkerOptions': The provided value '"
+                        + type + "' is not a valid enum value of type WorkerType."
+                    );
+                }
+                const name = options && options.name !== undefined
+                    ? String(options.name)
+                    : '';
+                const resolved = _resolveNestedWorker(scriptURL);
+                const state = {
+                    id: 0,
+                    initializing: true,
+                    pendingReceive: null,
+                    refNextReceive: false,
+                    handlers: { message: null, error: null },
+                };
+                _nestedWorkerState.set(this, state);
+
+                if (!resolved.source) {
+                    Promise.resolve().then(() => {
+                        this.dispatchEvent(_markTrustedEvent(new ErrorEvent('error', {
+                            message: 'Worker script could not be resolved: ' + resolved.url,
+                            filename: resolved.url,
+                            lineno: 0,
+                            colno: 0,
+                        })));
+                    });
+                    return;
+                }
+
+                const storageAllowed = !ops.op_worker_storage_directory_allowed
+                    || ops.op_worker_storage_directory_allowed();
+                state.id = ops.op_worker_spawn(
+                    resolved.source,
+                    name,
+                    type === 'module',
+                    resolved.url,
+                    storageAllowed,
+                );
+                if (state.id <= 0) {
+                    state.id = 0;
+                    return;
+                }
+
+                const _drainOnce = () => {
+                    if (!state.id) return;
+                    const pending = ops.op_worker_await_message(state.id);
+                    state.pendingReceive = pending;
+                    const keepRefed = state.initializing || state.refNextReceive;
+                    if (state.refNextReceive) state.refNextReceive = false;
+                    if (_unrefNestedWorkerOp && !keepRefed) {
+                        try { _unrefNestedWorkerOp(pending); } catch (_) {}
+                    }
+                    pending.then((raw) => {
+                        if (state.pendingReceive === pending) state.pendingReceive = null;
+                        if (!raw || !state.id) return;
+                        _deliverNestedWorkerRaw(this, state, raw);
+                        _drainOnce();
+                    }).catch(() => {});
+                };
+                _drainOnce();
+            }
+
+            postMessage(message, transfer) {
+                const state = _nestedStateFor(this);
+                if (!state.id) return;
+                const prepared = _browser_oxide && _browser_oxide.prepareWireMessage
+                    ? _browser_oxide.prepareWireMessage(
+                        message,
+                        transfer,
+                        'postMessage',
+                        'Worker',
+                    )
+                    : { data: message, ports: [], transferState: null };
+                if (_browser_oxide && _browser_oxide.commitPreparedTransfers) {
+                    _browser_oxide.commitPreparedTransfers(prepared.transferState);
+                }
+                let payload;
+                try {
+                    payload = JSON.stringify({
+                        data: prepared.data,
+                        ports: prepared.ports,
+                    });
+                } catch (_) {
+                    payload = JSON.stringify({ data: null });
+                }
+                ops.op_worker_post_to_worker(state.id, payload);
+                if (_refNestedWorkerOp && state.pendingReceive) {
+                    try { _refNestedWorkerOp(state.pendingReceive); } catch (_) {}
+                    if (state.initializing) state.refNextReceive = true;
+                } else {
+                    state.refNextReceive = true;
+                }
+            }
+
+            terminate() {
+                const state = _nestedStateFor(this);
+                if (!state.id) return;
+                const id = state.id;
+                state.id = 0;
+                try { ops.op_worker_terminate(id); } catch (_) {}
+            }
         };
+
+        const _nestedPostMessage = globalThis.Worker.prototype.postMessage;
+        const _nestedTerminate = globalThis.Worker.prototype.terminate;
+        for (const name of Object.getOwnPropertyNames(globalThis.Worker.prototype)) {
+            delete globalThis.Worker.prototype[name];
+        }
+        const _defineNestedHandler = (type) => {
+            Object.defineProperty(globalThis.Worker.prototype, 'on' + type, {
+                configurable: true,
+                enumerable: true,
+                get() { return _nestedStateFor(this).handlers[type]; },
+                set(value) {
+                    _nestedStateFor(this).handlers[type] =
+                        typeof value === 'function' ? value : null;
+                },
+            });
+        };
+        _defineNestedHandler('message');
+        Object.defineProperty(globalThis.Worker.prototype, 'postMessage', {
+            value: _nestedPostMessage,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(globalThis.Worker.prototype, 'terminate', {
+            value: _nestedTerminate,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(globalThis.Worker.prototype, 'constructor', {
+            value: globalThis.Worker,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        _defineNestedHandler('error');
+        Object.defineProperty(globalThis.Worker.prototype, Symbol.toStringTag, {
+            value: 'Worker',
+            configurable: true,
+        });
         if (typeof _maskFunction === 'function') _maskFunction(globalThis.Worker, 'Worker');
         if (typeof _maskAsNative === 'function') {
-            _maskAsNative(globalThis.Worker.prototype, 'onerror', 'onmessage', 'postMessage', 'terminate');
+            _maskAsNative(globalThis.Worker.prototype,
+                'onmessage', 'postMessage', 'terminate', 'onerror');
         }
     }
 

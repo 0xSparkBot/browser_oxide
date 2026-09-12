@@ -84,6 +84,35 @@ fn worker_echo_round_trip() {
 }
 
 #[test]
+fn nested_worker_round_trip_matches_chrome() {
+    let code = r#"
+        const outerSource = `
+            const nestedSource = 'postMessage(42)';
+            const nested = new Worker(URL.createObjectURL(
+                new Blob([nestedSource], { type: 'text/javascript' })
+            ));
+            nested.onmessage = (event) => {
+                postMessage(JSON.stringify({ value: event.data, trusted: event.isTrusted }));
+                nested.terminate();
+            };
+            nested.onerror = (event) => {
+                postMessage(JSON.stringify({ error: String(event.message || event) }));
+            };
+        `;
+        const outer = new Worker(URL.createObjectURL(
+            new Blob([outerSource], { type: 'text/javascript' })
+        ));
+        outer.onmessage = (event) => {
+            document.querySelector('#out').textContent = event.data;
+            outer.terminate();
+        };
+    "#;
+    let out = drive_runtime(code, 3000);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value, serde_json::json!({"value": 42, "trusted": true}));
+}
+
+#[test]
 fn worker_message_port_post_message_arity_matches_chrome() {
     let code = r#"
         const src = `
