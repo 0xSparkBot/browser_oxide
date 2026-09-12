@@ -461,8 +461,14 @@ fn idle_worker_receive_does_not_pin_event_loop() {
                 None,
             )
             .unwrap();
+        // This is a liveness assertion, not a 100ms performance budget. When
+        // the full Worker suite runs in parallel, V8 isolate startup and the
+        // worker thread can legitimately lose more than 100ms of wall-clock
+        // time to scheduler contention even though the idle receive is
+        // correctly unref'ed. Keep the bound short enough to catch a genuinely
+        // pinned event loop while avoiding a timing-only CI flake.
         let result =
-            tokio::time::timeout(Duration::from_millis(100), runtime.run_event_loop()).await;
+            tokio::time::timeout(Duration::from_millis(500), runtime.run_event_loop()).await;
         assert!(
             result.is_ok(),
             "an idle worker receive must not pin the page event loop"
