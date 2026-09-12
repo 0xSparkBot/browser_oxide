@@ -1,9 +1,14 @@
 //! Holistic site verification — runs a comprehensive list of high-traffic
 //! and high-protection sites through `Page::navigate` and prints per-site
-//! outcomes. Each site has its own `#[tokio::test]` so they get isolated
-//! tokio runtimes — running them all in one tokio task shares the deno_core
-//! event loop, and a setTimeout fired by site N can re-enter the runtime
-//! while site N+1 is awaiting, hitting `RefCell already borrowed`.
+//! outcomes. Each site runs on its own dedicated large-stack V8 thread with a
+//! current-thread Tokio runtime. Running them all in one tokio task shares the
+//! deno_core event loop, and a setTimeout fired by site N can re-enter the
+//! runtime while site N+1 is awaiting, hitting `RefCell already borrowed`.
+//! Running V8 directly on Rust's default test-thread stack is also unsafe for
+//! sufficiently complex bootstraps: deno_core primordials initialization can
+//! exhaust that stack. Use BrowserOxide's `block_on_v8_thread` adapter here so
+//! the single-site diagnostics obey the same 64 MiB stack contract as the
+//! production parallel pager.
 //!
 //! Run with:
 //!     cargo test --release -p browser --test holistic_sweep \
@@ -169,27 +174,32 @@ fn page_drop_marker() -> u64 {
 /// instant; any gap reveals tokio runtime teardown or other overhead.
 macro_rules! site {
     ($name:ident, $cat:expr, $sname:expr, $url:expr) => {
-        #[tokio::test]
+        #[test]
         #[ignore]
-        async fn $name() {
-            eprintln!(
-                "holistic-start: {} {} {} {}",
-                now_unix_ms(),
-                $cat,
-                $sname,
-                $url
-            );
-            let (out, len, nav_ms, drop_ms) = fetch_one($url).await;
-            eprintln!(
-                "holistic-end: {} {} {} {} len={} nav_ms={} drop_ms={} url={}",
-                now_unix_ms(),
-                $cat,
-                $sname,
-                out,
-                len,
-                nav_ms,
-                drop_ms,
-                $url
+        fn $name() {
+            browser_oxide::js_runtime::block_on_v8_thread(
+                concat!("holistic-", stringify!($name)),
+                || async move {
+                    eprintln!(
+                        "holistic-start: {} {} {} {}",
+                        now_unix_ms(),
+                        $cat,
+                        $sname,
+                        $url
+                    );
+                    let (out, len, nav_ms, drop_ms) = fetch_one($url).await;
+                    eprintln!(
+                        "holistic-end: {} {} {} {} len={} nav_ms={} drop_ms={} url={}",
+                        now_unix_ms(),
+                        $cat,
+                        $sname,
+                        out,
+                        len,
+                        nav_ms,
+                        drop_ms,
+                        $url
+                    );
+                },
             );
         }
     };
