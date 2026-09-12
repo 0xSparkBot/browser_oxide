@@ -756,9 +756,13 @@ fn worker_message_channel_and_cache_storage_are_functional() {
               try {
                 const channel = new MessageChannel();
                 const channelResult = new Promise((resolve) => {
-                    channel.port1.onmessage = (event) => resolve(event.data);
+                    channel.port1.onmessage = (event) => resolve({
+                        data: event.data,
+                        trusted: event.isTrusted,
+                    });
                 });
                 channel.port2.postMessage({ answer: 42 });
+                const channelMessage = await channelResult;
 
                 const cache = await caches.open('probe');
                 const result = {
@@ -768,7 +772,8 @@ fn worker_message_channel_and_cache_storage_are_functional() {
                     portType: typeof MessagePort,
                     channelTag: Object.prototype.toString.call(channel),
                     portTag: Object.prototype.toString.call(channel.port1),
-                    channelValue: (await channelResult).answer,
+                    channelValue: channelMessage.data.answer,
+                    channelTrusted: channelMessage.trusted,
                     cachesType: typeof caches,
                     cacheStorageTag: Object.prototype.toString.call(caches),
                     cacheTag: Object.prototype.toString.call(cache),
@@ -803,6 +808,7 @@ fn worker_message_channel_and_cache_storage_are_functional() {
     assert_eq!(v["channelTag"], "[object MessageChannel]", "{out}");
     assert_eq!(v["portTag"], "[object MessagePort]", "{out}");
     assert_eq!(v["channelValue"], 42, "{out}");
+    assert_eq!(v["channelTrusted"], true, "{out}");
     assert_eq!(v["cachesType"], "object", "{out}");
     assert_eq!(v["cacheStorageTag"], "[object CacheStorage]", "{out}");
     assert_eq!(v["cacheTag"], "[object Cache]", "{out}");

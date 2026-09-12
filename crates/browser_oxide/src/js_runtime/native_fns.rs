@@ -405,6 +405,7 @@ mod tests {
     /// `op_create_child_realm`) doesn't change what `get_prototype()` returns.
     #[test]
     fn verify_inner_global_property_visibility() {
+        let _tokio_guard = crate::js_runtime::tokio_fallback::ensure_tokio_context();
         let mut rt = JsRuntime::new(RuntimeOptions::default());
         let main_ctx = rt.main_context();
         v8::scope_with_context!(let scope, rt.v8_isolate(), &main_ctx);
@@ -458,6 +459,7 @@ mod tests {
     /// parent-aliased). Foundation for the _getIframeWindow wiring.
     #[test]
     fn child_realm_has_genuine_native_intrinsics() {
+        let _tokio_guard = crate::js_runtime::tokio_fallback::ensure_tokio_context();
         let mut rt = JsRuntime::new(RuntimeOptions::default());
         let main_ctx = rt.main_context();
         v8::scope_with_context!(let scope, rt.v8_isolate(), &main_ctx);
@@ -536,6 +538,7 @@ mod tests {
     fn native_fp_tostring_uses_js_symbol_registry() {
         use deno_core::JsRuntime;
 
+        let _tokio_guard = crate::js_runtime::tokio_fallback::ensure_tokio_context();
         let mut rt = JsRuntime::new(RuntimeOptions::default());
 
         // Capture original FP.toString (pre-bootstrap).

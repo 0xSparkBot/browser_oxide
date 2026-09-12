@@ -4146,12 +4146,12 @@
         const _dispatchPortEvent = (port, data, ports = []) => {
             if (_PortClosed.get(port)) return;
             try {
-                const ev = new MessageEvent('message', {
+                const ev = _markTrustedEvent(new MessageEvent('message', {
                     data,
                     ports,
                     bubbles: false,
                     cancelable: false,
-                });
+                }));
                 port.dispatchEvent(ev);
             } catch (_e) {}
         };

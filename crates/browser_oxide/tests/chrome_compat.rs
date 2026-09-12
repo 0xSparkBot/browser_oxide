@@ -10982,10 +10982,13 @@ async fn message_channel_paired_routing() {
         .unwrap();
     let _ = page.evaluate(
         r#"(() => {
-            globalThis.__mctest = { got: [] };
+            globalThis.__mctest = { got: [], trusted: [] };
             const ch = new MessageChannel();
             globalThis.__mctest.ch = ch;
-            ch.port2.onmessage = (e) => { globalThis.__mctest.got.push(e.data); };
+            ch.port2.onmessage = (e) => {
+                globalThis.__mctest.got.push(e.data);
+                globalThis.__mctest.trusted.push(e.isTrusted);
+            };
             ch.port1.postMessage('hello');
             ch.port1.postMessage({n: 42});
         })()"#,
@@ -11002,7 +11005,7 @@ async fn message_channel_paired_routing() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let result = page
-        .evaluate("JSON.stringify({len: globalThis.__mctest.got.length, first: globalThis.__mctest.got[0], second: globalThis.__mctest.got[1] && globalThis.__mctest.got[1].n})")
+        .evaluate("JSON.stringify({len: globalThis.__mctest.got.length, first: globalThis.__mctest.got[0], second: globalThis.__mctest.got[1] && globalThis.__mctest.got[1].n, trusted: globalThis.__mctest.trusted})")
         .unwrap();
     let v: serde_json::Value =
         serde_json::from_str(&result).unwrap_or_else(|e| panic!("json: {e}; raw={result}"));
@@ -11013,6 +11016,7 @@ async fn message_channel_paired_routing() {
     );
     assert_eq!(v["first"], "hello");
     assert_eq!(v["second"].as_u64().unwrap(), 42);
+    assert_eq!(v["trusted"], serde_json::json!([true, true]));
 }
 
 #[tokio::test]
