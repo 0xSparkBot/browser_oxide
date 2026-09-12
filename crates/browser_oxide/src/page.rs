@@ -1114,6 +1114,7 @@ impl Page {
             &scripts,
             url,
             &mut script_fetches,
+            None,
         )
         .await;
         Self::finish_document_script_schedule(
@@ -1122,6 +1123,7 @@ impl Page {
             url,
             &mut script_fetches,
             pending_async,
+            None,
         )
         .await;
         // Top realm initial load settled: release deferred frame-message
@@ -2150,6 +2152,7 @@ impl Page {
             init_scripts,
             None,
             cross_origin_isolated,
+            None,
         )
         .await?;
         // Keep the same connection/cookie/Accept-CH pools available to any
@@ -2975,6 +2978,7 @@ impl Page {
             &scripts_meta,
             &resp_url,
             &mut script_fetches,
+            None,
         )
         .await;
         wmark!("document parser + deferred script schedule");
@@ -2992,6 +2996,7 @@ impl Page {
             &resp_url,
             &mut script_fetches,
             pending_async,
+            None,
         )
         .await;
         wmark!("DOMContentLoaded + async scripts + load");
@@ -3343,6 +3348,7 @@ impl Page {
                 &init_scripts,
                 current_storage.take(),
                 current_cross_origin_isolated,
+                Some(nav_t0 + nav_budget),
             )
             .await?;
 
@@ -4462,6 +4468,16 @@ impl Page {
         }
     }
 
+    fn build_deadline_remaining(deadline: Option<Instant>) -> Option<Duration> {
+        deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn build_phase_timeout(deadline: Option<Instant>, cap: Duration) -> Duration {
+        Self::build_deadline_remaining(deadline)
+            .map(|remaining| remaining.min(cap))
+            .unwrap_or(cap)
+    }
+
     async fn build_page_with_scripts_and_init(
         html: &str,
         url: &str,
@@ -4477,6 +4493,7 @@ impl Page {
             init_scripts,
             None,
             false,
+            None,
         )
         .await
     }
@@ -4485,9 +4502,24 @@ impl Page {
         event_loop: &mut BrowserEventLoop,
         fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
         index: usize,
+        deadline: Option<Instant>,
     ) -> Option<(String, Instant)> {
-        let handle = fetches.remove(&index)?;
-        match handle.await {
+        let mut handle = fetches.remove(&index)?;
+        let result = match Self::build_deadline_remaining(deadline) {
+            Some(remaining) if remaining.is_zero() => {
+                handle.abort();
+                return None;
+            }
+            Some(remaining) => match tokio::time::timeout(remaining, &mut handle).await {
+                Ok(result) => result,
+                Err(_) => {
+                    handle.abort();
+                    return None;
+                }
+            },
+            None => handle.await,
+        };
+        match result {
             Ok(Some((code, timing, completed_at))) => {
                 event_loop.runtime_mut().record_resource_timing(timing);
                 Some((code, completed_at))
@@ -4506,7 +4538,11 @@ impl Page {
         index: usize,
         code: String,
         document_url: &str,
+        deadline: Option<Instant>,
     ) {
+        if Self::build_deadline_remaining(deadline).is_some_and(|remaining| remaining.is_zero()) {
+            return;
+        }
         if code.trim().is_empty() {
             return;
         }
@@ -4537,11 +4573,11 @@ impl Page {
             } else {
                 format!("{document_url}#oxide-mod-{index}")
             };
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                event_loop.eval_module_code(&specifier, code),
-            )
-            .await
+            let timeout = Self::build_phase_timeout(deadline, Duration::from_secs(10));
+            if timeout.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(timeout, event_loop.eval_module_code(&specifier, code)).await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -4549,8 +4585,7 @@ impl Page {
                     eprintln!("[module] {name}: {error}");
                 }
                 Err(_) => {
-                    tracing::warn!(script = %name, "ES module eval timed out (10s) — continuing");
-                    eprintln!("[module-timeout] {name}");
+                    tracing::debug!(script = %name, ?timeout, "ES module eval reached document build deadline");
                 }
             }
         } else {
@@ -4589,6 +4624,7 @@ impl Page {
         document_url: &str,
         fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
         pending_async: &mut Vec<usize>,
+        deadline: Option<Instant>,
     ) {
         let mut ready = Vec::new();
         let mut keep = Vec::new();
@@ -4601,7 +4637,7 @@ impl Page {
                 .is_some_and(tokio::task::JoinHandle::is_finished)
             {
                 if let Some((code, completed_at)) =
-                    Self::take_document_script_fetch(event_loop, fetches, index).await
+                    Self::take_document_script_fetch(event_loop, fetches, index, deadline).await
                 {
                     ready.push((index, code, completed_at));
                 }
@@ -4618,6 +4654,7 @@ impl Page {
                 index,
                 code,
                 document_url,
+                deadline,
             )
             .await;
         }
@@ -4629,17 +4666,20 @@ impl Page {
         document_url: &str,
         fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
         pending_async: &mut Vec<usize>,
-    ) {
+        deadline: Option<Instant>,
+    ) -> bool {
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         // Inline async modules are already executable at discovery time, but
         // keep this fallback for completeness.
         let mut inline = Vec::new();
         let mut external = FuturesUnordered::new();
+        let mut aborts = Vec::new();
         for index in pending_async.drain(..) {
             if scripts[index].src.is_none() {
                 inline.push(index);
             } else if let Some(handle) = fetches.remove(&index) {
+                aborts.push(handle.abort_handle());
                 external.push(async move { (index, handle.await) });
             }
         }
@@ -4650,10 +4690,32 @@ impl Page {
                 index,
                 scripts[index].code.clone(),
                 document_url,
+                deadline,
             )
             .await;
         }
-        while let Some((index, result)) = external.next().await {
+        loop {
+            let next = match Self::build_deadline_remaining(deadline) {
+                Some(remaining) if remaining.is_zero() => {
+                    for abort in &aborts {
+                        abort.abort();
+                    }
+                    return false;
+                }
+                Some(remaining) => match tokio::time::timeout(remaining, external.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        for abort in &aborts {
+                            abort.abort();
+                        }
+                        return false;
+                    }
+                },
+                None => external.next().await,
+            };
+            let Some((index, result)) = next else {
+                return true;
+            };
             match result {
                 Ok(Some((code, timing, _))) => {
                     event_loop.runtime_mut().record_resource_timing(timing);
@@ -4663,6 +4725,7 @@ impl Page {
                         index,
                         code,
                         document_url,
+                        deadline,
                     )
                     .await;
                 }
@@ -4679,6 +4742,7 @@ impl Page {
         scripts: &[script_runner::ScriptInfo],
         document_url: &str,
         fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
+        deadline: Option<Instant>,
     ) -> Vec<usize> {
         use script_runner::ScriptScheduling;
 
@@ -4691,7 +4755,7 @@ impl Page {
             match script.scheduling() {
                 ScriptScheduling::ParserBlocking => {
                     let code = if script.src.is_some() {
-                        Self::take_document_script_fetch(event_loop, fetches, index)
+                        Self::take_document_script_fetch(event_loop, fetches, index, deadline)
                             .await
                             .map(|(code, _)| code)
                     } else {
@@ -4704,6 +4768,7 @@ impl Page {
                             index,
                             code,
                             document_url,
+                            deadline,
                         )
                         .await;
                     }
@@ -4717,6 +4782,7 @@ impl Page {
                 document_url,
                 fetches,
                 &mut pending_async,
+                deadline,
             )
             .await;
         }
@@ -4732,11 +4798,12 @@ impl Page {
                 document_url,
                 fetches,
                 &mut pending_async,
+                deadline,
             )
             .await;
             let script = &scripts[index];
             let code = if script.src.is_some() {
-                Self::take_document_script_fetch(event_loop, fetches, index)
+                Self::take_document_script_fetch(event_loop, fetches, index, deadline)
                     .await
                     .map(|(code, _)| code)
             } else {
@@ -4749,6 +4816,7 @@ impl Page {
                     index,
                     code,
                     document_url,
+                    deadline,
                 )
                 .await;
             }
@@ -4758,6 +4826,7 @@ impl Page {
                 document_url,
                 fetches,
                 &mut pending_async,
+                deadline,
             )
             .await;
         }
@@ -4771,7 +4840,8 @@ impl Page {
         document_url: &str,
         fetches: &mut std::collections::HashMap<usize, DocumentScriptFetchHandle>,
         mut pending_async: Vec<usize>,
-    ) {
+        deadline: Option<Instant>,
+    ) -> bool {
         // Any async entry whose resource became ready while the caller did its
         // post-script internal cleanup still runs before DOMContentLoaded.
         Self::drain_ready_async_document_scripts(
@@ -4780,18 +4850,23 @@ impl Page {
             document_url,
             fetches,
             &mut pending_async,
+            deadline,
         )
         .await;
         event_loop.dispatch_dom_content_loaded();
-        Self::finish_async_document_scripts(
+        let load_ready = Self::finish_async_document_scripts(
             event_loop,
             scripts,
             document_url,
             fetches,
             &mut pending_async,
+            deadline,
         )
         .await;
-        event_loop.dispatch_load();
+        if load_ready {
+            event_loop.dispatch_load();
+        }
+        load_ready
     }
 
     async fn build_page_with_scripts_init_and_storage(
@@ -4804,6 +4879,7 @@ impl Page {
             std::collections::HashMap<String, std::collections::HashMap<String, String>>,
         >,
         cross_origin_isolated: bool,
+        deadline: Option<Instant>,
     ) -> Result<Self, deno_core::error::AnyError> {
         crate::js_runtime::readiness::reset();
         let bp_trace = std::env::var("BROWSER_OXIDE_BUILD_PROFILE").is_ok();
@@ -4931,7 +5007,26 @@ impl Page {
 
         // Stylesheets are render-blocking for the initial document. Script
         // tasks continue running while CSS resolves and while V8 boots.
-        let fetched_css_results = futures_util::future::join_all(css_futures).await;
+        let fetched_css_results = if let Some(remaining) = Self::build_deadline_remaining(deadline)
+        {
+            if remaining.is_zero() {
+                Vec::new()
+            } else {
+                match tokio::time::timeout(remaining, futures_util::future::join_all(css_futures))
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(_) => {
+                        tracing::debug!(
+                            "navigation build deadline reached while waiting for stylesheets"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        } else {
+            futures_util::future::join_all(css_futures).await
+        };
         mark!("stylesheet fetch join (script fetches remain in flight)");
 
         let mut all_timings = Vec::new();
@@ -4977,8 +5072,13 @@ impl Page {
         // first-paint scripts spawn document.write(<script>) chains or
         // tight setTimeout polling that hold the V8 thread indefinitely).
         // This is the navigation timeout's watchdog; `None` leaves it unbounded.
-        let _build_watcher = navigation_timeout()
-            .map(|d| V8DeadlineWatcher::new(event_loop.runtime_mut().isolate_handle(), d));
+        let build_watchdog =
+            navigation_timeout().map(|timeout| Self::build_phase_timeout(deadline, timeout));
+        let _build_watcher = build_watchdog
+            .filter(|timeout| !timeout.is_zero())
+            .map(|timeout| {
+                V8DeadlineWatcher::new(event_loop.runtime_mut().isolate_handle(), timeout)
+            });
 
         // Set location (URL-state setup, not a real navigation —
         // reset the nav-pending signal so subsequent run_until_idle calls
@@ -5258,6 +5358,7 @@ impl Page {
             &scripts,
             url,
             &mut script_fetches,
+            deadline,
         )
         .await;
         mark!("document parser + deferred script schedule");
@@ -5274,6 +5375,7 @@ impl Page {
             url,
             &mut script_fetches,
             pending_async,
+            deadline,
         )
         .await;
 
@@ -5318,7 +5420,17 @@ impl Page {
 
         // Drive the page in (script errors log and continue). Normal pages use
         // `run_until_settled`; challenge docs need the full `run_until_idle` drain.
-        let drain = match (doc_is_challenge, navigation_timeout()) {
+        let drain_timeout = match (
+            navigation_timeout(),
+            Self::build_deadline_remaining(deadline),
+        ) {
+            (Some(timeout), Some(remaining)) => Some(timeout.min(remaining)),
+            (Some(timeout), None) => Some(timeout),
+            (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        };
+        let drain = match (doc_is_challenge, drain_timeout) {
+            (_, Some(timeout)) if timeout.is_zero() => Ok(IdleReason::Timeout),
             (true, Some(timeout)) => event_loop.run_until_idle(timeout).await,
             (true, None) => event_loop.run_until_idle_unbounded().await,
             (false, Some(timeout)) => event_loop.run_until_settled(timeout).await,
@@ -5446,6 +5558,29 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    static NAV_BUDGET_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn spawn_slow_script_fixture_server(delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf);
+            std::thread::sleep(delay);
+            let body = "globalThis.__slowAsyncRan = true;";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        });
+        format!("http://{addr}")
+    }
 
     fn spawn_page_fixture_server(body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6258,8 +6393,9 @@ mod tests {
 
     #[test]
     fn explicit_nav_budget_is_hard_for_pending_navigation() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = NAV_BUDGET_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let previous = std::env::var_os("BROWSER_OXIDE_NAV_BUDGET_MS");
         std::env::set_var("BROWSER_OXIDE_NAV_BUDGET_MS", "250");
@@ -6296,6 +6432,57 @@ mod tests {
         );
         assert_eq!(url, "https://example.test/start");
         assert_eq!(body_tag, "BODY");
+    }
+
+    #[test]
+    fn explicit_nav_budget_bounds_async_script_fetch_during_build() {
+        let _guard = NAV_BUDGET_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("BROWSER_OXIDE_NAV_BUDGET_MS");
+        std::env::set_var("BROWSER_OXIDE_NAV_BUDGET_MS", "250");
+        let origin = spawn_slow_script_fixture_server(Duration::from_secs(2));
+
+        let result =
+            crate::js_runtime::block_on_v8_thread("build-budget-test", move || async move {
+                let started = Instant::now();
+                let html = r#"<!doctype html><html><body>
+                <main id="ready">READY</main>
+                <script async src="/slow.js"></script>
+            </body></html>"#;
+                let mut page = Page::navigate_with_html(
+                    html,
+                    &format!("{origin}/start"),
+                    crate::stealth::presets::chrome_148_macos(),
+                    1,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                let body = page
+                    .evaluate("document.getElementById('ready').textContent")
+                    .map_err(|e| e.to_string())?;
+                let slow_ran = page
+                    .evaluate("String(globalThis.__slowAsyncRan)")
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>((started.elapsed(), body, slow_ran))
+            });
+
+        match previous {
+            Some(v) => std::env::set_var("BROWSER_OXIDE_NAV_BUDGET_MS", v),
+            None => std::env::remove_var("BROWSER_OXIDE_NAV_BUDGET_MS"),
+        }
+
+        let (elapsed, body, slow_ran) =
+            result.expect("budgeted navigation should return partial page");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "250ms navigation budget waited for the 2s async script: {elapsed:?}"
+        );
+        assert_eq!(body, "READY");
+        assert_eq!(
+            slow_ran, "undefined",
+            "timed-out async script must not execute"
+        );
     }
 
     #[test]
