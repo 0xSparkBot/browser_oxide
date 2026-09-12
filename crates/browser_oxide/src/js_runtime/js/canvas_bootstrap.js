@@ -1218,6 +1218,8 @@
     const _webglRenderbufferBinding = new WeakMap();
     const _webglVertexArrayState = new WeakMap();
     const _webglVertexArrayBinding = new WeakMap();
+    const _webglDefaultVertexArrayState = new WeakMap();
+    const _webglCurrentVertexAttribValues = new WeakMap();
     const _webglQueryState = new WeakMap();
     const _webglQueryBindings = new WeakMap();
     const _webglSamplerState = new WeakMap();
@@ -1240,6 +1242,172 @@
             _webglBufferBindings.set(ctx, bindings);
         }
         return bindings;
+    }
+
+    function _newWebGLVertexAttribEntry() {
+        return {
+            enabled: false,
+            size: 4,
+            stride: 0,
+            type: WebGLRenderingContext.FLOAT,
+            normalized: false,
+            buffer: null,
+            offset: 0,
+            integer: false,
+            divisor: 0,
+        };
+    }
+
+    function _newWebGLVertexArrayRecord(ctx) {
+        const max = Number(WebGLRenderingContext._surfaceFor(ctx).params[WebGLRenderingContext.MAX_VERTEX_ATTRIBS] || 16);
+        return {
+            context: ctx,
+            deleted: false,
+            everBound: false,
+            elementBuffer: null,
+            attribs: Array.from({ length: max }, _newWebGLVertexAttribEntry),
+        };
+    }
+
+    function _webglVertexArrayRecord(ctx) {
+        const contextState = _webglState(ctx);
+        if (contextState && contextState.isWebGL2) {
+            const vao = _webglVertexArrayBinding.get(ctx);
+            if (vao) {
+                const state = _webglVertexArrayState.get(vao);
+                if (state) {
+                    if (!state.attribs) {
+                        const fresh = _newWebGLVertexArrayRecord(ctx);
+                        state.attribs = fresh.attribs;
+                        state.elementBuffer = state.elementBuffer || null;
+                    }
+                    return state;
+                }
+            }
+        }
+        let state = _webglDefaultVertexArrayState.get(ctx);
+        if (!state) {
+            state = _newWebGLVertexArrayRecord(ctx);
+            _webglDefaultVertexArrayState.set(ctx, state);
+        }
+        return state;
+    }
+
+    function _webglElementArrayBuffer(ctx) {
+        const contextState = _webglState(ctx);
+        if (contextState && contextState.isWebGL2) {
+            return _webglVertexArrayRecord(ctx).elementBuffer || null;
+        }
+        return _webglBindings(ctx).element;
+    }
+
+    function _setWebGLElementArrayBuffer(ctx, buffer) {
+        const contextState = _webglState(ctx);
+        if (contextState && contextState.isWebGL2) {
+            _webglVertexArrayRecord(ctx).elementBuffer = buffer;
+        } else {
+            _webglBindings(ctx).element = buffer;
+        }
+    }
+
+    function _webglVertexAttribEntry(ctx, index) {
+        index = Number(index) >>> 0;
+        const state = _webglVertexArrayRecord(ctx);
+        if (index >= state.attribs.length) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_VALUE);
+            return null;
+        }
+        return state.attribs[index];
+    }
+
+    function _webglCurrentVertexAttribs(ctx) {
+        let values = _webglCurrentVertexAttribValues.get(ctx);
+        if (!values) {
+            const max = Number(WebGLRenderingContext._surfaceFor(ctx).params[WebGLRenderingContext.MAX_VERTEX_ATTRIBS] || 16);
+            values = Array.from({ length: max }, () => [0, 0, 0, 1]);
+            _webglCurrentVertexAttribValues.set(ctx, values);
+        }
+        return values;
+    }
+
+    function _webglVertexAttribTypeBytes(type) {
+        switch (Number(type) >>> 0) {
+            case WebGLRenderingContext.BYTE:
+            case WebGLRenderingContext.UNSIGNED_BYTE:
+                return 1;
+            case WebGLRenderingContext.SHORT:
+            case WebGLRenderingContext.UNSIGNED_SHORT:
+            case 0x140B: // HALF_FLOAT (WebGL2)
+                return 2;
+            case WebGLRenderingContext.INT:
+            case WebGLRenderingContext.UNSIGNED_INT:
+            case WebGLRenderingContext.FLOAT:
+            case 0x8D9F: // INT_2_10_10_10_REV
+            case 0x8368: // UNSIGNED_INT_2_10_10_10_REV
+                return 4;
+            default:
+                return 0;
+        }
+    }
+
+    function _webglSetVertexAttribPointer(ctx, index, size, type, normalized, stride, offset, integer) {
+        const entry = _webglVertexAttribEntry(ctx, index);
+        if (!entry) return;
+        size = Number(size) | 0;
+        type = Number(type) >>> 0;
+        stride = Number(stride);
+        offset = Number(offset);
+        const contextState = _webglState(ctx);
+        const isWebGL2 = !!(contextState && contextState.isWebGL2);
+        const floatTypes = isWebGL2
+            ? [
+                WebGLRenderingContext.BYTE, WebGLRenderingContext.UNSIGNED_BYTE,
+                WebGLRenderingContext.SHORT, WebGLRenderingContext.UNSIGNED_SHORT,
+                WebGLRenderingContext.INT, WebGLRenderingContext.UNSIGNED_INT,
+                WebGLRenderingContext.FLOAT, 0x140B, 0x8D9F, 0x8368,
+            ]
+            : [
+                WebGLRenderingContext.BYTE, WebGLRenderingContext.UNSIGNED_BYTE,
+                WebGLRenderingContext.SHORT, WebGLRenderingContext.UNSIGNED_SHORT,
+                WebGLRenderingContext.FLOAT,
+            ];
+        const integerTypes = [
+            WebGLRenderingContext.BYTE, WebGLRenderingContext.UNSIGNED_BYTE,
+            WebGLRenderingContext.SHORT, WebGLRenderingContext.UNSIGNED_SHORT,
+            WebGLRenderingContext.INT, WebGLRenderingContext.UNSIGNED_INT,
+        ];
+        const allowed = integer ? integerTypes : floatTypes;
+        if (!allowed.includes(type)) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_ENUM);
+            return;
+        }
+        if (size < 1 || size > 4 || !Number.isFinite(stride) || stride < 0 || stride > 255 ||
+            !Number.isFinite(offset) || offset < 0) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_VALUE);
+            return;
+        }
+        if ((type === 0x8D9F || type === 0x8368) && size !== 4) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_OPERATION);
+            return;
+        }
+        const bytes = _webglVertexAttribTypeBytes(type);
+        if (!bytes || (Math.trunc(stride) % bytes) !== 0 || (Math.trunc(offset) % bytes) !== 0) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_OPERATION);
+            return;
+        }
+        const buffer = _webglBindings(ctx).array;
+        const bufferState = buffer && _webglBufferState.get(buffer);
+        if (!bufferState || bufferState.deleted) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_OPERATION);
+            return;
+        }
+        entry.size = size;
+        entry.type = type;
+        entry.normalized = integer ? false : !!normalized;
+        entry.stride = Math.trunc(stride);
+        entry.offset = Math.trunc(offset);
+        entry.buffer = buffer;
+        entry.integer = !!integer;
     }
 
     function _webglTextureBindingState(ctx) {
@@ -1458,7 +1626,12 @@
         static LINE_STRIP = 3;
         static POINTS = 0;
         static RGBA = 0x1908;
+        static BYTE = 0x1400;
         static UNSIGNED_BYTE = 0x1401;
+        static SHORT = 0x1402;
+        static UNSIGNED_SHORT = 0x1403;
+        static INT = 0x1404;
+        static UNSIGNED_INT = 0x1405;
         static FLOAT = 0x1406;
         static ARRAY_BUFFER = 0x8892;
         static ELEMENT_ARRAY_BUFFER = 0x8893;
@@ -1469,6 +1642,14 @@
         static STREAM_DRAW = 0x88E0;
         static STATIC_DRAW = 0x88E4;
         static DYNAMIC_DRAW = 0x88E8;
+        static VERTEX_ATTRIB_ARRAY_ENABLED = 0x8622;
+        static VERTEX_ATTRIB_ARRAY_SIZE = 0x8623;
+        static VERTEX_ATTRIB_ARRAY_STRIDE = 0x8624;
+        static VERTEX_ATTRIB_ARRAY_TYPE = 0x8625;
+        static CURRENT_VERTEX_ATTRIB = 0x8626;
+        static VERTEX_ATTRIB_ARRAY_POINTER = 0x8645;
+        static VERTEX_ATTRIB_ARRAY_NORMALIZED = 0x886A;
+        static VERTEX_ATTRIB_ARRAY_BUFFER_BINDING = 0x889F;
         static TEXTURE_2D = 0x0DE1;
         static TEXTURE = 0x1702;
         static TEXTURE_BINDING_2D = 0x8069;
@@ -1817,7 +1998,7 @@
                 return _webglBindings(this).array;
             }
             if (pname === WebGLRenderingContext.ELEMENT_ARRAY_BUFFER_BINDING) {
-                return _webglBindings(this).element;
+                return _webglElementArrayBuffer(this);
             }
             if (pname === WebGLRenderingContext.ACTIVE_TEXTURE) {
                 return WebGLRenderingContext.TEXTURE0 + _webglTextureBindingState(this).activeUnit;
@@ -2206,7 +2387,8 @@
                 return;
             }
             if (buffer == null) {
-                _webglBindings(this)[slot] = null;
+                if (slot === 'element') _setWebGLElementArrayBuffer(this, null);
+                else _webglBindings(this)[slot] = null;
                 return;
             }
             const state = _requireWebGLObject('WebGLBuffer', _webglBufferState, buffer, false, 'bindBuffer');
@@ -2215,7 +2397,8 @@
                 return;
             }
             state.everBound = true;
-            _webglBindings(this)[slot] = buffer;
+            if (slot === 'element') _setWebGLElementArrayBuffer(this, buffer);
+            else _webglBindings(this)[slot] = buffer;
         }
         bufferData(target, dataOrSize, usage) {
             target = Number(target) >>> 0;
@@ -2231,7 +2414,9 @@
                 _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
                 return;
             }
-            const buffer = _webglBindings(this)[slot];
+            const buffer = slot === 'element'
+                ? _webglElementArrayBuffer(this)
+                : _webglBindings(this)[slot];
             const state = buffer && _webglBufferState.get(buffer);
             if (!state || state.deleted) {
                 _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
@@ -2262,7 +2447,9 @@
                 _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
                 return null;
             }
-            const buffer = _webglBindings(this)[slot];
+            const buffer = slot === 'element'
+                ? _webglElementArrayBuffer(this)
+                : _webglBindings(this)[slot];
             const state = buffer && _webglBufferState.get(buffer);
             if (!state || state.deleted) {
                 _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
@@ -2278,9 +2465,63 @@
             const state = _requireWebGLObject('WebGLBuffer', _webglBufferState, buffer, false, 'isBuffer');
             return !!state && state.context === this && !state.deleted && state.everBound;
         }
-        enableVertexAttribArray() {}
-        disableVertexAttribArray() {}
-        vertexAttribPointer() {}
+        enableVertexAttribArray(index) {
+            const entry = _webglVertexAttribEntry(this, index);
+            if (entry) entry.enabled = true;
+        }
+        disableVertexAttribArray(index) {
+            const entry = _webglVertexAttribEntry(this, index);
+            if (entry) entry.enabled = false;
+        }
+        vertexAttribPointer(index, size, type, normalized, stride, offset) {
+            _webglSetVertexAttribPointer(this, index, size, type, normalized, stride, offset, false);
+        }
+        getVertexAttrib(index, pname) {
+            const entry = _webglVertexAttribEntry(this, index);
+            if (!entry) return null;
+            pname = Number(pname) >>> 0;
+            switch (pname) {
+                case WebGLRenderingContext.VERTEX_ATTRIB_ARRAY_ENABLED: return entry.enabled;
+                case WebGLRenderingContext.VERTEX_ATTRIB_ARRAY_SIZE: return entry.size;
+                case WebGLRenderingContext.VERTEX_ATTRIB_ARRAY_STRIDE: return entry.stride;
+                case WebGLRenderingContext.VERTEX_ATTRIB_ARRAY_TYPE: return entry.type;
+                case WebGLRenderingContext.VERTEX_ATTRIB_ARRAY_NORMALIZED: return entry.normalized;
+                case WebGLRenderingContext.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: return entry.buffer;
+                case WebGLRenderingContext.CURRENT_VERTEX_ATTRIB: {
+                    const values = _webglCurrentVertexAttribs(this)[Number(index) >>> 0];
+                    return new Float32Array(values || [0, 0, 0, 1]);
+                }
+                case 0x88FD: // VERTEX_ATTRIB_ARRAY_INTEGER (WebGL2)
+                    if ((_webglState(this) || {}).isWebGL2) return entry.integer;
+                    break;
+                case 0x88FE: // VERTEX_ATTRIB_ARRAY_DIVISOR (WebGL2)
+                    if ((_webglState(this) || {}).isWebGL2) return entry.divisor;
+                    break;
+            }
+            _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+            return null;
+        }
+        getVertexAttribOffset(index, pname) {
+            const entry = _webglVertexAttribEntry(this, index);
+            if (!entry) return 0;
+            if ((Number(pname) >>> 0) !== WebGLRenderingContext.VERTEX_ATTRIB_ARRAY_POINTER) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return 0;
+            }
+            return entry.offset;
+        }
+        vertexAttrib1f(index, x) { this.vertexAttrib4f(index, x, 0, 0, 1); }
+        vertexAttrib2f(index, x, y) { this.vertexAttrib4f(index, x, y, 0, 1); }
+        vertexAttrib3f(index, x, y, z) { this.vertexAttrib4f(index, x, y, z, 1); }
+        vertexAttrib4f(index, x, y, z, w) {
+            const entry = _webglVertexAttribEntry(this, index);
+            if (!entry) return;
+            _webglCurrentVertexAttribs(this)[Number(index) >>> 0] = [Number(x), Number(y), Number(z), Number(w)];
+        }
+        vertexAttrib1fv(index, values) { this.vertexAttrib1f(index, values[0]); }
+        vertexAttrib2fv(index, values) { this.vertexAttrib2f(index, values[0], values[1]); }
+        vertexAttrib3fv(index, values) { this.vertexAttrib3f(index, values[0], values[1], values[2]); }
+        vertexAttrib4fv(index, values) { this.vertexAttrib4f(index, values[0], values[1], values[2], values[3]); }
         drawArrays() {}
         drawElements() {}
         createTexture() {
@@ -2716,7 +2957,7 @@
             state.deleted = true;
             const bindings = _webglBindings(this);
             if (bindings.array === buffer) bindings.array = null;
-            if (bindings.element === buffer) bindings.element = null;
+            if (_webglElementArrayBuffer(this) === buffer) _setWebGLElementArrayBuffer(this, null);
         }
         deleteTexture(texture) {
             if (texture == null) return;
@@ -2817,6 +3058,11 @@
         static SYNC_FLUSH_COMMANDS_BIT = 0x00000001;
         static TIMEOUT_IGNORED = -1;
         static MAX_CLIENT_WAIT_TIMEOUT_WEBGL = 0x9247;
+        static VERTEX_ATTRIB_ARRAY_INTEGER = 0x88FD;
+        static VERTEX_ATTRIB_ARRAY_DIVISOR = 0x88FE;
+        static HALF_FLOAT = 0x140B;
+        static INT_2_10_10_10_REV = 0x8D9F;
+        static UNSIGNED_INT_2_10_10_10_REV = 0x8368;
 
         getParameter(pname) {
             pname = Number(pname) >>> 0;
@@ -2840,10 +3086,17 @@
             return WebGLRenderingContext.prototype.getParameter.call(this, pname);
         }
 
+        vertexAttribIPointer(index, size, type, stride, offset) {
+            _webglSetVertexAttribPointer(this, index, size, type, false, stride, offset, true);
+        }
+        vertexAttribDivisor(index, divisor) {
+            const entry = _webglVertexAttribEntry(this, index);
+            if (!entry) return;
+            entry.divisor = Number(divisor) >>> 0;
+        }
+
         createVertexArray() {
-            return _newWebGLObject('WebGLVertexArrayObject', _webglVertexArrayState, {
-                context: this, deleted: false, everBound: false,
-            });
+            return _newWebGLObject('WebGLVertexArrayObject', _webglVertexArrayState, _newWebGLVertexArrayRecord(this));
         }
         bindVertexArray(vertexArray) {
             if (vertexArray == null) {
