@@ -1057,7 +1057,18 @@
     // names such as `__NEXT_DATA__` remain visible.
     try { delete globalThis.XSLTProcessor; } catch (_) {}
 
-    if (!globalThis.__browserOxideOwnKeysPatched) {
+    // Cleanup intentionally runs more than once for a document. The page-global
+    // reset keeps only keys captured by __markGlobalsBaseline(), and that
+    // baseline is seeded before this reflection layer is installed. A normal
+    // configurable string/symbol guard would therefore be deleted between
+    // cleanup passes and we'd wrap Object/Reflect a second time, capturing the
+    // first wrapper as the new "raw" primitive. That creates recursive
+    // getOwnPropertyDescriptor/ownKeys calls under deep reflection probes.
+    // Keep the idempotence bit in a non-configurable private Symbol: reset may
+    // attempt to delete it, but cannot; the reflection layer below already
+    // hides __browser_oxide_* Symbols from page-visible reflection.
+    const _reflectionPatchTag = Symbol.for('__browser_oxide_reflection_patched__');
+    if (!globalThis[_reflectionPatchTag]) {
         const _hiddenExact = new Set([
             '_browser_oxide',
             '__bgSetTimeout', '__bo_input_events', '__cancelAllListeners',
@@ -1251,9 +1262,18 @@
             if (_isHiddenOwnKey(target, key)) return undefined;
             return _windowDescriptor(target, key);
         };
-        const reflectGetOwnPropertyDescriptor = function getOwnPropertyDescriptor(target, key) {
-            return getOwnPropertyDescriptor(target, key);
-        };
+        // Do not use a named function expression here. Inside
+        // `function getOwnPropertyDescriptor(){...}` the function's own name
+        // shadows the outer Object wrapper, so calling
+        // `getOwnPropertyDescriptor(...)` recursively invokes itself forever.
+        // Method syntax is also non-constructable, matching the native Reflect
+        // builtin (no own `prototype` property).
+        const _publicGetOwnPropertyDescriptor = getOwnPropertyDescriptor;
+        const reflectGetOwnPropertyDescriptor = ({
+            getOwnPropertyDescriptor(target, key) {
+                return _publicGetOwnPropertyDescriptor(target, key);
+            },
+        }).getOwnPropertyDescriptor;
         const getOwnPropertyNames = function getOwnPropertyNames(target) {
             const names = _isGlobalTarget(target) ? _windowOwnKeys(target) : _objectGetOwnPropertyNames(target);
             return names.filter((name) => typeof name === 'string');
@@ -1330,8 +1350,11 @@
             globalThis._maskFunction(reflectGetPrototypeOf, 'getPrototypeOf');
             globalThis._maskFunction(ownKeys, 'ownKeys');
         }
-        Object.defineProperty(globalThis, '__browserOxideOwnKeysPatched', {
-            value: true, configurable: true, enumerable: false,
+        Object.defineProperty(globalThis, _reflectionPatchTag, {
+            value: true,
+            writable: false,
+            configurable: false,
+            enumerable: false,
         });
     }
 

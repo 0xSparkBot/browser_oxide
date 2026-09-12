@@ -508,14 +508,30 @@
     // Prototype-install helpers — kNoScriptId-safe layout
     // ================================================================
     const _defProtoGetter = (proto, name, getter, setter) => {
+        // WebIDL accessors are native non-constructable getter/setter
+        // functions. Passing a plain `function () {}` directly leaks an own
+        // `prototype` property and [[Construct]], which deep reflection can
+        // distinguish from Blink. Reify accessor syntax wrappers while
+        // preserving the original implementation's receiver semantics.
+        const getHolder = {
+            get [name]() { return Reflect.apply(getter, this, []); },
+        };
+        const exposedGetter = Object.getOwnPropertyDescriptor(getHolder, name).get;
+        let exposedSetter;
+        if (setter) {
+            const setHolder = {
+                set [name](value) { return Reflect.apply(setter, this, [value]); },
+            };
+            exposedSetter = Object.getOwnPropertyDescriptor(setHolder, name).set;
+        }
         Object.defineProperty(proto, name, {
-            get: getter,
-            set: setter,
+            get: exposedGetter,
+            set: exposedSetter,
             enumerable: true,
             configurable: true,
         });
-        _maskFunction(getter, `get ${name}`);
-        if (setter) _maskFunction(setter, `set ${name}`);
+        _maskFunction(exposedGetter, `get ${name}`);
+        if (exposedSetter) _maskFunction(exposedSetter, `set ${name}`);
     };
     const _defProtoMethod = (proto, name, fn) => {
         // WebIDL methods are NOT constructors. Using object literal
@@ -1761,11 +1777,7 @@
     // consistent with worker_bootstrap.js (already `false`). The prior
     // "returns undefined" was a wrong assumption. Some scripts also check
     // the getter source, so it is masked native via _maskFunction.
-    Object.defineProperty(Navigator.prototype, 'webdriver', {
-        get: _maskFunction(function() { return false; }, 'get webdriver'),
-        enumerable: true,
-        configurable: true
-    });
+    _defNav('webdriver', () => false);
     _defNav('doNotTrack', () => null);
 
     // Object getters — stable references.
@@ -1773,28 +1785,28 @@
     // Safari and Firefox have no `connection` on Navigator (Gecko gates it
     // behind a pref, off by default). Skip on iOS + Firefox.
     if (!_isMobileIOS() && !_isFirefox()) {
-        Object.defineProperty(_NavProto, 'connection', { get: () => _navConnection, enumerable: false, configurable: true });
+        _defNav('connection', () => _navConnection);
     }
-    Object.defineProperty(_NavProto, 'plugins', { get: () => _navPlugins, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'mimeTypes', { get: () => _navMimeTypes, enumerable: false, configurable: true });
+    _defNav('plugins', () => _navPlugins);
+    _defNav('mimeTypes', () => _navMimeTypes);
     // Navigator getters. Properties marked /* SC */ are
     // [SecureContext]-only per their IDL — return undefined on
     // insecure contexts so the surface matches real Chrome on
     // data:/http:/about:blank URLs. Phase 7 fix.
-    Object.defineProperty(_NavProto, 'mediaDevices', { get: () => _secure() ? _navMediaDevices : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'permissions', { get: () => _navPermissions, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'credentials', { get: () => _secure() ? _navCredentials : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'bluetooth', { get: () => _secure() ? _navBluetooth : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'usb', { get: () => _secure() ? _navUsb : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'serial', { get: () => _secure() ? _navSerial : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'hid', { get: () => _secure() ? _navHid : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'keyboard', { get: () => _secure() ? _navKeyboard : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'locks', { get: () => _secure() ? _navLocks : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'storage', { get: () => _secure() ? _navStorage : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'serviceWorker', { get: () => _secure() ? _navServiceWorker : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'clipboard', { get: () => _secure() ? _navClipboard : undefined, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'geolocation', { get: () => _navGeolocation, enumerable: false, configurable: true });
-    Object.defineProperty(_NavProto, 'wakeLock', { get: () => _secure() ? _navWakeLock : undefined, enumerable: false, configurable: true });
+    _defNav('mediaDevices', () => _secure() ? _navMediaDevices : undefined);
+    _defNav('permissions', () => _navPermissions);
+    _defNav('credentials', () => _secure() ? _navCredentials : undefined);
+    _defNav('bluetooth', () => _secure() ? _navBluetooth : undefined);
+    _defNav('usb', () => _secure() ? _navUsb : undefined);
+    _defNav('serial', () => _secure() ? _navSerial : undefined);
+    _defNav('hid', () => _secure() ? _navHid : undefined);
+    _defNav('keyboard', () => _secure() ? _navKeyboard : undefined);
+    _defNav('locks', () => _secure() ? _navLocks : undefined);
+    _defNav('storage', () => _secure() ? _navStorage : undefined);
+    _defNav('serviceWorker', () => _secure() ? _navServiceWorker : undefined);
+    _defNav('clipboard', () => _secure() ? _navClipboard : undefined);
+    _defNav('geolocation', () => _navGeolocation);
+    _defNav('wakeLock', () => _secure() ? _navWakeLock : undefined);
 
     // Apply native masking to all getters
     _maskAsNative(_NavProto, 'userAgent', 'platform', 'vendor', 'vendorSub', 'productSub', 
@@ -2846,11 +2858,7 @@
         // Navigator.prototype).
         // webdriver: defined identically to the Navigator.prototype block
         // above — `false` (Chrome-148-faithful).
-        Object.defineProperty(_NavProto, 'webdriver', {
-            get: _maskFunction(function() { return false; }, 'get webdriver'),
-            enumerable: true,
-            configurable: true
-        });
+        _defNav('webdriver', () => false);
 
         // Chrome 148 Protected Audience/MIDI and singleton-backed Navigator
         // members. These are part of Navigator.prototype even when a call is
@@ -2916,17 +2924,20 @@
 
     if (globalThis.Screen) {
         const _ScreenProto = Screen.prototype;
-        _defProtoGetter(_ScreenProto, 'availLeft', () => 0);
-        _defProtoGetter(_ScreenProto, 'availTop', () => _pInt("screen_avail_top", 0));
-        _defProtoGetter(_ScreenProto, 'colorDepth', () => _pInt("screen_color_depth", 24));
-        _defProtoGetter(_ScreenProto, 'pixelDepth', () => _pInt("screen_color_depth", 24));
+        _defProtoGetter(_ScreenProto, 'availLeft', _screenGetter(() => 0));
+        _defProtoGetter(_ScreenProto, 'availTop', _screenGetter(() => _pInt("screen_avail_top", 0)));
+        _defProtoGetter(_ScreenProto, 'colorDepth', _screenGetter(() => _pInt("screen_color_depth", 24)));
+        _defProtoGetter(_ScreenProto, 'pixelDepth', _screenGetter(() => _pInt("screen_color_depth", 24)));
         let _screenOnChange = null;
-        Object.defineProperty(_ScreenProto, 'onchange', {
-            get: _maskFunction(function() { return _screenOnChange; }, 'get onchange'),
-            set: _maskFunction(function(value) { _screenOnChange = typeof value === 'function' ? value : null; }, 'set onchange'),
-            enumerable: true,
-            configurable: true,
-        });
+        _defProtoGetter(
+            _ScreenProto,
+            'onchange',
+            _screenGetter(() => _screenOnChange),
+            function(value) {
+                if (this !== _screenInstance) throw new TypeError("Illegal invocation");
+                _screenOnChange = typeof value === 'function' ? value : null;
+            },
+        );
     }
 
     // Explicitly define documentMode as undefined to pass 'prop in document' checks quietly
@@ -4662,6 +4673,15 @@
         const _profileLocale = () => _p("language", "");
         const _OrigDTF = globalThis.Intl.DateTimeFormat;
 
+        const _intlNativeMethod = (name, implementation, length = implementation.length) => {
+            const exposed = ({
+                [name](...args) { return Reflect.apply(implementation, this, args); },
+            })[name];
+            try { Object.defineProperty(exposed, 'length', { value: length, configurable: true }); } catch (_) {}
+            if (typeof _maskFunction === 'function') _maskFunction(exposed, name);
+            return exposed;
+        };
+
         const _patchIntl = (klass) => {
             if (!globalThis.Intl[klass]) return;
             const _Orig = globalThis.Intl[klass];
@@ -4676,6 +4696,7 @@
                 }
                 return new _Orig(locales, options);
             };
+            try { Object.defineProperty(Patched, 'name', { value: klass, configurable: true }); } catch (_) {}
             Patched.prototype = _Orig.prototype;
             if (_Orig.supportedLocalesOf) Patched.supportedLocalesOf = _Orig.supportedLocalesOf.bind(_Orig);
             Object.defineProperty(globalThis.Intl, klass, { value: Patched, writable: true, configurable: true });
@@ -4691,20 +4712,42 @@
             if (!globalThis.Intl[klass]) continue;
             const proto = globalThis.Intl[klass].prototype;
             const origResolved = proto.resolvedOptions;
-            proto.resolvedOptions = function() {
+            proto.resolvedOptions = _intlNativeMethod('resolvedOptions', function() {
                 const res = origResolved.call(this);
                 const pTz = _profileTz();
                 const pLoc = _profileLocale();
                 if (pTz) res.timeZone = pTz;
                 if (pLoc) res.locale = pLoc;
                 return res;
-            };
+            }, 0);
         }
+
+        // Expose patched Date operations with the same callable shape as V8's
+        // native prototype methods. Plain function expressions are
+        // constructable and carry an own `prototype`; attaching a bespoke
+        // `.toString` property leaks even more reflection state. Concise method
+        // syntax is non-constructable by construction, while `_maskFunction`
+        // supplies the native source string through the runtime's final
+        // Function#toString implementation.
+        const _installDateNativeMethod = (name, implementation, length = 0) => {
+            const exposed = ({
+                [name](...args) { return Reflect.apply(implementation, this, args); },
+            })[name];
+            try { Object.defineProperty(exposed, 'length', { value: length, configurable: true }); } catch (_) {}
+            if (typeof _maskFunction === 'function') _maskFunction(exposed, name);
+            Object.defineProperty(Date.prototype, name, {
+                value: exposed,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            });
+            return exposed;
+        };
 
         // Date.prototype.getTimezoneOffset — compute the offset from the
         // profile timezone at each call so DST transitions stay accurate.
         const _origGetTimezoneOffset = Date.prototype.getTimezoneOffset;
-        Date.prototype.getTimezoneOffset = function () {
+        _installDateNativeMethod('getTimezoneOffset', function () {
             const profileTz = _profileTz();
             if (!profileTz) return _origGetTimezoneOffset.call(this);
             try {
@@ -4728,12 +4771,7 @@
             } catch (_e) {
                 return _origGetTimezoneOffset.call(this);
             }
-        };
-        Object.defineProperty(Date.prototype.getTimezoneOffset, "toString", {
-            value: () => "function getTimezoneOffset() { [native code] }",
-            configurable: true,
         });
-        Object.defineProperty(Date.prototype.getTimezoneOffset, _nativeTag, { value: 'getTimezoneOffset', configurable: true });
 
         // =========================================================
         // Date.prototype toString patches — print the profile's
@@ -4805,7 +4843,7 @@
         };
 
         const _origDateToString = Date.prototype.toString;
-        Date.prototype.toString = function toString() {
+        _installDateNativeMethod('toString', function () {
             // `Date.prototype.toString.call(non-Date)` must throw TypeError —
             // mirror real Chrome by delegating to the original.
             if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
@@ -4820,15 +4858,10 @@
             // Format: "Tue Apr 29 2026 13:02:46 GMT-0700 (Pacific Daylight Time)"
             const longPart = longName ? ` (${longName})` : "";
             return `${p.weekday} ${p.month} ${p.day} ${p.year} ${p.hour}:${p.minute}:${p.second} ${offStr}${longPart}`;
-        };
-        Object.defineProperty(Date.prototype.toString, "toString", {
-            value: () => "function toString() { [native code] }",
-            configurable: true,
         });
-        Object.defineProperty(Date.prototype.toString, _nativeTag, { value: 'toString', configurable: true });
 
         const _origDateToDateString = Date.prototype.toDateString;
-        Date.prototype.toDateString = function toDateString() {
+        _installDateNativeMethod('toDateString', function () {
             if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
                 return _origDateToDateString.call(this);
             }
@@ -4837,15 +4870,10 @@
             const p = _tzParts(this, tz);
             if (!p) return _origDateToDateString.call(this);
             return `${p.weekday} ${p.month} ${p.day} ${p.year}`;
-        };
-        Object.defineProperty(Date.prototype.toDateString, "toString", {
-            value: () => "function toDateString() { [native code] }",
-            configurable: true,
         });
-        Object.defineProperty(Date.prototype.toDateString, _nativeTag, { value: 'toDateString', configurable: true });
 
         const _origDateToTimeString = Date.prototype.toTimeString;
-        Date.prototype.toTimeString = function toTimeString() {
+        _installDateNativeMethod('toTimeString', function () {
             if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
                 return _origDateToTimeString.call(this);
             }
@@ -4857,19 +4885,14 @@
             const offStr = _gmtOffsetString(this);
             const longPart = longName ? ` (${longName})` : "";
             return `${p.hour}:${p.minute}:${p.second} ${offStr}${longPart}`;
-        };
-        Object.defineProperty(Date.prototype.toTimeString, "toString", {
-            value: () => "function toTimeString() { [native code] }",
-            configurable: true,
         });
-        Object.defineProperty(Date.prototype.toTimeString, _nativeTag, { value: 'toTimeString', configurable: true });
 
         // toLocaleString is already covered by the patched Intl.DateTimeFormat
         // (which Date.prototype.toLocaleString delegates to internally), but
         // V8's implementation calls the *original* Intl constructor directly
         // bypassing our patch. Force-route through our patched constructor.
         const _origDateToLocaleString = Date.prototype.toLocaleString;
-        Date.prototype.toLocaleString = function toLocaleString(...args) {
+        _installDateNativeMethod('toLocaleString', function (...args) {
             if (!(this instanceof Date) || Number.isNaN(this.getTime?.())) {
                 return _origDateToLocaleString.apply(this, args);
             }
@@ -4889,12 +4912,7 @@
             } catch (_e) {
                 return _origDateToLocaleString.apply(this, args);
             }
-        };
-        Object.defineProperty(Date.prototype.toLocaleString, "toString", {
-            value: () => "function toLocaleString() { [native code] }",
-            configurable: true,
         });
-        Object.defineProperty(Date.prototype.toLocaleString, _nativeTag, { value: 'toLocaleString', configurable: true });
     }
 
     // =========================================================

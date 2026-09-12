@@ -3765,17 +3765,44 @@
         return fn;
     };
     const _audioMethod = (prototype, name, fn, length) => {
-        try { Object.defineProperty(fn, 'length', { value: length, configurable: true }); } catch (_) {}
-        _audioMask(fn, name);
+        // WebIDL operations are native, non-constructable functions. A plain
+        // `function (...) {}` carries own `prototype` / `arguments` / `caller`
+        // slots even if Function#toString is masked, which is observably unlike
+        // Blink and is detected by deep reflection probes. Wrap the actual
+        // implementation in concise-method syntax so the exposed callable has
+        // the same non-constructable shape as a native WebIDL operation while
+        // preserving exact `this` and argument forwarding.
+        const exposed = ({
+            [name](...args) { return Reflect.apply(fn, this, args); },
+        })[name];
+        try { Object.defineProperty(exposed, 'length', { value: length, configurable: true }); } catch (_) {}
+        _audioMask(exposed, name);
         Object.defineProperty(prototype, name, {
-            value: fn, writable: true, enumerable: true, configurable: true,
+            value: exposed, writable: true, enumerable: true, configurable: true,
         });
     };
     const _audioAccessor = (prototype, name, get, set) => {
-        if (get) _audioMask(get, `get ${name}`);
-        if (set) _audioMask(set, `set ${name}`);
+        // Accessor functions created from ordinary function expressions are
+        // constructable too. Reify genuine getter/setter syntax wrappers so
+        // their own property surface matches Blink (`length,name` only).
+        let exposedGet;
+        let exposedSet;
+        if (get) {
+            const holder = {
+                get [name]() { return Reflect.apply(get, this, []); },
+            };
+            exposedGet = Object.getOwnPropertyDescriptor(holder, name).get;
+            _audioMask(exposedGet, `get ${name}`);
+        }
+        if (set) {
+            const holder = {
+                set [name](value) { return Reflect.apply(set, this, [value]); },
+            };
+            exposedSet = Object.getOwnPropertyDescriptor(holder, name).set;
+            _audioMask(exposedSet, `set ${name}`);
+        }
         Object.defineProperty(prototype, name, {
-            get, set, enumerable: true, configurable: true,
+            get: exposedGet, set: exposedSet, enumerable: true, configurable: true,
         });
     };
     const _audioFinalize = (Ctor, name, length) => {
@@ -4691,23 +4718,23 @@
                 height: state.height,
             });
         }
-        async convertToBlob() {
+        convertToBlob() {
             const state = _requireOffscreenCanvasState(this);
             const options = arguments[0];
             const type = (options && options.type) || "image/png";
             if (!state.canvasId) {
-                return new Blob([], { type });
+                return Promise.resolve(new Blob([], { type }));
             }
             // toDataURL returns `data:<type>;base64,<data>` — strip
             // the prefix and decode to bytes for a real Blob body.
             const url = ops.op_canvas_to_data_url(state.canvasId);
             const comma = url.indexOf(",");
-            if (comma < 0) return new Blob([], { type });
+            if (comma < 0) return Promise.resolve(new Blob([], { type }));
             const b64 = url.slice(comma + 1);
             const bin = typeof atob === "function" ? atob(b64) : "";
             const bytes = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            return new Blob([bytes], { type });
+            return Promise.resolve(new Blob([bytes], { type }));
         }
     }
     for (const name of [
@@ -4772,6 +4799,30 @@
             });
             try { _maskAsNative(_HTMLCanvasProto, 'transferControlToOffscreen'); } catch (_) {}
         }
+
+        // The DOM-side canvas operations above were installed with ordinary
+        // function expressions. Re-expose them as non-constructable WebIDL
+        // methods while preserving their implementation and exact arity.
+        const _shapeCanvasMethod = (name, length) => {
+            if (!_HTMLCanvasProto) return;
+            const descriptor = Object.getOwnPropertyDescriptor(_HTMLCanvasProto, name);
+            if (!descriptor || typeof descriptor.value !== 'function') return;
+            const implementation = descriptor.value;
+            const exposed = ({
+                [name](...args) { return Reflect.apply(implementation, this, args); },
+            })[name];
+            try { Object.defineProperty(exposed, 'length', { value: length, configurable: true }); } catch (_) {}
+            if (typeof _maskFunction === 'function') _maskFunction(exposed, name);
+            Object.defineProperty(_HTMLCanvasProto, name, {
+                ...descriptor,
+                value: exposed,
+                enumerable: true,
+            });
+        };
+        _shapeCanvasMethod('getContext', 1);
+        _shapeCanvasMethod('toDataURL', 0);
+        _shapeCanvasMethod('toBlob', 1);
+        _shapeCanvasMethod('transferControlToOffscreen', 0);
 
         if (_HTMLCanvasProto) {
             _maskAsNative(_HTMLCanvasProto, 'getContext', 'toDataURL', 'toBlob');

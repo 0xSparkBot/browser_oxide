@@ -11,6 +11,45 @@ use std::time::Duration;
 const CHROME_REFERENCE_SUM: f64 = 124.04347527516074;
 
 #[test]
+fn web_audio_webidl_callables_are_non_constructable() {
+    let dom = browser_oxide::html_parser::parse_html("<html><body></body></html>");
+    let mut runtime = BrowserJsRuntime::new(dom);
+
+    let result = runtime
+        .execute_script(
+            r#"
+            (() => {
+                const callables = [
+                    AnalyserNode.prototype.getByteFrequencyData,
+                    AudioBuffer.prototype.getChannelData,
+                    BiquadFilterNode.prototype.getFrequencyResponse,
+                    Object.getOwnPropertyDescriptor(AnalyserNode.prototype, 'fftSize').get,
+                    Object.getOwnPropertyDescriptor(AudioBuffer.prototype, 'length').get,
+                    Object.getOwnPropertyDescriptor(BiquadFilterNode.prototype, 'frequency').get,
+                ];
+                return JSON.stringify(callables.map(fn => {
+                    let constructable = true;
+                    try { Reflect.construct(function(){}, [], fn); }
+                    catch (error) { constructable = false; }
+                    return {
+                        own: Object.getOwnPropertyNames(fn).sort(),
+                        hasPrototype: 'prototype' in fn,
+                        constructable,
+                    };
+                }));
+            })()
+            "#,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        result,
+        r#"[{"own":["length","name"],"hasPrototype":false,"constructable":false},{"own":["length","name"],"hasPrototype":false,"constructable":false},{"own":["length","name"],"hasPrototype":false,"constructable":false},{"own":["length","name"],"hasPrototype":false,"constructable":false},{"own":["length","name"],"hasPrototype":false,"constructable":false},{"own":["length","name"],"hasPrototype":false,"constructable":false}]"#
+    );
+}
+
+#[test]
 fn offline_audio_context_renders_via_rust_op() {
     let dom = browser_oxide::html_parser::parse_html(
         "<html><head></head><body><div id=\"out\"></div></body></html>",

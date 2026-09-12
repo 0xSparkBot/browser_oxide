@@ -229,23 +229,27 @@ fn fp_to_string_cb<'s>(
         // Fallback: v8::Symbol::for_global (V8 API registry, won't find
         // JS-tagged symbols but avoids hard failure in no-sym contexts).
         let maybe_tag: Option<String> = if let Some(sym) = tag_sym {
-            if let Some(tagv) = this_obj.get(scope, sym.into()) {
-                if tagv.is_string() {
-                    Some(tagv.to_rust_string_lossy(scope))
-                } else {
-                    None
-                }
+            // The marker is metadata for the FUNCTION ITSELF. A normal
+            // property `get()` walks the prototype chain, so
+            // `Object.create(maskedFunction)` inherited the marker and was
+            // incorrectly stringified as native instead of letting V8 throw
+            // the TypeError that real Function#toString produces for a
+            // non-callable receiver. Gate the lookup on an own property.
+            let key: v8::Local<v8::Name> = sym.into();
+            if this_obj.has_own_property(scope, key) == Some(true) {
+                this_obj
+                    .get(scope, sym.into())
+                    .and_then(|tagv| tagv.is_string().then(|| tagv.to_rust_string_lossy(scope)))
             } else {
                 None
             }
         } else if let Some(key) = v8::String::new(scope, NATIVE_TAG) {
             let sym = v8::Symbol::for_api(scope, key);
-            if let Some(tagv) = this_obj.get(scope, sym.into()) {
-                if tagv.is_string() {
-                    Some(tagv.to_rust_string_lossy(scope))
-                } else {
-                    None
-                }
+            let key: v8::Local<v8::Name> = sym.into();
+            if this_obj.has_own_property(scope, key) == Some(true) {
+                this_obj
+                    .get(scope, sym.into())
+                    .and_then(|tagv| tagv.is_string().then(|| tagv.to_rust_string_lossy(scope)))
             } else {
                 None
             }
@@ -607,6 +611,47 @@ mod tests {
             s2.contains("[native code]"),
             "real native should return [native code]; got: {s2}"
         );
+
+        // The private native marker is own metadata, not an inherited brand.
+        // Deep reflection probes intentionally call `.toString()` on objects
+        // whose prototype is a masked function. Real V8 throws TypeError for
+        // these non-callable receivers; following the marker through the
+        // prototype chain would incorrectly return a native source string.
+        let inherited = rt
+            .execute_script(
+                "<test>",
+                r#"(() => {
+                    const child = Object.create(globalThis.__testFn);
+                    try { child.toString(); return 'NO_THROW'; }
+                    catch (e) { return e instanceof TypeError ? 'TypeError' : e.name; }
+                })()"#,
+            )
+            .map(|v| {
+                let main_ctx = rt.main_context();
+                v8::scope_with_context!(let scope, rt.v8_isolate(), &main_ctx);
+                let local = v8::Local::new(scope, &v);
+                local.to_rust_string_lossy(scope)
+            })
+            .expect("inherited marker probe");
+        assert_eq!(inherited, "TypeError");
+
+        let proxy_inherited = rt
+            .execute_script(
+                "<test>",
+                r#"(() => {
+                    const child = Object.create(new Proxy(globalThis.__testFn, {}));
+                    try { child.toString(); return 'NO_THROW'; }
+                    catch (e) { return e instanceof TypeError ? 'TypeError' : e.name; }
+                })()"#,
+            )
+            .map(|v| {
+                let main_ctx = rt.main_context();
+                v8::scope_with_context!(let scope, rt.v8_isolate(), &main_ctx);
+                let local = v8::Local::new(scope, &v);
+                local.to_rust_string_lossy(scope)
+            })
+            .expect("proxy inherited marker probe");
+        assert_eq!(proxy_inherited, "TypeError");
     }
 
     /// V8's embedder-supported WindowProxy handoff: reuse the prior global

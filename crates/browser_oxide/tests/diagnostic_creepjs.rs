@@ -99,6 +99,17 @@ mod tests {
             .unwrap_or_default();
         println!("CREEPJS ERRORS:\n{}", errors);
 
+        let lie_detail = page
+            .evaluate(
+                r#"JSON.stringify(
+                    globalThis.Fingerprint && globalThis.Fingerprint.lies || null,
+                    null,
+                    2
+                )"#,
+            )
+            .unwrap_or_default();
+        println!("CREEPJS LIE DETAIL:\n{}", lie_detail);
+
         let executed = page.executed_scripts();
         println!("CREEPJS EXECUTED SCRIPT COUNT: {}", executed.len());
         for (index, (name, code)) in executed.iter().enumerate() {

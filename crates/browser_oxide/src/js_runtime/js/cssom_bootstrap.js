@@ -17,17 +17,27 @@
         try { Object.defineProperty(fn, 'length', { value: length, configurable: true }); } catch (_) {}
     };
     const defineMethod = (proto, name, fn, length) => {
-        setLength(fn, length);
-        mask(fn, name);
+        const exposed = ({
+            [name](...args) { return Reflect.apply(fn, this, args); },
+        })[name];
+        setLength(exposed, length);
+        mask(exposed, name);
         Object.defineProperty(proto, name, {
-            value: fn, writable: true, enumerable: true, configurable: true,
+            value: exposed, writable: true, enumerable: true, configurable: true,
         });
     };
     const defineGetter = (proto, name, getter, setter) => {
-        mask(getter, `get ${name}`);
-        if (setter) mask(setter, `set ${name}`);
+        const getHolder = { get [name]() { return Reflect.apply(getter, this, []); } };
+        const exposedGet = Object.getOwnPropertyDescriptor(getHolder, name).get;
+        let exposedSet;
+        if (setter) {
+            const setHolder = { set [name](value) { return Reflect.apply(setter, this, [value]); } };
+            exposedSet = Object.getOwnPropertyDescriptor(setHolder, name).set;
+        }
+        mask(exposedGet, `get ${name}`);
+        if (exposedSet) mask(exposedSet, `set ${name}`);
         Object.defineProperty(proto, name, {
-            get: getter, set: setter,
+            get: exposedGet, set: exposedSet,
             enumerable: true, configurable: true,
         });
     };

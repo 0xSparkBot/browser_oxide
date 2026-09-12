@@ -1593,6 +1593,111 @@ async fn match_media_device_dimensions_follow_screen_not_viewport() {
         assert_eq!(value["wrongDeviceHeight"], false, "{result}");
     }
 }
+
+#[tokio::test]
+async fn reflection_descriptor_wrappers_remain_non_recursive_after_cleanup() {
+    let result = check(
+        r#"JSON.stringify((() => {
+            const getter = Object.getOwnPropertyDescriptor(DOMRect.prototype, 'x').get;
+            const navGetter = Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get;
+            const capture = fn => {
+                try { return { ok: true, value: fn() }; }
+                catch (error) { return { ok: false, name: error.name, message: error.message }; }
+            };
+            return {
+                objectDescriptor: capture(() => Object.getOwnPropertyDescriptor(getter, 'arguments') === undefined),
+                reflectDescriptor: capture(() => Reflect.getOwnPropertyDescriptor(getter, 'arguments') === undefined),
+                getterKeys: capture(() => Reflect.ownKeys(getter).map(String).join(',')),
+                navDescriptor: capture(() => Object.getOwnPropertyDescriptor(navGetter, 'arguments') === undefined),
+                navReflectDescriptor: capture(() => Reflect.getOwnPropertyDescriptor(navGetter, 'arguments') === undefined),
+                reflectBuiltinKeys: capture(() => Reflect.ownKeys(Reflect.getOwnPropertyDescriptor).map(String).join(',')),
+                privateGuardVisible: Reflect.ownKeys(window).some(key =>
+                    typeof key === 'symbol' && String(key).includes('__browser_oxide_reflection_patched__'))
+            };
+        })())"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        value["objectDescriptor"],
+        serde_json::json!({"ok":true,"value":true}),
+        "{result}"
+    );
+    assert_eq!(
+        value["reflectDescriptor"],
+        serde_json::json!({"ok":true,"value":true}),
+        "{result}"
+    );
+    assert_eq!(
+        value["getterKeys"],
+        serde_json::json!({"ok":true,"value":"length,name"}),
+        "{result}"
+    );
+    assert_eq!(
+        value["navDescriptor"],
+        serde_json::json!({"ok":true,"value":true}),
+        "{result}"
+    );
+    assert_eq!(
+        value["navReflectDescriptor"],
+        serde_json::json!({"ok":true,"value":true}),
+        "{result}"
+    );
+    assert_eq!(
+        value["reflectBuiltinKeys"],
+        serde_json::json!({"ok":true,"value":"length,name"}),
+        "{result}"
+    );
+    assert_eq!(value["privateGuardVisible"], false, "{result}");
+}
+
+#[tokio::test]
+async fn native_mask_does_not_leak_through_function_prototype_inheritance() {
+    let result = check(
+        r#"JSON.stringify((() => {
+            const getter = Object.getOwnPropertyDescriptor(DOMRect.prototype, 'x').get;
+            const capture = value => {
+                try { value.toString(); return { threw: false }; }
+                catch (error) {
+                    return {
+                        threw: true,
+                        name: error.name,
+                        firstFrame: String(error.stack || '').split('\n')[1] || ''
+                    };
+                }
+            };
+            return {
+                getterSource: Function.prototype.toString.call(getter),
+                inherited: capture(Object.create(getter)),
+                proxyInherited: capture(Object.create(new Proxy(getter, {})))
+            };
+        })())"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        value["getterSource"], "function get x() { [native code] }",
+        "{result}"
+    );
+    assert_eq!(value["inherited"]["threw"], true, "{result}");
+    assert_eq!(value["inherited"]["name"], "TypeError", "{result}");
+    assert!(
+        value["inherited"]["firstFrame"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Function.toString"),
+        "{result}"
+    );
+    assert_eq!(value["proxyInherited"]["threw"], true, "{result}");
+    assert_eq!(value["proxyInherited"]["name"], "TypeError", "{result}");
+    assert!(
+        value["proxyInherited"]["firstFrame"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Object.toString"),
+        "{result}"
+    );
+}
 #[tokio::test]
 async fn fn_get_selection() {
     assert_eq!(check("typeof getSelection").await, "function");

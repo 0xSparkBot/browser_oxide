@@ -12,6 +12,7 @@
     // we set on masked functions.
     const _nativeTag = Symbol.for('__browser_oxide_native__');
     const _origFnToStr = Function.prototype.toString;
+    const _origGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 
     // Re-entrant guard: prevents infinite recursion when this[_nativeTag] access
     // triggers a Proxy get trap that itself calls Function.prototype.toString.
@@ -28,7 +29,17 @@
         try {
             if (this !== null && this !== undefined) {
                 try {
-                    const tag = this[_nativeTag];
+                    // The marker only makes the FUNCTION ITSELF native-shaped.
+                    // Reading `this[_nativeTag]` also sees an inherited marker,
+                    // so `Object.create(maskedFunction).toString()` incorrectly
+                    // returned native source instead of throwing the native V8
+                    // incompatible-receiver TypeError. Fingerprint probes use
+                    // exactly this distinction. Use the pristine descriptor
+                    // primitive captured before any reflection wrappers so only
+                    // an own marker qualifies (empty function Proxies still
+                    // forward the target's own descriptor, matching Chrome).
+                    const tagDescriptor = _origGetOwnPropertyDescriptor(this, _nativeTag);
+                    const tag = tagDescriptor && tagDescriptor.value;
                     if (tag) return `function ${tag}() { [native code] }`;
                 } catch (_) {}
             }

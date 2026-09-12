@@ -176,6 +176,69 @@ async fn cross_realm_events_dispatch_with_original_identity() {
 }
 
 #[tokio::test]
+async fn cross_realm_webidl_prototype_getters_require_receiver_brand() {
+    let mut page = Page::from_html(
+        r#"<!DOCTYPE html><html><body><iframe id="f"></iframe></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    let result = page
+        .evaluate(
+            r#"JSON.stringify((() => {
+                const child = document.getElementById('f').contentWindow;
+                const tests = [
+                    ['Navigator', 'userAgent'],
+                    ['Screen', 'width'],
+                    ['Document', 'referrer'],
+                    ['HTMLElement', 'offsetWidth'],
+                    ['HTMLIFrameElement', 'contentWindow'],
+                    ['HTMLCanvasElement', 'width'],
+                    ['CanvasRenderingContext2D', 'font'],
+                    ['DOMRect', 'x'],
+                    ['DOMRectReadOnly', 'width'],
+                    ['IntersectionObserverEntry', 'boundingClientRect']
+                ];
+                const read = (win, ctor, prop) => {
+                    try {
+                        void win[ctor].prototype[prop];
+                        return 'NO_THROW';
+                    } catch (error) {
+                        return error.name + ': ' + error.message;
+                    }
+                };
+                const out = {};
+                for (const [ctor, prop] of tests) {
+                    out[ctor + '.' + prop] = {
+                        parent: read(window, ctor, prop),
+                        child: read(child, ctor, prop)
+                    };
+                }
+                return out;
+            })())"#,
+        )
+        .unwrap();
+
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let expected = "TypeError: Illegal invocation";
+    let mut failures = Vec::new();
+    for (api, row) in value.as_object().unwrap() {
+        if row["parent"] != expected {
+            failures.push(format!("parent {api} => {}", row["parent"]));
+        }
+        if row["child"] != expected {
+            failures.push(format!("child {api} => {}", row["child"]));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "prototype getter receiver-brand mismatches:\n{}\nraw={result}",
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
 async fn multiple_iframes_isolated() {
     let mut page = Page::from_html(
         r#"<!DOCTYPE html><html><body>

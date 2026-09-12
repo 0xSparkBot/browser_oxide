@@ -40,8 +40,15 @@
         'isIntersecting', 'isVisible', 'intersectionRatio', 'target',
     ];
     for (const name of entryGetters) {
+        const holder = {
+            get [name]() { return requireState(entryState, this)[name]; },
+        };
+        const getter = Object.getOwnPropertyDescriptor(holder, name).get;
+        if (typeof globalThis._maskFunction === 'function') {
+            globalThis._maskFunction(getter, `get ${name}`);
+        }
         Object.defineProperty(IntersectionObserverEntry.prototype, name, {
-            get: function () { return requireState(entryState, this)[name]; },
+            get: getter,
             enumerable: true,
             configurable: true,
         });
