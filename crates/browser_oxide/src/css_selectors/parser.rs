@@ -361,37 +361,57 @@ impl<'a> SelectorParser<'a> {
             }
             TokenKind::Delim('~') => {
                 self.advance();
-                if matches!(self.current_kind(), TokenKind::Delim('=')) {
-                    self.advance();
+                if !matches!(self.current_kind(), TokenKind::Delim('=')) {
+                    return Err(SelectorParseError::UnexpectedToken {
+                        loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                        message: "expected '=' after '~' in attribute selector".into(),
+                    });
                 }
+                self.advance();
                 Ok(AttributeOperator::Includes)
             }
             TokenKind::Delim('|') => {
                 self.advance();
-                if matches!(self.current_kind(), TokenKind::Delim('=')) {
-                    self.advance();
+                if !matches!(self.current_kind(), TokenKind::Delim('=')) {
+                    return Err(SelectorParseError::UnexpectedToken {
+                        loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                        message: "expected '=' after '|' in attribute selector".into(),
+                    });
                 }
+                self.advance();
                 Ok(AttributeOperator::DashMatch)
             }
             TokenKind::Delim('^') => {
                 self.advance();
-                if matches!(self.current_kind(), TokenKind::Delim('=')) {
-                    self.advance();
+                if !matches!(self.current_kind(), TokenKind::Delim('=')) {
+                    return Err(SelectorParseError::UnexpectedToken {
+                        loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                        message: "expected '=' after '^' in attribute selector".into(),
+                    });
                 }
+                self.advance();
                 Ok(AttributeOperator::Prefix)
             }
             TokenKind::Delim('$') => {
                 self.advance();
-                if matches!(self.current_kind(), TokenKind::Delim('=')) {
-                    self.advance();
+                if !matches!(self.current_kind(), TokenKind::Delim('=')) {
+                    return Err(SelectorParseError::UnexpectedToken {
+                        loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                        message: "expected '=' after '$' in attribute selector".into(),
+                    });
                 }
+                self.advance();
                 Ok(AttributeOperator::Suffix)
             }
             TokenKind::Delim('*') => {
                 self.advance();
-                if matches!(self.current_kind(), TokenKind::Delim('=')) {
-                    self.advance();
+                if !matches!(self.current_kind(), TokenKind::Delim('=')) {
+                    return Err(SelectorParseError::UnexpectedToken {
+                        loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                        message: "expected '=' after '*' in attribute selector".into(),
+                    });
                 }
+                self.advance();
                 Ok(AttributeOperator::Substring)
             }
             _ => Err(SelectorParseError::UnexpectedToken {
@@ -907,6 +927,22 @@ mod tests {
     #[test]
     fn parse_attribute_case_sensitive_modifier_rejected_like_chromium() {
         assert!(parse_selector_list("[type=\"text\" s]").is_err());
+    }
+
+    #[test]
+    fn parse_attribute_compound_operators_require_equals() {
+        for selector in [
+            "[data-x~foo]",
+            "[data-x|foo]",
+            "[data-x^foo]",
+            "[data-x$foo]",
+            "[data-x*foo]",
+        ] {
+            assert!(
+                parse_selector_list(selector).is_err(),
+                "malformed attribute operator must be rejected: {selector}"
+            );
+        }
     }
 
     #[test]

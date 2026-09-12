@@ -99,6 +99,40 @@ async fn attribute_selector_s_modifier_is_rejected_like_chrome() {
 }
 
 #[tokio::test]
+async fn malformed_attribute_operators_throw_syntax_error_like_chrome() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<html><body><div data-x="foo bar"></div></body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    let result = rt
+        .execute_script(
+            r#"(() => {
+                const selectors = [
+                    '[data-x~foo]',
+                    '[data-x|foo]',
+                    '[data-x^foo]',
+                    '[data-x$foo]',
+                    '[data-x*foo]'
+                ];
+                return JSON.stringify(selectors.map(selector => {
+                    try {
+                        document.querySelectorAll(selector);
+                        return 'NO_THROW';
+                    } catch (e) {
+                        return e.name;
+                    }
+                }));
+            })()"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"["SyntaxError","SyntaxError","SyntaxError","SyntaxError","SyntaxError"]"#
+    );
+}
+
+#[tokio::test]
 async fn html_default_attribute_value_case_sensitivity_matches_chrome() {
     let dom = browser_oxide::html_parser::parse_html(
         r#"<!doctype html><html><body>
