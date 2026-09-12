@@ -11641,11 +11641,33 @@
                     "Failed to execute 'set' on 'CookieStore': 1 argument required, but only 0 present."
                 );
             }
-            const options = typeof optionsOrName === 'string'
-                ? { name: optionsOrName, value: String(arguments[1]) }
-                : Object.assign({}, optionsOrName || {});
-            if (options.name === undefined) options.name = '';
-            if (options.value === undefined) options.value = '';
+            let options;
+            if (typeof optionsOrName === 'string') {
+                if (arguments.length < 2) {
+                    throw new TypeError(
+                        "Failed to execute 'set' on 'CookieStore': The provided value is not of type 'CookieInit'."
+                    );
+                }
+                options = { name: optionsOrName, value: String(arguments[1]) };
+            } else {
+                if (optionsOrName === null ||
+                    (typeof optionsOrName !== 'object' && typeof optionsOrName !== 'function')) {
+                    throw new TypeError(
+                        "Failed to execute 'set' on 'CookieStore': The provided value is not of type 'CookieInit'."
+                    );
+                }
+                options = Object.assign({}, optionsOrName);
+                if (options.name === undefined) {
+                    throw new TypeError(
+                        "Failed to execute 'set' on 'CookieStore': Failed to read the 'name' property from 'CookieInit': Required member is undefined."
+                    );
+                }
+                if (options.value === undefined) {
+                    throw new TypeError(
+                        "Failed to execute 'set' on 'CookieStore': Failed to read the 'value' property from 'CookieInit': Required member is undefined."
+                    );
+                }
+            }
             ops.op_cookie_set_sync(_cookieStoreCurrentUrl(), _cookieStoreSerialize(options, false));
             await _cookieStoreSyncDocumentMirror();
         });

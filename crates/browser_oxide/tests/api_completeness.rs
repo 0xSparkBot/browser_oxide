@@ -354,3 +354,60 @@ async fn cookie_store_round_trips_with_document_cookie() {
     let deleted = page.evaluate("globalThis.__cookieStoreDeleted").unwrap();
     assert_eq!(deleted, "null");
 }
+
+#[tokio::test]
+async fn cookie_store_set_validates_webidl_overloads() {
+    let mut page = Page::from_html_with_url(
+        "<!DOCTYPE html><html><body></body></html>",
+        "https://example.com/",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    page.evaluate(
+        r#"Promise.all([
+            cookieStore.set('x').then(
+                () => 'ok',
+                e => e.name + ':' + e.message,
+            ),
+            cookieStore.set(null).then(
+                () => 'ok',
+                e => e.name + ':' + e.message,
+            ),
+            cookieStore.set({}).then(
+                () => 'ok',
+                e => e.name + ':' + e.message,
+            ),
+            cookieStore.set({ name: 'x' }).then(
+                () => 'ok',
+                e => e.name + ':' + e.message,
+            ),
+        ]).then(values => {
+            globalThis.__cookieStoreSetValidation = JSON.stringify(values);
+        })"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    let raw = page
+        .evaluate("globalThis.__cookieStoreSetValidation")
+        .unwrap();
+    let values: Vec<String> = serde_json::from_str(&raw).unwrap();
+    assert_eq!(values.len(), 4);
+    assert!(values[0].contains("TypeError:"), "{values:?}");
+    assert!(values[0].contains("not of type 'CookieInit'"), "{values:?}");
+    assert!(values[1].contains("not of type 'CookieInit'"), "{values:?}");
+    assert!(values[2].contains("'name' property"), "{values:?}");
+    assert!(
+        values[2].contains("Required member is undefined"),
+        "{values:?}"
+    );
+    assert!(values[3].contains("'value' property"), "{values:?}");
+    assert!(
+        values[3].contains("Required member is undefined"),
+        "{values:?}"
+    );
+}
