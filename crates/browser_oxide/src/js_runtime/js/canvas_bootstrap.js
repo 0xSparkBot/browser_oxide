@@ -665,7 +665,10 @@
         set lineWidth(v) { ops.op_canvas_set_line_width(this.#id, +v); }
         set globalAlpha(v) { _debugCanvas({ op: 'setGlobalAlpha', value: +v }); ops.op_canvas_set_global_alpha(this.#id, +v); }
         set font(v) { this._font = String(v); ops.op_canvas_set_font(this.#id, this._font); }
-        get font() { return this._font || "10px sans-serif"; }
+        get font() {
+            if (!(#id in this)) throw new TypeError("Illegal invocation");
+            return this._font || "10px sans-serif";
+        }
 
         // Rectangles
         fillRect(x, y, w, h) {

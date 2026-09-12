@@ -537,7 +537,15 @@
     // Navigator class + prototype — kNoScriptId-safe layout
     // ================================================================
     const _NavProto = globalThis.Navigator.prototype;
-    const _defNav = (name, getter) => _defProtoGetter(_NavProto, name, getter);
+    let _navigatorInstance = globalThis.navigator || null;
+    const _defNav = (name, getter) => _defProtoGetter(
+        _NavProto,
+        name,
+        function() {
+            if (this !== _navigatorInstance) throw new TypeError("Illegal invocation");
+            return Reflect.apply(getter, this, []);
+        },
+    );
     const _defNavMethod = (name, fn) => _defProtoMethod(_NavProto, name, fn);
 
     // Stable-object references — object getters return the same reference
@@ -2079,6 +2087,7 @@
     // Instantiate — zero own properties.
     const _navigator = globalThis.navigator || Object.create(_NavProto);
     Object.setPrototypeOf(_navigator, _NavProto);
+    _navigatorInstance = _navigator;
     globalThis.navigator = _navigator;
 
     // location — Proxy-based, tracks URL components and navigation requests
@@ -2599,19 +2608,24 @@
     });
     _defProtoMethod(_ScreenOrientationProto, 'unlock', function unlock() {});
 
-    _defProtoGetter(_ScreenProto, 'width', () => _pInt("screen_width", 1920));
-    _defProtoGetter(_ScreenProto, 'height', () => _pInt("screen_height", 1080));
-    _defProtoGetter(_ScreenProto, 'availWidth', () => _pInt("screen_avail_width", 1920));
-    _defProtoGetter(_ScreenProto, 'availHeight', () => _pInt("screen_avail_height", 1040));
-    _defProtoGetter(_ScreenProto, 'availLeft', () => 0);
-    _defProtoGetter(_ScreenProto, 'availTop', () => _pInt("screen_avail_top", 0));
-    _defProtoGetter(_ScreenProto, 'colorDepth', () => _pInt("screen_color_depth", 24));
-    _defProtoGetter(_ScreenProto, 'pixelDepth', () => _pInt("screen_color_depth", 24));
-    _defProtoGetter(_ScreenProto, 'orientation', () => _screenOrientation);
-    _defProtoGetter(_ScreenProto, 'isExtended', () => false);
+    let _screenInstance = null;
+    const _screenGetter = getter => function() {
+        if (this !== _screenInstance) throw new TypeError("Illegal invocation");
+        return Reflect.apply(getter, this, []);
+    };
+    _defProtoGetter(_ScreenProto, 'width', _screenGetter(() => _pInt("screen_width", 1920)));
+    _defProtoGetter(_ScreenProto, 'height', _screenGetter(() => _pInt("screen_height", 1080)));
+    _defProtoGetter(_ScreenProto, 'availWidth', _screenGetter(() => _pInt("screen_avail_width", 1920)));
+    _defProtoGetter(_ScreenProto, 'availHeight', _screenGetter(() => _pInt("screen_avail_height", 1040)));
+    _defProtoGetter(_ScreenProto, 'availLeft', _screenGetter(() => 0));
+    _defProtoGetter(_ScreenProto, 'availTop', _screenGetter(() => _pInt("screen_avail_top", 0)));
+    _defProtoGetter(_ScreenProto, 'colorDepth', _screenGetter(() => _pInt("screen_color_depth", 24)));
+    _defProtoGetter(_ScreenProto, 'pixelDepth', _screenGetter(() => _pInt("screen_color_depth", 24)));
+    _defProtoGetter(_ScreenProto, 'orientation', _screenGetter(() => _screenOrientation));
+    _defProtoGetter(_ScreenProto, 'isExtended', _screenGetter(() => false));
     Object.defineProperty(_ScreenProto, Symbol.toStringTag, { value: "Screen", configurable: true });
     Object.defineProperty(ScreenOrientation.prototype, Symbol.toStringTag, { value: "ScreenOrientation", configurable: true });
-    const _screenInstance = Object.create(_ScreenProto);
+    _screenInstance = Object.create(_ScreenProto);
     Object.defineProperty(globalThis, 'screen', {
         get: function() { return _screenInstance; },
         enumerable: true,

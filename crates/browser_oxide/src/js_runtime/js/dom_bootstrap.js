@@ -1638,7 +1638,11 @@
             return new DOMRect(r.x, r.y, r.width, r.height);
         }
         getClientRects() { return [this.getBoundingClientRect()]; }
-        get offsetWidth() { return ops.op_layout_get_offset_width(_getNodeId(this)); }
+        get offsetWidth() {
+            const id = _getNodeId(this);
+            if (id < 0) throw new TypeError("Illegal invocation");
+            return ops.op_layout_get_offset_width(id);
+        }
         get offsetHeight() { return ops.op_layout_get_offset_height(_getNodeId(this)); }
         get offsetTop() { return ops.op_layout_get_offset_top(_getNodeId(this)); }
         get offsetLeft() { return ops.op_layout_get_offset_left(_getNodeId(this)); }
@@ -2227,18 +2231,26 @@
     class HTMLCanvasElement extends HTMLElement {}
     Object.defineProperty(HTMLCanvasElement.prototype, "width", {
         get() {
+            if (_getNodeId(this) < 0) throw new TypeError("Illegal invocation");
             const attr = this.getAttribute("width");
             return attr ? parseInt(attr, 10) : 300;
         },
-        set(v) { this.setAttribute("width", v); },
+        set(v) {
+            if (_getNodeId(this) < 0) throw new TypeError("Illegal invocation");
+            this.setAttribute("width", v);
+        },
         enumerable: true, configurable: true
     });
     Object.defineProperty(HTMLCanvasElement.prototype, "height", {
         get() {
+            if (_getNodeId(this) < 0) throw new TypeError("Illegal invocation");
             const attr = this.getAttribute("height");
             return attr ? parseInt(attr, 10) : 150;
         },
-        set(v) { this.setAttribute("height", v); },
+        set(v) {
+            if (_getNodeId(this) < 0) throw new TypeError("Illegal invocation");
+            this.setAttribute("height", v);
+        },
         enumerable: true, configurable: true
     });
     HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
@@ -3299,6 +3311,8 @@
         return implementation;
     }
 
+    const _documentBrand = new WeakSet();
+
     class Document extends Node {
         constructor() {
             const nodeId = arguments[0];
@@ -3307,6 +3321,7 @@
             // resolved to 0 (the "no such node" sentinel), which broke
             // anything walking parentNode→isConnected. Phase 7 follow-up.
             super(nodeId);
+            _documentBrand.add(this);
             if (!globalThis.__browser_oxide) {
                 Object.defineProperty(globalThis, '__browser_oxide', { value: {}, enumerable: false, configurable: true });
             }
@@ -3511,7 +3526,10 @@
         set domain(_value) {}
         get location() { return globalThis.location; }
         set location(val) { if (globalThis.location) globalThis.location.href = val; }
-        get referrer() { return globalThis.__frameReferrer || ""; }
+        get referrer() {
+            if (!_documentBrand.has(this)) throw new TypeError("Illegal invocation");
+            return globalThis.__frameReferrer || "";
+        }
         get hidden() { return false; }
         get visibilityState() { return "visible"; }
         get cookie() {
@@ -5111,7 +5129,8 @@
         "SVGEllipseElement", "SVGLineElement", "SVGPathElement",
         "SVGPolygonElement", "SVGPolylineElement", "SVGScriptElement",
         "SVGStyleElement", "SVGTitleElement", "SVGRect",
-        "NodeList", "HTMLCollection", "DOMTokenList", "Storage",
+        "NodeList", "HTMLCollection", "DOMTokenList", "Storage", "Screen",
+        "CanvasRenderingContext2D", "IntersectionObserverEntry",
         "HTMLHtmlElement", "HTMLHeadElement", "HTMLBodyElement",
         "HTMLDivElement", "HTMLSpanElement", "HTMLParagraphElement", "HTMLHeadingElement",
         "HTMLAnchorElement", "HTMLImageElement",
@@ -6162,6 +6181,7 @@
             open() { return _document.open(); },
             close() { return _document.close(); },
         };
+        _documentBrand.add(iframeDoc);
 
         // ── Screen mirror ─────────────────────────────────────────────────
         const _parentScreen = globalThis.screen || {};
@@ -6767,8 +6787,12 @@
                         var values=globalThis.__oxideNavigatorValues||{};
                         try{delete globalThis.__oxideNavigatorValues;}catch(_){}
                         var nativeTag=Symbol.for('__browser_oxide_native__');
+                        var nav=null;
                         function nativeGetter(key,value){
-                            var getter=function(){return value;};
+                            var getter=function(){
+                                if(this!==nav)throw new TypeError('Illegal invocation');
+                                return value;
+                            };
                             try{
                                 Object.defineProperty(getter,'name',{value:'get '+key,configurable:true});
                                 Object.defineProperty(getter,nativeTag,{value:'get '+key,configurable:true});
@@ -6787,7 +6811,7 @@
                                 enumerable:true,configurable:true
                             });}catch(_){}
                         }
-                        var nav=Object.create(proto);
+                        nav=Object.create(proto);
                         Object.defineProperty(globalThis,'navigator',{
                             value:nav,writable:false,enumerable:true,configurable:true
                         });
@@ -7631,6 +7655,7 @@
 
         Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
             get: function() {
+                if (_getNodeId(this) < 0) throw new TypeError("Illegal invocation");
                 if (!this.isConnected) return null;
                 // Accessing contentWindow materializes the browsing context even
                 // if the caller does not immediately read a property from it.
