@@ -9463,7 +9463,7 @@ async fn check_payment_request_surface() {
     println!("PAYMENT REQUEST SYNC CHECK:\n{}", sync_result);
 
     assert!(sync_result.contains("\"PaymentRequest_typeof\": \"function\""));
-    assert!(sync_result.contains("\"PaymentRequest_length\": 2"));
+    assert!(sync_result.contains("\"PaymentRequest_length\": 1"));
     assert!(sync_result.contains("\"PaymentResponse_typeof\": \"function\""));
     assert!(sync_result.contains("\"PaymentMethodChangeEvent_typeof\": \"function\""));
     assert!(sync_result.contains("\"PaymentRequestUpdateEvent_typeof\": \"function\""));
@@ -9496,7 +9496,8 @@ async fn check_payment_request_surface() {
                 r.hasEnrolledInstrument = await pr.hasEnrolledInstrument();
                 try { await pr.show(); r.show_ok = 'unexpected resolve'; }
                 catch (e) { r.show_rejected = e.name; }
-                r.abort_resolved = await pr.abort();
+                try { await pr.abort(); r.abort_ok = 'unexpected resolve'; }
+                catch (e) { r.abort_rejected = e.name; }
             } catch (e) { r.ctor_err = e.name + ': ' + e.message; }
 
             try {
@@ -9529,6 +9530,7 @@ async fn check_payment_request_surface() {
     assert!(async_result.contains("\"canMakePayment_unknown\": false"));
     assert!(async_result.contains("\"hasEnrolledInstrument\": false"));
     assert!(async_result.contains("\"show_rejected\": \"AbortError\""));
+    assert!(async_result.contains("\"abort_rejected\": \"InvalidStateError\""));
     assert!(
         async_result.contains("\"spc\": \"unavailable-no-user-verifying-platform-authenticator\"")
     );

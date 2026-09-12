@@ -463,6 +463,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/emerging_webidl_bootstrap.js"),
             "\n",
+            include_str!("js/payment_request_bootstrap.js"),
+            "\n",
             include_str!("js/eme_bootstrap.js"),
             "\n",
             include_str!("js/window_reflection_spec.js"),
