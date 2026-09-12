@@ -5587,6 +5587,15 @@
     // causing `crypto.subtle.digest` to throw "Cannot read properties
     // of undefined (reading 'digest')". Now we expose full classes
     // backed by Rust ops for real SHA-1/256/384/512 digest.
+    //
+    // shared_apis_bootstrap.js runs before this file and owns the canonical
+    // WebCrypto implementation for both Window and Worker realms.  Keep the
+    // historical implementation below only as a fallback for embedders that
+    // execute window_bootstrap.js in isolation; otherwise it would replace
+    // newer shared algorithms (for example ECDH) with this older duplicate.
+    if (!(globalThis.crypto && globalThis.Crypto && globalThis.SubtleCrypto
+        && globalThis.crypto instanceof globalThis.Crypto
+        && globalThis.crypto.subtle instanceof globalThis.SubtleCrypto)) {
     class Crypto {}
     globalThis.Crypto = Crypto;
     const _CryptoProto = Crypto.prototype;
@@ -6765,6 +6774,7 @@
     // Reparent or create the crypto instance.
     let _cryptoInstance = Object.create(_CryptoProto);
     globalThis.crypto = _cryptoInstance;
+    }
 
     // ================================================================
     // TextEncoder / TextDecoder — Chrome-shaped, kNoScriptId-safe.

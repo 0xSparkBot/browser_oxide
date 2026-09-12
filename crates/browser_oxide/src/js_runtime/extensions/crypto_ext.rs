@@ -4,6 +4,7 @@
 
 use boring2::aes::{unwrap_key, wrap_key, AesKey};
 use boring2::bn::{BigNum, BigNumContext};
+use boring2::derive::Deriver;
 use boring2::ec::{EcGroup, EcKey, EcPoint, PointConversionForm};
 use boring2::ecdsa::EcdsaSig;
 use boring2::nid::Nid;
@@ -165,6 +166,14 @@ fn ec_verify(curve: &str, hash: &str, spki: &[u8], signature: &[u8], data: &[u8]
         .ok()?
         .verify(&digest, &ec)
         .ok()
+}
+
+fn ec_derive(private_pkcs8: &[u8], public_spki: &[u8]) -> Option<Vec<u8>> {
+    let private = PKey::private_key_from_pkcs8(private_pkcs8).ok()?;
+    let public = PKey::public_key_from_der(public_spki).ok()?;
+    let mut deriver = Deriver::new(&private).ok()?;
+    deriver.set_peer(&public).ok()?;
+    deriver.derive_to_vec().ok()
 }
 
 #[derive(Serialize)]
@@ -579,6 +588,15 @@ pub fn op_crypto_ecdsa_verify(
     ec_verify(&curve, &hash, spki, signature, data).unwrap_or(false)
 }
 
+#[op2]
+#[buffer]
+pub fn op_crypto_ecdh_derive(
+    #[buffer] private_pkcs8: &[u8],
+    #[buffer] public_spki: &[u8],
+) -> Vec<u8> {
+    ec_derive(private_pkcs8, public_spki).unwrap_or_default()
+}
+
 #[op2(fast)]
 pub fn op_crypto_random_fill(#[buffer] out: &mut [u8]) {
     use rand::Rng;
@@ -603,6 +621,7 @@ deno_core::extension!(
         op_crypto_ec_import_jwk,
         op_crypto_ecdsa_sign,
         op_crypto_ecdsa_verify,
+        op_crypto_ecdh_derive,
         op_crypto_random_fill
     ],
 );
@@ -611,8 +630,9 @@ deno_core::extension!(
 mod tests {
     use super::{
         aes_cbc_decrypt_bytes, aes_cbc_encrypt_bytes, aes_gcm_decrypt_bytes, aes_gcm_encrypt_bytes,
-        aes_kw_unwrap_bytes, aes_kw_wrap_bytes, ec_generate, ec_import_jwk, ec_import_pkcs8,
-        ec_import_raw, ec_import_spki, ec_sign, ec_verify, hkdf_bytes, hmac_bytes, pbkdf2_bytes,
+        aes_kw_unwrap_bytes, aes_kw_wrap_bytes, ec_derive, ec_generate, ec_import_jwk,
+        ec_import_pkcs8, ec_import_raw, ec_import_spki, ec_sign, ec_verify, hkdf_bytes, hmac_bytes,
+        pbkdf2_bytes,
     };
 
     #[test]
@@ -792,6 +812,18 @@ mod tests {
             assert!(ec_import_spki(curve, &material.public_spki).is_some());
             assert!(ec_import_pkcs8(curve, &material.private_pkcs8).is_some());
             assert!(ec_import_jwk(curve, &material.x, &material.y, &material.d).is_some());
+        }
+    }
+
+    #[test]
+    fn ecdh_all_chrome_curves_derive_symmetric_shared_secret() {
+        for (curve, secret_len) in [("P-256", 32usize), ("P-384", 48), ("P-521", 66)] {
+            let a = ec_generate(curve).expect("generate EC key A");
+            let b = ec_generate(curve).expect("generate EC key B");
+            let ab = ec_derive(&a.private_pkcs8, &b.public_spki).expect("derive A->B");
+            let ba = ec_derive(&b.private_pkcs8, &a.public_spki).expect("derive B->A");
+            assert_eq!(ab.len(), secret_len);
+            assert_eq!(ab, ba);
         }
     }
 }

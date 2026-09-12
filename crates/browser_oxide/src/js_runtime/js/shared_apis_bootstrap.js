@@ -121,8 +121,8 @@
         ? { name: state.name }
         : (state.name === 'AES-GCM' || state.name === 'AES-CBC' || state.name === 'AES-KW')
             ? { name: state.name, length: state.length }
-            : state.name === 'ECDSA'
-                ? { name: 'ECDSA', namedCurve: state.namedCurve }
+            : (state.name === 'ECDSA' || state.name === 'ECDH')
+                ? { name: state.name, namedCurve: state.namedCurve }
                 : {
                     name: "HMAC",
                     hash: { name: state.hash },
@@ -775,9 +775,141 @@
         }
         return { name: 'ECDSA', hash };
     };
+
+    const _normalizeEcdhKeyAlgorithm = (algorithm, operationName) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'ECDH') {
+            throw new DOMException('Unrecognized name.', 'NotSupportedError');
+        }
+        const namedCurve = String(algorithm && algorithm.namedCurve || '');
+        if (!_ecdsaCurves.has(namedCurve)) {
+            throw new DOMException(
+                `Failed to execute '${operationName}' on 'SubtleCrypto': EcKeyGenParams: Unrecognized namedCurve`,
+                'NotSupportedError'
+            );
+        }
+        return { name: 'ECDH', namedCurve };
+    };
+    const _canonicalEcdhUsages = (keyUsages) => {
+        const requested = Array.from(keyUsages || [], String);
+        if (requested.some((usage) => usage !== 'deriveKey' && usage !== 'deriveBits')) {
+            throw new DOMException('Cannot create a key using the specified key usages.', 'SyntaxError');
+        }
+        const usages = ['deriveKey', 'deriveBits'].filter((usage) => requested.includes(usage));
+        if (usages.length === 0) {
+            throw new DOMException('Usages cannot be empty when creating a key.', 'SyntaxError');
+        }
+        return usages;
+    };
+    const _normalizeEcdhGenerateUsages = (keyUsages) => ({
+        publicUsages: [],
+        privateUsages: _canonicalEcdhUsages(keyUsages),
+    });
+    const _normalizeEcdhImportUsages = (type, keyUsages) => {
+        const requested = Array.from(keyUsages || [], String);
+        if (type === 'public') {
+            if (requested.length !== 0) {
+                throw new DOMException('Cannot create a key using the specified key usages.', 'SyntaxError');
+            }
+            return [];
+        }
+        return _canonicalEcdhUsages(requested);
+    };
+    const _makeEcdhKey = (material, type, namedCurve, extractable, usages) => {
+        if (!material || !material.ok) throw new DOMException('', 'DataError');
+        const key = Object.create(_CryptoKeyProto);
+        _cryptoKeyState.set(key, {
+            name: 'ECDH', type, namedCurve,
+            extractable: !!extractable,
+            usages: usages.slice(),
+            publicSpki: _ecMaterialBytes(material.public_spki),
+            privatePkcs8: _ecMaterialBytes(material.private_pkcs8),
+            rawPublic: _ecMaterialBytes(material.raw_public),
+            x: _ecMaterialBytes(material.x),
+            y: _ecMaterialBytes(material.y),
+            d: _ecMaterialBytes(material.d),
+        });
+        return key;
+    };
+    const _makeEcdhKeyPair = (material, namedCurve, extractable, usages) => ({
+        publicKey: _makeEcdhKey(material, 'public', namedCurve, true, usages.publicUsages),
+        privateKey: _makeEcdhKey(material, 'private', namedCurve, extractable, usages.privateUsages),
+    });
+    const _importEcdhJwk = (jwk, namedCurve, extractable, keyUsages) => {
+        if (!jwk || typeof jwk !== 'object' || ArrayBuffer.isView(jwk) || jwk instanceof ArrayBuffer) {
+            throw new TypeError("Failed to execute 'importKey' on 'SubtleCrypto': The provided value is not of type '(ArrayBuffer or ArrayBufferView or JsonWebKey)'.");
+        }
+        if (jwk.kty !== 'EC' || String(jwk.crv || '') !== namedCurve) throw new DOMException('', 'DataError');
+        const curve = _ecdsaCurves.get(namedCurve);
+        const type = Object.prototype.hasOwnProperty.call(jwk, 'd') ? 'private' : 'public';
+        const usages = _normalizeEcdhImportUsages(type, keyUsages);
+        if (jwk.use !== undefined && String(jwk.use) !== 'enc') throw new DOMException('', 'DataError');
+        if (jwk.key_ops !== undefined) {
+            const keyOps = Array.from(jwk.key_ops, String);
+            if (usages.some((usage) => !keyOps.includes(usage))) throw new DOMException('', 'DataError');
+        }
+        if (jwk.ext === false && extractable) throw new DOMException('', 'DataError');
+        const x = _ecdsaJwkMember(jwk, 'x', curve.bytes);
+        const y = _ecdsaJwkMember(jwk, 'y', curve.bytes);
+        const d = type === 'private' ? _ecdsaJwkMember(jwk, 'd', curve.bytes) : new Uint8Array(0);
+        const material = ops.op_crypto_ec_import_jwk(namedCurve, x, y, d);
+        return _makeEcdhKey(material, type, namedCurve, extractable, usages);
+    };
+    const _deriveEcdhSecret = (algorithm, baseKey, usage) => {
+        const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+        if (String(rawName || '').toUpperCase() !== 'ECDH') {
+            throw new DOMException('Unrecognized name.', 'NotSupportedError');
+        }
+        const state = _requireCryptoKey(baseKey);
+        if (state.name !== 'ECDH' || state.type !== 'private' || !state.usages.includes(usage)) {
+            throw new DOMException('key.usages does not permit this operation', 'InvalidAccessError');
+        }
+        const publicState = _requireCryptoKey(algorithm && algorithm.public);
+        if (publicState.name !== 'ECDH' || publicState.type !== 'public') {
+            throw new DOMException('The public parameter for ECDH key derivation is not an ECDH public key', 'InvalidAccessError');
+        }
+        if (publicState.namedCurve !== state.namedCurve) {
+            throw new DOMException(
+                'The public parameter for ECDH key derivation is for a different named curve',
+                'InvalidAccessError'
+            );
+        }
+        const secret = new Uint8Array(ops.op_crypto_ecdh_derive(state.privatePkcs8, publicState.publicSpki));
+        const expected = _ecdsaCurves.get(state.namedCurve).bytes;
+        if (secret.byteLength !== expected) throw new DOMException('', 'OperationError');
+        return secret;
+    };
+    const _sliceEcdhBits = (secret, length) => {
+        if (length === undefined || length === null) return secret.slice();
+        const bitLength = Number(length);
+        if (!Number.isFinite(bitLength) || !Number.isInteger(bitLength) || bitLength < 0) {
+            throw new DOMException('The operation failed for an operation-specific reason', 'OperationError');
+        }
+        const maximum = secret.byteLength * 8;
+        if (bitLength > maximum) {
+            throw new DOMException(
+                `Length specified for ECDH key derivation is too large. Maximum allowed is ${maximum} bits`,
+                'OperationError'
+            );
+        }
+        const byteLength = Math.ceil(bitLength / 8);
+        const out = secret.slice(0, byteLength);
+        const remainder = bitLength % 8;
+        if (remainder !== 0 && out.byteLength !== 0) {
+            out[out.byteLength - 1] &= (0xff << (8 - remainder)) & 0xff;
+        }
+        return out;
+    };
     _defProtoMethod(_SubtleProto, 'generateKey', function generateKey(algorithm, extractable, keyUsages) {
         try {
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'ECDH') {
+                const alg = _normalizeEcdhKeyAlgorithm(algorithm, 'generateKey');
+                const usages = _normalizeEcdhGenerateUsages(keyUsages);
+                const material = ops.op_crypto_ec_generate(alg.namedCurve);
+                if (!material || !material.ok) throw new DOMException('', 'OperationError');
+                return Promise.resolve(_makeEcdhKeyPair(material, alg.namedCurve, extractable, usages));
+            }
             if (String(rawName || '').toUpperCase() === 'ECDSA') {
                 const alg = _normalizeEcdsaKeyAlgorithm(algorithm, 'generateKey');
                 const usages = _normalizeEcdsaGenerateUsages(keyUsages);
@@ -820,6 +952,22 @@
         try {
             const normalizedFormat = String(format).toLowerCase();
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'ECDH') {
+                const alg = _normalizeEcdhKeyAlgorithm(algorithm, 'importKey');
+                if (!['raw', 'spki', 'pkcs8', 'jwk'].includes(normalizedFormat)) {
+                    throw new DOMException("The requested operation is not supported", "NotSupportedError");
+                }
+                if (normalizedFormat === 'jwk') {
+                    return Promise.resolve(_importEcdhJwk(keyData, alg.namedCurve, extractable, keyUsages));
+                }
+                if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+                    throw new TypeError("keyData is not a BufferSource");
+                }
+                const type = normalizedFormat === 'pkcs8' ? 'private' : 'public';
+                const usages = _normalizeEcdhImportUsages(type, keyUsages);
+                const material = ops.op_crypto_ec_import(alg.namedCurve, normalizedFormat, _toBytes(keyData));
+                return Promise.resolve(_makeEcdhKey(material, type, alg.namedCurve, extractable, usages));
+            }
             if (String(rawName || '').toUpperCase() === 'ECDSA') {
                 const alg = _normalizeEcdsaKeyAlgorithm(algorithm, 'importKey');
                 if (!['raw', 'spki', 'pkcs8', 'jwk'].includes(normalizedFormat)) {
@@ -924,7 +1072,7 @@
                 throw new DOMException("Failed to execute 'exportKey' on 'SubtleCrypto': key is not extractable", "InvalidAccessError");
             }
             const normalizedFormat = String(format).toLowerCase();
-            if (state.name === 'ECDSA') {
+            if (state.name === 'ECDSA' || state.name === 'ECDH') {
                 if (normalizedFormat === 'jwk') return Promise.resolve(_exportEcdsaJwk(state));
                 let bytes;
                 if (state.type === 'public' && normalizedFormat === 'raw') bytes = state.rawPublic;
@@ -988,6 +1136,11 @@
     _defProtoMethod(_SubtleProto, 'deriveBits', function deriveBits(algorithm, baseKey, length) {
         try {
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'ECDH') {
+                const secret = _deriveEcdhSecret(algorithm, baseKey, 'deriveBits');
+                const out = _sliceEcdhBits(secret, length);
+                return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+            }
             if (String(rawName || '').toUpperCase() === 'HKDF') {
                 const alg = _normalizeHkdfAlgorithm(algorithm, 'deriveBits');
                 const state = _requireCryptoKey(baseKey);
@@ -1021,6 +1174,37 @@
     _defProtoMethod(_SubtleProto, 'deriveKey', function deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
         try {
             const rawName = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+            if (String(rawName || '').toUpperCase() === 'ECDH') {
+                const secret = _deriveEcdhSecret(algorithm, baseKey, 'deriveKey');
+                const derivedName = typeof derivedKeyType === 'string'
+                    ? derivedKeyType
+                    : (derivedKeyType && derivedKeyType.name);
+                if (String(derivedName || '').toUpperCase() === 'AES-GCM') {
+                    const derived = _normalizeAesGcmKeyAlgorithm(derivedKeyType, true);
+                    const usages = _normalizeAesGcmUsages(keyUsages);
+                    return Promise.resolve(_makeAesGcmKey(_sliceEcdhBits(secret, derived.length), extractable, usages));
+                }
+                if (String(derivedName || '').toUpperCase() === 'AES-CBC') {
+                    const derived = _normalizeAesCbcKeyAlgorithm(derivedKeyType, true);
+                    const usages = _normalizeAesCbcUsages(keyUsages);
+                    return Promise.resolve(_makeAesCbcKey(_sliceEcdhBits(secret, derived.length), extractable, usages));
+                }
+                if (String(derivedName || '').toUpperCase() === 'AES-KW') {
+                    const derived = _normalizeAesKwKeyAlgorithm(derivedKeyType, true);
+                    const usages = _normalizeAesKwUsages(keyUsages);
+                    return Promise.resolve(_makeAesKwKey(_sliceEcdhBits(secret, derived.length), extractable, usages));
+                }
+                const derived = _normalizeHmacAlgorithm(derivedKeyType, true);
+                const usages = _normalizeHmacUsages(keyUsages);
+                const bitLength = derived.length === undefined
+                    ? (derived.hash === 'SHA-384' || derived.hash === 'SHA-512' ? 1024 : 512)
+                    : derived.length;
+                if (bitLength % 8 !== 0) {
+                    throw new DOMException('The operation failed for an operation-specific reason', 'OperationError');
+                }
+                const out = _sliceEcdhBits(secret, bitLength);
+                return Promise.resolve(_makeHmacKey(out, derived.hash, extractable, usages, bitLength));
+            }
             if (String(rawName || '').toUpperCase() === 'HKDF') {
                 const alg = _normalizeHkdfAlgorithm(algorithm, 'deriveKey');
                 const state = _requireCryptoKey(baseKey);
