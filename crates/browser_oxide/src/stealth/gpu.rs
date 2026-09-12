@@ -439,6 +439,14 @@ fn common_params_desktop() -> Vec<(u32, serde_json::Value)> {
         (0x8872, json!(16)),             // MAX_TEXTURE_IMAGE_UNITS
         (0x8B4D, json!(16)),             // MAX_VERTEX_TEXTURE_IMAGE_UNITS
         (0x8B4C, json!(32)),             // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+        // Extension/core capability limits. Verified on the same Apple M3
+        // machine with desktop Chrome: WEBGL_draw_buffers exposes 8 draw
+        // buffers in WebGL 1, while EXT_texture_filter_anisotropic exposes
+        // a max anisotropy of 16 in both WebGL 1 and WebGL 2.  Keeping these
+        // in the shared parameter catalog prevents the inconsistent state
+        // where an extension is advertised but querying its enum returns null.
+        (0x8824, json!(8)),  // MAX_DRAW_BUFFERS / MAX_DRAW_BUFFERS_WEBGL
+        (0x84FF, json!(16)), // MAX_TEXTURE_MAX_ANISOTROPY_EXT
         (0x846D, json!([1.0, 8190.0])),  // ALIASED_POINT_SIZE_RANGE
         (0x846E, json!([1.0, 1.0])),     // ALIASED_LINE_WIDTH_RANGE
         (0x0D3A, json!([32767, 32767])), // MAX_VIEWPORT_DIMS

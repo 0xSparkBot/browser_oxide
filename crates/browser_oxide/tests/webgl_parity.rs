@@ -309,6 +309,7 @@ async fn webgl2_extension_objects_match_chrome_surface() {
 
             const anisotropic = gl.getExtension('EXT_texture_filter_anisotropic');
             if (anisotropic.TEXTURE_MAX_ANISOTROPY_EXT !== 34046 || anisotropic.MAX_TEXTURE_MAX_ANISOTROPY_EXT !== 34047) errors.push('anisotropic-values');
+            if (gl.getParameter(anisotropic.MAX_TEXTURE_MAX_ANISOTROPY_EXT) !== 16) errors.push('anisotropic-max-parameter');
             if (gl.getExtension('KHR_parallel_shader_compile').COMPLETION_STATUS_KHR !== 37297) errors.push('khr-value');
             const debug = gl.getExtension('WEBGL_debug_renderer_info');
             if (debug.UNMASKED_VENDOR_WEBGL !== 37445 || debug.UNMASKED_RENDERER_WEBGL !== 37446) errors.push('debug-values');
@@ -370,7 +371,11 @@ async fn webgl1_only_extension_objects_match_chrome_surface() {
             const vao = vaoExt.createVertexArrayOES();
             if (Object.prototype.toString.call(vao) !== '[object WebGLVertexArrayObjectOES]' || Reflect.ownKeys(vao).length || vaoExt.isVertexArrayOES(vao) !== false) errors.push('vao-shape');
             if (gl.getExtension('ANGLE_instanced_arrays').VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE !== 35070) errors.push('angle-value');
-            if (gl.getExtension('WEBGL_draw_buffers').MAX_DRAW_BUFFERS_WEBGL !== 34852) errors.push('draw-buffers-value');
+            const drawBuffers = gl.getExtension('WEBGL_draw_buffers');
+            if (drawBuffers.MAX_DRAW_BUFFERS_WEBGL !== 34852) errors.push('draw-buffers-value');
+            if (gl.getParameter(drawBuffers.MAX_DRAW_BUFFERS_WEBGL) !== 8) errors.push('draw-buffers-max-parameter');
+            const anisotropic = gl.getExtension('EXT_texture_filter_anisotropic');
+            if (gl.getParameter(anisotropic.MAX_TEXTURE_MAX_ANISOTROPY_EXT) !== 16) errors.push('anisotropic-max-parameter');
             return JSON.stringify(errors);
         })()
         "#,

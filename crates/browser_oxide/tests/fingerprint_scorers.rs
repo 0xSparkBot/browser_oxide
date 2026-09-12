@@ -411,15 +411,59 @@ async fn scorer_browserleaks_webgl() {
     let report = page
         .evaluate(
             r#"(() => {
-                const text = document.body ? document.body.textContent : '';
-                const vendor = text.match(/Vendor[:\s]+([^\n]{1,100})/i)?.[1] || 'none';
-                const renderer = text.match(/Renderer[:\s]+([^\n]{1,150})/i)?.[1] || 'none';
-                const unmasked = text.match(/Unmasked\s*Renderer[:\s]+([^\n]{1,150})/i)?.[1] || 'none';
-                return JSON.stringify({vendor, renderer, unmasked});
+                const text = (id) => document.querySelector(id)?.textContent?.trim() || '';
+                return JSON.stringify({
+                    reportHash: text('#gl-report-hash'),
+                    imageHash: text('#gl-image-hash'),
+                    status1: text('#gl1-status'),
+                    status2: text('#gl2-status'),
+                    context: text('#gl-context'),
+                    unmaskedVendor: text('#UNMASKED_VENDOR_WEBGL'),
+                    unmaskedRenderer: text('#UNMASKED_RENDERER_WEBGL'),
+                });
             })()"#,
         )
         .unwrap_or_default();
     println!("webgl report: {report}");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&report).expect("browserleaks report json");
+    let is_md5 = |name: &str| {
+        let value = parsed[name].as_str().unwrap_or_default();
+        value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    assert!(is_md5("reportHash"), "WebGL report hash missing: {report}");
+    assert!(is_md5("imageHash"), "WebGL image hash missing: {report}");
+    assert!(
+        parsed["status1"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("True"),
+        "WebGL 1 did not initialize: {report}"
+    );
+    assert!(
+        parsed["status2"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("True"),
+        "WebGL 2 did not initialize: {report}"
+    );
+    let contexts = parsed["context"].as_str().unwrap_or_default();
+    assert!(
+        contexts.contains("webgl") && contexts.contains("webgl2"),
+        "expected WebGL 1+2 contexts: {report}"
+    );
+    assert!(
+        !parsed["unmaskedVendor"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+            && !parsed["unmaskedRenderer"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+        "unmasked WebGL identity missing: {report}"
+    );
 }
 
 // §6.6 item 1 — navigator.plugins / mimeTypes parity with fixture §10.1.
