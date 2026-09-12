@@ -431,7 +431,7 @@
     }
     for (const name of ['pointerId', 'width', 'height', 'pressure', 'tiltX',
         'tiltY', 'azimuthAngle', 'altitudeAngle', 'tangentialPressure', 'twist',
-        'pointerType', 'isPrimary', 'persistentDeviceId']) {
+        'pointerType', 'isPrimary']) {
         _defineGetter(PointerEvent.prototype, name, _pointerEventState);
     }
     const _pointerGetPredictedEvents = { getPredictedEvents() { return []; } }.getPredictedEvents;
@@ -439,6 +439,7 @@
         value: _native(_pointerGetPredictedEvents, 'getPredictedEvents'),
         writable: true, enumerable: true, configurable: true,
     });
+    _defineGetter(PointerEvent.prototype, 'persistentDeviceId', _pointerEventState);
     _moveConstructorLast(PointerEvent);
 
     class WheelEvent extends MouseEvent {
