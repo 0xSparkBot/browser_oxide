@@ -18,6 +18,12 @@ use tokio_boring2::SslStream;
 
 use crate::net::error::NetError;
 
+/// Bound the TLS handshake independently from the TCP connect timeout.
+/// A peer can accept TCP and then stop responding mid-handshake; without a
+/// separate deadline that path inherits the OS/socket timeout and can pin a
+/// browser request for well over a minute before protocol fallback runs.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The Chrome major version whose **verified-real** ClientHello / H2
 /// fingerprint these constants reproduce, byte-exact.
 ///
@@ -601,11 +607,27 @@ pub async fn connect_tls(
     domain: &str,
     stream: TcpStream,
 ) -> Result<SslStream<TcpStream>, NetError> {
+    connect_tls_with_timeout(connector, profile, domain, stream, TLS_HANDSHAKE_TIMEOUT).await
+}
+
+async fn connect_tls_with_timeout(
+    connector: &SslConnector,
+    profile: &StealthProfile,
+    domain: &str,
+    stream: TcpStream,
+    timeout: std::time::Duration,
+) -> Result<SslStream<TcpStream>, NetError> {
     let config = configure_connection(connector, profile, domain)?;
     let sni_domain = domain.trim_start_matches('[').trim_end_matches(']');
 
-    tokio_boring2::connect(config, sni_domain, stream)
+    tokio::time::timeout(timeout, tokio_boring2::connect(config, sni_domain, stream))
         .await
+        .map_err(|_| {
+            NetError::Tls(format!(
+                "TLS handshake timed out after {}ms",
+                timeout.as_millis()
+            ))
+        })?
         .map_err(|e| NetError::Tls(format!("TLS handshake failed: {e}")))
 }
 
@@ -617,6 +639,47 @@ pub fn negotiated_alpn(stream: &SslStream<TcpStream>) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tls_handshake_timeout_bounds_a_stalled_peer() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Keep the accepted TCP connection open without sending any TLS
+            // bytes. This reproduces the generic failure mode where TCP
+            // succeeds but the TLS peer stalls indefinitely.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+
+        let profile = crate::stealth::presets::chrome_148_macos();
+        let connector = chrome_connector(&profile).expect("connector");
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let started = std::time::Instant::now();
+        let result = connect_tls_with_timeout(
+            &connector,
+            &profile,
+            "localhost",
+            tcp,
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+
+        match result {
+            Err(NetError::Tls(message)) => {
+                assert!(message.contains("timed out"), "unexpected error: {message}");
+            }
+            Err(other) => panic!("expected TLS timeout, got {other}"),
+            Ok(_) => panic!("stalled peer unexpectedly completed TLS handshake"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "TLS timeout must bound a stalled peer independently of OS socket timeouts"
+        );
+        server.abort();
+    }
 
     /// Self-verifying JA4 drift guard + UA/TLS coherence assert.
     /// Network-free.
