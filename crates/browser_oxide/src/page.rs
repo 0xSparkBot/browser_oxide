@@ -6130,12 +6130,18 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn navigate_stealth_js_fingerprint() {
         let profile = crate::stealth::presets::chrome_148_linux();
-        let mut page = Page::navigate_stealth("https://httpbin.org/html", profile)
-            .await
-            .expect("stealth navigate failed");
+        // This is a JavaScript-surface regression, not a network test. Keep it
+        // deterministic so transient httpbin/TLS failures cannot hide a real
+        // fingerprint regression or make the ignored network smoke suite flaky.
+        let mut page = Page::from_html_with_url(
+            "<!doctype html><html><body></body></html>",
+            "https://example.test/stealth-fingerprint",
+            Some(profile),
+        )
+        .await
+        .expect("local stealth page failed");
         // Verify stealth properties are wired
         let ua = page.evaluate("navigator.userAgent").unwrap();
         println!("[stealth] userAgent: {ua}");
