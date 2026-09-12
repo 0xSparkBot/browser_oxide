@@ -50,6 +50,20 @@ fn pick_profile() -> browser_oxide::stealth::StealthProfile {
     }
 }
 
+/// Classify a navigated page with the engine's canonical body classifier,
+/// while preserving the URL-only redirect signals that cannot be recovered
+/// from serialized HTML alone.
+fn classify_with_url(html: &str, current_url: &str) -> String {
+    let current_url = current_url.to_lowercase();
+    if current_url.contains("/sttc/px/captcha-v2/") || current_url.contains("/_pxcaptcha") {
+        return "BehaviorChallenge-CHL".to_string();
+    }
+    if current_url.contains("captcha-delivery.com") {
+        return "Interstitial-CHL".to_string();
+    }
+    browser_oxide::engine_classify(html).tag.to_string()
+}
+
 async fn fetch_one(url: &str) -> (String, usize, u64, u64) {
     let nav_start = Instant::now();
     let profile = pick_profile();
@@ -59,89 +73,8 @@ async fn fetch_one(url: &str) -> (String, usize, u64, u64) {
             Err(e) => return (format!("ERROR: {e}"), 0, page_drop_marker()),
         };
         let html = page.content();
-        let lower = html.to_lowercase();
         let len = html.len();
-        // FP-Classify: detect challenges by *current URL* before falling
-        // through to body markers. Some vendors redirect to a thin generic
-        // SPA shell (such sites land on /sttc/px/captcha-v2/) that contains
-        // no body marker — the URL is the only signal. Must run BEFORE
-        // the THIN-BODY check below (709-byte challenge page would
-        // otherwise be tagged THIN-BODY).
-        let current_url = page.url().to_lowercase();
-        let url_outcome: Option<&'static str> = if current_url.contains("/sttc/px/captcha-v2/")
-            || current_url.contains("/_pxcaptcha")
-        {
-            Some("BehaviorChallenge-CHL")
-        } else if current_url.contains("captcha-delivery.com") {
-            Some("Interstitial-CHL")
-        } else {
-            None
-        };
-
-        // Vendor-specific markers — high-confidence detections. If any of
-        // these substrings appears, the response is definitely a challenge
-        // page (these strings don't legitimately appear in normal site
-        // bodies — e.g. `_kpsdk` is a challenge vendor's tracker variable name).
-        let strong_markers: &[(&str, &str)] = &[
-            ("just a moment", "ManagedChallenge-CHL"),
-            ("checking your browser", "ManagedChallenge-CHL"),
-            ("cf-browser-verification", "ManagedChallenge-CHL"),
-            ("_kpsdk", "ScriptChallenge-CHL"),
-            ("ips.js", "ScriptChallenge-CHL"),
-            ("/_sec/cp_challenge", "SecCpt-CHL"),
-            ("akam/13", "SensorChallenge-CHL"),
-            ("_abck", "SensorChallenge-CHL"),
-            ("captcha-delivery", "Interstitial-CHL"),
-            ("ddcaptchaencoded", "Interstitial-CHL"),
-            ("press &amp; hold", "HoldChallenge-PaH"),
-            ("_pxhd", "BehaviorChallenge-CHL"),
-        ];
-        // Weak markers — common words that appear in normal site footers /
-        // privacy policies / blog posts. Only consult these if the body is
-        // small enough that a CMS footer wouldn't dominate the bytes.
-        let weak_markers: &[(&str, &str)] = &[
-            ("captcha", "captcha-CHL"),
-            ("403 forbidden", "BLOCKED"),
-            ("access denied", "BLOCKED"),
-            ("blocked", "BLOCKED"),
-        ];
-        let outcome = {
-            // 0. URL-based challenge detection (vendor redirected us to a
-            // generic SPA challenge page with no body markers).
-            // Must run BEFORE everything else — the thin shell would
-            // otherwise be tagged THIN-BODY or L3-RENDERED.
-            if let Some(tag) = url_outcome {
-                tag.to_string()
-            } else {
-                // 1. Strong markers — always trust.
-                let mut o = "L3-RENDERED".to_string();
-                for (needle, tag) in strong_markers {
-                    if lower.contains(needle) {
-                        o = tag.to_string();
-                        break;
-                    }
-                }
-                // 2. Weak markers — only when body is small (<100 KB). A site
-                // returning 100 KB+ of HTML almost certainly rendered the real
-                // homepage; the substring "captcha" is footer / cookie-banner
-                // text, not a challenge. (github.com 581 KB, bbc.com 537 KB,
-                // washingtonpost.com 3.1 MB all hit this false-positive in the
-                // Phase A baseline sweep — DEEP_NEXT_STEPS Part 2 §C.)
-                if o == "L3-RENDERED" && len < 100 * 1024 {
-                    for (needle, tag) in weak_markers {
-                        if lower.contains(needle) {
-                            o = tag.to_string();
-                            break;
-                        }
-                    }
-                }
-                // 3. Stub bodies — definitely not a real render.
-                if o == "L3-RENDERED" && len < 1000 {
-                    o = "THIN-BODY".to_string();
-                }
-                o
-            }
-        };
+        let outcome = classify_with_url(&html, page.url());
         // Capture drop start before page goes out of scope; the actual drop
         // happens here at end-of-block.
         let drop_t0 = Instant::now();
@@ -905,7 +838,7 @@ fn classify(html: &str) -> String {
 
 #[cfg(test)]
 mod classifier_tests {
-    use super::classify;
+    use super::{classify, classify_with_url};
 
     #[tokio::test]
     async fn sensor_bootstrap_tag_in_rendered_page_is_not_chl() {
@@ -997,6 +930,40 @@ mod classifier_tests {
         html.push_str("</body></html>");
         assert!(html.len() > 100 * 1024);
         assert_eq!(classify(&html), "L3-RENDERED");
+    }
+
+    #[tokio::test]
+    async fn medium_page_with_invisible_recaptcha_sdk_is_not_chl() {
+        // A normal 50-90 KB landing page can load reCAPTCHA Enterprise as
+        // always-on SDK plumbing. The obsolete per-site sweep classifier
+        // treated the bare substring "captcha" as a challenge below 100 KB,
+        // even though the canonical engine classifier correctly requires an
+        // interactive captcha co-signal.
+        let mut html = String::from(
+            r#"<html><head><script src="https://www.recaptcha.net/recaptcha/enterprise.js?render=site-key"></script></head><body>"#,
+        );
+        while html.len() < 70 * 1024 {
+            html.push_str("<div>normal application hydration content</div>");
+        }
+        html.push_str("</body></html>");
+        assert!(html.len() < 100 * 1024);
+        assert_eq!(
+            classify_with_url(&html, "https://example.test/"),
+            "L3-RENDERED"
+        );
+    }
+
+    #[tokio::test]
+    async fn url_only_challenge_redirects_still_override_body_classifier() {
+        let body = "<html><body><main>generic shell</main></body></html>";
+        assert_eq!(
+            classify_with_url(body, "https://example.test/sttc/px/captcha-v2/"),
+            "BehaviorChallenge-CHL"
+        );
+        assert_eq!(
+            classify_with_url(body, "https://geo.captcha-delivery.com/interstitial"),
+            "Interstitial-CHL"
+        );
     }
 
     #[tokio::test]
