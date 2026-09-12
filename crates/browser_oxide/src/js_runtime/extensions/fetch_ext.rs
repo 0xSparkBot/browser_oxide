@@ -702,6 +702,58 @@ pub async fn op_cookie_get(#[string] url: String) -> String {
     client.cookies_for_url(&parsed).await.unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CookieStoreCookie {
+    pub domain: Option<String>,
+    pub expires: Option<u64>,
+    pub name: String,
+    pub partitioned: bool,
+    pub path: String,
+    pub same_site: String,
+    pub secure: bool,
+    pub value: String,
+}
+
+/// Return the non-HttpOnly cookies visible to the supplied document URL with
+/// Cookie Store API metadata.  `document.cookie` only exposes name/value
+/// pairs; CookieStore.get()/getAll() additionally surface path, domain,
+/// expiry, SameSite and Secure state, so use the jar's metadata snapshots
+/// rather than reparsing the header string on the JS side.
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_cookie_store_get_all(#[string] url: String) -> Vec<CookieStoreCookie> {
+    let Some(client) = FETCH_CLIENT.with(|c| c.borrow().clone()) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = Url::parse(&url) else {
+        return Vec::new();
+    };
+    let cookies = client.cookies();
+    let jar = cookies.lock().await;
+    jar.snapshots_for(&parsed)
+        .into_iter()
+        .filter(|cookie| !cookie.http_only)
+        .map(|cookie| CookieStoreCookie {
+            domain: if cookie.host_only {
+                None
+            } else {
+                Some(cookie.domain.trim_start_matches('.').to_string())
+            },
+            expires: cookie.expires.map(|seconds| seconds.saturating_mul(1000)),
+            name: cookie.name,
+            partitioned: false,
+            path: cookie.path,
+            same_site: cookie
+                .same_site
+                .unwrap_or_else(|| "Lax".to_string())
+                .to_ascii_lowercase(),
+            secure: cookie.secure,
+            value: cookie.value,
+        })
+        .collect()
+}
+
 /// Set a cookie via a raw "name=value; path=/; ..." string, scoped to the URL's origin.
 #[op2(async(lazy), fast)]
 pub async fn op_cookie_set(#[string] url: String, #[string] cookie: String) {
@@ -1175,6 +1227,7 @@ deno_core::extension!(
     ops = [
         op_fetch,
         op_cookie_get,
+        op_cookie_store_get_all,
         op_cookie_set,
         op_cookie_set_sync,
         op_net_fetch_sync,

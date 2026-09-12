@@ -11496,34 +11496,178 @@
     // Spec: https://wicg.github.io/cookie-store/
     // [SecureContext] — undefined on insecure contexts. Phase 7.
     // Real Chrome exposes a CookieStore INSTANCE on globalThis (not a
-    // constructor) when secure. Our prior `_illegalCtor("CookieStore")`
-    // from interfaces_bootstrap is replaced unconditionally so the
-    // *constructor* exists on globalThis as a real class — but the
-    // instance binding `globalThis.cookieStore` is gated on secure.
+    // constructor) when secure. Keep the instance wired to the same Rust
+    // cookie jar used by document.cookie/fetch so all three surfaces observe
+    // one source of truth.
     {
-        // Real Chrome's CookieStore is [Exposed] but has no public
-        // constructor — `new CookieStore()` throws "Failed to construct
-        // 'CookieStore': Illegal constructor". We mirror that, while
-        // still being able to materialise the `globalThis.cookieStore`
-        // instance via a private symbol that's only known to this file.
         const _internalBuild = Symbol("CookieStore.internalBuild");
-        class CookieStore extends EventTarget {
-            constructor(token) {
-                super();
-                if (token !== _internalBuild) {
+        const _cookieStoreBrand = new WeakSet();
+        const _cookieStoreState = new WeakMap();
+        const _cookieStoreRequire = self => {
+            if (!_cookieStoreBrand.has(self)) throw new TypeError('Illegal invocation');
+        };
+        const _cookieStoreCurrentUrl = () => String(
+            globalThis.location && globalThis.location.href || 'about:blank'
+        );
+        const _cookieStoreNormalizeQuery = (raw, allowEmpty) => {
+            if (raw === undefined) {
+                if (allowEmpty) return { name: undefined, url: _cookieStoreCurrentUrl() };
+                throw new TypeError(
+                    "Failed to execute 'get' on 'CookieStore': CookieStoreGetOptions must not be empty"
+                );
+            }
+            let name;
+            let requestedUrl = _cookieStoreCurrentUrl();
+            if (typeof raw === 'string') {
+                name = raw;
+            } else if (raw !== null && (typeof raw === 'object' || typeof raw === 'function')) {
+                if (raw.name !== undefined) name = String(raw.name);
+                if (raw.url !== undefined) {
+                    const parsed = new URL(String(raw.url), requestedUrl);
+                    const current = new URL(requestedUrl);
+                    if (parsed.origin !== current.origin) {
+                        throw new TypeError(
+                            "Failed to execute 'getAll' on 'CookieStore': URL must match the document origin"
+                        );
+                    }
+                    requestedUrl = parsed.href;
+                }
+            } else {
+                name = String(raw);
+            }
+            if (!allowEmpty && name === undefined) {
+                throw new TypeError(
+                    "Failed to execute 'get' on 'CookieStore': CookieStoreGetOptions must not be empty"
+                );
+            }
+            return { name, url: requestedUrl };
+        };
+        const _cookieStoreFormat = cookie => ({
+            domain: cookie.domain == null ? null : String(cookie.domain),
+            expires: cookie.expires == null ? null : Number(cookie.expires),
+            name: String(cookie.name),
+            partitioned: !!cookie.partitioned,
+            path: String(cookie.path || '/'),
+            sameSite: String(cookie.sameSite || 'lax'),
+            secure: !!cookie.secure,
+            value: String(cookie.value),
+        });
+        const _cookieStoreRead = async (query, firstOnly) => {
+            const cookies = await ops.op_cookie_store_get_all(query.url);
+            const matches = query.name === undefined
+                ? cookies
+                : cookies.filter(cookie => cookie.name === query.name);
+            const formatted = matches.map(_cookieStoreFormat);
+            return firstOnly ? (formatted[0] || null) : formatted;
+        };
+        const _cookieStoreSyncDocumentMirror = async () => {
+            const cookies = await ops.op_cookie_store_get_all(_cookieStoreCurrentUrl());
+            const next = {};
+            for (const cookie of cookies) next[String(cookie.name)] = String(cookie.value);
+            globalThis.__jsCookies = next;
+        };
+        const _cookieStoreSameSite = (value, methodName) => {
+            value = value === undefined ? 'strict' : String(value);
+            if (!['strict', 'lax', 'none'].includes(value)) {
+                throw new TypeError(
+                    "Failed to execute '" + methodName + "' on 'CookieStore': Failed to read the 'sameSite' property from 'CookieInit': The provided value '" +
+                    value + "' is not a valid enum value of type CookieSameSite."
+                );
+            }
+            return value;
+        };
+        const _cookieStoreSerialize = (options, forDelete) => {
+            const name = String(options.name);
+            const value = forDelete ? '' : String(options.value);
+            const path = options.path === undefined ? '/' : String(options.path);
+            const domain = options.domain == null ? null : String(options.domain);
+            const sameSite = _cookieStoreSameSite(options.sameSite, forDelete ? 'delete' : 'set');
+            const secure = options.secure === undefined ? true : !!options.secure;
+            let raw = name + '=' + value + '; Path=' + path;
+            if (domain) raw += '; Domain=' + domain;
+            if (forDelete) {
+                raw += '; Expires=Thu, 01 Jan 1970 00:00:00 GMT';
+            } else if (options.expires !== undefined && options.expires !== null) {
+                const expires = Number(options.expires);
+                if (!Number.isFinite(expires)) {
                     throw new TypeError(
-                        "Failed to construct 'CookieStore': Illegal constructor"
+                        "Failed to execute 'set' on 'CookieStore': The provided value is not a finite timestamp."
                     );
                 }
+                raw += '; Expires=' + new Date(expires).toUTCString();
             }
-            get(_name) { return Promise.resolve(null); }
-            getAll(_name) { return Promise.resolve([]); }
-            set(_optionsOrName, _value) { return Promise.resolve(); }
-            delete(_optionsOrName) { return Promise.resolve(); }
+            raw += '; SameSite=' + sameSite[0].toUpperCase() + sameSite.slice(1);
+            if (secure) raw += '; Secure';
+            if (options.partitioned === true) raw += '; Partitioned';
+            return raw;
+        };
+
+        function CookieStore() {
+            if (!new.target) throw new TypeError('Illegal constructor');
+            if (arguments[0] !== _internalBuild) {
+                throw new TypeError("Failed to construct 'CookieStore': Illegal constructor");
+            }
+            _cookieStoreBrand.add(this);
+            _cookieStoreState.set(this, { onchange: null });
         }
+        CookieStore.prototype = Object.create(EventTarget.prototype);
+
+        _defProtoMethod(CookieStore.prototype, 'delete', async function deleteCookie(optionsOrName) {
+            _cookieStoreRequire(this);
+            if (arguments.length === 0) {
+                throw new TypeError(
+                    "Failed to execute 'delete' on 'CookieStore': 1 argument required, but only 0 present."
+                );
+            }
+            const options = (typeof optionsOrName === 'string')
+                ? { name: optionsOrName }
+                : Object.assign({}, optionsOrName || {});
+            if (options.name === undefined) options.name = '';
+            ops.op_cookie_set_sync(_cookieStoreCurrentUrl(), _cookieStoreSerialize(options, true));
+            await _cookieStoreSyncDocumentMirror();
+        });
+        _defProtoMethod(CookieStore.prototype, 'get', async function getCookie() {
+            _cookieStoreRequire(this);
+            return _cookieStoreRead(_cookieStoreNormalizeQuery(arguments[0], false), true);
+        });
+        _defProtoMethod(CookieStore.prototype, 'getAll', async function getAllCookies() {
+            _cookieStoreRequire(this);
+            return _cookieStoreRead(_cookieStoreNormalizeQuery(arguments[0], true), false);
+        });
+        _defProtoMethod(CookieStore.prototype, 'set', async function setCookie(optionsOrName) {
+            _cookieStoreRequire(this);
+            if (arguments.length === 0) {
+                throw new TypeError(
+                    "Failed to execute 'set' on 'CookieStore': 1 argument required, but only 0 present."
+                );
+            }
+            const options = typeof optionsOrName === 'string'
+                ? { name: optionsOrName, value: String(arguments[1]) }
+                : Object.assign({}, optionsOrName || {});
+            if (options.name === undefined) options.name = '';
+            if (options.value === undefined) options.value = '';
+            ops.op_cookie_set_sync(_cookieStoreCurrentUrl(), _cookieStoreSerialize(options, false));
+            await _cookieStoreSyncDocumentMirror();
+        });
+        Object.defineProperty(CookieStore.prototype, 'constructor', {
+            value: CookieStore, writable: true, enumerable: false, configurable: true,
+        });
+        _defProtoGetter(
+            CookieStore.prototype,
+            'onchange',
+            function onchange() {
+                _cookieStoreRequire(this);
+                return _cookieStoreState.get(this).onchange;
+            },
+            function onchange(value) {
+                _cookieStoreRequire(this);
+                _cookieStoreState.get(this).onchange = typeof value === 'function' ? value : null;
+            },
+        );
         Object.defineProperty(CookieStore.prototype, Symbol.toStringTag, {
             value: "CookieStore", configurable: true,
         });
+        _maskFunction(CookieStore, 'CookieStore');
         // Override the earlier _illegalCtor binding from interfaces_bootstrap.
         Object.defineProperty(globalThis, "CookieStore", {
             value: CookieStore, configurable: true, writable: true,

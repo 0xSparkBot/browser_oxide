@@ -4,6 +4,7 @@
 //! the constructors browser_oxide stubs to land.
 
 use browser_oxide::Page;
+use std::time::Duration;
 
 async fn evaluate(js: &str) -> String {
     let mut page = Page::from_html_with_url(
@@ -267,4 +268,89 @@ async fn cookie_store_illegal_constructor() {
         r.contains("TypeError:true"),
         "CookieStore should throw Illegal constructor: {r}"
     );
+}
+
+#[tokio::test]
+async fn cookie_store_round_trips_with_document_cookie() {
+    let mut page = Page::from_html_with_url(
+        "<!DOCTYPE html><html><body></body></html>",
+        "https://example.com/app/page",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    page.evaluate("document.cookie = 'fromDocument=alpha; Path=/app; SameSite=Lax; Secure'")
+        .unwrap();
+
+    page.evaluate(
+        r#"cookieStore.get('fromDocument').then(cookie => {
+            globalThis.__cookieStoreFromDocument = JSON.stringify(cookie);
+        })"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", Duration::from_secs(1))
+        .await
+        .unwrap();
+    let from_document = page
+        .evaluate("globalThis.__cookieStoreFromDocument")
+        .unwrap();
+    let from_document: serde_json::Value = serde_json::from_str(&from_document).unwrap();
+    assert_eq!(from_document["name"], "fromDocument");
+    assert_eq!(from_document["value"], "alpha");
+    assert_eq!(from_document["path"], "/app");
+    assert_eq!(from_document["sameSite"], "lax");
+    assert_eq!(from_document["secure"], true);
+
+    page.evaluate_async(
+        r#"cookieStore.set({
+            name: 'fromStore',
+            value: 'beta',
+            path: '/app',
+            sameSite: 'strict',
+            secure: true,
+        })"#,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    let document_cookie = page.evaluate("document.cookie").unwrap();
+    assert!(
+        document_cookie.contains("fromStore=beta"),
+        "CookieStore.set must update the shared cookie jar: {document_cookie}"
+    );
+
+    page.evaluate(
+        r#"cookieStore.getAll({ url: '/app/child' }).then(cookies => {
+            globalThis.__cookieStoreAll = JSON.stringify(cookies);
+        })"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", Duration::from_secs(1))
+        .await
+        .unwrap();
+    let all = page.evaluate("globalThis.__cookieStoreAll").unwrap();
+    let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+    let all = all.as_array().unwrap();
+    assert_eq!(
+        all.len(),
+        2,
+        "unexpected CookieStore.getAll result: {all:?}"
+    );
+
+    page.evaluate_async("cookieStore.delete('fromStore')", Duration::from_secs(1))
+        .await
+        .unwrap();
+    page.evaluate(
+        r#"cookieStore.get('fromStore').then(cookie => {
+            globalThis.__cookieStoreDeleted = JSON.stringify(cookie);
+        })"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", Duration::from_secs(1))
+        .await
+        .unwrap();
+    let deleted = page.evaluate("globalThis.__cookieStoreDeleted").unwrap();
+    assert_eq!(deleted, "null");
 }
