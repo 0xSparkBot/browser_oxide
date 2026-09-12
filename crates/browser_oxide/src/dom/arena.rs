@@ -19,6 +19,11 @@ pub struct Dom {
     /// deliberately separate from content attributes so changing input.value
     /// does not mutate input.defaultValue / getAttribute / serialized HTML.
     form_control_values: HashMap<NodeId, String>,
+    /// Autonomous custom-element names registered for this document's global
+    /// CustomElementRegistry. Selectors Level 4 `:defined` needs this state in
+    /// the DOM matcher: an HTML `x-*` element is undefined until its name is
+    /// registered, while ordinary/unknown built-ins remain defined.
+    defined_custom_elements: HashSet<String>,
 }
 
 /// Tripwire for tree-walking helpers. A correct DOM tree never has cycles
@@ -47,7 +52,22 @@ impl Dom {
             modal_dialogs: HashSet::new(),
             dialog_return_values: HashMap::new(),
             form_control_values: HashMap::new(),
+            defined_custom_elements: HashSet::new(),
         }
+    }
+
+    pub fn define_custom_element(&mut self, name: &str) {
+        self.defined_custom_elements
+            .insert(name.to_ascii_lowercase());
+    }
+
+    pub fn clear_custom_element_definitions(&mut self) {
+        self.defined_custom_elements.clear();
+    }
+
+    pub fn is_custom_element_defined(&self, name: &str) -> bool {
+        self.defined_custom_elements
+            .contains(&name.to_ascii_lowercase())
     }
 
     /// Mark or unmark an element as a modal dialog/top-layer participant.

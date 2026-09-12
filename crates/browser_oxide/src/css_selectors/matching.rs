@@ -341,6 +341,7 @@ fn matches_pseudo_class<E: Element>(element: &E, pc: &PseudoClass, scope: Option
         PseudoClass::ReadOnly => element.is_read_only(),
         PseudoClass::PlaceholderShown => element.is_placeholder_shown(),
         PseudoClass::Modal => element.is_modal(),
+        PseudoClass::Defined => element.is_defined(),
 
         PseudoClass::Scope => scope
             .map(|scope_root| element.same_element(scope_root))

@@ -6,6 +6,7 @@
 // elements, while keeping all registry/upgrade state in WeakMaps/Sets so page
 // reflection never sees browser_oxide implementation fields.
 ((globalThis) => {
+    const ops = globalThis.Deno && Deno.core && Deno.core.ops;
     const construction = globalThis.__oxideCustomElementConstruction;
     const installDomHooks = globalThis.__oxideInstallCustomElementHooks;
     if (!construction || typeof construction.constructExisting !== 'function'
@@ -193,6 +194,14 @@
         state.definitions.set(normalized, entry);
         state.constructors.set(constructor, normalized);
 
+        // Keep the Rust DOM selector matcher in sync with the document's
+        // global registry so Selectors Level 4 `:defined` changes immediately
+        // for already-parsed autonomous custom elements. Scoped registries are
+        // intentionally not promoted into document-global selector state.
+        if (this === globalRegistry && ops && typeof ops.op_dom_define_custom_element === 'function') {
+            try { ops.op_dom_define_custom_element(normalized); } catch (_) {}
+        }
+
         // The document uses the global registry. Upgrade already-parsed
         // candidates synchronously, before whenDefined reactions run.
         if (this === globalRegistry && globalThis.document) {
@@ -315,6 +324,9 @@
             globalState.constructors.clear();
             globalState.pending.clear();
             globalState.initializedRoot = null;
+            if (ops && typeof ops.op_dom_clear_custom_element_definitions === 'function') {
+                try { ops.op_dom_clear_custom_element_definitions(); } catch (_) {}
+            }
         },
         writable: true,
         configurable: true,

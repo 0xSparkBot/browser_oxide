@@ -431,6 +431,7 @@ impl<'a> SelectorParser<'a> {
                     "read-only" => PseudoClass::ReadOnly,
                     "placeholder-shown" => PseudoClass::PlaceholderShown,
                     "modal" => PseudoClass::Modal,
+                    "defined" => PseudoClass::Defined,
                     "scope" => PseudoClass::Scope,
                     "root" => PseudoClass::Root,
                     "empty" => PseudoClass::Empty,

@@ -125,6 +125,9 @@ pub trait Element: Sized + Clone {
     fn is_modal(&self) -> bool {
         false
     }
+    fn is_defined(&self) -> bool {
+        true
+    }
     fn is_any_link(&self) -> bool {
         self.is_link() || self.is_visited()
     }

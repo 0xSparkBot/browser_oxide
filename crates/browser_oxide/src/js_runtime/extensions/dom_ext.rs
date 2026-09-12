@@ -294,6 +294,22 @@ pub fn op_dom_selector_is_valid(#[string] selector: &str) -> bool {
 }
 
 #[op2(fast)]
+pub fn op_dom_define_custom_element(state: &mut OpState, #[string] name: &str) {
+    state
+        .borrow_mut::<DomState>()
+        .dom
+        .define_custom_element(name);
+}
+
+#[op2(fast)]
+pub fn op_dom_clear_custom_element_definitions(state: &mut OpState) {
+    state
+        .borrow_mut::<DomState>()
+        .dom
+        .clear_custom_element_definitions();
+}
+
+#[op2(fast)]
 #[smi]
 pub fn op_dom_query_selector(
     state: &mut OpState,
@@ -2887,6 +2903,8 @@ deno_core::extension!(
         op_dom_get_next_sibling,
         op_dom_get_prev_sibling,
         op_dom_selector_is_valid,
+        op_dom_define_custom_element,
+        op_dom_clear_custom_element_definitions,
         op_dom_query_selector,
         op_dom_query_selector_all,
         op_dom_get_element_by_id,

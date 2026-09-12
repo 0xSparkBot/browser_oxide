@@ -194,6 +194,43 @@ impl<'a> Element for DomElement<'a> {
         self.element_data().name.ns.as_deref()
     }
 
+    fn is_defined(&self) -> bool {
+        // HTML parser nodes use `None` for the HTML namespace while elements
+        // created through the DOM ops may retain the canonical XHTML URI.
+        // Only potential autonomous custom-element names can be undefined.
+        // SVG (including hyphenated SVG names) is always outside the custom
+        // element definition state used by HTML's `:defined` pseudo-class.
+        let namespace = self.namespace();
+        let is_html = namespace.is_none() || namespace == Some("http://www.w3.org/1999/xhtml");
+        if !is_html {
+            return true;
+        }
+
+        let name = self.local_name().to_ascii_lowercase();
+        if !name.contains('-') {
+            return true;
+        }
+
+        // HTML reserves these historical hyphenated names from the custom
+        // element name grammar. Chromium still considers them defined even
+        // though they are exposed as HTMLUnknownElement instances.
+        if matches!(
+            name.as_str(),
+            "annotation-xml"
+                | "color-profile"
+                | "font-face"
+                | "font-face-src"
+                | "font-face-uri"
+                | "font-face-format"
+                | "font-face-name"
+                | "missing-glyph"
+        ) {
+            return true;
+        }
+
+        self.dom.is_custom_element_defined(&name)
+    }
+
     fn id(&self) -> Option<&str> {
         self.element_data()
             .attrs
