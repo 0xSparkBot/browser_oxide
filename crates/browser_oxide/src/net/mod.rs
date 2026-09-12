@@ -35,7 +35,7 @@ use pool::ConnectionPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -144,6 +144,17 @@ impl Response {
     pub fn ok(&self) -> bool {
         self.status >= 200 && self.status < 300
     }
+}
+
+/// Response headers plus an incrementally delivered transfer-decoded body.
+/// Used by APIs whose browser semantics require data before response EOF.
+pub struct StreamingResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub headers: HashMap<String, String>,
+    pub set_cookies: Vec<String>,
+    pub url: String,
+    pub body: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
 }
 
 /// Stealth HTTP client configured with a browser fingerprint profile.
@@ -954,6 +965,36 @@ impl HttpClient {
         self.get_with_exact_headers(url, &hdrs).await
     }
 
+    /// Fetch-API-style streaming GET. Returns once response headers arrive and
+    /// yields transfer-decoded body chunks as the socket receives them.
+    pub async fn fetch_get_stream(
+        &self,
+        url: &str,
+        extra_headers: &[(String, String)],
+        origin: Option<&str>,
+        include_cross_origin_credentials: bool,
+    ) -> Result<StreamingResponse, NetError> {
+        let mut hdrs = headers::nav_headers_fetch(&self.profile, url, origin);
+        merge_headers(&mut hdrs, extra_headers);
+        if self.profile.browser_name != "Firefox" && self.profile.browser_name != "Safari" {
+            order_chrome_fetch_headers(&mut hdrs, extra_headers);
+        }
+        let same_origin = origin
+            .and_then(|source| Url::parse(source).ok())
+            .and_then(|source| {
+                Url::parse(url)
+                    .ok()
+                    .map(|target| source.origin() == target.origin())
+            })
+            .unwrap_or(true);
+        self.get_stream_with_exact_headers(
+            url,
+            &hdrs,
+            same_origin || include_cross_origin_credentials,
+        )
+        .await
+    }
+
     /// Fetch-API-style POST with raw bytes.
     pub async fn fetch_post_bytes(
         &self,
@@ -1094,6 +1135,120 @@ impl HttpClient {
             );
         }
         Ok(final_response)
+    }
+
+    /// Streaming counterpart to [`Self::get_with_exact_headers`]. This keeps
+    /// the browser-profile request shape and optional cookie handling, but
+    /// returns as soon as response headers are available instead of buffering
+    /// to EOF.
+    pub async fn get_stream_with_exact_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        include_cookies: bool,
+    ) -> Result<StreamingResponse, NetError> {
+        let parsed = Url::parse(url)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| NetError::Http(format!("no host in URL: {url}")))?;
+        let port = Self::port_for_url(&parsed)?;
+        let mut hdrs: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(key, _)| {
+                let lower = key.to_ascii_lowercase();
+                !lower.starts_with(':') && lower != "host" && lower != "connection"
+            })
+            .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+            .collect();
+
+        if include_cookies && !has_header(&hdrs, "cookie") {
+            let jar = self.cookies.lock().await;
+            if let Some(cookie_str) = jar.cookies_for(&parsed) {
+                insert_before_priority(&mut hdrs, "cookie".to_string(), cookie_str);
+            }
+        }
+
+        if parsed.scheme() == "https" {
+            for attempt in 0..2 {
+                let sender_res = self.get_sender(host, port).await;
+                let mut sender = match sender_res {
+                    Ok(sender) => sender,
+                    Err(_) => break,
+                };
+                match h2_client::send_get_stream(&mut sender, parsed.as_str(), host, &hdrs).await {
+                    Ok((parts, body)) => {
+                        let status = parts.status.as_u16();
+                        let status_text = parts.status.canonical_reason().unwrap_or("").to_string();
+                        let mut response_headers = HashMap::new();
+                        let mut set_cookies = Vec::new();
+                        for (key, value) in &parts.headers {
+                            if let Ok(value) = value.to_str() {
+                                if key.as_str().eq_ignore_ascii_case("set-cookie") {
+                                    set_cookies.push(value.to_string());
+                                } else {
+                                    response_headers.insert(key.to_string(), value.to_string());
+                                }
+                            }
+                        }
+                        self.learn_alt_svc(url, &response_headers).await;
+                        let _ = self.learn_accept_ch(host, &response_headers).await;
+                        self.store_set_cookies(&parsed, &set_cookies).await;
+                        return Ok(StreamingResponse {
+                            status,
+                            status_text,
+                            headers: response_headers,
+                            set_cookies,
+                            url: url.to_string(),
+                            body,
+                        });
+                    }
+                    Err(error) if attempt == 0 && is_stale_conn_error(&error) => {
+                        self.pool.evict(host, port).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        let path = if let Some(query) = parsed.query() {
+            format!("{}?{}", parsed.path(), query)
+        } else {
+            parsed.path().to_string()
+        };
+        let authority = Self::h1_host_header(&parsed, host, port);
+        let raw = match parsed.scheme() {
+            "http" => {
+                let tcp = self.connect_tcp(host, port).await?;
+                h1_client::send_get_stream(tcp, &authority, &path, &hdrs).await?
+            }
+            "https" => {
+                let tcp = self.connect_tcp(host, port).await?;
+                let tls_stream =
+                    tls::connect_tls(&self.tls_connector, &self.profile, host, tcp).await?;
+                h1_client::send_get_stream(tls_stream, &authority, &path, &hdrs).await?
+            }
+            scheme => return Err(NetError::Http(format!("unsupported URL scheme: {scheme}"))),
+        };
+        let mut response_headers = HashMap::new();
+        let mut set_cookies = Vec::new();
+        for (name, value) in &raw.headers {
+            if name.eq_ignore_ascii_case("set-cookie") {
+                set_cookies.push(value.clone());
+            } else {
+                response_headers.insert(name.clone(), value.clone());
+            }
+        }
+        self.learn_alt_svc(url, &response_headers).await;
+        let _ = self.learn_accept_ch(host, &response_headers).await;
+        self.store_set_cookies(&parsed, &set_cookies).await;
+        Ok(StreamingResponse {
+            status: raw.status,
+            status_text: raw.status_text,
+            headers: response_headers,
+            set_cookies,
+            url: url.to_string(),
+            body: raw.body,
+        })
     }
 
     /// GET follow for exact-header requests.

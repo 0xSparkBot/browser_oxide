@@ -1394,7 +1394,7 @@ fn worker_eventsource_receives_trusted_sse_events() {
         assert!(request.starts_with("GET /events HTTP/1.1\r\n"));
         let body = "id: worker-id\ndata: worker-message\n\nevent: custom\ndata: done\n\n";
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body,
         );

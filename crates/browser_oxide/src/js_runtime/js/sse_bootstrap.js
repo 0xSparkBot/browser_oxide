@@ -27,13 +27,28 @@
         return new URL(String(input), base).href;
     }
 
-    async function connect(source, generation) {
-        const current = state.get(source);
-        if (!current || current.readyState === CLOSED || current.generation !== generation) return;
+    function wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+    }
 
-        try {
-            const result = await ops.op_sse_connect(current.url);
-            const active = state.get(source);
+    async function connect(source, generation) {
+        while (true) {
+            let active = state.get(source);
+            if (!active || active.readyState === CLOSED || active.generation !== generation) return;
+            active.readyState = CONNECTING;
+
+            let result;
+            try {
+                result = await ops.op_sse_connect(
+                    active.url,
+                    globalThis.location?.origin || '',
+                    active.withCredentials,
+                    active.lastEventId,
+                );
+            } catch (_) {
+                result = null;
+            }
+            active = state.get(source);
             if (!active || active.readyState === CLOSED || active.generation !== generation) {
                 if (result && result.id >= 0) {
                     try { ops.op_sse_close(result.id); } catch (_) {}
@@ -41,7 +56,9 @@
                 return;
             }
             if (!result || !result.ok) {
-                throw new Error(result && result.error ? result.error : 'EventSource connection failed');
+                dispatch(source, 'error', new Event('error'));
+                await wait(active.reconnectDelay);
+                continue;
             }
 
             active.sseId = result.id;
@@ -49,20 +66,36 @@
             dispatch(source, 'open', new Event('open'));
 
             while (active.readyState === OPEN && active.sseId >= 0 && active.generation === generation) {
-                const message = await ops.op_sse_recv(active.sseId);
-                if (active.readyState === CLOSED || active.generation !== generation) break;
+                let message;
+                try {
+                    message = await ops.op_sse_recv(active.sseId);
+                } catch (_) {
+                    message = { status: 'error' };
+                }
+                if (active.readyState === CLOSED || active.generation !== generation) return;
+
+                if (message && message.status === 'retry') {
+                    if (Number.isFinite(message.retry_ms)) {
+                        active.reconnectDelay = Math.max(0, Number(message.retry_ms));
+                    }
+                    continue;
+                }
 
                 if (!message || message.status === 'closed' || message.status === 'error') {
+                    if (message && typeof message.id === 'string') {
+                        active.lastEventId = message.id;
+                    }
                     const id = active.sseId;
                     active.sseId = -1;
                     if (id >= 0) {
                         try { ops.op_sse_close(id); } catch (_) {}
                     }
-                    active.readyState = CLOSED;
+                    active.readyState = CONNECTING;
                     dispatch(source, 'error', new Event('error'));
                     break;
                 }
 
+                if (typeof message.id === 'string') active.lastEventId = message.id;
                 const type = message.event || 'message';
                 const event = new MessageEvent(type, {
                     data: message.data,
@@ -73,16 +106,10 @@
                 });
                 dispatch(source, type, event);
             }
-        } catch (_) {
-            const active = state.get(source);
+
+            active = state.get(source);
             if (!active || active.readyState === CLOSED || active.generation !== generation) return;
-            const id = active.sseId;
-            active.sseId = -1;
-            if (id >= 0) {
-                try { ops.op_sse_close(id); } catch (_) {}
-            }
-            active.readyState = CLOSED;
-            dispatch(source, 'error', new Event('error'));
+            await wait(active.reconnectDelay);
         }
     }
 
@@ -99,6 +126,8 @@
                 readyState: CONNECTING,
                 sseId: -1,
                 generation: 1,
+                lastEventId: '',
+                reconnectDelay: 3000,
                 handlers: Object.create(null),
             };
             state.set(this, entry);

@@ -49,6 +49,7 @@ pub struct SseEvent {
     pub id: String,
     /// Empty string = still open, "error" = connection error, "closed" = done
     pub status: String,
+    pub retry_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -63,10 +64,80 @@ pub struct SseConnectResult {
 #[serde]
 pub async fn op_sse_connect(
     #[string] url: String,
+    #[string] origin: String,
+    with_credentials: bool,
+    #[string] last_event_id: String,
 ) -> Result<SseConnectResult, deno_error::JsErrorBox> {
-    let (tx, rx) = mpsc::unbounded_channel::<SseEvent>();
+    let client = crate::js_runtime::extensions::fetch_ext::fetch_client().unwrap_or_else(|| {
+        crate::net::HttpClient::new(&crate::stealth::chrome_148_linux())
+            .expect("fallback SSE HTTP client")
+    });
+    let mut headers = vec![
+        ("accept".to_string(), "text/event-stream".to_string()),
+        ("cache-control".to_string(), "no-cache".to_string()),
+        // Keep the stream byte-oriented. Incremental content decoding can be
+        // added generically later; identity avoids buffering a compressed SSE
+        // response before event dispatch.
+        ("accept-encoding".to_string(), "identity".to_string()),
+    ];
+    if !last_event_id.is_empty() {
+        headers.push(("last-event-id".to_string(), last_event_id));
+    }
+    let request_origin = (!origin.is_empty()).then_some(origin.as_str());
+    let mut response = match client
+        .fetch_get_stream(&url, &headers, request_origin, with_credentials)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(SseConnectResult {
+                id: -1,
+                ok: false,
+                error: format!("SSE fetch failed: {error}"),
+            });
+        }
+    };
+    let content_type = response
+        .headers
+        .get("content-type")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if response.status != 200 || !content_type.starts_with("text/event-stream") {
+        return Ok(SseConnectResult {
+            id: -1,
+            ok: false,
+            error: format!(
+                "EventSource response must be 200 text/event-stream (status={}, content-type={content_type:?})",
+                response.status
+            ),
+        });
+    }
+    let is_cross_origin = match (url::Url::parse(&url), url::Url::parse(&origin)) {
+        (Ok(target), Ok(source)) => target.origin() != source.origin(),
+        _ => !origin.is_empty(),
+    };
+    if is_cross_origin {
+        let allow_origin = response
+            .headers
+            .get("access-control-allow-origin")
+            .map(String::as_str)
+            .unwrap_or("");
+        let origin_allowed = allow_origin == origin || (allow_origin == "*" && !with_credentials);
+        let credentials_allowed = !with_credentials
+            || response
+                .headers
+                .get("access-control-allow-credentials")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        if !origin_allowed || !credentials_allowed {
+            return Ok(SseConnectResult {
+                id: -1,
+                ok: false,
+                error: "EventSource response failed CORS validation".to_string(),
+            });
+        }
+    }
 
-    // Assign ID before spawning
+    let (tx, rx) = mpsc::unbounded_channel::<SseEvent>();
     let id = {
         let mut store = SSE_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
         let id = store.next_id;
@@ -77,23 +148,34 @@ pub async fn op_sse_connect(
         id
     };
 
-    // Spawn the SSE reader task
-    let url_clone = url.clone();
     tokio::spawn(async move {
-        if let Err(e) = sse_reader(&url_clone, &tx).await {
-            let _ = tx.send(SseEvent {
-                event: "error".to_string(),
-                data: e.to_string(),
-                id: String::new(),
-                status: "error".to_string(),
-            });
+        let mut parser = SseParser::default();
+        while let Some(chunk) = response.body.recv().await {
+            match chunk {
+                Ok(bytes) => {
+                    if !parser.feed(&bytes, &tx) {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(SseEvent {
+                        event: "error".to_string(),
+                        data: error,
+                        id: parser.last_id.clone(),
+                        status: "error".to_string(),
+                        retry_ms: None,
+                    });
+                    return;
+                }
+            }
         }
-        // Signal end of stream
+        parser.finish(&tx);
         let _ = tx.send(SseEvent {
             event: String::new(),
             data: String::new(),
-            id: String::new(),
+            id: parser.last_id,
             status: "closed".to_string(),
+            retry_ms: None,
         });
     });
 
@@ -122,6 +204,7 @@ pub async fn op_sse_recv(#[smi] id: i32) -> Result<SseEvent, deno_error::JsError
                     data: String::new(),
                     id: String::new(),
                     status: "closed".to_string(),
+                    retry_ms: None,
                 }),
             }
         }
@@ -130,6 +213,7 @@ pub async fn op_sse_recv(#[smi] id: i32) -> Result<SseEvent, deno_error::JsError
             data: String::new(),
             id: String::new(),
             status: "closed".to_string(),
+            retry_ms: None,
         }),
     }
 }
@@ -141,80 +225,123 @@ pub fn op_sse_close(#[smi] id: i32) {
     store.receivers.remove(&id);
 }
 
-/// Parse and stream SSE events from an HTTP response body.
-async fn sse_reader(
-    url: &str,
-    tx: &mpsc::UnboundedSender<SseEvent>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Use the stealth HTTP client to fetch the SSE endpoint
-    let profile = crate::stealth::chrome_148_linux();
-    let client = crate::net::HttpClient::new(&profile)
-        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
-    let resp = client
-        .get(url)
-        .await
-        .map_err(|e| format!("SSE fetch failed: {e}"))?;
-
-    let body = resp.text();
-    parse_sse_body(&body, tx);
-    Ok(())
+struct SseParser {
+    line: Vec<u8>,
+    skip_lf: bool,
+    first_line: bool,
+    event_type: String,
+    data_buf: String,
+    last_id: String,
 }
 
-/// Parse SSE text/event-stream body into events.
-fn parse_sse_body(body: &str, tx: &mpsc::UnboundedSender<SseEvent>) {
-    let mut event_type = String::new();
-    let mut data_buf = String::new();
-    let mut last_id = String::new();
+impl Default for SseParser {
+    fn default() -> Self {
+        Self {
+            line: Vec::new(),
+            skip_lf: false,
+            first_line: true,
+            event_type: String::new(),
+            data_buf: String::new(),
+            last_id: String::new(),
+        }
+    }
+}
 
-    for line in body.lines() {
+impl SseParser {
+    fn feed(&mut self, bytes: &[u8], tx: &mpsc::UnboundedSender<SseEvent>) -> bool {
+        for &byte in bytes {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    if !self.process_line(tx) {
+                        return false;
+                    }
+                    self.skip_lf = true;
+                }
+                b'\n' => {
+                    if !self.process_line(tx) {
+                        return false;
+                    }
+                }
+                _ => self.line.push(byte),
+            }
+        }
+        true
+    }
+
+    fn finish(&mut self, tx: &mpsc::UnboundedSender<SseEvent>) {
+        if !self.line.is_empty() {
+            let _ = self.process_line(tx);
+        }
+    }
+
+    fn process_line(&mut self, tx: &mpsc::UnboundedSender<SseEvent>) -> bool {
+        let bytes = std::mem::take(&mut self.line);
+        let mut line = String::from_utf8_lossy(&bytes).into_owned();
+        if self.first_line {
+            line = line.trim_start_matches('\u{feff}').to_string();
+            self.first_line = false;
+        }
         if line.is_empty() {
-            // Empty line = dispatch event
-            if !data_buf.is_empty() {
-                if data_buf.ends_with('\n') {
-                    data_buf.pop();
-                }
-                let event = SseEvent {
-                    event: if event_type.is_empty() {
-                        "message".to_string()
-                    } else {
-                        std::mem::take(&mut event_type)
-                    },
-                    data: std::mem::take(&mut data_buf),
-                    id: last_id.clone(),
-                    status: String::new(),
-                };
-                if tx.send(event).is_err() {
-                    return;
-                }
+            if self.data_buf.is_empty() {
+                self.event_type.clear();
+                return true;
             }
-            event_type.clear();
-            continue;
+            if self.data_buf.ends_with('\n') {
+                self.data_buf.pop();
+            }
+            let event = SseEvent {
+                event: if self.event_type.is_empty() {
+                    "message".to_string()
+                } else {
+                    std::mem::take(&mut self.event_type)
+                },
+                data: std::mem::take(&mut self.data_buf),
+                id: self.last_id.clone(),
+                status: String::new(),
+                retry_ms: None,
+            };
+            return tx.send(event).is_ok();
         }
-
         if line.starts_with(':') {
-            continue; // Comment
+            return true;
         }
-
-        let (field, value) = if let Some(colon_pos) = line.find(':') {
-            let field = &line[..colon_pos];
-            let value = line[colon_pos + 1..]
+        let (field, value) = if let Some(colon) = line.find(':') {
+            let value = line[colon + 1..]
                 .strip_prefix(' ')
-                .unwrap_or(&line[colon_pos + 1..]);
-            (field, value)
+                .unwrap_or(&line[colon + 1..]);
+            (&line[..colon], value)
         } else {
-            (line, "")
+            (line.as_str(), "")
         };
-
         match field {
-            "event" => event_type = value.to_string(),
+            "event" => self.event_type = value.to_string(),
             "data" => {
-                data_buf.push_str(value);
-                data_buf.push('\n');
+                self.data_buf.push_str(value);
+                self.data_buf.push('\n');
             }
-            "id" => last_id = value.to_string(),
-            "retry" => {}
+            "id" if !value.contains('\0') => self.last_id = value.to_string(),
+            "retry" if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                if let Ok(retry_ms) = value.parse::<u64>() {
+                    return tx
+                        .send(SseEvent {
+                            event: String::new(),
+                            data: String::new(),
+                            id: self.last_id.clone(),
+                            status: "retry".to_string(),
+                            retry_ms: Some(retry_ms),
+                        })
+                        .is_ok();
+                }
+            }
             _ => {}
         }
+        true
     }
 }
 

@@ -4,6 +4,7 @@
 
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::net::error::NetError;
 
@@ -14,6 +15,14 @@ pub struct RawResponse {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub(crate) timing: crate::net::WireTiming,
+}
+
+/// HTTP/1.1 response headers plus a decoded transfer-body chunk stream.
+pub struct RawStreamingResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    pub body: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
 }
 
 /// Send an HTTP/1.1 GET request over a stream.
@@ -27,6 +36,106 @@ where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     send_request(stream, "GET", authority, path, headers, None).await
+}
+
+/// Send an HTTP/1.1 GET and return as soon as response headers are available.
+/// Transfer-encoding is decoded incrementally on a background task.
+pub async fn send_get_stream<S>(
+    mut stream: S,
+    authority: &str,
+    path: &str,
+    headers: &[(String, String)],
+) -> Result<RawStreamingResponse, NetError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    let mut request = format!("GET {path} HTTP/1.1\r\n");
+    request.push_str(&format!("Host: {authority}\r\n"));
+    request.push_str("Connection: keep-alive\r\n");
+    for (name, value) in headers {
+        let lower = name.to_lowercase();
+        if lower == "host" || lower == "connection" || lower.starts_with(':') {
+            continue;
+        }
+        request.push_str(&format!(
+            "{}: {}\r\n",
+            normalize_h1_header_name(name),
+            value
+        ));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| NetError::Http(format!("failed to write request: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| NetError::Http(format!("failed to flush request: {e}")))?;
+
+    let mut buf = Vec::with_capacity(8192);
+    let header_len = loop {
+        let mut tmp = [0u8; 4096];
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|e| NetError::Http(format!("read error: {e}")))?;
+        if n == 0 {
+            return Err(NetError::Http(
+                "connection closed before headers".to_string(),
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_header_end(&buf) {
+            break pos + 4;
+        }
+        if buf.len() > 65536 {
+            return Err(NetError::Http("headers too large".to_string()));
+        }
+    };
+
+    let mut parsed_headers = [httparse::EMPTY_HEADER; 128];
+    let mut response = httparse::Response::new(&mut parsed_headers);
+    response
+        .parse(&buf[..header_len])
+        .map_err(|e| NetError::Http(format!("failed to parse response: {e}")))?;
+    let status = response.code.unwrap_or(0);
+    let status_text = response.reason.unwrap_or("").to_string();
+    let mut response_headers = Vec::new();
+    let mut content_length = None;
+    let mut chunked = false;
+    for header in response.headers.iter() {
+        let name = header.name.to_lowercase();
+        let value = String::from_utf8_lossy(header.value).to_string();
+        if name == "content-length" {
+            content_length = value.parse::<usize>().ok();
+        }
+        if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
+            chunked = true;
+        }
+        response_headers.push((name, value));
+    }
+    let initial = buf[header_len..].to_vec();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let result = if chunked {
+            stream_chunked_body(stream, initial, &tx).await
+        } else if let Some(len) = content_length {
+            stream_content_length_body(stream, initial, len, &tx).await
+        } else {
+            stream_until_close(stream, initial, &tx).await
+        };
+        if let Err(error) = result {
+            let _ = tx.send(Err(error));
+        }
+    });
+
+    Ok(RawStreamingResponse {
+        status,
+        status_text,
+        headers: response_headers,
+        body: rx,
+    })
 }
 
 /// Send an HTTP/1.1 POST request over a stream.
@@ -181,6 +290,120 @@ where
             response_end,
         },
     })
+}
+
+async fn stream_content_length_body<S>(
+    mut stream: S,
+    initial: Vec<u8>,
+    len: usize,
+    tx: &mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+) -> Result<(), String>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut remaining = len;
+    if !initial.is_empty() {
+        let take = initial.len().min(remaining);
+        if take > 0 && tx.send(Ok(initial[..take].to_vec())).is_err() {
+            return Ok(());
+        }
+        remaining -= take;
+    }
+    let mut buf = [0u8; 8192];
+    while remaining > 0 {
+        let cap = remaining.min(buf.len());
+        let n = stream
+            .read(&mut buf[..cap])
+            .await
+            .map_err(|e| format!("body read error: {e}"))?;
+        if n == 0 {
+            return Err("unexpected EOF in content-length body".to_string());
+        }
+        if tx.send(Ok(buf[..n].to_vec())).is_err() {
+            return Ok(());
+        }
+        remaining -= n;
+    }
+    Ok(())
+}
+
+async fn stream_until_close<S>(
+    mut stream: S,
+    initial: Vec<u8>,
+    tx: &mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+) -> Result<(), String>
+where
+    S: AsyncReadExt + Unpin,
+{
+    if !initial.is_empty() && tx.send(Ok(initial)).is_err() {
+        return Ok(());
+    }
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("body read error: {e}"))?;
+        if n == 0 {
+            return Ok(());
+        }
+        if tx.send(Ok(buf[..n].to_vec())).is_err() {
+            return Ok(());
+        }
+    }
+}
+
+async fn stream_chunked_body<S>(
+    mut stream: S,
+    mut raw: Vec<u8>,
+    tx: &mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+) -> Result<(), String>
+where
+    S: AsyncReadExt + Unpin,
+{
+    loop {
+        let line_end = loop {
+            if let Some(pos) = raw.windows(2).position(|w| w == b"\r\n") {
+                break pos;
+            }
+            let mut buf = [0u8; 4096];
+            let n = stream
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("chunked read error: {e}"))?;
+            if n == 0 {
+                return Err("unexpected EOF in chunked body".to_string());
+            }
+            raw.extend_from_slice(&buf[..n]);
+        };
+        let line = String::from_utf8_lossy(&raw[..line_end]);
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_text, 16)
+            .map_err(|e| format!("invalid chunk size '{size_text}': {e}"))?;
+        raw.drain(..line_end + 2);
+        if chunk_size == 0 {
+            return Ok(());
+        }
+        while raw.len() < chunk_size + 2 {
+            let mut buf = [0u8; 8192];
+            let n = stream
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("chunk data read error: {e}"))?;
+            if n == 0 {
+                return Err("unexpected EOF in chunked body".to_string());
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        if &raw[chunk_size..chunk_size + 2] != b"\r\n" {
+            return Err("malformed chunked encoding: missing chunk CRLF".to_string());
+        }
+        let chunk = raw[..chunk_size].to_vec();
+        raw.drain(..chunk_size + 2);
+        if !chunk.is_empty() && tx.send(Ok(chunk)).is_err() {
+            return Ok(());
+        }
+    }
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {

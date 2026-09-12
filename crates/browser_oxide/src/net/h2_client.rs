@@ -17,6 +17,7 @@ use http2::client::{Builder, Connection, SendRequest};
 use http2::frame::{PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 
 use crate::net::error::NetError;
 
@@ -288,6 +289,60 @@ pub(crate) async fn send_get(
             response_end,
         },
     ))
+}
+
+/// Send a GET over an existing HTTP/2 connection and return after response
+/// headers arrive, forwarding DATA frames incrementally through a channel.
+pub(crate) async fn send_get_stream(
+    sender: &mut SendRequest<Bytes>,
+    uri: &str,
+    _host: &str,
+    headers: &[(String, String)],
+) -> Result<
+    (
+        http::response::Parts,
+        mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
+    ),
+    NetError,
+> {
+    let mut ready_sender = sender
+        .clone()
+        .ready()
+        .await
+        .map_err(|e| NetError::Http(format!("HTTP/2 not ready: {e}")))?;
+
+    let mut request = http::Request::builder().method(http::Method::GET).uri(uri);
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let request = request
+        .body(())
+        .map_err(|e| NetError::Http(format!("failed to build request: {e}")))?;
+    let (response, _) = ready_sender
+        .send_request(request, true)
+        .map_err(|e| NetError::Http(format!("failed to send request: {e}")))?;
+    let response = response
+        .await
+        .map_err(|e| NetError::Http(format!("HTTP/2 response error: {e}")))?;
+    let (parts, mut body) = response.into_parts();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(chunk) = body.data().await {
+            match chunk {
+                Ok(chunk) => {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    if tx.send(Ok(chunk.to_vec())).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(format!("body read error: {error}")));
+                    return;
+                }
+            }
+        }
+    });
+    Ok((parts, rx))
 }
 
 /// Send a POST request over an HTTP/2 connection.
