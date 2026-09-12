@@ -125,6 +125,7 @@ pub enum PseudoClass {
     InRange,
     OutOfRange,
     PlaceholderShown,
+    Modal,
 
     // Tree-structural
     Scope,

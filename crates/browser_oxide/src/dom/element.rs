@@ -218,6 +218,10 @@ impl<'a> Element for DomElement<'a> {
         let name = self.local_name();
         (name == "a" || name == "area") && self.has_attribute("href")
     }
+
+    fn is_modal(&self) -> bool {
+        self.dom.is_dialog_modal(self.id)
+    }
 }
 
 #[cfg(test)]

@@ -496,6 +496,42 @@ pub fn op_dom_is_connected(state: &mut OpState, #[smi] node_id: i32) -> bool {
 }
 
 #[op2(fast)]
+pub fn op_dom_is_dialog_modal(state: &mut OpState, #[smi] node_id: i32) -> bool {
+    let state = state.borrow::<DomState>();
+    state.dom.is_dialog_modal(NodeId::from_raw(node_id as u32))
+}
+
+#[op2(fast)]
+pub fn op_dom_set_dialog_modal(state: &mut OpState, #[smi] node_id: i32, modal: bool) {
+    let state = state.borrow_mut::<DomState>();
+    state
+        .dom
+        .set_dialog_modal(NodeId::from_raw(node_id as u32), modal);
+}
+
+#[op2]
+#[string]
+pub fn op_dom_get_dialog_return_value(state: &mut OpState, #[smi] node_id: i32) -> String {
+    let state = state.borrow::<DomState>();
+    state
+        .dom
+        .dialog_return_value(NodeId::from_raw(node_id as u32))
+        .to_string()
+}
+
+#[op2(fast)]
+pub fn op_dom_set_dialog_return_value(
+    state: &mut OpState,
+    #[smi] node_id: i32,
+    #[string] value: String,
+) {
+    let state = state.borrow_mut::<DomState>();
+    state
+        .dom
+        .set_dialog_return_value(NodeId::from_raw(node_id as u32), value);
+}
+
+#[op2(fast)]
 #[smi]
 pub fn op_dom_get_first_element_child(state: &mut OpState, #[smi] node_id: i32) -> i32 {
     let state = state.borrow::<DomState>();
@@ -2426,6 +2462,10 @@ deno_core::extension!(
         op_dom_closest,
         op_dom_contains,
         op_dom_is_connected,
+        op_dom_is_dialog_modal,
+        op_dom_set_dialog_modal,
+        op_dom_get_dialog_return_value,
+        op_dom_set_dialog_return_value,
         op_dom_get_first_element_child,
         op_dom_get_last_element_child,
         op_dom_get_next_element_sibling,

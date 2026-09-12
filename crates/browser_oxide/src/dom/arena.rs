@@ -1,10 +1,20 @@
 use crate::dom::node::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Arena-allocated DOM tree. All nodes live in a flat Vec, referenced by NodeId.
 pub struct Dom {
     nodes: Vec<Option<Node>>,
     free_list: Vec<usize>,
+    /// Dialogs currently in the HTML "top layer" modal state. This is
+    /// browser-internal state, not a content attribute: exposing a synthetic
+    /// marker would leak through outerHTML/getAttributeNames and still would
+    /// not model the standard `:modal` pseudo-class correctly.
+    modal_dialogs: HashSet<NodeId>,
+    /// `HTMLDialogElement.returnValue` is per-node browser state, not a
+    /// reflected content attribute. Keep it in the arena rather than on a JS
+    /// wrapper because wrappers are WeakRef-cached and may be recreated while
+    /// the underlying DOM node is still alive.
+    dialog_return_values: HashMap<NodeId, String>,
 }
 
 /// Tripwire for tree-walking helpers. A correct DOM tree never has cycles
@@ -30,6 +40,56 @@ impl Dom {
         Self {
             nodes: vec![Some(doc_node)],
             free_list: Vec::new(),
+            modal_dialogs: HashSet::new(),
+            dialog_return_values: HashMap::new(),
+        }
+    }
+
+    /// Mark or unmark an element as a modal dialog/top-layer participant.
+    pub fn set_dialog_modal(&mut self, id: NodeId, modal: bool) {
+        if modal {
+            self.modal_dialogs.insert(id);
+        } else {
+            self.modal_dialogs.remove(&id);
+        }
+    }
+
+    /// Whether an element currently participates in the modal dialog top layer.
+    pub fn is_dialog_modal(&self, id: NodeId) -> bool {
+        self.modal_dialogs.contains(&id)
+    }
+
+    pub fn dialog_return_value(&self, id: NodeId) -> &str {
+        self.dialog_return_values
+            .get(&id)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub fn set_dialog_return_value(&mut self, id: NodeId, value: String) {
+        if value.is_empty() {
+            self.dialog_return_values.remove(&id);
+        } else {
+            self.dialog_return_values.insert(id, value);
+        }
+    }
+
+    /// Removing/moving a subtree from the document removes every modal dialog
+    /// in that subtree from the top layer. Chrome does this even for a move
+    /// that immediately reconnects the dialog under a different parent.
+    fn clear_modal_dialogs_in_subtree(&mut self, root: NodeId) {
+        let mut stack = vec![root];
+        let mut visited = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) || visited.len() > WALK_LIMIT {
+                continue;
+            }
+            self.modal_dialogs.remove(&id);
+            let mut child = self.get(id).and_then(|node| node.first_child);
+            while let Some(child_id) = child {
+                stack.push(child_id);
+                child = self.get(child_id).and_then(|node| node.next_sibling);
+            }
         }
     }
 
@@ -230,6 +290,8 @@ impl Dom {
             None => return,
         };
 
+        self.clear_modal_dialogs_in_subtree(id);
+
         if let Some(prev_id) = prev {
             if let Some(node) = self.get_mut(prev_id) {
                 node.next_sibling = next;
@@ -260,6 +322,7 @@ impl Dom {
     /// Remove a node from the arena entirely (recycles its slot).
     pub fn remove(&mut self, id: NodeId) {
         self.detach(id);
+        self.dialog_return_values.remove(&id);
         if id.0 < self.nodes.len() {
             self.nodes[id.0] = None;
             self.free_list.push(id.0);

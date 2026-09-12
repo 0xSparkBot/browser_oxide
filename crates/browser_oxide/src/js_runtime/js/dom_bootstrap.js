@@ -2465,6 +2465,138 @@
     class HTMLDataListElement extends HTMLElement {}
     class HTMLDetailsElement extends HTMLElement {}
     class HTMLDialogElement extends HTMLElement {}
+    // HTMLDialogElement has browser-managed state in addition to the reflected
+    // `open`/`closedby` attributes. Modal/top-layer state lives in the Rust DOM
+    // (so `:modal` works through the real selector engine); returnValue also
+    // lives there because node wrappers are WeakRef-cached and may be recreated.
+    const _dialogProto = HTMLDialogElement.prototype;
+    const _dialogCtorDesc = Object.getOwnPropertyDescriptor(_dialogProto, 'constructor');
+    try { delete _dialogProto.constructor; } catch (_) {}
+    const _dialogNodeId = (dialog) => {
+        const id = _getNodeId(dialog);
+        let isDialog = false;
+        try { isDialog = String(dialog.localName || '').toLowerCase() === 'dialog'; } catch (_) {}
+        if (id < 0 || !isDialog) throw new TypeError('Illegal invocation');
+        return id;
+    };
+    const _dialogInvalidState = (method, detail) => new DOMException(
+        `Failed to execute '${method}' on 'HTMLDialogElement': ${detail}`,
+        'InvalidStateError'
+    );
+    Object.defineProperties(_dialogProto, {
+        open: {
+            get: function() {
+                _dialogNodeId(this);
+                return this.hasAttribute('open');
+            },
+            set: function(value) {
+                _dialogNodeId(this);
+                if (value) this.setAttribute('open', '');
+                else this.removeAttribute('open');
+            },
+            enumerable: true, configurable: true,
+        },
+        returnValue: {
+            get: function() {
+                const id = _dialogNodeId(this);
+                return ops.op_dom_get_dialog_return_value(id);
+            },
+            set: function(value) {
+                const id = _dialogNodeId(this);
+                ops.op_dom_set_dialog_return_value(id, String(value));
+            },
+            enumerable: true, configurable: true,
+        },
+        closedBy: {
+            get: function() {
+                const id = _dialogNodeId(this);
+                const raw = this.getAttribute('closedby');
+                if (raw !== null) {
+                    const normalized = String(raw).toLowerCase();
+                    if (normalized === 'any' || normalized === 'closerequest' || normalized === 'none') {
+                        return normalized;
+                    }
+                }
+                return ops.op_dom_is_dialog_modal(id) ? 'closerequest' : 'none';
+            },
+            set: function(value) {
+                _dialogNodeId(this);
+                this.setAttribute('closedby', String(value));
+            },
+            enumerable: true, configurable: true,
+        },
+        close: {
+            value: function close() {
+                const id = _dialogNodeId(this);
+                // Chrome no-ops when the open content attribute is absent,
+                // even if script manually removed it while the dialog remains
+                // in the modal top layer.
+                if (!this.hasAttribute('open')) return;
+                if (arguments.length > 0) {
+                    ops.op_dom_set_dialog_return_value(id, String(arguments[0]));
+                }
+                this.removeAttribute('open');
+                ops.op_dom_set_dialog_modal(id, false);
+            },
+            writable: true, enumerable: true, configurable: true,
+        },
+        requestClose: {
+            value: function requestClose() {
+                const id = _dialogNodeId(this);
+                if (!this.hasAttribute('open')) return;
+                const event = new Event('cancel', { cancelable: true });
+                if (!this.dispatchEvent(event)) return;
+                if (arguments.length > 0) {
+                    ops.op_dom_set_dialog_return_value(id, String(arguments[0]));
+                }
+                this.removeAttribute('open');
+                ops.op_dom_set_dialog_modal(id, false);
+            },
+            writable: true, enumerable: true, configurable: true,
+        },
+        show: {
+            value: function show() {
+                const id = _dialogNodeId(this);
+                if (this.hasAttribute('open')) {
+                    if (ops.op_dom_is_dialog_modal(id)) {
+                        throw _dialogInvalidState(
+                            'show',
+                            'The dialog is already open as a modal dialog, and therefore cannot be opened as a non-modal dialog.'
+                        );
+                    }
+                    return;
+                }
+                // If script manually removed `open` from an existing modal,
+                // show() restores the attribute without leaving the top layer.
+                this.setAttribute('open', '');
+            },
+            writable: true, enumerable: true, configurable: true,
+        },
+        showModal: {
+            value: function showModal() {
+                const id = _dialogNodeId(this);
+                const modal = ops.op_dom_is_dialog_modal(id);
+                if (this.hasAttribute('open')) {
+                    if (modal) return;
+                    throw _dialogInvalidState(
+                        'showModal',
+                        'The dialog is already open as a non-modal dialog, and therefore cannot be opened as a modal dialog.'
+                    );
+                }
+                if (modal) {
+                    this.setAttribute('open', '');
+                    return;
+                }
+                if (!this.isConnected) {
+                    throw _dialogInvalidState('showModal', 'The element is not in a Document.');
+                }
+                this.setAttribute('open', '');
+                ops.op_dom_set_dialog_modal(id, true);
+            },
+            writable: true, enumerable: true, configurable: true,
+        },
+    });
+    if (_dialogCtorDesc) Object.defineProperty(_dialogProto, 'constructor', _dialogCtorDesc);
     class HTMLDirectoryElement extends HTMLElement {}
     class HTMLSelectedContentElement extends HTMLElement {}
 
