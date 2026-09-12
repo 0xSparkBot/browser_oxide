@@ -2,10 +2,10 @@ use browser_oxide::Page;
 use serde_json::Value;
 use std::time::Duration;
 
-async fn secure_page() -> Page {
+async fn secure_page(url: &str) -> Page {
     Page::from_html_with_url(
         "<!doctype html><html><body></body></html>",
-        "https://locks.example/",
+        url,
         Some(browser_oxide::stealth::presets::chrome_148_macos()),
     )
     .await
@@ -23,7 +23,7 @@ async fn drive(page: &mut Page, millis: u64) {
 
 #[tokio::test]
 async fn web_locks_queue_query_abort_and_shared_semantics_match_chrome_148() {
-    let mut page = secure_page().await;
+    let mut page = secure_page("https://locks-queue.example/").await;
     page.evaluate(
         r#"
         globalThis.__webLocksResult = null;
@@ -232,7 +232,7 @@ async fn web_locks_are_hidden_in_insecure_contexts() {
 
 #[tokio::test]
 async fn web_locks_coordinate_same_origin_window_and_worker() {
-    let mut page = secure_page().await;
+    let mut page = secure_page("https://locks-worker.example/").await;
     page.evaluate(
         r#"
         globalThis.__workerLocksResult = null;
@@ -285,15 +285,15 @@ async fn web_locks_coordinate_same_origin_window_and_worker() {
     let value: Value = serde_json::from_str(&raw).expect("worker result json");
     assert_eq!(value[0]["phase"], "check");
     assert_eq!(value[0]["value"], "none");
-    assert_eq!(value[0]["origin"], "https://locks.example");
+    assert_eq!(value[0]["origin"], "https://locks-worker.example");
     assert_eq!(value[1]["phase"], "after");
     assert_eq!(value[1]["value"], "cross-runtime:exclusive");
-    assert_eq!(value[1]["origin"], "https://locks.example");
+    assert_eq!(value[1]["origin"], "https://locks-worker.example");
 }
 
 #[tokio::test]
 async fn web_locks_illegal_constructors_and_steal_match_chrome_148() {
-    let mut page = secure_page().await;
+    let mut page = secure_page("https://locks-steal.example/").await;
     page.evaluate(
         r#"
         globalThis.__webLocksEdge = null;
