@@ -79,7 +79,10 @@ impl<'a> SelectorParser<'a> {
                 self.skip_whitespace();
                 selectors.push(self.parse_complex_selector()?);
             } else {
-                break;
+                return Err(SelectorParseError::UnexpectedToken {
+                    loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                    message: "unexpected token after selector".into(),
+                });
             }
         }
 
@@ -483,14 +486,17 @@ impl<'a> SelectorParser<'a> {
                     "lang" => self.parse_lang_pseudo(),
                     "dir" => self.parse_dir_pseudo(),
                     _ => Err(SelectorParseError::UnsupportedPseudoClass(name_lower)),
-                };
+                }?;
 
-                // Consume closing )
-                if matches!(self.current_kind(), TokenKind::CloseParen) {
-                    self.advance();
+                if !matches!(self.current_kind(), TokenKind::CloseParen) {
+                    return Err(SelectorParseError::UnexpectedToken {
+                        loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
+                        message: "expected ')' after functional pseudo-class".into(),
+                    });
                 }
+                self.advance();
 
-                Ok(SimpleSelector::PseudoClass(result?))
+                Ok(SimpleSelector::PseudoClass(result))
             }
             _ => Err(SelectorParseError::UnexpectedToken {
                 loc: self.current_token().map(|t| t.loc).unwrap_or_default(),
@@ -565,7 +571,7 @@ impl<'a> SelectorParser<'a> {
                         }
                     }
                     let mut inner_parser = SelectorParser::from_tokens(inner_tokens);
-                    Some(inner_parser.parse_selector_list().unwrap_or_default())
+                    Some(inner_parser.parse_selector_list()?)
                 } else {
                     None
                 };
@@ -943,6 +949,42 @@ mod tests {
                 "malformed attribute operator must be rejected: {selector}"
             );
         }
+    }
+
+    #[test]
+    fn parse_selector_list_rejects_trailing_garbage() {
+        for selector in ["div!", ".item?", "#main @"] {
+            assert!(
+                parse_selector_list(selector).is_err(),
+                "trailing garbage must invalidate the selector: {selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn functional_pseudo_classes_require_closing_parenthesis() {
+        for selector in [
+            ":not(.a",
+            ":is(.a",
+            ":where(.a",
+            ":has(.a",
+            ":nth-child(2n+1",
+            ":nth-last-child(2",
+            ":nth-of-type(odd",
+            ":nth-last-of-type(even",
+            ":lang(en",
+            ":dir(ltr",
+        ] {
+            assert!(
+                parse_selector_list(selector).is_err(),
+                "unterminated functional pseudo must be rejected: {selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn nth_child_of_clause_propagates_invalid_selector_list() {
+        assert!(parse_selector_list(":nth-child(1 of .a!)").is_err());
     }
 
     #[test]

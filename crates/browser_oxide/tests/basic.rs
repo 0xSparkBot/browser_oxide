@@ -133,6 +133,45 @@ async fn malformed_attribute_operators_throw_syntax_error_like_chrome() {
 }
 
 #[tokio::test]
+async fn malformed_selector_tails_and_unclosed_functions_throw_syntax_error() {
+    let dom = browser_oxide::html_parser::parse_html(
+        r#"<html><body><div id="main" class="a"></div></body></html>"#,
+    );
+    let mut rt = BrowserJsRuntime::new(dom);
+    let result = rt
+        .execute_script(
+            r#"(() => {
+                const selectors = [
+                    'div!',
+                    '.a?',
+                    ':not(.a',
+                    ':is(.a',
+                    ':where(.a',
+                    ':has(.a',
+                    ':nth-child(2n+1',
+                    ':nth-child(1 of .a!)',
+                    ':lang(en',
+                    ':dir(ltr'
+                ];
+                return JSON.stringify(selectors.map(selector => {
+                    try {
+                        document.querySelector(selector);
+                        return 'NO_THROW';
+                    } catch (e) {
+                        return e.name;
+                    }
+                }));
+            })()"#,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"["SyntaxError","SyntaxError","SyntaxError","SyntaxError","SyntaxError","SyntaxError","SyntaxError","SyntaxError","SyntaxError","SyntaxError"]"#
+    );
+}
+
+#[tokio::test]
 async fn html_default_attribute_value_case_sensitivity_matches_chrome() {
     let dom = browser_oxide::html_parser::parse_html(
         r#"<!doctype html><html><body>
