@@ -1152,3 +1152,81 @@ async fn indexeddb_cursor_continue_target_matches_chrome_direction_rules() {
     assert_eq!(value["errors"]["nextEqual"], "DataError");
     assert_eq!(value["errors"]["prevEqual"], "DataError");
 }
+
+#[tokio::test]
+async fn indexeddb_cursor_iteration_methods_reject_pending_or_exhausted_cursor() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbCursorState = null;
+        (() => {
+            const name = 'browser-oxide-idb-cursor-state';
+            const out = { errors: {}, seen: [] };
+            const open = indexedDB.open(name, 1);
+            open.onupgradeneeded = () => {
+                const store = open.result.createObjectStore('items');
+                store.put('a', 1);
+                store.put('b', 2);
+            };
+            open.onsuccess = () => {
+                const db = open.result;
+                const tx = db.transaction('items', 'readwrite');
+                const request = tx.objectStore('items').openCursor();
+                let saved = null;
+                let step = 0;
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) {
+                        try { saved.continue(); }
+                        catch (error) { out.errors.exhaustedContinue = error.name; }
+                        try { saved.advance(1); }
+                        catch (error) { out.errors.exhaustedAdvance = error.name; }
+                        try { saved.delete(); }
+                        catch (error) { out.errors.exhaustedDelete = error.name; }
+                        try { saved.update('exhausted'); }
+                        catch (error) { out.errors.exhaustedUpdate = error.name; }
+                        return;
+                    }
+                    saved = cursor;
+                    out.seen.push(cursor.key);
+                    if (step++ === 0) {
+                        cursor.continue();
+                        try { cursor.continue(); }
+                        catch (error) { out.errors.pendingContinue = error.name; }
+                        try { cursor.advance(1); }
+                        catch (error) { out.errors.pendingAdvance = error.name; }
+                        try { cursor.delete(); }
+                        catch (error) { out.errors.pendingDelete = error.name; }
+                        try { cursor.update('pending'); }
+                        catch (error) { out.errors.pendingUpdate = error.name; }
+                    } else {
+                        cursor.continue();
+                    }
+                };
+                tx.oncomplete = () => {
+                    globalThis.__idbCursorState = out;
+                    db.close();
+                    indexedDB.deleteDatabase(name);
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbCursorState)")
+        .expect("cursor state result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("cursor state json");
+
+    assert_eq!(value["seen"], serde_json::json!([1, 2]));
+    for field in [
+        "pendingContinue",
+        "pendingAdvance",
+        "exhaustedContinue",
+        "exhaustedAdvance",
+        "pendingDelete",
+        "pendingUpdate",
+        "exhaustedDelete",
+        "exhaustedUpdate",
+    ] {
+        assert_eq!(value["errors"][field], "InvalidStateError", "{field}");
+    }
+}

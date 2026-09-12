@@ -796,6 +796,14 @@
         });
         return cursor;
     }
+    function _assertCursorCanIterate(cursor) {
+        const state = _stateFor(_cursorState, cursor);
+        const reqState = _stateFor(_requestState, state.request);
+        if (state.key === undefined || reqState.readyState !== 'done') {
+            throw _domError('InvalidStateError', 'The cursor is not currently positioned on a value.');
+        }
+        return state;
+    }
     function _cursorStep(cursor, amount = 1) {
         const state = _stateFor(_cursorState, cursor);
         const reqState = _stateFor(_requestState, state.request);
@@ -849,13 +857,15 @@
         _defineGetter(IDBCursorProto, name, value => _stateFor(_cursorState, value)[name]);
     }
     _defineMethod(IDBCursorProto, 'advance', function advance(count) {
+        _assertCursorCanIterate(this);
         count = Number(count) >>> 0;
         if (!count) throw new TypeError("Failed to execute 'advance' on 'IDBCursor': The value provided must be greater than 0.");
         _cursorStep(this, count);
     });
     _defineMethod(IDBCursorProto, 'continue', function continueCursor(...args) {
+        const state = _assertCursorCanIterate(this);
         if (args.length && args[0] !== undefined) {
-            const state = _stateFor(_cursorState, this), target = args[0];
+            const target = args[0];
             if (state.key === undefined) {
                 throw _domError('InvalidStateError', 'The cursor has no current value.');
             }
@@ -882,7 +892,7 @@
         return keyCmp || _keyCmp(aPrimaryKey, bPrimaryKey);
     }
     _defineMethod(IDBCursorProto, 'continuePrimaryKey', function continuePrimaryKey(key, primaryKey) {
-        const state = _stateFor(_cursorState, this);
+        const state = _assertCursorCanIterate(this);
         if (!_indexState.has(state.source) || state.direction === 'nextunique' || state.direction === 'prevunique') {
             throw _domError('InvalidAccessError', 'continuePrimaryKey is only valid for non-unique index cursors.');
         }
@@ -911,13 +921,11 @@
         _cursorStep(this, Math.max(1, next - state.index));
     });
     _defineMethod(IDBCursorProto, 'delete', function deleteCursor() {
-        const state = _stateFor(_cursorState, this);
-        if (state.key === undefined) throw _domError('InvalidStateError', 'The cursor has no value.');
+        const state = _assertCursorCanIterate(this);
         return IDBObjectStoreProto.delete.call(state.store, state.primaryKey);
     });
     _defineMethod(IDBCursorProto, 'update', function update(value) {
-        const state = _stateFor(_cursorState, this);
-        if (state.key === undefined) throw _domError('InvalidStateError', 'The cursor has no value.');
+        const state = _assertCursorCanIterate(this);
         return IDBObjectStoreProto.put.call(state.store, value, state.primaryKey);
     });
     _finishProto(IDBCursor, IDBCursorProto, 'IDBCursor');
