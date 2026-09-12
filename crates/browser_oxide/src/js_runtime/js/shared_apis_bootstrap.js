@@ -1712,7 +1712,7 @@
         URLSearchParams.prototype.keys = function() { return _uspMap.get(this).map(([k]) => k)[Symbol.iterator](); };
         URLSearchParams.prototype.values = function() { return _uspMap.get(this).map(([, v]) => v)[Symbol.iterator](); };
         URLSearchParams.prototype.entries = function() { return _uspMap.get(this)[Symbol.iterator](); };
-        URLSearchParams.prototype[Symbol.iterator] = function() { return this.entries(); };
+        URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
         Object.defineProperty(URLSearchParams.prototype, 'size', {
             get: function() { return _uspMap.get(this).length; },
             enumerable: true,
@@ -2029,6 +2029,15 @@
             entries() { return this.#data[Symbol.iterator](); }
             [Symbol.iterator]() { return this.entries(); }
         };
+        {
+            const descriptor = Object.getOwnPropertyDescriptor(globalThis.FormData.prototype, Symbol.iterator);
+            if (descriptor) {
+                Object.defineProperty(globalThis.FormData.prototype, Symbol.iterator, {
+                    ...descriptor,
+                    value: globalThis.FormData.prototype.entries,
+                });
+            }
+        }
         _maskAsNative(globalThis.FormData);
     }
 

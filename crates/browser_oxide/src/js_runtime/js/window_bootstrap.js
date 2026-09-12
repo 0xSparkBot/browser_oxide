@@ -8509,6 +8509,15 @@
         entries() { return this.#data[Symbol.iterator](); }
         [Symbol.iterator]() { return this.entries(); }
     };
+    {
+        const descriptor = Object.getOwnPropertyDescriptor(globalThis.FormData.prototype, Symbol.iterator);
+        if (descriptor) {
+            Object.defineProperty(globalThis.FormData.prototype, Symbol.iterator, {
+                ...descriptor,
+                value: globalThis.FormData.prototype.entries,
+            });
+        }
+    }
 
     // --- customElements registry with lifecycle ---
     const _customElementsRegistry = new Map();

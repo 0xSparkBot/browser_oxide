@@ -734,6 +734,112 @@
         }
     } catch (_e) { /* universal mask sweep is best-effort */ }
 
+    // -- WebIDL interface constructor prototype descriptors -----------------
+    // Blink exposes interface-object `.prototype` as a non-writable,
+    // non-enumerable, non-configurable data property. Most of our public
+    // interfaces are backed by ordinary JS functions/classes, whose default
+    // function `prototype` slot is writable. Tighten only browser-facing
+    // constructor-shaped globals (uppercase names with an own object
+    // prototype); ECMAScript builtins are already non-writable and this pass
+    // therefore leaves them unchanged. This runs after every feature bootstrap
+    // so late-installed interfaces get the same WebIDL invariant.
+    try {
+        for (const _gname of Object.getOwnPropertyNames(globalThis)) {
+            if (!/^[A-Z]/.test(_gname)) continue;
+            let _desc;
+            try { _desc = Object.getOwnPropertyDescriptor(globalThis, _gname); } catch (_e) { continue; }
+            if (!_desc || !Object.prototype.hasOwnProperty.call(_desc, 'value')) continue;
+            const _ctor = _desc.value;
+            if (typeof _ctor !== 'function') continue;
+            let _prototypeDesc;
+            try { _prototypeDesc = Object.getOwnPropertyDescriptor(_ctor, 'prototype'); } catch (_e) { continue; }
+            if (!_prototypeDesc || !Object.prototype.hasOwnProperty.call(_prototypeDesc, 'value')) continue;
+            if (_prototypeDesc.writable !== true || !_prototypeDesc.value) continue;
+            try { Object.defineProperty(_ctor, 'prototype', { writable: false }); } catch (_e) {}
+        }
+    } catch (_e) { /* WebIDL prototype normalization is best-effort */ }
+
+    // -- WebIDL operation/accessor callable shape ----------------------------
+    // WebIDL prototype operations and accessors are native callables without
+    // [[Construct]]. Ordinary JS function expressions/classes used by a number
+    // of bootstraps are constructable and therefore leak an own `prototype`
+    // property even after their Function#toString is native-masked. Reify only
+    // callables that actually have [[Construct]], preserving the descriptor,
+    // observable name/length, receiver semantics, and aliases. A shared cache
+    // keeps identities such as `entries === Symbol.iterator` intact.
+    try {
+        const _mask = globalThis._maskFunction;
+        const _callableCache = new Map();
+        const _isConstructable = (fn) => {
+            if (typeof fn !== 'function') return false;
+            try {
+                Reflect.construct(function () {}, [], fn);
+                return true;
+            } catch (_e) {
+                return false;
+            }
+        };
+        const _shapeCallable = (fn, kind, key) => {
+            if (!_isConstructable(fn)) return fn;
+            let shaped = _callableCache.get(fn);
+            if (shaped) return shaped;
+
+            if (kind === 'get') {
+                const holder = { get [key]() { return Reflect.apply(fn, this, []); } };
+                shaped = Object.getOwnPropertyDescriptor(holder, key).get;
+            } else if (kind === 'set') {
+                const holder = { set [key](value) { return Reflect.apply(fn, this, [value]); } };
+                shaped = Object.getOwnPropertyDescriptor(holder, key).set;
+            } else {
+                shaped = ({ [key](...args) { return Reflect.apply(fn, this, args); } })[key];
+            }
+
+            try { Object.defineProperty(shaped, 'length', { value: fn.length, configurable: true }); } catch (_e) {}
+            try { Object.defineProperty(shaped, 'name', { value: fn.name, configurable: true }); } catch (_e) {}
+            if (typeof _mask === 'function') {
+                try { _mask(shaped, fn.name); } catch (_e) {}
+            }
+            _callableCache.set(fn, shaped);
+            return shaped;
+        };
+
+        for (const _gname of Object.getOwnPropertyNames(globalThis)) {
+            if (!/^[A-Z]/.test(_gname)) continue;
+            let _globalDesc;
+            try { _globalDesc = Object.getOwnPropertyDescriptor(globalThis, _gname); } catch (_e) { continue; }
+            if (!_globalDesc || !Object.prototype.hasOwnProperty.call(_globalDesc, 'value')) continue;
+            const _ctor = _globalDesc.value;
+            if (typeof _ctor !== 'function' || !_ctor.prototype) continue;
+
+            let _keys;
+            try { _keys = Reflect.ownKeys(_ctor.prototype); } catch (_e) { continue; }
+            for (const _key of _keys) {
+                if (_key === 'constructor') continue;
+                let _memberDesc;
+                try { _memberDesc = Object.getOwnPropertyDescriptor(_ctor.prototype, _key); } catch (_e) { continue; }
+                if (!_memberDesc) continue;
+
+                let _changed = false;
+                const _next = { ..._memberDesc };
+                if (typeof _memberDesc.value === 'function' && _isConstructable(_memberDesc.value)) {
+                    _next.value = _shapeCallable(_memberDesc.value, 'value', _key);
+                    _changed = true;
+                }
+                if (typeof _memberDesc.get === 'function' && _isConstructable(_memberDesc.get)) {
+                    _next.get = _shapeCallable(_memberDesc.get, 'get', _key);
+                    _changed = true;
+                }
+                if (typeof _memberDesc.set === 'function' && _isConstructable(_memberDesc.set)) {
+                    _next.set = _shapeCallable(_memberDesc.set, 'set', _key);
+                    _changed = true;
+                }
+                if (_changed) {
+                    try { Object.defineProperty(_ctor.prototype, _key, _next); } catch (_e) {}
+                }
+            }
+        }
+    } catch (_e) { /* WebIDL callable normalization is best-effort */ }
+
     const internals = [
         'Deno',
         'ops',
