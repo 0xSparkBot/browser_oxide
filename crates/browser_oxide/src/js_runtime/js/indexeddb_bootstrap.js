@@ -854,11 +854,24 @@
         _cursorStep(this, count);
     });
     _defineMethod(IDBCursorProto, 'continue', function continueCursor(...args) {
-        // Target-key seeking is supported for the common monotonic case.
         if (args.length && args[0] !== undefined) {
             const state = _stateFor(_cursorState, this), target = args[0];
+            if (state.key === undefined) {
+                throw _domError('InvalidStateError', 'The cursor has no current value.');
+            }
+            _keyCmp(target, target);
+            const targetVsCurrent = _keyCmp(target, state.key);
+            const forward = state.direction === 'next' || state.direction === 'nextunique';
+            if ((forward && targetVsCurrent <= 0) || (!forward && targetVsCurrent >= 0)) {
+                throw _domError('DataError', 'The requested key does not advance the cursor.');
+            }
+
             let next = state.index + 1;
-            while (next < state.entries.length && _keyCmp(state.entries[next].key, target) < 0) next++;
+            while (next < state.entries.length) {
+                const entryVsTarget = _keyCmp(state.entries[next].key, target);
+                if ((forward && entryVsTarget >= 0) || (!forward && entryVsTarget <= 0)) break;
+                next++;
+            }
             _cursorStep(this, Math.max(1, next - state.index));
             return;
         }

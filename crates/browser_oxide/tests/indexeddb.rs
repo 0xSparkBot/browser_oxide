@@ -1087,3 +1087,68 @@ async fn indexeddb_continue_primary_key_matches_chrome_tuple_seek() {
     assert_eq!(value["errors"]["store"], "InvalidAccessError");
     assert_eq!(value["errors"]["unique"], "InvalidAccessError");
 }
+
+#[tokio::test]
+async fn indexeddb_cursor_continue_target_matches_chrome_direction_rules() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbContinueTarget = null;
+        (() => {
+            const name = 'browser-oxide-idb-continue-target';
+            const out = { next: [], prev: [], errors: {} };
+            const open = indexedDB.open(name, 1);
+            open.onupgradeneeded = () => {
+                const store = open.result.createObjectStore('items');
+                store.put('a', 1);
+                store.put('b', 2);
+                store.put('c', 3);
+            };
+            open.onsuccess = () => {
+                const db = open.result;
+                const tx1 = db.transaction('items');
+                const nextRequest = tx1.objectStore('items').openCursor();
+                let nextStep = 0;
+                nextRequest.onsuccess = () => {
+                    const cursor = nextRequest.result;
+                    if (!cursor) return;
+                    out.next.push(cursor.key);
+                    if (nextStep++ === 0) {
+                        try { cursor.continue(1); }
+                        catch (error) { out.errors.nextEqual = error.name; }
+                        cursor.continue(3);
+                    }
+                };
+                tx1.oncomplete = () => {
+                    const tx2 = db.transaction('items');
+                    const prevRequest = tx2.objectStore('items').openCursor(null, 'prev');
+                    let prevStep = 0;
+                    prevRequest.onsuccess = () => {
+                        const cursor = prevRequest.result;
+                        if (!cursor) return;
+                        out.prev.push(cursor.key);
+                        if (prevStep++ === 0) {
+                            try { cursor.continue(3); }
+                            catch (error) { out.errors.prevEqual = error.name; }
+                            cursor.continue(1);
+                        }
+                    };
+                    tx2.oncomplete = () => {
+                        globalThis.__idbContinueTarget = out;
+                        db.close();
+                        indexedDB.deleteDatabase(name);
+                    };
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbContinueTarget)")
+        .expect("continue target result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("continue target json");
+
+    assert_eq!(value["next"], serde_json::json!([1, 3]));
+    assert_eq!(value["prev"], serde_json::json!([3, 1]));
+    assert_eq!(value["errors"]["nextEqual"], "DataError");
+    assert_eq!(value["errors"]["prevEqual"], "DataError");
+}
