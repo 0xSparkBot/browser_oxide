@@ -439,6 +439,8 @@ pub fn create_runtime_with_signals(
             "\n",
             include_str!("js/cssom_bootstrap.js"),
             "\n",
+            include_str!("js/highlight_bootstrap.js"),
+            "\n",
             include_str!("js/dom_element_webidl_bootstrap.js"),
             "\n",
             include_str!("js/constructor_webidl_bootstrap.js"),
