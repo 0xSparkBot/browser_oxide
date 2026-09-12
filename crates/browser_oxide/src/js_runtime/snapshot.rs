@@ -203,6 +203,8 @@ pub fn get_snapshot() -> &'static [u8] {
             "\n",
             include_str!("js/instance_webidl_bootstrap.js"),
             "\n",
+            include_str!("js/scroll_geometry_bootstrap.js"),
+            "\n",
             include_str!("js/scheduling_webidl_bootstrap.js"),
             "\n",
             include_str!("js/window_reflection_spec.js"),
