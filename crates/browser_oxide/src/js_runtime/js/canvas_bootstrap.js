@@ -1612,6 +1612,120 @@
         return names;
     }
 
+    function _webGLDeclaredUniforms(source) {
+        const uniforms = new Map();
+        const text = String(source || '')
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/\/\/.*$/gm, '');
+        const re = /\buniform\s+(?:(?:lowp|mediump|highp)\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(?:\s*\[\s*(\d+)\s*\])?/g;
+        let match;
+        while ((match = re.exec(text))) {
+            const [, type, name, arraySize] = match;
+            if (!uniforms.has(name)) {
+                uniforms.set(name, {
+                    type,
+                    size: arraySize ? Math.max(1, Number(arraySize) | 0) : 1,
+                    value: _webGLDefaultUniformValue(type),
+                });
+            }
+        }
+        return uniforms;
+    }
+
+    function _webGLDefaultUniformValue(type) {
+        const vectorSizes = {
+            vec2: 2, vec3: 3, vec4: 4,
+            ivec2: 2, ivec3: 3, ivec4: 4,
+            uvec2: 2, uvec3: 3, uvec4: 4,
+            bvec2: 2, bvec3: 3, bvec4: 4,
+            mat2: 4, mat3: 9, mat4: 16,
+            mat2x3: 6, mat2x4: 8, mat3x2: 6,
+            mat3x4: 12, mat4x2: 8, mat4x3: 12,
+        };
+        if (type === 'bool') return false;
+        if (type === 'float') return 0;
+        if (type === 'int' || type === 'uint' || /^([iu]?sampler|sampler)/.test(type)) return 0;
+        const count = vectorSizes[type];
+        if (!count) return 0;
+        if (/^(ivec|bvec)/.test(type)) return new Int32Array(count);
+        if (/^uvec/.test(type)) return new Uint32Array(count);
+        return new Float32Array(count);
+    }
+
+    function _webGLCloneUniformValue(value) {
+        if (ArrayBuffer.isView(value)) return new value.constructor(value);
+        return value;
+    }
+
+    function _webGLMergeUniforms(...sources) {
+        const merged = new Map();
+        for (const source of sources) {
+            for (const [name, info] of _webGLDeclaredUniforms(source)) {
+                if (!merged.has(name)) merged.set(name, info);
+            }
+        }
+        return merged;
+    }
+
+    function _webGLUniformLocationForWrite(ctx, location, operation, acceptedTypes) {
+        if (location == null) return null;
+        const state = _requireWebGLObject('WebGLUniformLocation', _webglUniformLocationState, location, false, operation);
+        if (!state || state.context !== ctx) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_OPERATION);
+            return null;
+        }
+        const program = _webglProgramState.get(state.program);
+        if (!program || program.context !== ctx || !program.linked ||
+            program.linkGeneration !== state.generation || _webglCurrentProgram.get(ctx) !== state.program) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_OPERATION);
+            return null;
+        }
+        const uniform = program.uniforms.get(state.name);
+        const accepted = !acceptedTypes ||
+            (typeof acceptedTypes === 'function'
+                ? acceptedTypes(uniform && uniform.type)
+                : acceptedTypes.has(uniform && uniform.type));
+        if (!uniform || !accepted) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_OPERATION);
+            return null;
+        }
+        return uniform;
+    }
+
+    function _webGLSetUniformFloatVector(ctx, location, values, type, operation) {
+        const uniform = _webGLUniformLocationForWrite(ctx, location, operation, new Set([type]));
+        if (!uniform) return;
+        uniform.value = new Float32Array(values.map(Number));
+    }
+
+    function _webGLSetUniformIntVector(ctx, location, values, types, operation) {
+        const uniform = _webGLUniformLocationForWrite(ctx, location, operation, new Set(types));
+        if (!uniform) return;
+        if (uniform.type === 'bool') {
+            uniform.value = !!Number(values[0]);
+        } else if (/^bvec/.test(uniform.type)) {
+            uniform.value = new Int32Array(values.map(v => Number(v) ? 1 : 0));
+        } else {
+            uniform.value = new Int32Array(values.map(v => Number(v) | 0));
+        }
+    }
+
+    function _webGLSetUniformMatrix(ctx, location, transpose, values, type, count, operation) {
+        if (location == null) return;
+        if (transpose) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_VALUE);
+            return;
+        }
+        const uniform = _webGLUniformLocationForWrite(ctx, location, operation, new Set([type]));
+        if (!uniform) return;
+        const data = Array.from(values || []);
+        if (data.length < count || (data.length % count) !== 0) {
+            _setWebGLError(ctx, WebGLRenderingContext.INVALID_VALUE);
+            return;
+        }
+        uniform.value = new Float32Array(data.slice(0, count).map(Number));
+    }
+
     // WebGL — routes through Canvas2D backend for real pixel output.
     // Some scripts call readPixels() after clearColor()+clear() and expect real data.
     class WebGLRenderingContext {
@@ -2183,7 +2297,8 @@
                 infoLog: '',
                 attribBindings: new Map(),
                 attribLocations: new Map(),
-                uniforms: new Set(),
+                uniforms: new Map(),
+                linkGeneration: 0,
             });
         }
         attachShader(program, shader) {
@@ -2242,6 +2357,8 @@
                 _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
                 return;
             }
+            p.linkGeneration += 1;
+            p.uniforms = new Map();
             const shaders = Array.from(p.attached).map((shader) => [shader, _webglShaderState.get(shader)]);
             const vertex = shaders.find(([, s]) => s && s.type === WebGLRenderingContext.VERTEX_SHADER);
             const fragment = shaders.find(([, s]) => s && s.type === WebGLRenderingContext.FRAGMENT_SHADER);
@@ -2280,10 +2397,7 @@
                 p.attribLocations.set(name, next);
                 used.add(next++);
             }
-            p.uniforms = new Set([
-                ..._webGLDeclaredNames(vertex[1].source, 'uniform'),
-                ..._webGLDeclaredNames(fragment[1].source, 'uniform'),
-            ]);
+            p.uniforms = _webGLMergeUniforms(vertex[1].source, fragment[1].source);
         }
         validateProgram(program) {
             const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
@@ -2347,6 +2461,7 @@
                 context: this,
                 program,
                 name,
+                generation: p.linkGeneration,
             });
         }
         getAttribLocation(program, name) {
@@ -2362,12 +2477,88 @@
             name = String(name);
             return p.attribLocations.has(name) ? p.attribLocations.get(name) : -1;
         }
-        uniform1f() {}
-        uniform1i() {}
-        uniform2f() {}
-        uniform3f() {}
-        uniform4f() {}
-        uniformMatrix4fv() {}
+        getUniform(program, location) {
+            const p = _requireWebGLObject('WebGLProgram', _webglProgramState, program);
+            const l = _requireWebGLObject('WebGLUniformLocation', _webglUniformLocationState, location, false, 'getUniform');
+            const retained = p && p.deleted && _webglCurrentProgram.get(this) === program;
+            if (!p || !l || p.context !== this || l.context !== this || l.program !== program ||
+                !p.linked || (p.deleted && !retained) || p.linkGeneration !== l.generation) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return null;
+            }
+            const uniform = p.uniforms.get(l.name);
+            if (!uniform) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return null;
+            }
+            return _webGLCloneUniformValue(uniform.value);
+        }
+        uniform1f(location, x) {
+            const uniform = _webGLUniformLocationForWrite(this, location, 'uniform1f', new Set(['float']));
+            if (uniform) uniform.value = Math.fround(Number(x));
+        }
+        uniform1i(location, x) {
+            const uniform = _webGLUniformLocationForWrite(
+                this,
+                location,
+                'uniform1i',
+                type => type === 'int' || type === 'bool' || /sampler/.test(type || ''),
+            );
+            if (!uniform) return;
+            uniform.value = uniform.type === 'bool' ? !!Number(x) : (Number(x) | 0);
+        }
+        uniform2f(location, x, y) {
+            _webGLSetUniformFloatVector(this, location, [x, y], 'vec2', 'uniform2f');
+        }
+        uniform3f(location, x, y, z) {
+            _webGLSetUniformFloatVector(this, location, [x, y, z], 'vec3', 'uniform3f');
+        }
+        uniform4f(location, x, y, z, w) {
+            _webGLSetUniformFloatVector(this, location, [x, y, z, w], 'vec4', 'uniform4f');
+        }
+        uniform2i(location, x, y) {
+            _webGLSetUniformIntVector(this, location, [x, y], ['ivec2', 'bvec2'], 'uniform2i');
+        }
+        uniform3i(location, x, y, z) {
+            _webGLSetUniformIntVector(this, location, [x, y, z], ['ivec3', 'bvec3'], 'uniform3i');
+        }
+        uniform4i(location, x, y, z, w) {
+            _webGLSetUniformIntVector(this, location, [x, y, z, w], ['ivec4', 'bvec4'], 'uniform4i');
+        }
+        uniform1fv(location, values) {
+            const uniform = _webGLUniformLocationForWrite(this, location, 'uniform1fv', new Set(['float']));
+            if (uniform) uniform.value = Math.fround(Number(values[0]));
+        }
+        uniform2fv(location, values) {
+            _webGLSetUniformFloatVector(this, location, Array.from(values).slice(0, 2), 'vec2', 'uniform2fv');
+        }
+        uniform3fv(location, values) {
+            _webGLSetUniformFloatVector(this, location, Array.from(values).slice(0, 3), 'vec3', 'uniform3fv');
+        }
+        uniform4fv(location, values) {
+            _webGLSetUniformFloatVector(this, location, Array.from(values).slice(0, 4), 'vec4', 'uniform4fv');
+        }
+        uniform1iv(location, values) {
+            this.uniform1i(location, values[0]);
+        }
+        uniform2iv(location, values) {
+            _webGLSetUniformIntVector(this, location, Array.from(values).slice(0, 2), ['ivec2', 'bvec2'], 'uniform2iv');
+        }
+        uniform3iv(location, values) {
+            _webGLSetUniformIntVector(this, location, Array.from(values).slice(0, 3), ['ivec3', 'bvec3'], 'uniform3iv');
+        }
+        uniform4iv(location, values) {
+            _webGLSetUniformIntVector(this, location, Array.from(values).slice(0, 4), ['ivec4', 'bvec4'], 'uniform4iv');
+        }
+        uniformMatrix2fv(location, transpose, values) {
+            _webGLSetUniformMatrix(this, location, transpose, values, 'mat2', 4, 'uniformMatrix2fv');
+        }
+        uniformMatrix3fv(location, transpose, values) {
+            _webGLSetUniformMatrix(this, location, transpose, values, 'mat3', 9, 'uniformMatrix3fv');
+        }
+        uniformMatrix4fv(location, transpose, values) {
+            _webGLSetUniformMatrix(this, location, transpose, values, 'mat4', 16, 'uniformMatrix4fv');
+        }
         createBuffer() {
             return _newWebGLObject('WebGLBuffer', _webglBufferState, {
                 context: this,
