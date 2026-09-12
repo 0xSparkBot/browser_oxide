@@ -490,8 +490,24 @@
         } catch (_) {}
     })();
 
-    // Run first cycle immediately
+    // Run first cycle immediately.
     runCycle();
-    // Then every 4 seconds to keep the "human" active during long builds
-    setInterval(runCycle, 4000);
+
+    // Keep the synthetic user active while the document is still loading, but
+    // stop once load has completed.  A permanent interval can keep stimulating
+    // an otherwise-settled page: input listeners may create fresh short-lived
+    // timers/network work on every cycle, so navigation never reaches idle even
+    // though the interval's own sleep promise is unref'ed.  The engine-internal
+    // background timeout does not pin idle by itself, and the readyState guard
+    // prevents post-load input from re-activating page work indefinitely.
+    function scheduleRepeatCycle() {
+        _sched(function repeatCycle() {
+            try {
+                if (document.readyState === 'complete') return;
+            } catch (_) {}
+            runCycle();
+            scheduleRepeatCycle();
+        }, 4000);
+    }
+    scheduleRepeatCycle();
 })();
