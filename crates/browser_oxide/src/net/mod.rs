@@ -662,10 +662,29 @@ impl HttpClient {
     /// Connect TCP+TLS and perform HTTP/2 handshake, returning a sender.
     /// Also spawns the connection driver task.
     async fn connect_h2(&self, host: &str, port: u16) -> Result<SendRequest<Bytes>, NetError> {
-        let tcp_stream = self.connect_tcp(host, port).await?;
-
-        let tls_stream =
-            tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await?;
+        let mut transient_tls_retries = 0u8;
+        let tls_stream = loop {
+            let tcp_stream = self.connect_tcp(host, port).await?;
+            match tls::connect_tls(&self.tls_connector, &self.profile, host, tcp_stream).await {
+                Ok(stream) => break stream,
+                Err(error)
+                    if transient_tls_retries == 0 && is_transient_tls_handshake_eof(&error) =>
+                {
+                    // Chrome/BoringSSL permutes TLS extensions per connection.
+                    // A small class of real TLS endpoints occasionally closes a
+                    // ClientHello before sending an alert (surfacing as an
+                    // unexpected EOF). A fresh TCP/TLS attempt produces a new
+                    // valid extension permutation and keeps the request on h2;
+                    // falling straight back to h1 instead makes the browser's
+                    // wire profile nondeterministic. Retry only this pre-request
+                    // transport EOF once: certificate, protocol, ALPN, and HTTP
+                    // failures remain fail-fast.
+                    transient_tls_retries += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         // Check ALPN
         let alpn = tls::negotiated_alpn(&tls_stream);
@@ -1892,6 +1911,18 @@ fn is_stale_conn_error(e: &NetError) -> bool {
         || msg.contains("HTTP/2 not ready")
 }
 
+/// A peer that closes during the TLS handshake without sending an alert can
+/// surface as an `unexpected EOF`. Retrying is safe here because no HTTP bytes
+/// have been sent yet. Keep this deliberately narrow: certificate validation,
+/// protocol negotiation, and post-handshake failures must remain fail-fast.
+fn is_transient_tls_handshake_eof(e: &NetError) -> bool {
+    matches!(
+        e,
+        NetError::Tls(message)
+            if message.contains("TLS handshake failed") && message.contains("unexpected EOF")
+    )
+}
+
 /// Check if a header name is already present (case-insensitive).
 fn has_header(hdrs: &[(String, String)], name: &str) -> bool {
     hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -2035,6 +2066,19 @@ fn resolve_redirect(current_url: &str, location: &str) -> Result<String, NetErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_tls_retry_is_limited_to_handshake_eof() {
+        assert!(is_transient_tls_handshake_eof(&NetError::Tls(
+            "TLS handshake failed: unexpected EOF".into()
+        )));
+        assert!(!is_transient_tls_handshake_eof(&NetError::Tls(
+            "certificate verify failed".into()
+        )));
+        assert!(!is_transient_tls_handshake_eof(&NetError::Http(
+            "unexpected EOF".into()
+        )));
+    }
 
     #[test]
     fn client_creates_successfully() {
