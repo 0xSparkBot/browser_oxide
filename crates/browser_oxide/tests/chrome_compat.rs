@@ -1563,6 +1563,36 @@ async fn fn_get_computed_style() {
 async fn fn_match_media() {
     assert_eq!(check("typeof matchMedia").await, "function");
 }
+
+#[tokio::test]
+async fn match_media_device_dimensions_follow_screen_not_viewport() {
+    let result = check(
+        r#"JSON.stringify({
+            screenWidth: screen.width,
+            screenHeight: screen.height,
+            innerWidth,
+            innerHeight,
+            deviceWidth: matchMedia(`(device-width: ${screen.width}px)`).matches,
+            deviceHeight: matchMedia(`(device-height: ${screen.height}px)`).matches,
+            viewportWidth: matchMedia(`(width: ${innerWidth}px)`).matches,
+            viewportHeight: matchMedia(`(height: ${innerHeight}px)`).matches,
+            wrongDeviceHeight: matchMedia(`(device-height: ${innerHeight}px)`).matches,
+            deviceAspect: matchMedia(`(device-aspect-ratio: ${screen.width}/${screen.height})`).matches,
+            viewportAspect: matchMedia(`(aspect-ratio: ${innerWidth}/${innerHeight})`).matches
+        })"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["deviceWidth"], true, "{result}");
+    assert_eq!(value["deviceHeight"], true, "{result}");
+    assert_eq!(value["viewportWidth"], true, "{result}");
+    assert_eq!(value["viewportHeight"], true, "{result}");
+    assert_eq!(value["deviceAspect"], true, "{result}");
+    assert_eq!(value["viewportAspect"], true, "{result}");
+    if value["screenHeight"] != value["innerHeight"] {
+        assert_eq!(value["wrongDeviceHeight"], false, "{result}");
+    }
+}
 #[tokio::test]
 async fn fn_get_selection() {
     assert_eq!(check("typeof getSelection").await, "function");

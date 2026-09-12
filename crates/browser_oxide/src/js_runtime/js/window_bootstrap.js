@@ -7966,11 +7966,13 @@
         const _numericFeature = (name) => {
             switch (name) {
                 case "width":
-                case "device-width":
                     return _pInt("inner_width", 1920);
+                case "device-width":
+                    return _pInt("screen_width", 1920);
                 case "height":
-                case "device-height":
                     return _pInt("inner_height", 1080);
+                case "device-height":
+                    return _pInt("screen_height", 1080);
                 case "color":
                     // Bits per color channel; Chrome reports 8.
                     return 8;
@@ -7981,10 +7983,14 @@
                     return _pFloat("device_pixel_ratio", 1);
                 case "device-pixel-ratio":
                     return _pFloat("device_pixel_ratio", 1);
-                case "aspect-ratio":
-                case "device-aspect-ratio": {
+                case "aspect-ratio": {
                     const w = _pInt("inner_width", 1920);
                     const h = _pInt("inner_height", 1080);
+                    return h > 0 ? w / h : 16 / 9;
+                }
+                case "device-aspect-ratio": {
+                    const w = _pInt("screen_width", 1920);
+                    const h = _pInt("screen_height", 1080);
                     return h > 0 ? w / h : 16 / 9;
                 }
                 default: return null;
