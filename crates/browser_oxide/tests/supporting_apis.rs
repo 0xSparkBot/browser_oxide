@@ -302,6 +302,98 @@ async fn structured_clone_symbol_throws() {
 }
 
 #[tokio::test]
+async fn structured_clone_error_sparse_array_and_host_object_semantics_match_chrome() {
+    let mut page = Page::from_html(
+        r#"<html><body><div id="out"></div><script>
+            const error = new TypeError('boom', { cause: { x: 1 } });
+            error.extra = 7;
+            const errorClone = structuredClone(error);
+
+            const domException = new DOMException('bad', 'AbortError');
+            domException.extra = 3;
+            const domExceptionClone = structuredClone(domException);
+
+            const aggregate = new AggregateError(
+                [new Error('a'), 2],
+                'agg',
+                { cause: 'why' }
+            );
+            const aggregateClone = structuredClone(aggregate);
+
+            const sparse = [];
+            sparse.length = 4;
+            sparse[2] = 'x';
+            sparse.foo = 3;
+            const sparseClone = structuredClone(sparse);
+
+            const denied = [
+                new WeakMap(),
+                new WeakSet(),
+                Promise.resolve(1),
+                new URL('https://example.com/a?b=1'),
+                new URLSearchParams('a=b'),
+                new FormData(),
+                new Headers({ a: 'b' }),
+                new Request('https://example.com/'),
+                new Response('x'),
+            ].map((value) => {
+                try {
+                    structuredClone(value);
+                    return 'NO_THROW';
+                } catch (e) {
+                    return e.name;
+                }
+            });
+
+            document.getElementById('out').textContent = JSON.stringify({
+                error: {
+                    tag: Object.prototype.toString.call(errorClone),
+                    name: errorClone.name,
+                    message: errorClone.message,
+                    cause: errorClone.cause,
+                    own: Reflect.ownKeys(errorClone).map(String),
+                },
+                domException: {
+                    tag: Object.prototype.toString.call(domExceptionClone),
+                    name: domExceptionClone.name,
+                    message: domExceptionClone.message,
+                    code: domExceptionClone.code,
+                    own: Reflect.ownKeys(domExceptionClone).map(String),
+                },
+                aggregateError: {
+                    tag: Object.prototype.toString.call(aggregateClone),
+                    name: aggregateClone.name,
+                    message: aggregateClone.message,
+                    cause: aggregateClone.cause,
+                    errors: Array.isArray(aggregateClone.errors)
+                        ? aggregateClone.errors
+                        : null,
+                    own: Reflect.ownKeys(aggregateClone).map(String),
+                },
+                sparseArray: {
+                    len: sparseClone.length,
+                    keys: Object.keys(sparseClone),
+                    has0: 0 in sparseClone,
+                    has2: 2 in sparseClone,
+                    foo: sparseClone.foo,
+                },
+                denied,
+            });
+        </script></body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        page.text_of("#out"),
+        Some(
+            r#"{"error":{"tag":"[object Error]","name":"TypeError","message":"boom","cause":{"x":1},"own":["stack","message","cause"]},"domException":{"tag":"[object DOMException]","name":"AbortError","message":"bad","code":20,"own":[]},"aggregateError":{"tag":"[object Error]","name":"Error","message":"agg","cause":"why","errors":null,"own":["stack","message","cause"]},"sparseArray":{"len":4,"keys":["2","foo"],"has0":false,"has2":true,"foo":3},"denied":["DataCloneError","DataCloneError","DataCloneError","DataCloneError","DataCloneError","DataCloneError","DataCloneError","DataCloneError","DataCloneError"]}"#.to_string()
+        )
+    );
+}
+
+#[tokio::test]
 async fn structured_clone_array_buffer_copy() {
     let mut page = Page::from_html(
         r#"<html><body><div id="out"></div><script>

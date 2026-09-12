@@ -610,15 +610,16 @@
             }
             return c;
         }
-        // Array — clone in order. Sparse arrays preserve holes via
-        // `i in value` tests (real Chrome does this).
+        // Array — structured clone walks enumerable own string keys. Using
+        // Object.keys preserves sparse holes while also retaining enumerable
+        // expando properties (`arr.foo = ...`), which Chrome clones alongside
+        // indexed elements. Inherited and non-enumerable properties are not
+        // serialized.
         if (Array.isArray(value)) {
             const c = new Array(value.length);
             seen.set(value, c);
-            for (let i = 0; i < value.length; i++) {
-                if (i in value) {
-                    c[i] = clone(value[i], seen, transferState);
-                }
+            for (const key of Object.keys(value)) {
+                c[key] = clone(value[key], seen, transferState);
             }
             return c;
         }
@@ -644,20 +645,69 @@
             seen.set(value, c);
             return c;
         }
-        // Error objects — structured clone preserves name + message;
-        // stack is implementation-defined (Chrome preserves it, we do too).
-        if (value instanceof Error) {
-            const Ctor = value.constructor || Error;
-            let c;
-            try {
-                c = new Ctor(value.message);
-            } catch (_e) {
-                c = new Error(value.message);
-            }
-            c.name = value.name;
-            if (value.stack) c.stack = value.stack;
+        // DOMException is a structured-serializable platform object. Its
+        // name drives the legacy numeric `code` getter, so reconstruct with
+        // both message and name instead of flattening it to a plain object.
+        if (typeof DOMException !== "undefined" && value instanceof DOMException) {
+            const c = new DOMException(value.message, value.name);
             seen.set(value, c);
             return c;
+        }
+        // Error objects — Chrome preserves the built-in Error subclass for
+        // the seven classic error constructors, plus stack/message and an own
+        // non-enumerable `cause`. Enumerable expando properties are dropped.
+        // AggregateError is still cloned as a plain Error in current Chromium
+        // (its `errors` list is not serialized), and custom subclasses likewise
+        // lose their prototype.
+        if (value instanceof Error) {
+            const ctor = value.constructor;
+            const Ctor = (
+                ctor === EvalError ||
+                ctor === RangeError ||
+                ctor === ReferenceError ||
+                ctor === SyntaxError ||
+                ctor === TypeError ||
+                ctor === URIError
+            ) ? ctor : Error;
+            const c = new Ctor(value.message);
+            seen.set(value, c);
+            if (value.stack) c.stack = value.stack;
+            if (Object.prototype.hasOwnProperty.call(value, "cause")) {
+                Object.defineProperty(c, "cause", {
+                    value: clone(value.cause, seen, transferState),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                });
+            }
+            return c;
+        }
+        // Objects that are explicitly not structured-serializable must throw
+        // rather than silently degrading to `{}`. Keep this list limited to
+        // browser objects whose Chromium behaviour is stable and covered by
+        // regression tests below; serializable platform types (Blob/File,
+        // geometry objects, CryptoKey, etc.) are handled separately.
+        const nonSerializableCtor = value.constructor && value.constructor.name;
+        if (
+            (typeof WeakMap !== "undefined" && value instanceof WeakMap) ||
+            (typeof WeakSet !== "undefined" && value instanceof WeakSet) ||
+            (typeof Promise !== "undefined" && value instanceof Promise)
+        ) {
+            throw _dataCloneError(
+                `Failed to execute 'structuredClone' on 'Window': #<${nonSerializableCtor}> could not be cloned.`
+            );
+        }
+        if (
+            nonSerializableCtor === "URL" ||
+            nonSerializableCtor === "URLSearchParams" ||
+            nonSerializableCtor === "FormData" ||
+            nonSerializableCtor === "Headers" ||
+            nonSerializableCtor === "Request" ||
+            nonSerializableCtor === "Response"
+        ) {
+            throw _dataCloneError(
+                `Failed to execute 'structuredClone' on 'Window': ${nonSerializableCtor} object could not be cloned.`
+            );
         }
         // DOM nodes / Windows / other host objects — DataCloneError.
         // We detect the most common host types by name or internal slots.
