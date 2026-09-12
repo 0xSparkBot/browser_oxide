@@ -727,6 +727,7 @@ async fn attr_and_named_node_map_match_chrome_148() {
                     instance:attrs instanceof NamedNodeMap,
                     keys:Reflect.ownKeys(attrs).map(String),
                     objectKeys:Object.keys(attrs),
+                    protoSymbols:Object.getOwnPropertySymbols(NamedNodeMap.prototype).map(String),
                     length:attrs.length,
                     indexDescriptor:indexDescriptor && [
                         indexDescriptor.enumerable,
@@ -776,7 +777,7 @@ async fn attr_and_named_node_map_match_chrome_148() {
     .await;
     assert_eq!(
         result,
-        r#"{"map":{"same":true,"tag":"[object NamedNodeMap]","instance":true,"keys":["0","1","id","data-a"],"objectKeys":["0","1"],"length":2,"indexDescriptor":[true,true,false,"[object Attr]"],"namedDescriptor":[false,true,false,"[object Attr]"]},"attr":{"tag":"[object Attr]","instance":true,"node":true,"keys":[],"nodeType":2,"nodeName":"id","textContent":"x","parentNode":null,"name":"id","localName":"id","namespaceURI":null,"prefix":null,"owner":true,"specified":true,"value":"x","stable":true},"constructors":{"attr":[0,"function Attr() { [native code] }","TypeError:Failed to construct 'Attr': Illegal constructor"],"map":[0,"function NamedNodeMap() { [native code] }","TypeError:Failed to construct 'NamedNodeMap': Illegal constructor"],"attrProtoNode":true},"mutations":{"replaced":true,"afterSet":"hello","removedTag":"[object Attr]","detached":true}}"#
+        r#"{"map":{"same":true,"tag":"[object NamedNodeMap]","instance":true,"keys":["0","1","id","data-a"],"objectKeys":["0","1"],"protoSymbols":["Symbol(Symbol.toStringTag)","Symbol(Symbol.iterator)"],"length":2,"indexDescriptor":[true,true,false,"[object Attr]"],"namedDescriptor":[false,true,false,"[object Attr]"]},"attr":{"tag":"[object Attr]","instance":true,"node":true,"keys":[],"nodeType":2,"nodeName":"id","textContent":"x","parentNode":null,"name":"id","localName":"id","namespaceURI":null,"prefix":null,"owner":true,"specified":true,"value":"x","stable":true},"constructors":{"attr":[0,"function Attr() { [native code] }","TypeError:Failed to construct 'Attr': Illegal constructor"],"map":[0,"function NamedNodeMap() { [native code] }","TypeError:Failed to construct 'NamedNodeMap': Illegal constructor"],"attrProtoNode":true},"mutations":{"replaced":true,"afterSet":"hello","removedTag":"[object Attr]","detached":true}}"#
     );
 }
 

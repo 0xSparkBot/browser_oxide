@@ -5,6 +5,15 @@
 ((globalThis) => {
     if (!globalThis.document || !globalThis.Element || !globalThis.Node) return;
 
+    // Proxy traps must use the pristine reflection primitives captured before
+    // cleanup_bootstrap installs WindowProxy-facing reflection wrappers.
+    // Calling the live global Reflect helpers from inside a trap can recurse:
+    // wrapper -> Proxy [[OwnPropertyKeys]]/[[GetOwnProperty]] -> trap -> wrapper.
+    const rawReflectGet = Reflect.get;
+    const rawReflectSet = Reflect.set;
+    const rawReflectHas = Reflect.has;
+    const rawReflectGetOwnPropertyDescriptor = Reflect.getOwnPropertyDescriptor;
+
     const attrState = new WeakMap();
     const mapState = new WeakMap();
     const elementAttrCache = new WeakMap();
@@ -114,7 +123,7 @@
                     };
                     case 'getRootNode': return function getRootNode() { return proxy; };
                     case 'normalize': return function normalize() {};
-                    default: return Reflect.get(object, prop, receiver);
+                    default: return rawReflectGet(object, prop, receiver);
                 }
             },
             set(object, prop, value, receiver) {
@@ -122,7 +131,7 @@
                     setAttrValue(state, value);
                     return true;
                 }
-                return Reflect.set(object, prop, value, receiver);
+                return rawReflectSet(object, prop, value, receiver);
             },
         });
         attrState.set(target, state);
@@ -285,10 +294,10 @@
             [Symbol.iterator]() { return this; },
         };
     };
+    Object.defineProperty(NamedNodeMap.prototype, Symbol.toStringTag, { value:'NamedNodeMap', configurable:true });
     Object.defineProperty(NamedNodeMap.prototype, Symbol.iterator, {
         value:values, writable:true, configurable:true,
     });
-    Object.defineProperty(NamedNodeMap.prototype, Symbol.toStringTag, { value:'NamedNodeMap', configurable:true });
 
     const makeMap = element => {
         const cached = elementMapCache.get(element);
@@ -300,11 +309,11 @@
                 if (typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop)) {
                     return receiver.item(Number(prop));
                 }
-                if (typeof prop === 'string' && !Reflect.has(object, prop)) {
+                if (typeof prop === 'string' && !rawReflectHas(object, prop)) {
                     const attr = attachedAttr(state.element, prop);
                     if (attr) return attr;
                 }
-                return Reflect.get(object, prop, receiver);
+                return rawReflectGet(object, prop, receiver);
             },
             has(object, prop) {
                 const state = stateForMap(proxy);
@@ -312,7 +321,7 @@
                     return Number(prop) < attributeNames(state.element).length;
                 }
                 if (typeof prop === 'string' && state.element.hasAttribute(prop)) return true;
-                return Reflect.has(object, prop);
+                return rawReflectHas(object, prop);
             },
             ownKeys() {
                 const state = stateForMap(proxy);
@@ -327,17 +336,17 @@
                         value:attr, writable:false, enumerable:true, configurable:true,
                     };
                 }
-                if (typeof prop === 'string' && !Reflect.has(object, prop)) {
+                if (typeof prop === 'string' && !rawReflectHas(object, prop)) {
                     const attr = attachedAttr(state.element, prop);
                     if (attr) return { value:attr, writable:false, enumerable:false, configurable:true };
                 }
-                return Reflect.getOwnPropertyDescriptor(object, prop);
+                return rawReflectGetOwnPropertyDescriptor(object, prop);
             },
             set(object, prop, value, receiver) {
                 if (typeof prop === 'string' && (/^(0|[1-9]\d*)$/.test(prop) || stateForMap(proxy).element.hasAttribute(prop))) {
                     return false;
                 }
-                return Reflect.set(object, prop, value, receiver);
+                return rawReflectSet(object, prop, value, receiver);
             },
         });
         mapState.set(target, { element });
