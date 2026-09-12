@@ -424,3 +424,92 @@ async fn web_locks_illegal_constructors_and_steal_match_chrome_148() {
         serde_json::json!({"held": [], "pending": []})
     );
 }
+
+#[tokio::test]
+async fn web_locks_share_same_origin_pages_and_isolate_different_origins() {
+    async fn page(url: &str) -> Page {
+        Page::from_html_with_url(
+            "<!doctype html><html><body></body></html>",
+            url,
+            Some(browser_oxide::stealth::presets::chrome_148_macos()),
+        )
+        .await
+        .expect("secure page")
+    }
+
+    let mut owner = page("https://same.example/owner").await;
+    let mut peer = page("https://same.example/peer").await;
+    let mut other = page("https://other.example/").await;
+
+    owner
+        .evaluate(
+            r#"
+            globalThis.__releaseOriginLock = null;
+            globalThis.__ownerHeld = false;
+            navigator.locks.request('origin-scope', async () => {
+                globalThis.__ownerHeld = true;
+                await new Promise(resolve => { globalThis.__releaseOriginLock = resolve; });
+            });
+            "#,
+        )
+        .expect("start owner lock");
+    drive(&mut owner, 30).await;
+    assert_eq!(owner.evaluate("String(__ownerHeld)").unwrap(), "true");
+
+    peer.evaluate(
+        r#"
+            globalThis.__sameOriginAvailable = null;
+            globalThis.__sameOriginQueued = false;
+            navigator.locks.request('origin-scope', { ifAvailable: true }, lock => {
+                globalThis.__sameOriginAvailable = lock ? 'got' : 'none';
+            });
+            navigator.locks.request('origin-scope', () => {
+                globalThis.__sameOriginQueued = true;
+            });
+            "#,
+    )
+    .expect("start same-origin requests");
+    drive(&mut peer, 30).await;
+    assert_eq!(peer.evaluate("__sameOriginAvailable").unwrap(), "none");
+    assert_eq!(
+        peer.evaluate("String(__sameOriginQueued)").unwrap(),
+        "false"
+    );
+
+    other
+        .evaluate(
+            r#"
+            globalThis.__otherOriginAvailable = null;
+            navigator.locks.request('origin-scope', { ifAvailable: true }, lock => {
+                globalThis.__otherOriginAvailable = lock ? 'got' : 'none';
+            });
+            "#,
+        )
+        .expect("start cross-origin request");
+    drive(&mut other, 30).await;
+    assert_eq!(other.evaluate("__otherOriginAvailable").unwrap(), "got");
+
+    owner
+        .evaluate(
+            r#"
+            navigator.locks.query().then(value => {
+                globalThis.__ownerQuery = JSON.stringify(value);
+            });
+            "#,
+        )
+        .expect("query owner origin");
+    drive(&mut owner, 20).await;
+    let query: Value =
+        serde_json::from_str(&owner.evaluate("__ownerQuery").unwrap()).expect("owner query json");
+    assert_eq!(query["held"].as_array().unwrap().len(), 1);
+    assert_eq!(query["pending"].as_array().unwrap().len(), 1);
+    assert_eq!(query["held"][0]["name"], "origin-scope");
+    assert_eq!(query["pending"][0]["name"], "origin-scope");
+
+    owner
+        .evaluate("__releaseOriginLock()")
+        .expect("release lock");
+    drive(&mut owner, 20).await;
+    drive(&mut peer, 40).await;
+    assert_eq!(peer.evaluate("String(__sameOriginQueued)").unwrap(), "true");
+}
