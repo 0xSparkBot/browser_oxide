@@ -829,6 +829,9 @@
         name = String(name);
         if (state.record.indexes.has(name)) throw _domError('ConstraintError', 'The index already exists.');
         const options = rest[0] || {};
+        if (options.multiEntry && Array.isArray(keyPath)) {
+            throw _domError('InvalidAccessError', 'A multiEntry index cannot use a sequence key path.');
+        }
         const record = { name, keyPath, multiEntry: !!options.multiEntry, unique: !!options.unique };
         state.record.indexes.set(name, record);
         return _makeIndex(this, record);
@@ -1027,13 +1030,10 @@
         const storeState = _stateFor(_storeState, state.store);
         const out = [];
         for (const [primaryKey, value] of _sortedEntries(storeState.record)) {
-            let key = _extractKey(value, state.record.keyPath);
-            if (key === undefined) continue;
-            const keys = state.record.multiEntry && Array.isArray(key) ? key : [key];
-            for (const candidate of keys) {
+            for (const candidate of _indexKeys(state.record, value)) {
                 const match = query == null ? true :
                     (query instanceof IDBKeyRange ? query.includes(candidate) : _keyCmp(candidate, query) === 0);
-                if (match) { out.push({ key: candidate, primaryKey, value }); break; }
+                if (match) out.push({ key: candidate, primaryKey, value });
             }
         }
         out.sort((a, b) => _keyCmp(a.key, b.key) || _keyCmp(a.primaryKey, b.primaryKey));
