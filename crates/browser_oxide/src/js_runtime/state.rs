@@ -154,6 +154,7 @@ impl DomState {
                 }
             }
         }
+        self.layout_engine.set_author_stylesheets(&self.stylesheets);
     }
 
     pub fn with_base_url(mut self, url: url::Url) -> Self {

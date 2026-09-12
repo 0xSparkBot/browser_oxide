@@ -1,8 +1,10 @@
-use crate::css_cascade::ComputedStyle;
-use crate::css_values::property::{CssValue, PropertyId};
-use crate::css_values::types::display::Display;
+use crate::css_cascade::{cascade_sort, CascadeEntry, ComputedStyle, Origin};
+use crate::css_selectors::{SelectorList, Specificity};
+use crate::css_values::property::{CssValue, PropertyDeclaration, PropertyId};
+use crate::css_values::types::display::{Display, Position};
+use crate::css_values::types::length::{LengthPercentage, LengthPercentageAuto};
 use crate::dom::node::{NodeData, NodeId};
-use crate::dom::Dom;
+use crate::dom::{Dom, DomElement};
 use crate::layout::query::DOMRect;
 use crate::layout::resolve::ResolveContext;
 use crate::layout::style_map::computed_to_taffy;
@@ -17,11 +19,19 @@ use taffy::prelude::*;
 /// real document.
 const LAYOUT_BUILD_LIMIT: usize = 100_000;
 
+#[derive(Clone)]
+struct AuthorRule {
+    selectors: SelectorList,
+    declarations: Vec<PropertyDeclaration>,
+    source_order: u32,
+}
+
 /// The layout engine. Converts a DOM + styles into positioned elements.
 pub struct LayoutEngine {
     tree: TaffyTree,
     dom_to_taffy: HashMap<u32, taffy::NodeId>,
     viewport: Viewport,
+    author_rules: Vec<AuthorRule>,
     dirty: bool,
     root_taffy: Option<taffy::NodeId>,
 }
@@ -32,9 +42,59 @@ impl LayoutEngine {
             tree: TaffyTree::new(),
             dom_to_taffy: HashMap::new(),
             viewport,
+            author_rules: Vec::new(),
             dirty: true,
             root_taffy: None,
         }
+    }
+
+    /// Update the viewport used as the initial containing block.
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        if self.viewport.width != viewport.width || self.viewport.height != viewport.height {
+            self.viewport = viewport;
+            self.dirty = true;
+        }
+    }
+
+    /// Compile author stylesheets into typed rules consumed by layout.
+    pub fn set_author_stylesheets(&mut self, stylesheets: &[String]) {
+        self.author_rules.clear();
+        let mut source_order = 0u32;
+
+        for css_text in stylesheets {
+            let (stylesheet, _errors) = crate::css_parser::parse_stylesheet(css_text);
+            for rule in &stylesheet.rules {
+                let crate::css_parser::ast::Rule::Qualified(rule) = rule else {
+                    continue;
+                };
+                let selector_text = crate::js_runtime::utils::tokens_to_string(&rule.prelude);
+                let Ok(selectors) = crate::css_selectors::parse_selector_list(&selector_text)
+                else {
+                    source_order = source_order.saturating_add(1);
+                    continue;
+                };
+
+                let mut declarations = Vec::new();
+                for declaration in &rule.declarations {
+                    if let Ok(mut parsed) = crate::css_values::parse_property(
+                        declaration.name,
+                        &declaration.value,
+                        declaration.important,
+                    ) {
+                        declarations.append(&mut parsed);
+                    }
+                }
+                if !declarations.is_empty() {
+                    self.author_rules.push(AuthorRule {
+                        selectors,
+                        declarations,
+                        source_order,
+                    });
+                }
+                source_order = source_order.saturating_add(1);
+            }
+        }
+        self.dirty = true;
     }
 
     /// Mark layout as dirty (needs recomputation).
@@ -55,8 +115,12 @@ impl LayoutEngine {
             viewport_h: self.viewport.height,
         };
 
+        // Resolve the author cascade top-down first so inherited values are
+        // available before the post-order Taffy tree construction.
+        let computed_styles = self.compute_styles(dom);
+
         // Build taffy tree from DOM
-        let root = self.build_node(dom, NodeId::DOCUMENT, &ctx);
+        let root = self.build_node(dom, NodeId::DOCUMENT, &ctx, &computed_styles);
         self.root_taffy = root;
 
         // Run layout
@@ -193,6 +257,7 @@ impl LayoutEngine {
         dom: &Dom,
         root: NodeId,
         ctx: &ResolveContext,
+        computed_styles: &HashMap<NodeId, ComputedStyle>,
     ) -> Option<taffy::NodeId> {
         enum Work {
             Visit(NodeId),
@@ -224,17 +289,149 @@ impl LayoutEngine {
                     }
                 }
                 Work::Finish(node_id) => {
-                    self.finish_node(dom, node_id, ctx);
+                    self.finish_node(dom, node_id, ctx, computed_styles);
                 }
             }
         }
         self.dom_to_taffy.get(&root.to_raw()).copied()
     }
 
+    fn compute_styles(&self, dom: &Dom) -> HashMap<NodeId, ComputedStyle> {
+        let mut styles = HashMap::new();
+        let mut stack = vec![NodeId::DOCUMENT];
+
+        while let Some(node_id) = stack.pop() {
+            if dom.get(node_id).is_some_and(|node| node.is_element()) {
+                let parent_style = dom
+                    .get(node_id)
+                    .and_then(|node| node.parent)
+                    .and_then(|parent| styles.get(&parent));
+                let cascaded = self.cascade_for_element(dom, node_id);
+                styles.insert(node_id, ComputedStyle::resolve(&cascaded, parent_style));
+            }
+
+            for child in dom.children(node_id).into_iter().rev() {
+                stack.push(child);
+            }
+        }
+        styles
+    }
+
+    fn cascade_for_element(&self, dom: &Dom, node_id: NodeId) -> HashMap<PropertyId, CssValue> {
+        let Some(element) = DomElement::new(dom, node_id) else {
+            return HashMap::new();
+        };
+        let mut entries = Vec::new();
+
+        for rule in &self.author_rules {
+            let specificity = rule
+                .selectors
+                .iter()
+                .filter(|selector| crate::css_selectors::matches_selector(&element, selector))
+                .map(crate::css_selectors::compute_specificity)
+                .max();
+            let Some(specificity) = specificity else {
+                continue;
+            };
+            for declaration in &rule.declarations {
+                entries.push(CascadeEntry {
+                    declaration: declaration.clone(),
+                    origin: Origin::Author,
+                    layer: None,
+                    specificity,
+                    source_order: rule.source_order,
+                });
+            }
+        }
+
+        if let Some(style_text) = dom
+            .get(node_id)
+            .and_then(|node| node.as_element())
+            .and_then(|element| {
+                element
+                    .attrs
+                    .iter()
+                    .find(|attr| attr.name.local.eq_ignore_ascii_case("style"))
+                    .map(|attr| attr.value.as_str())
+            })
+        {
+            let (declarations, _errors) = crate::css_parser::parse_declaration_list(style_text);
+            for declaration in declarations {
+                if let Ok(parsed) = crate::css_values::parse_property(
+                    declaration.name,
+                    &declaration.value,
+                    declaration.important,
+                ) {
+                    for declaration in parsed {
+                        entries.push(CascadeEntry {
+                            declaration,
+                            origin: Origin::Author,
+                            layer: None,
+                            specificity: Specificity::new(u32::MAX, 0, 0),
+                            source_order: u32::MAX,
+                        });
+                    }
+                }
+            }
+        }
+
+        cascade_sort(&mut entries)
+    }
+
+    fn has_positioned_ancestor(
+        &self,
+        dom: &Dom,
+        node_id: NodeId,
+        computed_styles: &HashMap<NodeId, ComputedStyle>,
+    ) -> bool {
+        let mut current = dom.get(node_id).and_then(|node| node.parent);
+        while let Some(ancestor) = current {
+            if computed_styles.get(&ancestor).is_some_and(|style| {
+                matches!(
+                    style.get(&PropertyId::Position),
+                    Some(CssValue::Position(position)) if *position != Position::Static
+                )
+            }) {
+                return true;
+            }
+            current = dom.get(ancestor).and_then(|node| node.parent);
+        }
+        false
+    }
+
+    fn initial_containing_block_dimension(
+        style: &ComputedStyle,
+        property: &PropertyId,
+        ctx: &ResolveContext,
+        reference: f32,
+    ) -> Option<f32> {
+        match style.get(property) {
+            Some(CssValue::LengthPercentageAuto(LengthPercentageAuto::Percentage(value))) => {
+                Some(*value as f32 / 100.0 * reference)
+            }
+            Some(CssValue::LengthPercentageAuto(LengthPercentageAuto::Calc(expr))) => Some(
+                crate::layout::resolve::resolve_calc_expression(expr, ctx, reference),
+            ),
+            Some(CssValue::LengthPercentage(LengthPercentage::Percentage(value))) => {
+                Some(*value as f32 / 100.0 * reference)
+            }
+            Some(CssValue::LengthPercentage(LengthPercentage::Calc(expr))) => Some(
+                crate::layout::resolve::resolve_calc_expression(expr, ctx, reference),
+            ),
+            _ => None,
+        }
+    }
+
     /// Build the taffy node for `node_id` using already-built children
     /// recorded in `self.dom_to_taffy` (set by prior Finish calls in
     /// post-order). Returns nothing — the result lives in `dom_to_taffy`.
-    fn finish_node(&mut self, dom: &Dom, node_id: NodeId, ctx: &ResolveContext) {
+    fn finish_node(
+        &mut self,
+        dom: &Dom,
+        node_id: NodeId,
+        ctx: &ResolveContext,
+        computed_styles: &HashMap<NodeId, ComputedStyle>,
+    ) {
         let node = match dom.get(node_id) {
             Some(n) => n,
             None => return,
@@ -264,18 +461,49 @@ impl LayoutEngine {
                     Err(_) => return,
                 }
             }
-            NodeData::Element(elem) => {
-                let computed = ComputedStyle::resolve(&HashMap::new(), None);
-                let inline_style = self.parse_inline_style(elem);
-                let computed = if !inline_style.is_empty() {
-                    ComputedStyle::resolve(&inline_style, None)
-                } else {
-                    computed
-                };
+            NodeData::Element(_) => {
+                let computed = computed_styles
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_else(|| ComputedStyle::resolve(&HashMap::new(), None));
                 if let Some(CssValue::Display(Display::None)) = computed.get(&PropertyId::Display) {
                     return;
                 }
-                let taffy_style = computed_to_taffy(&computed, ctx);
+                let mut taffy_style = computed_to_taffy(&computed, ctx);
+
+                // CSS2 absolute positioning: if an absolutely positioned box
+                // has no positioned ancestor, percentage width/height resolve
+                // against the initial containing block (the viewport). Taffy
+                // otherwise sees the immediate DOM parent, whose auto block
+                // height is indefinite, and resolves `height:100%` to zero.
+                // Fixed-position boxes use the viewport regardless of DOM
+                // ancestry (transform-established fixed containing blocks are
+                // outside the subset this engine models today).
+                let position = match computed.get(&PropertyId::Position) {
+                    Some(CssValue::Position(position)) => *position,
+                    _ => Position::Static,
+                };
+                let uses_initial_containing_block = position == Position::Fixed
+                    || (position == Position::Absolute
+                        && !self.has_positioned_ancestor(dom, node_id, computed_styles));
+                if uses_initial_containing_block {
+                    if let Some(width) = Self::initial_containing_block_dimension(
+                        &computed,
+                        &PropertyId::Width,
+                        ctx,
+                        ctx.viewport_w,
+                    ) {
+                        taffy_style.size.width = Dimension::length(width);
+                    }
+                    if let Some(height) = Self::initial_containing_block_dimension(
+                        &computed,
+                        &PropertyId::Height,
+                        ctx,
+                        ctx.viewport_h,
+                    ) {
+                        taffy_style.size.height = Dimension::length(height);
+                    }
+                }
                 match self.tree.new_with_children(taffy_style, &children) {
                     Ok(id) => id,
                     Err(_) => return,
@@ -300,27 +528,6 @@ impl LayoutEngine {
             _ => return,
         };
         self.dom_to_taffy.insert(node_id.to_raw(), taffy_id);
-    }
-
-    fn parse_inline_style(
-        &self,
-        elem: &crate::dom::node::ElementData,
-    ) -> HashMap<PropertyId, CssValue> {
-        let mut map = HashMap::new();
-        let style_attr = elem.attrs.iter().find(|a| a.name.local == "style");
-        if let Some(attr) = style_attr {
-            let (decls, _) = crate::css_parser::parse_declaration_list(&attr.value);
-            for decl in &decls {
-                if let Ok(props) =
-                    crate::css_values::parse_property(decl.name, &decl.value, decl.important)
-                {
-                    for prop in props {
-                        map.insert(prop.property, prop.value);
-                    }
-                }
-            }
-        }
-        map
     }
 
     fn absolute_position(&self, taffy_id: taffy::NodeId) -> (f32, f32) {

@@ -1,5 +1,7 @@
 use crate::dom::node::NodeId;
+use crate::js_runtime::extensions::stealth_ext::StealthState;
 use crate::js_runtime::state::DomState;
+use crate::layout::Viewport;
 use deno_core::op2;
 use deno_core::OpState;
 use serde::Serialize;
@@ -16,10 +18,24 @@ pub struct DOMRectJson {
     pub left: f64,
 }
 
+fn sync_layout_viewport(state: &mut OpState) {
+    let viewport = state
+        .try_borrow::<StealthState>()
+        .and_then(|stealth| stealth.profile.as_ref())
+        .map(|profile| Viewport::new(profile.inner_width as f32, profile.inner_height as f32));
+    if let Some(viewport) = viewport {
+        state
+            .borrow_mut::<DomState>()
+            .layout_engine
+            .set_viewport(viewport);
+    }
+}
+
 /// Get bounding rect using real taffy layout computation.
 #[op2]
 #[serde]
 pub fn op_layout_get_bounding_rect(state: &mut OpState, #[smi] node_id: i32) -> DOMRectJson {
+    sync_layout_viewport(state);
     let state = state.borrow_mut::<DomState>();
     let nid = NodeId::from_raw(node_id as u32);
     let rect = state.layout_engine.get_bounding_rect(&state.dom, nid);
@@ -39,6 +55,7 @@ pub fn op_layout_get_bounding_rect(state: &mut OpState, #[smi] node_id: i32) -> 
 #[op2]
 #[serde]
 pub fn op_layout_elements_from_point(state: &mut OpState, x: f64, y: f64) -> Vec<i32> {
+    sync_layout_viewport(state);
     let state = state.borrow_mut::<DomState>();
     state
         .layout_engine
@@ -51,6 +68,7 @@ pub fn op_layout_elements_from_point(state: &mut OpState, x: f64, y: f64) -> Vec
 #[op2(fast)]
 #[smi]
 pub fn op_layout_get_offset_width(state: &mut OpState, #[smi] node_id: i32) -> i32 {
+    sync_layout_viewport(state);
     let state = state.borrow_mut::<DomState>();
     let nid = NodeId::from_raw(node_id as u32);
     state
@@ -62,6 +80,7 @@ pub fn op_layout_get_offset_width(state: &mut OpState, #[smi] node_id: i32) -> i
 #[op2(fast)]
 #[smi]
 pub fn op_layout_get_offset_height(state: &mut OpState, #[smi] node_id: i32) -> i32 {
+    sync_layout_viewport(state);
     let state = state.borrow_mut::<DomState>();
     let nid = NodeId::from_raw(node_id as u32);
     state
@@ -73,6 +92,7 @@ pub fn op_layout_get_offset_height(state: &mut OpState, #[smi] node_id: i32) -> 
 #[op2(fast)]
 #[smi]
 pub fn op_layout_get_offset_top(state: &mut OpState, #[smi] node_id: i32) -> i32 {
+    sync_layout_viewport(state);
     let state = state.borrow_mut::<DomState>();
     let nid = NodeId::from_raw(node_id as u32);
     state.layout_engine.get_offset_top(&state.dom, nid).round() as i32
@@ -81,6 +101,7 @@ pub fn op_layout_get_offset_top(state: &mut OpState, #[smi] node_id: i32) -> i32
 #[op2(fast)]
 #[smi]
 pub fn op_layout_get_offset_left(state: &mut OpState, #[smi] node_id: i32) -> i32 {
+    sync_layout_viewport(state);
     let state = state.borrow_mut::<DomState>();
     let nid = NodeId::from_raw(node_id as u32);
     state.layout_engine.get_offset_left(&state.dom, nid).round() as i32
