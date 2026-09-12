@@ -108,7 +108,7 @@
         "PerformanceEntry", "PerformanceObserver",
         "ReportingObserver", "PressureObserver",
         // Misc real-implementations
-        "CloseEvent", "EventSource",
+        "CloseEvent", "CloseWatcher", "EventSource",
         "OffscreenCanvas", "ImageBitmap",
         "Touch", "TouchEvent", "TouchList",
         // URL pair (real impls in shared_apis_bootstrap.js)
