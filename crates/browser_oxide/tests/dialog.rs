@@ -1,4 +1,5 @@
 use browser_oxide::js_runtime::BrowserJsRuntime;
+use std::time::Duration;
 
 fn runtime(html: &str) -> BrowserJsRuntime {
     let dom = browser_oxide::html_parser::parse_html(html);
@@ -130,5 +131,81 @@ async fn dialog_detached_and_manual_open_edge_cases_match_chromium() {
     assert_eq!(
         result,
         r#"{"modalDetached":"InvalidStateError: Failed to execute 'showModal' on 'HTMLDialogElement': The element is not in a Document.","showDetached":"ok","detachedState":{"open":true,"modal":false},"manual":{"open":false,"modal":true,"closedBy":"closerequest"},"closeNoop":{"open":false,"modal":true,"returnValue":""},"restoredByShow":{"open":true,"modal":true},"restoredByModal":{"open":true,"modal":true}}"#
+    );
+}
+
+#[tokio::test]
+async fn dialog_cancel_and_close_event_lifecycle_matches_chrome_148() {
+    let mut rt = runtime("<!doctype html><html><body></body></html>");
+    let immediate = rt
+        .execute_script(
+            r#"
+            (() => {
+                globalThis.__dialogEvents = [];
+                const make = label => {
+                    const d = document.createElement('dialog');
+                    document.body.appendChild(d);
+                    for (const type of ['cancel', 'close']) {
+                        d.addEventListener(type, event => __dialogEvents.push({
+                            label,
+                            type,
+                            trusted: event.isTrusted,
+                            cancelable: event.cancelable,
+                            open: d.open,
+                            modal: d.matches(':modal'),
+                            rv: d.returnValue,
+                        }));
+                    }
+                    return d;
+                };
+
+                const nonModal = make('closeNonModal');
+                nonModal.show();
+                nonModal.close('n');
+
+                const modal = make('closeModal');
+                modal.showModal();
+                modal.close('m');
+
+                const requested = make('request');
+                requested.showModal();
+                requested.requestClose('r');
+
+                const prevented = make('prevent');
+                prevented.showModal();
+                prevented.addEventListener('cancel', event => event.preventDefault());
+                prevented.requestClose('p');
+
+                return JSON.stringify({
+                    events: __dialogEvents,
+                    states: {
+                        nonModal: [nonModal.open, nonModal.matches(':modal'), nonModal.returnValue],
+                        modal: [modal.open, modal.matches(':modal'), modal.returnValue],
+                        requested: [requested.open, requested.matches(':modal'), requested.returnValue],
+                        prevented: [prevented.open, prevented.matches(':modal'), prevented.returnValue],
+                    },
+                });
+            })()
+            "#,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        immediate,
+        r#"{"events":[{"label":"request","type":"cancel","trusted":true,"cancelable":true,"open":true,"modal":true,"rv":""},{"label":"prevent","type":"cancel","trusted":true,"cancelable":true,"open":true,"modal":true,"rv":""}],"states":{"nonModal":[false,false,"n"],"modal":[false,false,"m"],"requested":[false,false,"r"],"prevented":[true,true,""]}}"#
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), rt.run_event_loop())
+        .await
+        .expect("dialog close tasks must settle")
+        .expect("dialog close task event loop");
+
+    let final_events = rt
+        .execute_script("JSON.stringify(globalThis.__dialogEvents)", None)
+        .unwrap();
+    assert_eq!(
+        final_events,
+        r#"[{"label":"request","type":"cancel","trusted":true,"cancelable":true,"open":true,"modal":true,"rv":""},{"label":"prevent","type":"cancel","trusted":true,"cancelable":true,"open":true,"modal":true,"rv":""},{"label":"closeNonModal","type":"close","trusted":true,"cancelable":false,"open":false,"modal":false,"rv":"n"},{"label":"closeModal","type":"close","trusted":true,"cancelable":false,"open":false,"modal":false,"rv":"m"},{"label":"request","type":"close","trusted":true,"cancelable":false,"open":false,"modal":false,"rv":"r"}]"#
     );
 }
