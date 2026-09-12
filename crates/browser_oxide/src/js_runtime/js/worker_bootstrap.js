@@ -647,7 +647,8 @@
     // implemented yet, but a standards-shaped asynchronous empty store is much
     // closer to Chrome than an absent global and is sufficient for capability
     // probes and cache-miss paths.
-    if (ops.op_is_secure_context && ops.op_is_secure_context()) {
+    if (ops.op_is_secure_context && ops.op_is_secure_context()
+        && typeof globalThis.caches === 'undefined') {
         class Cache {
             match(_request, _options) { return Promise.resolve(undefined); }
             matchAll(_request, _options) { return Promise.resolve([]); }

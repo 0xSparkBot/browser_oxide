@@ -1,6 +1,7 @@
 use crate::dom::Dom;
 use crate::js_runtime::extensions::audio_ext::audio_extension;
 use crate::js_runtime::extensions::canvas_ext::{canvas_extension, CanvasState};
+use crate::js_runtime::extensions::cache_storage_ext::cache_storage_extension;
 use crate::js_runtime::extensions::compression_stream_ext::compression_stream_extension;
 use crate::js_runtime::extensions::console_ext::console_extension;
 use crate::js_runtime::extensions::crypto_ext::crypto_extension;
@@ -83,6 +84,7 @@ pub fn get_snapshot() -> &'static [u8] {
         let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
             extensions: vec![
                 console_extension::init(),
+                cache_storage_extension::init(),
                 compression_stream_extension::init(),
                 crypto_extension::init(),
                 dom_extension::init(),
@@ -158,6 +160,8 @@ pub fn get_snapshot() -> &'static [u8] {
             include_str!("js/canvas_bootstrap.js"),
             "\n",
             include_str!("js/window_bootstrap.js"),
+            "\n",
+            include_str!("js/cache_storage_bootstrap.js"),
             "\n",
             include_str!("js/sse_bootstrap.js"),
             "\n",

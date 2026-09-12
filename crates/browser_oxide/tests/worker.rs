@@ -744,6 +744,7 @@ fn worker_message_channel_and_cache_storage_are_functional() {
                     cacheStorageTag: Object.prototype.toString.call(caches),
                     cacheTag: Object.prototype.toString.call(cache),
                     cacheNames: (await caches.keys()).length,
+                    cacheNameList: await caches.keys(),
                     cacheMatch: await caches.match('/missing'),
                 };
                 channel.port1.close();
@@ -776,7 +777,8 @@ fn worker_message_channel_and_cache_storage_are_functional() {
     assert_eq!(v["cachesType"], "object", "{out}");
     assert_eq!(v["cacheStorageTag"], "[object CacheStorage]", "{out}");
     assert_eq!(v["cacheTag"], "[object Cache]", "{out}");
-    assert_eq!(v["cacheNames"], 0, "{out}");
+    assert_eq!(v["cacheNames"], 1, "{out}");
+    assert_eq!(v["cacheNameList"], serde_json::json!(["probe"]), "{out}");
     assert_eq!(v["cacheMatch"], serde_json::Value::Null, "{out}");
 }
 
