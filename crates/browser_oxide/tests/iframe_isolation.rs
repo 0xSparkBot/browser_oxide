@@ -103,6 +103,79 @@ async fn iframe_srcdoc_executes_scripts() {
 }
 
 #[tokio::test]
+async fn cross_realm_events_dispatch_with_original_identity() {
+    let mut page = Page::from_html(
+        r#"<!DOCTYPE html><html><body>
+        <iframe id="f" srcdoc="<html><body><div id='child-target'></div></body></html>"></iframe>
+        </body></html>"#,
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    let result = page
+        .evaluate(
+            r#"JSON.stringify((() => {
+                const frame = document.getElementById('f');
+                const child = frame.contentWindow;
+
+                const childEvent = new child.Event('child-to-parent', {
+                    bubbles: true,
+                    cancelable: true
+                });
+                let parentSeen = null;
+                frame.addEventListener('child-to-parent', event => {
+                    parentSeen = {
+                        same: event === childEvent,
+                        target: event.target === frame,
+                        currentTarget: event.currentTarget === frame,
+                        type: event.type,
+                        bubbles: event.bubbles
+                    };
+                });
+                const parentReturn = frame.dispatchEvent(childEvent);
+
+                const parentEvent = new Event('parent-to-child', {
+                    bubbles: true,
+                    cancelable: true
+                });
+                const childTarget = child.document.getElementById('child-target');
+                let childSeen = null;
+                childTarget.addEventListener('parent-to-child', event => {
+                    childSeen = {
+                        same: event === parentEvent,
+                        target: event.target === childTarget,
+                        currentTarget: event.currentTarget === childTarget,
+                        type: event.type,
+                        bubbles: event.bubbles
+                    };
+                });
+                const childReturn = childTarget.dispatchEvent(parentEvent);
+
+                return {
+                    parentReturn,
+                    childReturn,
+                    parentSeen,
+                    childSeen,
+                    childEventParentInstance: childEvent instanceof Event,
+                    childEventChildInstance: childEvent instanceof child.Event,
+                    parentEventParentInstance: parentEvent instanceof Event,
+                    parentEventChildInstance: parentEvent instanceof child.Event,
+                    parentCurrentAfter: childEvent.currentTarget === null,
+                    childCurrentAfter: parentEvent.currentTarget === null
+                };
+            })())"#,
+        )
+        .unwrap();
+
+    let expected = r#"{"parentReturn":true,"childReturn":true,"parentSeen":{"same":true,"target":true,"currentTarget":true,"type":"child-to-parent","bubbles":true},"childSeen":{"same":true,"target":true,"currentTarget":true,"type":"parent-to-child","bubbles":true},"childEventParentInstance":false,"childEventChildInstance":true,"parentEventParentInstance":true,"parentEventChildInstance":false,"parentCurrentAfter":true,"childCurrentAfter":true}"#;
+    assert_eq!(
+        result, expected,
+        "cross-realm Event dispatch must match Chromium semantics"
+    );
+}
+
+#[tokio::test]
 async fn multiple_iframes_isolated() {
     let mut page = Page::from_html(
         r#"<!DOCTYPE html><html><body>

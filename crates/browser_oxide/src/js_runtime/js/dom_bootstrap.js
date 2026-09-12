@@ -5155,6 +5155,24 @@
         }
         try {
             ops.op_set_child_realm_prop(realmId, "__oxideInterfaceSources", sources);
+            if (_getFrameEventState && _setFrameEventState) {
+                // Temporary cross-realm WebIDL brand/state bridge. Child Event
+                // constructors invoke the parent implementation with a child
+                // newTarget, so their private Event state lives in the parent
+                // WeakMap even though `childEvent instanceof parent.Event` is
+                // false. Capture the private accessors inside the child realm
+                // and delete the page-visible temporary names immediately.
+                ops.op_set_child_realm_prop(
+                    realmId,
+                    "__oxideInterfaceGetEventState",
+                    _getFrameEventState,
+                );
+                ops.op_set_child_realm_prop(
+                    realmId,
+                    "__oxideInterfaceSetEventState",
+                    _setFrameEventState,
+                );
+            }
         } catch (_) {
             return;
         }
@@ -5163,8 +5181,10 @@
         const illegalJson = JSON.stringify(Array.from(_ILLEGAL_CONSTRUCTORS));
         const code = `(function(){
             const sources=globalThis.__oxideInterfaceSources||{};
+            const frameEventStateGet=globalThis.__oxideInterfaceGetEventState;
+            const frameEventStateSet=globalThis.__oxideInterfaceSetEventState;
             const frameRegistryHook=globalThis.__oxideFrameRegistryHook;
-            try{delete globalThis.__oxideFrameRegistryHook;}catch(_){}
+            try{delete globalThis.__oxideFrameRegistryHook;delete globalThis.__oxideInterfaceGetEventState;delete globalThis.__oxideInterfaceSetEventState;}catch(_){}
             const names=${namesJson};
             const illegal=new Set(${illegalJson});
             const nativeTag=Symbol.for('__browser_oxide_native__');
@@ -5406,9 +5426,13 @@
                     for(let i=remove.length-1;i>=0;i--)list.splice(remove[i],1);
                 }
                 function dispatchEvent(event){
-                    if(!(event instanceof built.Event))throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
-                    const state=()=>{try{return _getFrameEventState?_getFrameEventState(event):{stopped:!!event._stopped,stoppedImmediate:!!event._stoppedImmediate,bubbles:!!event.bubbles,defaultPrevented:!!event.defaultPrevented};}catch(_){return {stopped:false,stoppedImmediate:false,bubbles:!!event.bubbles,defaultPrevented:!!event.defaultPrevented};}};
-                    const setState=patch=>{try{if(_setFrameEventState)_setFrameEventState(event,patch);else for(const key of Object.keys(patch))event[key]=patch[key];}catch(_){}};
+                    let validEvent=event instanceof built.Event;
+                    if(!validEvent&&typeof frameEventStateGet==='function'){
+                        try{frameEventStateGet(event);validEvent=true;}catch(_){}
+                    }
+                    if(!validEvent)throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+                    const state=()=>{try{return typeof frameEventStateGet==='function'?frameEventStateGet(event):{stopped:!!event._stopped,stoppedImmediate:!!event._stoppedImmediate,bubbles:!!event.bubbles,defaultPrevented:!!event.defaultPrevented};}catch(_){return {stopped:false,stoppedImmediate:false,bubbles:!!event.bubbles,defaultPrevented:!!event.defaultPrevented};}};
+                    const setState=patch=>{try{if(typeof frameEventStateSet==='function')frameEventStateSet(event,patch);else for(const key of Object.keys(patch))event[key]=patch[key];}catch(_){}};
                     if(state().dispatching)throw new DOMException('The event is already being dispatched.','InvalidStateError');
                     setState({target:this,dispatching:true});
                     const path=[];let current=this;
@@ -5498,6 +5522,8 @@
         })();`;
         try { ops.op_eval_in_child_realm(realmId, code); } catch (_) {}
         try { ops.op_delete_child_realm_prop(realmId, "__oxideInterfaceSources"); } catch (_) {}
+        try { ops.op_delete_child_realm_prop(realmId, "__oxideInterfaceGetEventState"); } catch (_) {}
+        try { ops.op_delete_child_realm_prop(realmId, "__oxideInterfaceSetEventState"); } catch (_) {}
     }
 
     // Same-origin child realms have their own Storage wrappers/prototype, but
