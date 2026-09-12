@@ -2,6 +2,8 @@
 // subclasses. The DOM backend remains unchanged; this layer relocates members
 // to their Chrome prototype owners and fills standards-shaped reflection/state.
 ((globalThis) => {
+    const domOps = Deno.core.ops;
+    const getNodeIdForInnerText = globalThis.__browser_oxide?._getNodeId;
     // Internal bridges are removed from the public global by cleanup. Capture
     // the state-preserving DOM move helper now; never resolve it per call.
     const preserveDomMoveBefore = globalThis.__browser_oxide?.domMoveBeforePreservingState;
@@ -427,6 +429,128 @@
     const editContexts = new WeakMap();
     const internals = new WeakMap();
     const popoverOpen = new WeakSet();
+
+    // `innerText` is rendered text, not a textContent alias.  Keep this
+    // implementation in the WebIDL overlay instead of the DOM core so the
+    // arena/tree backend stays independent from CSS presentation details.
+    // The full CSSOM rendered-text algorithm is large; these helpers model the
+    // browser-visible semantics that matter for ordinary document extraction:
+    // hidden/non-rendered descendants, whitespace collapsing, BR/block line
+    // boundaries, paragraphs, PRE whitespace, and table cell separators.
+    const innerTextBlockTags = new Set([
+        'ADDRESS','ARTICLE','ASIDE','BLOCKQUOTE','BODY','DD','DIV','DL','DT',
+        'FIELDSET','FIGCAPTION','FIGURE','FOOTER','FORM','H1','H2','H3','H4',
+        'H5','H6','HEADER','HGROUP','HR','LI','MAIN','NAV','OL','PRE','SECTION',
+        'TABLE','TR','UL',
+    ]);
+    const innerTextExcludedTags = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','HEAD']);
+    const innerTextParagraphTags = new Set(['P']);
+    const innerTextPreWhiteSpace = new Set(['pre','pre-wrap','break-spaces']);
+    const safeComputedStyle = (el) => {
+        try { return typeof globalThis.getComputedStyle === 'function' ? globalThis.getComputedStyle(el) : null; }
+        catch (_) { return null; }
+    };
+    const isInnerTextRendered = (el) => {
+        try { if (!el.isConnected) return false; } catch (_) { return false; }
+        for (let cur = el; cur && cur.nodeType === 1; cur = cur.parentElement) {
+            const style = safeComputedStyle(cur);
+            if (style && String(style.display || '').toLowerCase() === 'none') return false;
+        }
+        return true;
+    };
+    const renderedInnerText = (root) => {
+        // HTML says a node that is not being rendered falls back to
+        // textContent.  This is observable for detached/display:none roots.
+        if (!isInnerTextRendered(root)) return root.textContent || '';
+
+        let output = '';
+        const ensureBreaks = (count) => {
+            if (!output) return;
+            output = output.replace(/[\t ]+$/g, '');
+            let have = 0;
+            for (let i = output.length - 1; i >= 0 && output[i] === '\n'; i--) have++;
+            if (have < count) output += '\n'.repeat(count - have);
+        };
+        const appendText = (value, preserveWhiteSpace) => {
+            let text = String(value == null ? '' : value).replace(/\r\n?/g, '\n');
+            if (!preserveWhiteSpace) {
+                text = text.replace(/[\t\n\f\r ]+/g, ' ');
+                if (!text) return;
+                if (!output || output.endsWith('\n')) text = text.replace(/^ +/, '');
+                else if (output.endsWith(' ') && text.startsWith(' ')) text = text.slice(1);
+            }
+            output += text;
+        };
+        const walk = (node, inheritedWhiteSpace = 'normal', inheritedVisibility = 'visible') => {
+            if (!node) return;
+            if (node.nodeType === 3) {
+                if (inheritedVisibility !== 'hidden' && inheritedVisibility !== 'collapse') {
+                    appendText(node.data ?? node.textContent ?? '', innerTextPreWhiteSpace.has(inheritedWhiteSpace));
+                }
+                return;
+            }
+            if (node.nodeType !== 1) return;
+
+            const tag = String(node.tagName || node.nodeName || '').toUpperCase();
+            if (innerTextExcludedTags.has(tag)) return;
+            const style = safeComputedStyle(node);
+            const display = String(style?.display || '').toLowerCase();
+            if (display === 'none') return;
+            const visibility = String(style?.visibility || inheritedVisibility || 'visible').toLowerCase();
+            // BrowserOxide's layout defaults intentionally stay lightweight,
+            // so computed `display` is not yet a reliable source for the
+            // inline-vs-block default of every HTML tag (eg. SPAN can report
+            // block).  Use semantic HTML defaults for line boundaries and
+            // reserve computed style for visibility/display:none.  Explicit
+            // inline display styles can still override the semantic default.
+            const explicitDisplay = String(node.style?.display || '').toLowerCase();
+            const whiteSpace = tag === 'PRE'
+                ? 'pre'
+                : String(node.style?.whiteSpace || style?.whiteSpace || inheritedWhiteSpace || 'normal').toLowerCase();
+
+            if (tag === 'BR') { if (visibility !== 'hidden' && visibility !== 'collapse') ensureBreaks(1); return; }
+
+            const paragraph = innerTextParagraphTags.has(tag);
+            const block = paragraph || innerTextBlockTags.has(tag) ||
+                ['block','flow-root','list-item','table','table-row','flex','grid'].includes(explicitDisplay);
+            if (block) ensureBreaks(paragraph ? 2 : 1);
+
+            const children = node.childNodes ? Array.from(node.childNodes) : [];
+            for (let i = 0; i < children.length; i++) {
+                const child = children[i];
+                // Chrome separates rendered table cells with a tab.
+                if (i > 0 && (tag === 'TR') && child?.nodeType === 1) {
+                    const ctag = String(child.tagName || child.nodeName || '').toUpperCase();
+                    if ((ctag === 'TD' || ctag === 'TH') && !output.endsWith('\n') && !output.endsWith('\t')) output += '\t';
+                }
+                walk(child, whiteSpace, visibility);
+            }
+            if (block) ensureBreaks(paragraph ? 2 : 1);
+        };
+
+        // The root itself establishes visibility/white-space, but should not
+        // introduce its own block boundary into its returned innerText.
+        const rootStyle = safeComputedStyle(root);
+        const rootVisibility = String(rootStyle?.visibility || 'visible').toLowerCase();
+        const rootTag = String(root.tagName || root.nodeName || '').toUpperCase();
+        const rootWhiteSpace = rootTag === 'PRE'
+            ? 'pre'
+            : String(root.style?.whiteSpace || rootStyle?.whiteSpace || 'normal').toLowerCase();
+        for (const child of (root.childNodes ? Array.from(root.childNodes) : [])) {
+            walk(child, rootWhiteSpace, rootVisibility);
+        }
+        return output.replace(/^\n+|\n+$/g, '');
+    };
+    const textReplacementNodes = (el, value) => {
+        const doc = el.ownerDocument || globalThis.document;
+        const lines = String(value).replace(/\r\n?/g, '\n').split('\n');
+        const nodes = [];
+        for (let i = 0; i < lines.length; i++) {
+            if (i > 0) nodes.push(doc.createElement('br'));
+            if (lines[i] !== '') nodes.push(doc.createTextNode(lines[i]));
+        }
+        return nodes;
+    };
     reflectString(hp,'accessKey','accesskey','');
     reflectString(hp,'autocapitalize','autocapitalize','');
     reflectBoolean(hp,'autofocus','autofocus');
@@ -437,12 +561,31 @@
     reflectString(hp,'enterKeyHint','enterkeyhint','');
     reflectBoolean(hp,'hidden','hidden');
     reflectBoolean(hp,'inert','inert');
-    getter(hp,'innerText',function innerText(){ return this.textContent || ''; },function innerText(v){ this.textContent=String(v); });
+    getter(hp,'innerText',function innerText(){
+        if (typeof domOps.op_dom_get_inner_text === 'function' && typeof getNodeIdForInnerText === 'function') {
+            return domOps.op_dom_get_inner_text(getNodeIdForInnerText(this));
+        }
+        return renderedInnerText(this);
+    },function innerText(v){
+        const nodes = textReplacementNodes(this, v);
+        if (typeof this.replaceChildren === 'function') this.replaceChildren(...nodes);
+        else {
+            while (this.firstChild) this.removeChild(this.firstChild);
+            for (const node of nodes) this.appendChild(node);
+        }
+    });
     reflectString(hp,'inputMode','inputmode','');
     getter(hp,'isContentEditable',function isContentEditable(){ const v=this.getAttribute('contenteditable'); return v===''||String(v).toLowerCase()==='true'; });
     reflectString(hp,'lang','lang','');
     reflectString(hp,'nonce','nonce','');
-    getter(hp,'outerText',function outerText(){ return this.innerText; },function outerText(v){ this.textContent=String(v); });
+    getter(hp,'outerText',function outerText(){ return this.innerText; },function outerText(v){
+        const parent = this.parentNode;
+        if (!parent) throw new DOMException("Failed to set the 'outerText' property on 'HTMLElement': This element has no parent node.", 'NoModificationAllowedError');
+        const nodes = textReplacementNodes(this, v);
+        const ref = this;
+        for (const node of nodes) parent.insertBefore(node, ref);
+        parent.removeChild(this);
+    });
     reflectNullable(hp,'popover','popover');
     getter(hp,'spellcheck',function spellcheck(){ const v=this.getAttribute('spellcheck'); return v==null ? true : String(v).toLowerCase()!=='false'; },function spellcheck(v){ this.setAttribute('spellcheck',v?'true':'false'); });
     reflectNumber(hp,'tabIndex','tabindex',-1);

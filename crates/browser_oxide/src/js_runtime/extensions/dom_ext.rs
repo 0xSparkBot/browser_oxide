@@ -11,7 +11,7 @@ use deno_core::op2;
 use deno_core::v8;
 use deno_core::JsRuntime;
 use deno_core::OpState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[op2(fast)]
 pub fn op_dom_private_trace_enabled() -> bool {
@@ -1277,6 +1277,426 @@ pub fn op_dom_get_computed_style(
     crate::js_runtime::extensions::layout_ext::css_default(property)
 }
 
+#[derive(Default)]
+struct InnerTextSpecifiedStyle {
+    display: Option<String>,
+    visibility: Option<String>,
+    white_space: Option<String>,
+}
+
+/// Resolve only the three CSS properties needed by the rendered-text
+/// algorithm.  Doing this in one rule walk is substantially cheaper than
+/// issuing three `getComputedStyle()` calls from JS for every DOM element.
+fn inner_text_specified_style(state: &DomState, id: NodeId) -> InnerTextSpecifiedStyle {
+    let Some(dom_el) = DomElement::new(&state.dom, id) else {
+        return InnerTextSpecifiedStyle::default();
+    };
+
+    let mut display: Option<(u32, u32, String)> = None;
+    let mut visibility: Option<(u32, u32, String)> = None;
+    let mut white_space: Option<(u32, u32, String)> = None;
+
+    for (source_order, rule) in state.cached_rules.iter().enumerate() {
+        // Most stylesheet rules do not affect rendered-text inclusion or
+        // whitespace.  Avoid selector matching entirely for those rules; on
+        // large real pages this cuts the innerText walk from matching every
+        // element against the whole stylesheet to only the small relevant
+        // subset.
+        if !rule.declarations.contains_key("display")
+            && !rule.declarations.contains_key("visibility")
+            && !rule.declarations.contains_key("white-space")
+        {
+            continue;
+        }
+        let mut best_spec = None;
+        for selector in &rule.selectors {
+            if crate::css_selectors::matches_selector(&dom_el, selector) {
+                let s = crate::css_selectors::compute_specificity(selector);
+                let spec = s.a * 10_000 + s.b * 100 + s.c;
+                best_spec = Some(best_spec.map_or(spec, |current: u32| current.max(spec)));
+            }
+        }
+        let Some(spec) = best_spec else { continue };
+        let order = source_order as u32;
+        for (property, slot) in [
+            ("display", &mut display),
+            ("visibility", &mut visibility),
+            ("white-space", &mut white_space),
+        ] {
+            let Some(value) = rule.declarations.get(property) else {
+                continue;
+            };
+            let replace = slot.as_ref().is_none_or(|(old_spec, old_order, _)| {
+                spec > *old_spec || (spec == *old_spec && order >= *old_order)
+            });
+            if replace {
+                *slot = Some((spec, order, value.trim().to_string()));
+            }
+        }
+    }
+
+    // Inline style wins over author stylesheet declarations for the subset we
+    // need here. Parse it once instead of rescanning the attribute per property.
+    if let Some(style_attr) = state
+        .dom
+        .get(id)
+        .and_then(|n| n.as_element())
+        .and_then(|e| {
+            e.attrs
+                .iter()
+                .find(|a| a.name.local.eq_ignore_ascii_case("style"))
+                .map(|a| a.value.as_str())
+        })
+    {
+        for declaration in style_attr.split(';') {
+            let Some((name, value)) = declaration.split_once(':') else {
+                continue;
+            };
+            let value = value.trim().to_string();
+            if name.trim().eq_ignore_ascii_case("display") {
+                display = Some((u32::MAX, u32::MAX, value));
+            } else if name.trim().eq_ignore_ascii_case("visibility") {
+                visibility = Some((u32::MAX, u32::MAX, value));
+            } else if name.trim().eq_ignore_ascii_case("white-space") {
+                white_space = Some((u32::MAX, u32::MAX, value));
+            }
+        }
+    }
+
+    // The HTML hidden attribute supplies the UA-level hidden rendering default.
+    // An explicit author display value above takes precedence, matching normal
+    // cascade behavior rather than treating the attribute as an unconditional
+    // DOM omission.
+    if display.is_none()
+        && state
+            .dom
+            .get(id)
+            .and_then(|n| n.as_element())
+            .is_some_and(|e| {
+                e.attrs
+                    .iter()
+                    .any(|a| a.name.local.eq_ignore_ascii_case("hidden"))
+            })
+    {
+        display = Some((0, 0, "none".to_string()));
+    }
+
+    InnerTextSpecifiedStyle {
+        display: display.map(|(_, _, value)| value),
+        visibility: visibility.map(|(_, _, value)| value),
+        white_space: white_space.map(|(_, _, value)| value),
+    }
+}
+
+fn inner_text_is_connected(dom: &crate::dom::Dom, id: NodeId) -> bool {
+    let mut current = Some(id);
+    let mut visited = HashSet::new();
+    while let Some(node_id) = current {
+        if node_id == NodeId::DOCUMENT {
+            return true;
+        }
+        if !visited.insert(node_id) {
+            return false;
+        }
+        current = dom.get(node_id).and_then(|node| match &node.data {
+            NodeData::ShadowRoot { host, .. } => Some(*host),
+            _ => node.parent,
+        });
+    }
+    false
+}
+
+fn inner_text_semantic_block(tag: &str) -> bool {
+    matches!(
+        tag,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "body"
+            | "dd"
+            | "div"
+            | "dl"
+            | "dt"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hgroup"
+            | "hr"
+            | "li"
+            | "main"
+            | "nav"
+            | "ol"
+            | "pre"
+            | "section"
+            | "table"
+            | "tr"
+            | "ul"
+    )
+}
+
+fn inner_text_excluded_tag(tag: &str) -> bool {
+    matches!(tag, "script" | "style" | "noscript" | "template" | "head")
+}
+
+fn inner_text_block_from_display(display: &str) -> Option<bool> {
+    let first = display.split_whitespace().next().unwrap_or_default();
+    match first {
+        "none" => None,
+        "block" | "flow-root" | "list-item" | "table" | "table-row" | "flex" | "grid" => Some(true),
+        "inline" | "inline-block" | "inline-flex" | "inline-grid" | "table-cell" | "contents" => {
+            Some(false)
+        }
+        _ => Some(false),
+    }
+}
+
+fn inner_text_ensure_breaks(output: &mut String, count: usize) {
+    if output.is_empty() {
+        return;
+    }
+    while output.ends_with([' ', '\t']) {
+        output.pop();
+    }
+    let have = output.chars().rev().take_while(|c| *c == '\n').count();
+    if have < count {
+        output.push_str(&"\n".repeat(count - have));
+    }
+}
+
+fn inner_text_append_normal(output: &mut String, text: &str, white_space: &str) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if matches!(white_space, "pre" | "pre-wrap" | "break-spaces") {
+        output.push_str(&normalized);
+        return;
+    }
+
+    if white_space == "pre-line" {
+        for (line_index, line) in normalized.split('\n').enumerate() {
+            if line_index > 0 {
+                inner_text_ensure_breaks(output, 1);
+            }
+            let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.is_empty() {
+                continue;
+            }
+            if !output.is_empty() && !output.ends_with(['\n', ' ', '\t']) {
+                output.push(' ');
+            }
+            output.push_str(&collapsed);
+        }
+        return;
+    }
+
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        // A pure whitespace text node still separates two inline text runs.
+        if !output.is_empty() && !output.ends_with(['\n', ' ', '\t']) {
+            output.push(' ');
+        }
+        return;
+    }
+    let starts_with_ws = normalized.chars().next().is_some_and(char::is_whitespace);
+    if starts_with_ws && !output.is_empty() && !output.ends_with(['\n', ' ', '\t']) {
+        output.push(' ');
+    }
+    output.push_str(&collapsed);
+    if normalized.chars().last().is_some_and(char::is_whitespace) && !output.ends_with(' ') {
+        output.push(' ');
+    }
+}
+
+#[derive(Clone)]
+enum InnerTextTask {
+    Node {
+        id: NodeId,
+        visibility: String,
+        white_space: String,
+    },
+    Break(usize),
+    CellSeparator,
+}
+
+/// Rendered text for HTMLElement.innerText.
+///
+/// This intentionally runs as one Rust op. A JS implementation that called
+/// getComputedStyle() for every descendant was semantically closer to Chrome
+/// but catastrophically slow on large documents (Wikipedia-sized pages made
+/// tens of thousands of JS↔Rust crossings). Here selector matching, visibility
+/// filtering and line-boundary generation stay inside one DOM traversal.
+#[op2]
+#[string]
+pub fn op_dom_get_inner_text(state: &mut OpState, #[smi] node_id: i32) -> String {
+    let state = state.borrow_mut::<DomState>();
+    if state.cached_rules.is_empty() && !state.stylesheets.is_empty() {
+        state.update_cached_rules();
+    }
+    let root = NodeId::from_raw(node_id as u32);
+    let Some(root_node) = state.dom.get(root) else {
+        return String::new();
+    };
+    if !matches!(root_node.data, NodeData::Element(_)) {
+        return state.dom.text_content(root);
+    }
+
+    // Per HTML, innerText falls back to textContent when the element itself is
+    // not being rendered (detached or under a display:none ancestor).
+    if !inner_text_is_connected(&state.dom, root) {
+        return state.dom.text_content(root);
+    }
+    let mut ancestor = Some(root);
+    let mut root_hidden_by_display = false;
+    let mut ancestor_seen = HashSet::new();
+    while let Some(id) = ancestor {
+        if !ancestor_seen.insert(id) {
+            break;
+        }
+        if inner_text_specified_style(state, id)
+            .display
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+        {
+            root_hidden_by_display = true;
+            break;
+        }
+        ancestor = state.dom.get(id).and_then(|node| node.parent);
+    }
+    if root_hidden_by_display {
+        return state.dom.text_content(root);
+    }
+
+    let root_style = inner_text_specified_style(state, root);
+    let root_tag = root_node
+        .as_element()
+        .map(|e| e.name.local.to_ascii_lowercase())
+        .unwrap_or_default();
+    let root_visibility = root_style
+        .visibility
+        .unwrap_or_else(|| "visible".to_string());
+    let root_white_space = root_style.white_space.unwrap_or_else(|| {
+        if root_tag == "pre" {
+            "pre".to_string()
+        } else {
+            "normal".to_string()
+        }
+    });
+
+    let mut output = String::new();
+    let mut tasks = Vec::new();
+    for child in state.dom.children(root).into_iter().rev() {
+        tasks.push(InnerTextTask::Node {
+            id: child,
+            visibility: root_visibility.clone(),
+            white_space: root_white_space.clone(),
+        });
+    }
+    let mut visited = HashSet::new();
+    let mut steps = 0usize;
+    while let Some(task) = tasks.pop() {
+        steps += 1;
+        if steps > 500_000 {
+            break;
+        }
+        match task {
+            InnerTextTask::Break(count) => inner_text_ensure_breaks(&mut output, count),
+            InnerTextTask::CellSeparator => {
+                if !output.ends_with(['\n', '\t']) {
+                    output.push('\t');
+                }
+            }
+            InnerTextTask::Node {
+                id,
+                visibility,
+                white_space,
+            } => {
+                if !visited.insert(id) {
+                    continue;
+                }
+                let Some(node) = state.dom.get(id) else {
+                    continue;
+                };
+                match &node.data {
+                    NodeData::Text(text) => {
+                        if visibility != "hidden" && visibility != "collapse" {
+                            inner_text_append_normal(&mut output, text, &white_space);
+                        }
+                    }
+                    NodeData::Element(element) => {
+                        let tag = element.name.local.to_ascii_lowercase();
+                        if inner_text_excluded_tag(&tag) {
+                            continue;
+                        }
+                        let style = inner_text_specified_style(state, id);
+                        let display = style.display.as_deref().map(str::trim);
+                        if display.is_some_and(|value| value.eq_ignore_ascii_case("none")) {
+                            continue;
+                        }
+                        let own_visibility = style.visibility.unwrap_or(visibility);
+                        let own_white_space = style.white_space.unwrap_or_else(|| {
+                            if tag == "pre" {
+                                "pre".to_string()
+                            } else {
+                                white_space
+                            }
+                        });
+                        if tag == "br" {
+                            if own_visibility != "hidden" && own_visibility != "collapse" {
+                                inner_text_ensure_breaks(&mut output, 1);
+                            }
+                            continue;
+                        }
+
+                        let paragraph = tag == "p";
+                        let is_block = paragraph
+                            || display
+                                .and_then(inner_text_block_from_display)
+                                .unwrap_or_else(|| inner_text_semantic_block(&tag));
+                        if is_block {
+                            inner_text_ensure_breaks(&mut output, if paragraph { 2 } else { 1 });
+                            tasks.push(InnerTextTask::Break(if paragraph { 2 } else { 1 }));
+                        }
+
+                        let children = state.dom.children(id);
+                        for (index, child) in children.into_iter().enumerate().rev() {
+                            tasks.push(InnerTextTask::Node {
+                                id: child,
+                                visibility: own_visibility.clone(),
+                                white_space: own_white_space.clone(),
+                            });
+                            if tag == "tr" && index > 0 {
+                                if let Some(child_tag) = state
+                                    .dom
+                                    .get(child)
+                                    .and_then(|n| n.as_element())
+                                    .map(|e| e.name.local.as_str())
+                                {
+                                    if child_tag.eq_ignore_ascii_case("td")
+                                        || child_tag.eq_ignore_ascii_case("th")
+                                    {
+                                        tasks.push(InnerTextTask::CellSeparator);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    output.trim_matches('\n').to_string()
+}
+
 /// Extract a property value from an element's inline style attribute.
 fn get_inline_style_value(dom: &crate::dom::Dom, id: NodeId, property: &str) -> Option<String> {
     let style_attr = dom.get(id).and_then(|n| n.as_element()).and_then(|e| {
@@ -2490,6 +2910,7 @@ deno_core::extension!(
         op_dom_insert_adjacent_html,
         op_dom_class_list_add,
         op_dom_class_list_remove,
+        op_dom_get_inner_text,
         op_dom_get_computed_style,
         op_dom_get_all_computed_styles,
         op_dom_get_stylesheet_count,

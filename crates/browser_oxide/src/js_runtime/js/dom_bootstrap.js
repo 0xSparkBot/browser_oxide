@@ -2483,6 +2483,27 @@
         `Failed to execute '${method}' on 'HTMLDialogElement': ${detail}`,
         'InvalidStateError'
     );
+    const _dialogMarkTrusted = (event) => {
+        // event_bootstrap runs after this file and installs the privileged
+        // WeakSet-backed minter into the existing DOM closure through
+        // _installFrameMessageTrustMarker. Resolve it at event-dispatch time,
+        // not bootstrap time, so dialog events use the same unforgeable trust
+        // state as browser-generated frame/message events.
+        try {
+            if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
+        } catch (_) {}
+        return event;
+    };
+    const _queueDialogCloseEvent = (dialog) => {
+        // Chromium mutates the dialog state synchronously and queues `close`
+        // for a later task. Keep that sync/async boundary while minting the
+        // browser-generated event through the existing private trust marker.
+        setTimeout(() => {
+            try {
+                dialog.dispatchEvent(_dialogMarkTrusted(new Event('close')));
+            } catch (_) {}
+        }, 0);
+    };
     Object.defineProperties(_dialogProto, {
         open: {
             get: function() {
@@ -2537,6 +2558,7 @@
                 }
                 this.removeAttribute('open');
                 ops.op_dom_set_dialog_modal(id, false);
+                _queueDialogCloseEvent(this);
             },
             writable: true, enumerable: true, configurable: true,
         },
@@ -2544,13 +2566,14 @@
             value: function requestClose() {
                 const id = _dialogNodeId(this);
                 if (!this.hasAttribute('open')) return;
-                const event = new Event('cancel', { cancelable: true });
+                const event = _dialogMarkTrusted(new Event('cancel', { cancelable: true }));
                 if (!this.dispatchEvent(event)) return;
                 if (arguments.length > 0) {
                     ops.op_dom_set_dialog_return_value(id, String(arguments[0]));
                 }
                 this.removeAttribute('open');
                 ops.op_dom_set_dialog_modal(id, false);
+                _queueDialogCloseEvent(this);
             },
             writable: true, enumerable: true, configurable: true,
         },
