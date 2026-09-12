@@ -5594,12 +5594,46 @@ mod tests {
             while served < 4 && std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
-                        let mut buf = [0u8; 8192];
-                        let n = socket.read(&mut buf).unwrap_or(0);
+                        // The listener is nonblocking, and accepted sockets can
+                        // transiently report WouldBlock before the client has
+                        // written the request bytes. A single `read()` plus
+                        // `unwrap_or(0)` made the parallel lib suite flaky by
+                        // occasionally recording an empty request even though
+                        // the navigation itself succeeded. Make the accepted
+                        // stream blocking and read through the HTTP header
+                        // terminator before recording it.
+                        let _ = socket.set_nonblocking(false);
+                        let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut request = Vec::with_capacity(1024);
+                        let mut buf = [0u8; 2048];
+                        loop {
+                            match socket.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    request.extend_from_slice(&buf[..n]);
+                                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                    if request.len() >= 16 * 1024 {
+                                        break;
+                                    }
+                                }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::Interrupted
+                                            | std::io::ErrorKind::WouldBlock
+                                    ) =>
+                                {
+                                    continue;
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         captured
                             .lock()
                             .unwrap()
-                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                            .push(String::from_utf8_lossy(&request).into_owned());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(), body
