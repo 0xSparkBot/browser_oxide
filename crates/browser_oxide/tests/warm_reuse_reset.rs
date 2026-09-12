@@ -201,7 +201,7 @@ async fn reset_clears_page_authored_globals() {
 
     assert_eq!(page.evaluate("typeof window.__appState").unwrap(), "object");
 
-    page.reset_for_reuse();
+    assert!(page.reset_for_reuse());
     page.reload_html(BLANK, "about:blank");
 
     assert_eq!(
@@ -218,6 +218,36 @@ async fn reset_clears_page_authored_globals() {
         page.evaluate("String(window.onscroll)").unwrap(),
         "null",
         "page-authored on* handler survived reset"
+    );
+}
+
+#[tokio::test]
+async fn reset_reports_nonconfigurable_page_global_as_unreusable() {
+    let mut page = Page::from_html(
+        r#"<html><body><script>
+            Object.defineProperty(window, '__stickyWarmGlobal', {
+                value: { marker: 73 }, configurable: false, enumerable: false
+            });
+        </script></body></html>"#,
+        None::<StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        page.evaluate("typeof globalThis.__stickyWarmGlobal")
+            .unwrap(),
+        "object"
+    );
+    assert!(
+        !page.reset_for_reuse(),
+        "a realm with an undeletable page-authored global must not be reused"
+    );
+    assert_eq!(
+        page.evaluate("typeof globalThis.__stickyWarmGlobal")
+            .unwrap(),
+        "object",
+        "configurable:false must remain a real JavaScript invariant"
     );
 }
 

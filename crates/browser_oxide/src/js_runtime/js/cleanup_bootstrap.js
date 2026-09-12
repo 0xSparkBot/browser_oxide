@@ -1051,9 +1051,17 @@
     if (typeof globalThis.__resetPageGlobals !== 'function') {
         let _globalsBaseline = null;
         let _onHandlerBaseline = null;
+        // Warm-reuse cleanup is an engine operation, so it must inspect the
+        // real global own-key set rather than the page-visible reflection
+        // wrappers installed later in this file. Capture the raw primitives
+        // now, before internal-name filtering exists.
+        const _rawGetOwnPropertyNames = Object.getOwnPropertyNames;
+        const _rawGetOwnPropertySymbols = Object.getOwnPropertySymbols;
+        const _rawGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
         const _BASELINE_ALWAYS = [
             '_browser_oxide', '__cookieWrites', '__scriptErrors',
             '__bo_input_events', '__jsCookies',
+            Symbol.for('__browser_oxide_reflection_patched__'),
         ];
 
         // `on*` handlers need value-level treatment, not just key-level.
@@ -1109,8 +1117,8 @@
         Object.defineProperty(globalThis, '__markGlobalsBaseline', {
             value: function __markGlobalsBaseline() {
                 const seen = new Set(_BASELINE_ALWAYS);
-                for (const k of Object.getOwnPropertyNames(globalThis)) seen.add(k);
-                for (const s of Object.getOwnPropertySymbols(globalThis)) seen.add(s);
+                for (const k of _rawGetOwnPropertyNames(globalThis)) seen.add(k);
+                for (const s of _rawGetOwnPropertySymbols(globalThis)) seen.add(s);
                 _globalsBaseline = seen;
                 // `document` is a singleton that survives `replace_dom`, so
                 // `document.onclick = fn` persists exactly like the window
@@ -1126,21 +1134,33 @@
             value: function __resetPageGlobals() {
                 // No baseline ⇒ nothing to compare against; deleting on a
                 // guess would strip the engine's own globals.
-                if (!_globalsBaseline) return 0;
-                let removed = 0;
-                const keys = Object.getOwnPropertyNames(globalThis)
-                    .concat(Object.getOwnPropertySymbols(globalThis));
+                if (!_globalsBaseline) return false;
+                let clean = true;
+                const keys = _rawGetOwnPropertyNames(globalThis)
+                    .concat(_rawGetOwnPropertySymbols(globalThis));
                 for (const k of keys) {
                     if (_globalsBaseline.has(k)) continue;
-                    // Best-effort: a page can install a non-configurable
-                    // property, and `delete` cannot remove those.
-                    try { if (delete globalThis[k]) removed++; } catch (_e) {}
+                    // Real top-level navigation gets a fresh global. If page
+                    // code adds a non-configurable own property, JavaScript
+                    // does not permit us to delete it; retaining this realm
+                    // would therefore leak state into the next document.
+                    // Report the realm as non-reusable instead of forging JS
+                    // descriptor semantics.
+                    let deleted = false;
+                    try { deleted = delete globalThis[k]; } catch (_e) {}
+                    if (!deleted) {
+                        let stillOwn = true;
+                        try {
+                            stillOwn = !!_rawGetOwnPropertyDescriptor(globalThis, k);
+                        } catch (_e) {}
+                        if (stillOwn) clean = false;
+                    }
                 }
                 if (_onHandlerBaseline) {
                     _restoreOnHandlers(globalThis, _onHandlerBaseline.global);
                     _restoreOnHandlers(globalThis.document, _onHandlerBaseline.document);
                 }
-                return removed;
+                return clean;
             },
             writable: true, configurable: true, enumerable: false,
         });

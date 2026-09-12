@@ -54,7 +54,11 @@ impl PagePool {
             // isolate's live heap grows ~10 MB per acquire, without ceiling.
             // Callers that reach `acquire` directly get the same treatment
             // as the `navigate` path.
-            page.reset_for_reuse();
+            if !page.reset_for_reuse() {
+                return Err(deno_core::error::AnyError::msg(
+                    "pooled page contains page-authored non-configurable globals and cannot be safely reused",
+                ));
+            }
             page.reload_html("<html><head></head><body></body></html>", "about:blank");
             return Ok(page);
         }
@@ -64,7 +68,15 @@ impl PagePool {
     }
 
     /// Return a page to the pool.
-    pub fn release(&self, page: Page) {
+    pub fn release(&self, mut page: Page) {
+        // Detect unrecoverable global-namespace pollution while this page is
+        // still the newest/active isolate. A page can legally define a
+        // non-configurable global; JavaScript does not permit us to delete it,
+        // so retaining that isolate would leak the old document into the next
+        // pool user. Fail closed by discarding the page instead.
+        if !page.reset_for_reuse() {
+            return;
+        }
         let mut pages = self.idle_pages.lock().unwrap_or_else(|e| e.into_inner());
         if pages.len() < self.max_size {
             pages.push_back(page);
@@ -114,5 +126,60 @@ impl PagePool {
         // warm reuse offers little benefit). In-place warm challenge-follow on
         // the same isolate is a tracked follow-up.
         Ok(page)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_keeps_clean_page_reusable() {
+        let pool = PagePool::new(1);
+        let page = Page::from_html(
+            r#"<html><body><script>
+                window.__temporaryPoolGlobal = { marker: 11 };
+            </script></body></html>"#,
+            None::<StealthProfile>,
+        )
+        .await
+        .unwrap();
+
+        pool.release(page);
+        assert_eq!(pool.idle_pages.lock().unwrap().len(), 1);
+
+        let mut reused = pool.acquire(None).await.unwrap();
+        assert_eq!(
+            reused
+                .evaluate("typeof globalThis.__temporaryPoolGlobal")
+                .unwrap(),
+            "undefined"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_discards_page_with_nonconfigurable_global() {
+        let pool = PagePool::new(1);
+        let page = Page::from_html(
+            r#"<html><body><script>
+                Object.defineProperty(window, '__stickyPoolGlobal', {
+                    value: { marker: 73 }, configurable: false, enumerable: false
+                });
+            </script></body></html>"#,
+            None::<StealthProfile>,
+        )
+        .await
+        .unwrap();
+
+        pool.release(page);
+        assert_eq!(pool.idle_pages.lock().unwrap().len(), 0);
+
+        let mut fresh = pool.acquire(None).await.unwrap();
+        assert_eq!(
+            fresh
+                .evaluate("typeof globalThis.__stickyPoolGlobal")
+                .unwrap(),
+            "undefined"
+        );
     }
 }

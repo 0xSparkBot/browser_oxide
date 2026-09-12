@@ -2560,11 +2560,18 @@ impl Page {
     ///   `dom_bootstrap.js`, …), and the page-instrumentation wrappers
     ///   on `globalThis.fetch` / `document.cookie` / `XMLHttpRequest`.
     ///   These are the expensive bits we're reusing.
-    pub fn reset_for_reuse(&mut self) {
+    /// Returns `true` only when every page-authored global could be removed.
+    /// A page may legally install a non-configurable global; such a realm
+    /// cannot emulate a fresh top-level navigation and must be discarded
+    /// rather than reused.
+    pub fn reset_for_reuse(&mut self) -> bool {
         crate::js_runtime::readiness::reset();
-        let _ = self.event_loop.execute_script(
+        let globals_clean = self
+            .event_loop
+            .execute_script(
             r#"(function() {
                 const g = globalThis;
+                let globalsClean = true;
                 try { g.__cancelAllTimers && g.__cancelAllTimers(); } catch (_) {}
                 try { g.__cancelAllListeners && g.__cancelAllListeners(); } catch (_) {}
                 try { g.__resetDomRegistries && g.__resetDomRegistries(); } catch (_) {}
@@ -2597,9 +2604,14 @@ impl Page {
                 // off `window`. Runs after the buffer resets above so those
                 // engine-owned names are already back to a clean value (they
                 // are baseline-allowlisted, so this does not remove them).
-                try { g.__resetPageGlobals && g.__resetPageGlobals(); } catch (_) {}
+                try {
+                    if (g.__resetPageGlobals) globalsClean = g.__resetPageGlobals() === true;
+                } catch (_) { globalsClean = false; }
+                return globalsClean;
             })();"#,
-        );
+        )
+            .map(|value| value == "true")
+            .unwrap_or(false);
         // Reap Workers the OUTGOING page spawned but never terminated. The
         // warm path reuses this isolate across navs, so — unlike the cold
         // `Page::drop` path, which already calls this — orphan Workers would
@@ -2641,6 +2653,7 @@ impl Page {
         while let Some(node) = self.frame_tree.pop() {
             crate::js_runtime::extensions::frame_ext::dispose_frame(node.id);
         }
+        globals_clean
     }
 
     /// Navigate this *warm* Page to a new URL by reusing its V8 isolate
@@ -2891,7 +2904,11 @@ impl Page {
         // Cancel all in-flight timers from the previous page and clear
         // cross-nav JS buffers BEFORE swapping the DOM, so any straggler
         // callbacks that try to fire don't see a half-installed state.
-        self.reset_for_reuse();
+        if !self.reset_for_reuse() {
+            return Err(deno_core::error::AnyError::msg(
+                "warm navigation cannot safely reuse a realm containing page-authored non-configurable globals",
+            ));
+        }
         wmark!("reset_for_reuse");
 
         // Swap DOM (also resets `TimerState` Rust-side).
