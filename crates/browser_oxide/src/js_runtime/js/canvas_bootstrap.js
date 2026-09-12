@@ -1209,6 +1209,13 @@
     const _webglUniformLocationState = new WeakMap();
     const _webglBufferState = new WeakMap();
     const _webglBufferBindings = new WeakMap();
+    const _webglTextureState = new WeakMap();
+    const _webglTextureBindings = new WeakMap();
+    const _webglFramebufferState = new WeakMap();
+    const _webglFramebufferBinding = new WeakMap();
+    const _webglFramebufferObjects = new WeakMap();
+    const _webglRenderbufferState = new WeakMap();
+    const _webglRenderbufferBinding = new WeakMap();
     const _webglContextState = new WeakMap();
     const _webglContextErrors = new WeakMap();
     const _webglCurrentProgram = new WeakMap();
@@ -1224,6 +1231,64 @@
             _webglBufferBindings.set(ctx, bindings);
         }
         return bindings;
+    }
+
+    function _webglTextureBindingState(ctx) {
+        let state = _webglTextureBindings.get(ctx);
+        if (!state) {
+            state = {
+                activeUnit: 0,
+                units: Array.from({ length: 32 }, () => ({ twoD: null, cube: null })),
+            };
+            _webglTextureBindings.set(ctx, state);
+        }
+        return state;
+    }
+
+    function _webglTextureSlot(target) {
+        if (target === WebGLRenderingContext.TEXTURE_2D) return 'twoD';
+        if (target === WebGLRenderingContext.TEXTURE_CUBE_MAP) return 'cube';
+        return null;
+    }
+
+    function _webglTextureImageBindingSlot(target) {
+        if (target === WebGLRenderingContext.TEXTURE_2D) return 'twoD';
+        if (target >= WebGLRenderingContext.TEXTURE_CUBE_MAP_POSITIVE_X &&
+            target <= WebGLRenderingContext.TEXTURE_CUBE_MAP_NEGATIVE_Z) return 'cube';
+        return null;
+    }
+
+    function _webglBoundTexture(ctx, target, imageTarget = false) {
+        const slot = imageTarget ? _webglTextureImageBindingSlot(target) : _webglTextureSlot(target);
+        if (!slot) return undefined;
+        const state = _webglTextureBindingState(ctx);
+        return state.units[state.activeUnit][slot];
+    }
+
+    function _webglFramebuffers(ctx) {
+        let set = _webglFramebufferObjects.get(ctx);
+        if (!set) {
+            set = new Set();
+            _webglFramebufferObjects.set(ctx, set);
+        }
+        return set;
+    }
+
+    function _webglDetachObjectFromFramebuffers(ctx, object) {
+        for (const framebuffer of _webglFramebuffers(ctx)) {
+            const state = _webglFramebufferState.get(framebuffer);
+            if (!state || state.deleted) continue;
+            for (const [attachment, entry] of state.attachments) {
+                if (entry && entry.object === object) state.attachments.delete(attachment);
+            }
+        }
+    }
+
+    function _webglAttachmentAllowed(attachment) {
+        return attachment === WebGLRenderingContext.COLOR_ATTACHMENT0 ||
+            attachment === WebGLRenderingContext.DEPTH_ATTACHMENT ||
+            attachment === WebGLRenderingContext.STENCIL_ATTACHMENT ||
+            attachment === WebGLRenderingContext.DEPTH_STENCIL_ATTACHMENT;
     }
 
     function _configureWebGLContext(ctx, options = {}) {
@@ -1354,6 +1419,63 @@
         static STREAM_DRAW = 0x88E0;
         static STATIC_DRAW = 0x88E4;
         static DYNAMIC_DRAW = 0x88E8;
+        static TEXTURE_2D = 0x0DE1;
+        static TEXTURE = 0x1702;
+        static TEXTURE_BINDING_2D = 0x8069;
+        static TEXTURE_CUBE_MAP = 0x8513;
+        static TEXTURE_BINDING_CUBE_MAP = 0x8514;
+        static TEXTURE_CUBE_MAP_POSITIVE_X = 0x8515;
+        static TEXTURE_CUBE_MAP_NEGATIVE_X = 0x8516;
+        static TEXTURE_CUBE_MAP_POSITIVE_Y = 0x8517;
+        static TEXTURE_CUBE_MAP_NEGATIVE_Y = 0x8518;
+        static TEXTURE_CUBE_MAP_POSITIVE_Z = 0x8519;
+        static TEXTURE_CUBE_MAP_NEGATIVE_Z = 0x851A;
+        static ACTIVE_TEXTURE = 0x84E0;
+        static TEXTURE0 = 0x84C0;
+        static TEXTURE_MAG_FILTER = 0x2800;
+        static TEXTURE_MIN_FILTER = 0x2801;
+        static TEXTURE_WRAP_S = 0x2802;
+        static TEXTURE_WRAP_T = 0x2803;
+        static NEAREST = 0x2600;
+        static LINEAR = 0x2601;
+        static NEAREST_MIPMAP_NEAREST = 0x2700;
+        static LINEAR_MIPMAP_NEAREST = 0x2701;
+        static NEAREST_MIPMAP_LINEAR = 0x2702;
+        static LINEAR_MIPMAP_LINEAR = 0x2703;
+        static REPEAT = 0x2901;
+        static CLAMP_TO_EDGE = 0x812F;
+        static MIRRORED_REPEAT = 0x8370;
+        static FRAMEBUFFER = 0x8D40;
+        static RENDERBUFFER = 0x8D41;
+        static FRAMEBUFFER_BINDING = 0x8CA6;
+        static RENDERBUFFER_BINDING = 0x8CA7;
+        static FRAMEBUFFER_COMPLETE = 0x8CD5;
+        static FRAMEBUFFER_INCOMPLETE_ATTACHMENT = 0x8CD6;
+        static FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT = 0x8CD7;
+        static FRAMEBUFFER_INCOMPLETE_DIMENSIONS = 0x8CD9;
+        static COLOR_ATTACHMENT0 = 0x8CE0;
+        static DEPTH_ATTACHMENT = 0x8D00;
+        static STENCIL_ATTACHMENT = 0x8D20;
+        static DEPTH_STENCIL_ATTACHMENT = 0x821A;
+        static FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE = 0x8CD0;
+        static FRAMEBUFFER_ATTACHMENT_OBJECT_NAME = 0x8CD1;
+        static FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL = 0x8CD2;
+        static FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE = 0x8CD3;
+        static RENDERBUFFER_WIDTH = 0x8D42;
+        static RENDERBUFFER_HEIGHT = 0x8D43;
+        static RENDERBUFFER_INTERNAL_FORMAT = 0x8D44;
+        static RENDERBUFFER_RED_SIZE = 0x8D50;
+        static RENDERBUFFER_GREEN_SIZE = 0x8D51;
+        static RENDERBUFFER_BLUE_SIZE = 0x8D52;
+        static RENDERBUFFER_ALPHA_SIZE = 0x8D53;
+        static RENDERBUFFER_DEPTH_SIZE = 0x8D54;
+        static RENDERBUFFER_STENCIL_SIZE = 0x8D55;
+        static RGBA4 = 0x8056;
+        static RGB5_A1 = 0x8057;
+        static RGB565 = 0x8D62;
+        static DEPTH_COMPONENT16 = 0x81A5;
+        static STENCIL_INDEX8 = 0x8D48;
+        static DEPTH_STENCIL = 0x84F9;
         static FRAGMENT_SHADER = 0x8B30;
         static VERTEX_SHADER = 0x8B31;
         static DELETE_STATUS = 0x8B80;
@@ -1615,6 +1737,21 @@
             }
             if (pname === WebGLRenderingContext.ELEMENT_ARRAY_BUFFER_BINDING) {
                 return _webglBindings(this).element;
+            }
+            if (pname === WebGLRenderingContext.ACTIVE_TEXTURE) {
+                return WebGLRenderingContext.TEXTURE0 + _webglTextureBindingState(this).activeUnit;
+            }
+            if (pname === WebGLRenderingContext.TEXTURE_BINDING_2D) {
+                return _webglBoundTexture(this, WebGLRenderingContext.TEXTURE_2D) || null;
+            }
+            if (pname === WebGLRenderingContext.TEXTURE_BINDING_CUBE_MAP) {
+                return _webglBoundTexture(this, WebGLRenderingContext.TEXTURE_CUBE_MAP) || null;
+            }
+            if (pname === WebGLRenderingContext.FRAMEBUFFER_BINDING) {
+                return _webglFramebufferBinding.get(this) || null;
+            }
+            if (pname === WebGLRenderingContext.RENDERBUFFER_BINDING) {
+                return _webglRenderbufferBinding.get(this) || null;
             }
             // Runtime-dependent values (not from the catalog)
             if (pname === 0x0BA2) {
@@ -2065,20 +2202,395 @@
         vertexAttribPointer() {}
         drawArrays() {}
         drawElements() {}
-        createTexture() { return { _id: 1 }; }
-        bindTexture() {}
-        texImage2D() {}
-        texParameteri() {}
-        activeTexture() {}
-        generateMipmap() {}
-        createFramebuffer() { return { _id: 1 }; }
-        bindFramebuffer() {}
-        framebufferTexture2D() {}
-        createRenderbuffer() { return { _id: 1 }; }
-        bindRenderbuffer() {}
-        renderbufferStorage() {}
-        framebufferRenderbuffer() {}
-        checkFramebufferStatus() { return 0x8CD5; } // FRAMEBUFFER_COMPLETE
+        createTexture() {
+            return _newWebGLObject('WebGLTexture', _webglTextureState, {
+                context: this,
+                deleted: false,
+                everBound: false,
+                target: 0,
+                parameters: new Map([
+                    [WebGLRenderingContext.TEXTURE_MAG_FILTER, WebGLRenderingContext.LINEAR],
+                    [WebGLRenderingContext.TEXTURE_MIN_FILTER, WebGLRenderingContext.NEAREST_MIPMAP_LINEAR],
+                    [WebGLRenderingContext.TEXTURE_WRAP_S, WebGLRenderingContext.REPEAT],
+                    [WebGLRenderingContext.TEXTURE_WRAP_T, WebGLRenderingContext.REPEAT],
+                ]),
+                images: new Map(),
+            });
+        }
+        bindTexture(target, texture) {
+            target = Number(target) >>> 0;
+            const slot = _webglTextureSlot(target);
+            if (!slot) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const bindings = _webglTextureBindingState(this);
+            if (texture == null) {
+                bindings.units[bindings.activeUnit][slot] = null;
+                return;
+            }
+            const state = _requireWebGLObject('WebGLTexture', _webglTextureState, texture, false, 'bindTexture');
+            if (!state || state.context !== this || state.deleted || (state.target && state.target !== target)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.target = target;
+            state.everBound = true;
+            bindings.units[bindings.activeUnit][slot] = texture;
+        }
+        texImage2D(target, level, internalformat, widthOrFormat, heightOrType, borderOrSource, ...rest) {
+            target = Number(target) >>> 0;
+            level = Number(level) | 0;
+            const slot = _webglTextureImageBindingSlot(target);
+            if (!slot) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const texture = _webglBoundTexture(this, target, true);
+            const state = texture && _webglTextureState.get(texture);
+            if (!state || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            if (level < 0) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            let width = 0;
+            let height = 0;
+            let format;
+            let type;
+            if (rest.length >= 3) {
+                width = Number(widthOrFormat);
+                height = Number(heightOrType);
+                const border = Number(borderOrSource);
+                format = rest[0];
+                type = rest[1];
+                if (!Number.isFinite(width) || !Number.isFinite(height) || width < 0 || height < 0 || border !== 0) {
+                    _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                    return;
+                }
+            } else {
+                format = widthOrFormat;
+                type = heightOrType;
+                const source = borderOrSource;
+                width = Number(source && (source.videoWidth ?? source.naturalWidth ?? source.width)) || 0;
+                height = Number(source && (source.videoHeight ?? source.naturalHeight ?? source.height)) || 0;
+            }
+            state.images.set(`${target}:${level}`, {
+                width: Math.trunc(width),
+                height: Math.trunc(height),
+                internalformat: Number(internalformat) >>> 0,
+                format: Number(format) >>> 0,
+                type: Number(type) >>> 0,
+            });
+        }
+        texParameteri(target, pname, param) {
+            target = Number(target) >>> 0;
+            const texture = _webglBoundTexture(this, target);
+            if (texture === undefined) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const state = texture && _webglTextureState.get(texture);
+            if (!state || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            pname = Number(pname) >>> 0;
+            param = Number(param) >>> 0;
+            let allowed;
+            if (pname === WebGLRenderingContext.TEXTURE_MAG_FILTER) {
+                allowed = [WebGLRenderingContext.NEAREST, WebGLRenderingContext.LINEAR];
+            } else if (pname === WebGLRenderingContext.TEXTURE_MIN_FILTER) {
+                allowed = [
+                    WebGLRenderingContext.NEAREST, WebGLRenderingContext.LINEAR,
+                    WebGLRenderingContext.NEAREST_MIPMAP_NEAREST, WebGLRenderingContext.LINEAR_MIPMAP_NEAREST,
+                    WebGLRenderingContext.NEAREST_MIPMAP_LINEAR, WebGLRenderingContext.LINEAR_MIPMAP_LINEAR,
+                ];
+            } else if (pname === WebGLRenderingContext.TEXTURE_WRAP_S || pname === WebGLRenderingContext.TEXTURE_WRAP_T) {
+                allowed = [WebGLRenderingContext.CLAMP_TO_EDGE, WebGLRenderingContext.MIRRORED_REPEAT, WebGLRenderingContext.REPEAT];
+            } else {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            if (!allowed.includes(param)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            state.parameters.set(pname, param);
+        }
+        getTexParameter(target, pname) {
+            target = Number(target) >>> 0;
+            const texture = _webglBoundTexture(this, target);
+            if (texture === undefined) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return null;
+            }
+            const state = texture && _webglTextureState.get(texture);
+            if (!state || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return null;
+            }
+            pname = Number(pname) >>> 0;
+            if (!state.parameters.has(pname)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return null;
+            }
+            return state.parameters.get(pname);
+        }
+        activeTexture(texture) {
+            const unit = (Number(texture) >>> 0) - WebGLRenderingContext.TEXTURE0;
+            if (unit < 0 || unit >= 32) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            _webglTextureBindingState(this).activeUnit = unit;
+        }
+        generateMipmap(target) {
+            target = Number(target) >>> 0;
+            const texture = _webglBoundTexture(this, target);
+            if (texture === undefined) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const state = texture && _webglTextureState.get(texture);
+            if (!state || state.deleted) _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+        }
+        isTexture(texture) {
+            const state = _requireWebGLObject('WebGLTexture', _webglTextureState, texture, false, 'isTexture');
+            return !!state && state.context === this && !state.deleted && state.everBound;
+        }
+        createFramebuffer() {
+            const framebuffer = _newWebGLObject('WebGLFramebuffer', _webglFramebufferState, {
+                context: this,
+                deleted: false,
+                everBound: false,
+                attachments: new Map(),
+            });
+            _webglFramebuffers(this).add(framebuffer);
+            return framebuffer;
+        }
+        bindFramebuffer(target, framebuffer) {
+            target = Number(target) >>> 0;
+            if (target !== WebGLRenderingContext.FRAMEBUFFER) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            if (framebuffer == null) {
+                _webglFramebufferBinding.set(this, null);
+                return;
+            }
+            const state = _requireWebGLObject('WebGLFramebuffer', _webglFramebufferState, framebuffer, false, 'bindFramebuffer');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.everBound = true;
+            _webglFramebufferBinding.set(this, framebuffer);
+        }
+        framebufferTexture2D(target, attachment, textarget, texture, level) {
+            target = Number(target) >>> 0;
+            attachment = Number(attachment) >>> 0;
+            textarget = Number(textarget) >>> 0;
+            level = Number(level) | 0;
+            if (target !== WebGLRenderingContext.FRAMEBUFFER || !_webglAttachmentAllowed(attachment) ||
+                !_webglTextureImageBindingSlot(textarget)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            if (level !== 0) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            const framebuffer = _webglFramebufferBinding.get(this);
+            const framebufferState = framebuffer && _webglFramebufferState.get(framebuffer);
+            if (!framebufferState || framebufferState.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            if (texture == null) {
+                framebufferState.attachments.delete(attachment);
+                return;
+            }
+            const textureState = _requireWebGLObject('WebGLTexture', _webglTextureState, texture, false, 'framebufferTexture2D');
+            if (!textureState || textureState.context !== this || textureState.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            framebufferState.attachments.set(attachment, { kind: 'texture', object: texture, target: textarget, level });
+        }
+        createRenderbuffer() {
+            return _newWebGLObject('WebGLRenderbuffer', _webglRenderbufferState, {
+                context: this,
+                deleted: false,
+                everBound: false,
+                width: 0,
+                height: 0,
+                internalFormat: 0,
+            });
+        }
+        bindRenderbuffer(target, renderbuffer) {
+            target = Number(target) >>> 0;
+            if (target !== WebGLRenderingContext.RENDERBUFFER) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            if (renderbuffer == null) {
+                _webglRenderbufferBinding.set(this, null);
+                return;
+            }
+            const state = _requireWebGLObject('WebGLRenderbuffer', _webglRenderbufferState, renderbuffer, false, 'bindRenderbuffer');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.everBound = true;
+            _webglRenderbufferBinding.set(this, renderbuffer);
+        }
+        renderbufferStorage(target, internalformat, width, height) {
+            target = Number(target) >>> 0;
+            internalformat = Number(internalformat) >>> 0;
+            width = Number(width);
+            height = Number(height);
+            if (target !== WebGLRenderingContext.RENDERBUFFER) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const validFormats = [
+                WebGLRenderingContext.RGBA4, WebGLRenderingContext.RGB5_A1,
+                WebGLRenderingContext.RGB565, WebGLRenderingContext.DEPTH_COMPONENT16,
+                WebGLRenderingContext.STENCIL_INDEX8, WebGLRenderingContext.DEPTH_STENCIL,
+            ];
+            if (!validFormats.includes(internalformat)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const renderbuffer = _webglRenderbufferBinding.get(this);
+            const state = renderbuffer && _webglRenderbufferState.get(renderbuffer);
+            if (!state || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            const maxSize = Number(WebGLRenderingContext._surfaceFor(this).params[WebGLRenderingContext.MAX_RENDERBUFFER_SIZE] || 16384);
+            if (!Number.isFinite(width) || !Number.isFinite(height) || width < 0 || height < 0 || width > maxSize || height > maxSize) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                return;
+            }
+            state.width = Math.trunc(width);
+            state.height = Math.trunc(height);
+            state.internalFormat = internalformat;
+        }
+        getRenderbufferParameter(target, pname) {
+            target = Number(target) >>> 0;
+            pname = Number(pname) >>> 0;
+            if (target !== WebGLRenderingContext.RENDERBUFFER) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return null;
+            }
+            const renderbuffer = _webglRenderbufferBinding.get(this);
+            const state = renderbuffer && _webglRenderbufferState.get(renderbuffer);
+            if (!state || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return null;
+            }
+            if (pname === WebGLRenderingContext.RENDERBUFFER_WIDTH) return state.width;
+            if (pname === WebGLRenderingContext.RENDERBUFFER_HEIGHT) return state.height;
+            if (pname === WebGLRenderingContext.RENDERBUFFER_INTERNAL_FORMAT) return state.internalFormat;
+            const components = {
+                [WebGLRenderingContext.RGBA4]: [4, 4, 4, 4, 0, 0],
+                [WebGLRenderingContext.RGB5_A1]: [5, 5, 5, 1, 0, 0],
+                [WebGLRenderingContext.RGB565]: [5, 6, 5, 0, 0, 0],
+                [WebGLRenderingContext.DEPTH_COMPONENT16]: [0, 0, 0, 0, 16, 0],
+                [WebGLRenderingContext.STENCIL_INDEX8]: [0, 0, 0, 0, 0, 8],
+                [WebGLRenderingContext.DEPTH_STENCIL]: [0, 0, 0, 0, 24, 8],
+            }[state.internalFormat] || [0, 0, 0, 0, 0, 0];
+            const componentIndex = new Map([
+                [WebGLRenderingContext.RENDERBUFFER_RED_SIZE, 0],
+                [WebGLRenderingContext.RENDERBUFFER_GREEN_SIZE, 1],
+                [WebGLRenderingContext.RENDERBUFFER_BLUE_SIZE, 2],
+                [WebGLRenderingContext.RENDERBUFFER_ALPHA_SIZE, 3],
+                [WebGLRenderingContext.RENDERBUFFER_DEPTH_SIZE, 4],
+                [WebGLRenderingContext.RENDERBUFFER_STENCIL_SIZE, 5],
+            ]).get(pname);
+            if (componentIndex !== undefined) return components[componentIndex];
+            _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+            return null;
+        }
+        framebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer) {
+            target = Number(target) >>> 0;
+            attachment = Number(attachment) >>> 0;
+            renderbuffertarget = Number(renderbuffertarget) >>> 0;
+            if (target !== WebGLRenderingContext.FRAMEBUFFER ||
+                renderbuffertarget !== WebGLRenderingContext.RENDERBUFFER ||
+                !_webglAttachmentAllowed(attachment)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const framebuffer = _webglFramebufferBinding.get(this);
+            const framebufferState = framebuffer && _webglFramebufferState.get(framebuffer);
+            if (!framebufferState || framebufferState.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            if (renderbuffer == null) {
+                framebufferState.attachments.delete(attachment);
+                return;
+            }
+            const renderbufferState = _requireWebGLObject('WebGLRenderbuffer', _webglRenderbufferState, renderbuffer, false, 'framebufferRenderbuffer');
+            if (!renderbufferState || renderbufferState.context !== this || renderbufferState.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            framebufferState.attachments.set(attachment, { kind: 'renderbuffer', object: renderbuffer });
+        }
+        checkFramebufferStatus(target) {
+            target = Number(target) >>> 0;
+            if (target !== WebGLRenderingContext.FRAMEBUFFER) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return 0;
+            }
+            const framebuffer = _webglFramebufferBinding.get(this);
+            if (!framebuffer) return WebGLRenderingContext.FRAMEBUFFER_COMPLETE;
+            const state = _webglFramebufferState.get(framebuffer);
+            if (!state || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return 0;
+            }
+            if (state.attachments.size === 0) return WebGLRenderingContext.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+            let dimensions = null;
+            for (const entry of state.attachments.values()) {
+                let width = 0;
+                let height = 0;
+                if (entry.kind === 'renderbuffer') {
+                    const render = _webglRenderbufferState.get(entry.object);
+                    if (!render || render.deleted) return WebGLRenderingContext.FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+                    width = render.width;
+                    height = render.height;
+                } else {
+                    const texture = _webglTextureState.get(entry.object);
+                    if (!texture || texture.deleted) return WebGLRenderingContext.FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+                    const image = texture.images.get(`${entry.target}:${entry.level}`);
+                    if (!image) return WebGLRenderingContext.FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+                    width = image.width;
+                    height = image.height;
+                }
+                if (width <= 0 || height <= 0) return WebGLRenderingContext.FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+                if (dimensions && (dimensions[0] !== width || dimensions[1] !== height)) {
+                    return WebGLRenderingContext.FRAMEBUFFER_INCOMPLETE_DIMENSIONS;
+                }
+                dimensions = [width, height];
+            }
+            return WebGLRenderingContext.FRAMEBUFFER_COMPLETE;
+        }
+        isFramebuffer(framebuffer) {
+            const state = _requireWebGLObject('WebGLFramebuffer', _webglFramebufferState, framebuffer, false, 'isFramebuffer');
+            return !!state && state.context === this && !state.deleted && state.everBound;
+        }
+        isRenderbuffer(renderbuffer) {
+            const state = _requireWebGLObject('WebGLRenderbuffer', _webglRenderbufferState, renderbuffer, false, 'isRenderbuffer');
+            return !!state && state.context === this && !state.deleted && state.everBound;
+        }
         enable() {}
         disable() {}
         blendFunc() {}
@@ -2125,9 +2637,44 @@
             if (bindings.array === buffer) bindings.array = null;
             if (bindings.element === buffer) bindings.element = null;
         }
-        deleteTexture() {}
-        deleteFramebuffer() {}
-        deleteRenderbuffer() {}
+        deleteTexture(texture) {
+            if (texture == null) return;
+            const state = _requireWebGLObject('WebGLTexture', _webglTextureState, texture, false, 'deleteTexture');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.deleted = true;
+            const bindings = _webglTextureBindingState(this);
+            for (const unit of bindings.units) {
+                if (unit.twoD === texture) unit.twoD = null;
+                if (unit.cube === texture) unit.cube = null;
+            }
+            _webglDetachObjectFromFramebuffers(this, texture);
+        }
+        deleteFramebuffer(framebuffer) {
+            if (framebuffer == null) return;
+            const state = _requireWebGLObject('WebGLFramebuffer', _webglFramebufferState, framebuffer, false, 'deleteFramebuffer');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.deleted = true;
+            state.attachments.clear();
+            if (_webglFramebufferBinding.get(this) === framebuffer) _webglFramebufferBinding.set(this, null);
+            _webglFramebuffers(this).delete(framebuffer);
+        }
+        deleteRenderbuffer(renderbuffer) {
+            if (renderbuffer == null) return;
+            const state = _requireWebGLObject('WebGLRenderbuffer', _webglRenderbufferState, renderbuffer, false, 'deleteRenderbuffer');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.deleted = true;
+            if (_webglRenderbufferBinding.get(this) === renderbuffer) _webglRenderbufferBinding.set(this, null);
+            _webglDetachObjectFromFramebuffers(this, renderbuffer);
+        }
         isContextLost() { return false; }
     }
 
