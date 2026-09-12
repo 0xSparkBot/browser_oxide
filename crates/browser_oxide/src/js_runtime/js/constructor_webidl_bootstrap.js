@@ -8,6 +8,40 @@
     const simpleDirectIllegal = new Set(["Attr","CharacterData","DocumentType","Element","HTMLDocument","HTMLMediaElement","HTMLUnknownElement","NamedNodeMap","Node","SVGAElement","SVGAnimateElement","SVGAnimateMotionElement","SVGAnimateTransformElement","SVGAnimationElement","SVGCircleElement","SVGClipPathElement","SVGComponentTransferFunctionElement","SVGDefsElement","SVGDescElement","SVGElement","SVGEllipseElement","SVGFEBlendElement","SVGFEColorMatrixElement","SVGFEComponentTransferElement","SVGFECompositeElement","SVGFEConvolveMatrixElement","SVGFEDiffuseLightingElement","SVGFEDisplacementMapElement","SVGFEDistantLightElement","SVGFEDropShadowElement","SVGFEFloodElement","SVGFEFuncAElement","SVGFEFuncBElement","SVGFEFuncGElement","SVGFEFuncRElement","SVGFEGaussianBlurElement","SVGFEImageElement","SVGFEMergeElement","SVGFEMergeNodeElement","SVGFEMorphologyElement","SVGFEOffsetElement","SVGFEPointLightElement","SVGFESpecularLightingElement","SVGFESpotLightElement","SVGFETileElement","SVGFETurbulenceElement","SVGFilterElement","SVGForeignObjectElement","SVGGElement","SVGGeometryElement","SVGGradientElement","SVGGraphicsElement","SVGImageElement","SVGLineElement","SVGLinearGradientElement","SVGMPathElement","SVGMarkerElement","SVGMaskElement","SVGMetadataElement","SVGPathElement","SVGPatternElement","SVGPolygonElement","SVGPolylineElement","SVGRadialGradientElement","SVGRectElement","SVGSVGElement","SVGScriptElement","SVGSetElement","SVGStopElement","SVGStyleElement","SVGSwitchElement","SVGSymbolElement","SVGTSpanElement","SVGTextContentElement","SVGTextElement","SVGTextPathElement","SVGTextPositioningElement","SVGTitleElement","SVGUseElement","SVGViewElement","Selection","ShadowRoot"]);
     const originals = new Map();
     const wrappers = new Map();
+    // HTML custom-element constructors need the browser's construction-stack
+    // exception to the otherwise-Illegal HTMLElement/HTML*Element public
+    // constructors.  A later custom-elements bootstrap captures this bridge,
+    // then cleanup removes the temporary page-visible name.  The stack and
+    // factory remain private in this closure for the lifetime of the realm.
+    const customElementConstructionStack = [];
+    let customElementNewFactory = null;
+    const customElementConstructionBridge = {
+        constructExisting(constructor, element) {
+            const frame = { constructor, element, used: false };
+            customElementConstructionStack.push(frame);
+            try {
+                if (Object.getPrototypeOf(element) !== constructor.prototype) {
+                    Object.setPrototypeOf(element, constructor.prototype);
+                }
+                const result = Reflect.construct(constructor, []);
+                if (result !== element || !frame.used) {
+                    throw new TypeError("custom element constructor did not initialize the expected element");
+                }
+                return result;
+            } finally {
+                customElementConstructionStack.pop();
+            }
+        },
+        setNewFactory(factory) {
+            customElementNewFactory = typeof factory === 'function' ? factory : null;
+        },
+    };
+    Object.defineProperty(globalThis, '__oxideCustomElementConstruction', {
+        value: customElementConstructionBridge,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+    });
 
     for (const name of order) {
         let original;
@@ -32,12 +66,27 @@
         if (!original) continue;
         const canConstruct = constructible.has(name);
         const simpleDirect = simpleDirectIllegal.has(name);
+        const isHtmlElementConstructor = /^HTML.*Element$/.test(name);
         const Wrapper = function() {
             if (!new.target) {
                 if (simpleDirect) throw new TypeError('Illegal constructor');
                 throw new TypeError(requireNewMessage(name));
             }
-            if (!canConstruct) throw new TypeError(illegalNewMessage(name));
+            if (!canConstruct) {
+                if (isHtmlElementConstructor && new.target !== Wrapper) {
+                    const frame = customElementConstructionStack[customElementConstructionStack.length - 1];
+                    if (frame) {
+                        if (frame.used) throw new TypeError(illegalNewMessage(name));
+                        frame.used = true;
+                        return frame.element;
+                    }
+                    if (customElementNewFactory) {
+                        const element = customElementNewFactory(new.target, name);
+                        if (element) return element;
+                    }
+                }
+                throw new TypeError(illegalNewMessage(name));
+            }
             return Reflect.construct(original, Array.from(arguments), new.target);
         };
         try { Object.defineProperty(Wrapper, 'length', { value: original.length, configurable: true }); } catch (_) {}

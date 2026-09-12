@@ -1225,6 +1225,7 @@
             } catch (_) {}
             ops.op_dom_append_child(_getNodeId(this), _getNodeId(child));
             _onNodeInserted(child);
+            try { if (child && child.isConnected) _ceConnected(child); } catch (_) {}
             return child;
         }
         removeChild(child) {
@@ -1253,6 +1254,7 @@
             ops.op_dom_insert_before(parent, newId, oldId);
             ops.op_dom_remove_child(parent, oldId);
             _onNodeInserted(newChild);
+            try { if (newChild && newChild.isConnected) _ceConnected(newChild); } catch (_) {}
             return oldChild;
         }
         insertBefore(newChild, refChild) {
@@ -1271,6 +1273,7 @@
             } catch (_) {}
             ops.op_dom_insert_before(_getNodeId(this), _getNodeId(newChild), _getNodeId(refChild));
             _onNodeInserted(newChild);
+            try { if (newChild && newChild.isConnected) _ceConnected(newChild); } catch (_) {}
             return newChild;
         }
         cloneNode(deep = false) {
@@ -4153,11 +4156,47 @@
         }
     }
 
+    // Custom-element lifecycle hooks are installed by the final
+    // custom_elements_bootstrap after public HTML constructor normalization.
+    // Keep only the closure here; the temporary installer is deleted by the
+    // cleanup bootstrap, so page JS cannot observe engine internals.
+    let _customElementHooks = null;
+    Object.defineProperty(globalThis, '__oxideInstallCustomElementHooks', {
+        value: function __oxideInstallCustomElementHooks(hooks) {
+            _customElementHooks = hooks && typeof hooks === 'object' ? hooks : null;
+            return {
+                createElement(documentObject, tag) {
+                    return _origCreateElement.call(documentObject, tag);
+                },
+            };
+        },
+        writable: false,
+        enumerable: false,
+        configurable: true,
+    });
+
     // Custom element lifecycle helper
     function _ceConnected(el) {
-        if (el && el._ceUpgraded && typeof el.connectedCallback === "function") {
+        if (_customElementHooks && typeof _customElementHooks.connected === 'function') {
+            try { _customElementHooks.connected(el); } catch (e) { console.error(e); }
+        } else if (el && el._ceUpgraded && typeof el.connectedCallback === "function") {
             try { el.connectedCallback(); } catch (e) { console.error(e); }
         }
+        // Connecting a subtree enqueues reactions for upgraded descendants in
+        // tree order (parent before children), not only for the inserted root.
+        try {
+            const children = el && el.childNodes;
+            if (children) {
+                for (let i = 0; i < children.length; i++) _ceConnected(children[i]);
+            }
+        } catch (_) {}
+        try {
+            const root = el && _shadowRoots.get(el);
+            const children = root && root.childNodes;
+            if (children) {
+                for (let i = 0; i < children.length; i++) _ceConnected(children[i]);
+            }
+        } catch (_) {}
     }
     // Assigned by the iframe subsystem below. Declared here because DOM removal
     // methods are installed before iframe state is initialized, but execute only
@@ -4210,18 +4249,26 @@
         } catch (_) {}
     }
     function _ceDisconnected(el) {
-        let root = null;
-        try { root = _shadowRoots.get(el) || null; } catch (_) {}
-        if (root) {
-            try {
-                const children = root.childNodes;
-                for (let i = 0; i < children.length; i++) _ceDisconnected(children[i]);
-            } catch (_) {}
-        }
-        _disposeIframeSubtree(el);
-        if (el && el._ceUpgraded && typeof el.disconnectedCallback === "function") {
+        if (_customElementHooks && typeof _customElementHooks.disconnected === 'function') {
+            try { _customElementHooks.disconnected(el); } catch (e) { console.error(e); }
+        } else if (el && el._ceUpgraded && typeof el.disconnectedCallback === "function") {
             try { el.disconnectedCallback(); } catch (e) { console.error(e); }
         }
+        // Chrome queues disconnected reactions in tree order as well.
+        try {
+            const children = el && el.childNodes;
+            if (children) {
+                for (let i = 0; i < children.length; i++) _ceDisconnected(children[i]);
+            }
+        } catch (_) {}
+        try {
+            const root = el && _shadowRoots.get(el);
+            const children = root && root.childNodes;
+            if (children) {
+                for (let i = 0; i < children.length; i++) _ceDisconnected(children[i]);
+            }
+        } catch (_) {}
+        _disposeIframeSubtree(el);
     }
 
     // Window frame registry: tracks appended iframes so window[0], window[1], etc.
@@ -4472,7 +4519,9 @@
             _notifyMO("attributes", _getNodeId(this), { target: this, attributeName: name });
         }
         // Custom element attributeChangedCallback
-        if (this._ceUpgraded && typeof this.attributeChangedCallback === "function") {
+        if (_customElementHooks && typeof _customElementHooks.attributeChanged === 'function') {
+            try { _customElementHooks.attributeChanged(this, String(name), oldVal, String(value)); } catch (e) { console.error(e); }
+        } else if (this._ceUpgraded && typeof this.attributeChangedCallback === "function") {
             const observed = this.constructor.observedAttributes;
             if (Array.isArray(observed) && observed.includes(name)) {
                 try { this.attributeChangedCallback(name, oldVal, value); } catch (e) { console.error(e); }
@@ -4498,7 +4547,9 @@
             _notifyMO("attributes", _getNodeId(this), { target: this, attributeName: name });
         }
         // Custom element attributeChangedCallback
-        if (this._ceUpgraded && typeof this.attributeChangedCallback === "function") {
+        if (_customElementHooks && typeof _customElementHooks.attributeChanged === 'function') {
+            try { _customElementHooks.attributeChanged(this, String(name), oldVal, null); } catch (e) { console.error(e); }
+        } else if (this._ceUpgraded && typeof this.attributeChangedCallback === "function") {
             const observed = this.constructor.observedAttributes;
             if (Array.isArray(observed) && observed.includes(name)) {
                 try { this.attributeChangedCallback(name, oldVal, null); } catch (e) { console.error(e); }
@@ -7524,19 +7575,19 @@
         });
     }
 
-    // Keep the createElement customElements-upgrade hook — still needed for
-    // user-defined custom elements.
+    // Keep one createElement hook, but delegate all Custom Elements behavior
+    // to the final registry implementation.  The old implementation called
+    // `constructor.call(el)`, which can never execute an ES class constructor.
     const _origCreateElement = Document.prototype.createElement;
-    Document.prototype.createElement = function(tag) {
+    Document.prototype.createElement = function(tag, options) {
         const el = _origCreateElement.call(this, tag);
-        const ceEntry = globalThis._customElementsRegistry && globalThis._customElementsRegistry.get(tag.toLowerCase());
-        if (ceEntry) {
-            Object.setPrototypeOf(el, ceEntry.constructor.prototype);
-            try { ceEntry.constructor.call(el); } catch (e) { console.error(e); }
-            el._ceUpgraded = true;
+        if (_customElementHooks && typeof _customElementHooks.created === 'function') {
+            try { return _customElementHooks.created(el, String(tag), options, this) || el; }
+            catch (e) { throw e; }
         }
         return el;
     };
+    try { Object.defineProperty(Document.prototype.createElement, 'length', { value: 1, configurable: true }); } catch (_) {}
 
     // ================================================================
     // Native-code mask sweep for every JS-defined Web API method.
