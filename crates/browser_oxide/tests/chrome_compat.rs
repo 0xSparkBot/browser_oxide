@@ -697,6 +697,37 @@ async fn dom_traversal_matches_chrome_148() {
 }
 
 #[tokio::test]
+async fn treewalker_large_sibling_scan_does_not_degrade_quadratically() {
+    let result = check(
+        r#"(() => {
+            const root = document.createElement('div');
+            const fragment = document.createDocumentFragment();
+            for (let i = 0; i < 1000; i++) {
+                const row = document.createElement('span');
+                row.appendChild(document.createTextNode(String(i)));
+                fragment.appendChild(row);
+            }
+            root.appendChild(fragment);
+            document.body.appendChild(root);
+
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const started = performance.now();
+            let count = 0;
+            let node;
+            while ((node = walker.nextNode())) {
+                count++;
+                if ((count & 63) === 0 && performance.now() - started > 750) {
+                    return 'slow:' + count;
+                }
+            }
+            return String(count);
+        })()"#,
+    )
+    .await;
+    assert_eq!(result, "1000");
+}
+
+#[tokio::test]
 async fn attr_and_named_node_map_match_chrome_148() {
     let result = check(
         r#"(() => {

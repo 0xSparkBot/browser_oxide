@@ -65,37 +65,29 @@
         result = Number(result);
         return result === FILTER_REJECT || result === FILTER_SKIP ? result : FILTER_ACCEPT;
     };
+    // Raw DFS stepping must use the Node sibling links directly. Rebuilding
+    // `parent.childNodes` and then `indexOf(current)` on every step makes a
+    // TreeWalker over N siblings O(N^2); large real documents can spend
+    // minutes in a simple SHOW_TEXT scan. The DOM bindings already expose
+    // firstChild/lastChild/nextSibling/previousSibling as O(1) Rust-backed
+    // links, matching the traversal primitive Blink uses internally.
     const nextRaw = (node, root, skipChildren = false) => {
-        if (!skipChildren) {
-            const first = children(node)[0];
-            if (first) return first;
-        }
+        if (!skipChildren && node?.firstChild) return node.firstChild;
         let cursor = node;
         while (cursor && cursor !== root) {
-            const parent = cursor.parentNode;
-            if (!parent) return null;
-            const siblings = children(parent);
-            const index = siblings.indexOf(cursor);
-            if (index >= 0 && index + 1 < siblings.length) return siblings[index + 1];
-            cursor = parent;
+            if (cursor.nextSibling) return cursor.nextSibling;
+            cursor = cursor.parentNode;
         }
         return null;
     };
     const previousRaw = (node, root) => {
         if (!node || node === root) return null;
-        const parent = node.parentNode;
-        if (!parent) return null;
-        const siblings = children(parent);
-        const index = siblings.indexOf(node);
-        if (index > 0) {
-            let cursor = siblings[index - 1];
-            while (true) {
-                const descendants = children(cursor);
-                if (!descendants.length) return cursor;
-                cursor = descendants[descendants.length - 1];
-            }
+        if (node.previousSibling) {
+            let cursor = node.previousSibling;
+            while (cursor.lastChild) cursor = cursor.lastChild;
+            return cursor;
         }
-        return parent;
+        return node.parentNode || null;
     };
     const firstAcceptedInBranch = (state, node, reverse = false) => {
         const decision = filterResult(state, node);
