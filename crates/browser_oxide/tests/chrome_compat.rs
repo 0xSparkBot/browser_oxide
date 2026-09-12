@@ -6356,6 +6356,115 @@ async fn media_key_access_key_system_is_string() {
     assert_eq!(page.evaluate("window.__r").unwrap(), "string");
 }
 
+#[tokio::test]
+async fn media_key_webidl_objects_match_chromium() {
+    let mut page = Page::from_html_with_url(
+        &html(""),
+        "https://example.com/",
+        Some(browser_oxide::stealth::presets::chrome_148_macos()),
+    )
+    .await
+    .unwrap();
+    page.evaluate(
+        r#"globalThis.__emeShape = null;
+        (async () => {
+            const access = await navigator.requestMediaKeySystemAccess(
+                'org.w3.clearkey',
+                [{initDataTypes:['keyids'],videoCapabilities:[{contentType:'video/webm; codecs="vp8"'}]}]
+            );
+            const keys = await access.createMediaKeys();
+            const session = keys.createSession();
+            const configA = access.getConfiguration();
+            const configB = access.getConfiguration();
+            let badSession = '';
+            try { keys.createSession('bogus'); }
+            catch (e) { badSession = e.name; }
+            let emptyCertificate = '';
+            try { await keys.setServerCertificate(new Uint8Array()); }
+            catch (e) { emptyCertificate = e.name; }
+            let missingGenerate = '';
+            try { await session.generateRequest(); }
+            catch (e) { missingGenerate = e.name; }
+            globalThis.__emeShape = {
+                access: [Object.prototype.toString.call(access), access instanceof MediaKeySystemAccess,
+                         Reflect.ownKeys(access).length, Object.getPrototypeOf(access) === MediaKeySystemAccess.prototype],
+                keys: [Object.prototype.toString.call(keys), keys instanceof MediaKeys,
+                       Reflect.ownKeys(keys).length, Object.getPrototypeOf(keys) === MediaKeys.prototype],
+                session: [Object.prototype.toString.call(session), session instanceof MediaKeySession,
+                          Reflect.ownKeys(session).length, Object.getPrototypeOf(session) === MediaKeySession.prototype,
+                          session instanceof EventTarget, session.sessionId, String(session.expiration),
+                          session.closed instanceof Promise, session.onmessage, session.onkeystatuseschange],
+                statuses: [Object.prototype.toString.call(session.keyStatuses),
+                           session.keyStatuses instanceof MediaKeyStatusMap, session.keyStatuses.size,
+                           MediaKeyStatusMap.prototype[Symbol.iterator] === MediaKeyStatusMap.prototype.entries],
+                config: [access.keySystem, configA === configB, configA.initDataTypes[0],
+                         configA.sessionTypes[0], configA.persistentState],
+                methods: [await keys.getStatusForPolicy(), badSession, emptyCertificate, missingGenerate],
+                parents: [Object.getPrototypeOf(MediaKeySession.prototype) === EventTarget.prototype,
+                          Object.getPrototypeOf(MediaKeyStatusMap.prototype) === Object.prototype],
+                native: [
+                    Function.prototype.toString.call(MediaKeySystemAccess.prototype.createMediaKeys).includes('[native code]'),
+                    Function.prototype.toString.call(MediaKeys.prototype.createSession).includes('[native code]'),
+                    Function.prototype.toString.call(MediaKeySession.prototype.generateRequest).includes('[native code]'),
+                ],
+            };
+        })();"#,
+    )
+    .unwrap();
+    page.evaluate_async("void 0", std::time::Duration::from_millis(100))
+        .await
+        .ok();
+    let value: serde_json::Value = serde_json::from_str(
+        &page
+            .evaluate("JSON.stringify(globalThis.__emeShape)")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value["access"],
+        serde_json::json!(["[object MediaKeySystemAccess]", true, 0, true])
+    );
+    assert_eq!(
+        value["keys"],
+        serde_json::json!(["[object MediaKeys]", true, 0, true])
+    );
+    assert_eq!(
+        value["session"],
+        serde_json::json!([
+            "[object MediaKeySession]",
+            true,
+            0,
+            true,
+            true,
+            "",
+            "NaN",
+            true,
+            null,
+            null
+        ])
+    );
+    assert_eq!(
+        value["statuses"],
+        serde_json::json!(["[object MediaKeyStatusMap]", true, 0, true])
+    );
+    assert_eq!(
+        value["config"],
+        serde_json::json!([
+            "org.w3.clearkey",
+            false,
+            "keyids",
+            "temporary",
+            "not-allowed"
+        ])
+    );
+    assert_eq!(
+        value["methods"],
+        serde_json::json!(["usable", "TypeError", "TypeError", "TypeError"])
+    );
+    assert_eq!(value["parents"], serde_json::json!([true, true]));
+    assert_eq!(value["native"], serde_json::json!([true, true, true]));
+}
+
 // --- Crypto / SubtleCrypto / Performance ---
 
 #[tokio::test]
