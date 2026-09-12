@@ -599,3 +599,293 @@ async fn indexeddb_aborted_initial_upgrade_does_not_leave_database_behind() {
     assert_eq!(value["version"], 1);
     assert_eq!(value["stores"], serde_json::json!(["fresh"]));
 }
+
+#[tokio::test]
+async fn indexeddb_upgrade_waits_for_open_connection_and_emits_blocked() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbBlockedUpgradeResult = null;
+        (() => {
+            const name = 'browser-oxide-idb-blocked-upgrade';
+            const out = { seq: [], versionchange: null, blocked: null, pending: null, version: null, stores: null };
+            const first = indexedDB.open(name, 1);
+            first.onupgradeneeded = () => first.result.createObjectStore('v1');
+            first.onsuccess = () => {
+                const oldConnection = first.result;
+                oldConnection.onversionchange = event => {
+                    out.seq.push('versionchange');
+                    out.versionchange = { old: event.oldVersion, new_: event.newVersion };
+                };
+
+                const upgrade = indexedDB.open(name, 2);
+                upgrade.onblocked = event => {
+                    out.seq.push('blocked');
+                    out.blocked = { old: event.oldVersion, new_: event.newVersion };
+                    out.pending = upgrade.readyState;
+                    queueMicrotask(() => oldConnection.close());
+                };
+                upgrade.onupgradeneeded = () => {
+                    out.seq.push('upgradeneeded');
+                    upgrade.result.createObjectStore('v2');
+                };
+                upgrade.onsuccess = () => {
+                    out.seq.push('success');
+                    out.version = upgrade.result.version;
+                    out.stores = Array.from(upgrade.result.objectStoreNames);
+                    globalThis.__idbBlockedUpgradeResult = out;
+                };
+                upgrade.onerror = () => {
+                    out.seq.push('error');
+                    globalThis.__idbBlockedUpgradeResult = out;
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbBlockedUpgradeResult)")
+        .expect("blocked upgrade result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("blocked upgrade json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!(["versionchange", "blocked", "upgradeneeded", "success"])
+    );
+    assert_eq!(
+        value["versionchange"],
+        serde_json::json!({"old":1,"new_":2})
+    );
+    assert_eq!(value["blocked"], serde_json::json!({"old":1,"new_":2}));
+    assert_eq!(value["pending"], "pending");
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["stores"], serde_json::json!(["v1", "v2"]));
+}
+
+#[tokio::test]
+async fn indexeddb_delete_database_waits_for_open_connection_and_emits_blocked() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbBlockedDeleteResult = null;
+        (() => {
+            const name = 'browser-oxide-idb-blocked-delete';
+            const out = { seq: [], versionchange: null, blocked: null, pending: null, databases: null, reopenOldVersion: null };
+            const first = indexedDB.open(name, 1);
+            first.onupgradeneeded = () => first.result.createObjectStore('items');
+            first.onsuccess = () => {
+                const oldConnection = first.result;
+                oldConnection.onversionchange = event => {
+                    out.seq.push('versionchange');
+                    out.versionchange = { old: event.oldVersion, new_: event.newVersion };
+                };
+
+                const deletion = indexedDB.deleteDatabase(name);
+                deletion.onblocked = event => {
+                    out.seq.push('blocked');
+                    out.blocked = { old: event.oldVersion, new_: event.newVersion };
+                    out.pending = deletion.readyState;
+                    queueMicrotask(() => oldConnection.close());
+                };
+                deletion.onsuccess = async () => {
+                    out.seq.push('success');
+                    out.databases = (await indexedDB.databases()).map(entry => entry.name);
+                    const reopen = indexedDB.open(name);
+                    reopen.onupgradeneeded = event => {
+                        out.reopenOldVersion = event.oldVersion;
+                    };
+                    reopen.onsuccess = () => {
+                        globalThis.__idbBlockedDeleteResult = out;
+                    };
+                };
+                deletion.onerror = () => {
+                    out.seq.push('error');
+                    globalThis.__idbBlockedDeleteResult = out;
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbBlockedDeleteResult)")
+        .expect("blocked delete result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("blocked delete json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!(["versionchange", "blocked", "success"])
+    );
+    assert_eq!(
+        value["versionchange"],
+        serde_json::json!({"old":1,"new_":null})
+    );
+    assert_eq!(value["blocked"], serde_json::json!({"old":1,"new_":null}));
+    assert_eq!(value["pending"], "pending");
+    assert_eq!(value["databases"], serde_json::json!([]));
+    assert_eq!(value["reopenOldVersion"], 0);
+}
+
+#[tokio::test]
+async fn indexeddb_versionchange_handler_can_close_without_blocked_event() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbImmediateCloseResult = null;
+        (() => {
+            const name = 'browser-oxide-idb-immediate-close';
+            const out = { seq: [], blocked: false, version: null };
+            const first = indexedDB.open(name, 1);
+            first.onupgradeneeded = () => first.result.createObjectStore('v1');
+            first.onsuccess = () => {
+                const oldConnection = first.result;
+                oldConnection.onversionchange = () => {
+                    out.seq.push('versionchange');
+                    oldConnection.close();
+                };
+                const upgrade = indexedDB.open(name, 2);
+                upgrade.onblocked = () => {
+                    out.blocked = true;
+                    out.seq.push('blocked');
+                };
+                upgrade.onupgradeneeded = () => out.seq.push('upgradeneeded');
+                upgrade.onsuccess = () => {
+                    out.seq.push('success');
+                    out.version = upgrade.result.version;
+                    globalThis.__idbImmediateCloseResult = out;
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbImmediateCloseResult)")
+        .expect("immediate close result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("immediate close json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!(["versionchange", "upgradeneeded", "success"])
+    );
+    assert_eq!(value["blocked"], false);
+    assert_eq!(value["version"], 2);
+}
+
+#[tokio::test]
+async fn indexeddb_queued_upgrade_uses_version_after_previous_upgrade() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbQueuedUpgradeResult = null;
+        (() => {
+            const name = 'browser-oxide-idb-queued-upgrade';
+            const out = { seq: [], secondVersionchange: null, thirdUpgrade: null, finalVersion: null };
+            const first = indexedDB.open(name, 1);
+            first.onupgradeneeded = () => first.result.createObjectStore('v1');
+            first.onsuccess = () => {
+                const db1 = first.result;
+                db1.onversionchange = () => db1.close();
+
+                const second = indexedDB.open(name, 2);
+                const third = indexedDB.open(name, 3);
+
+                second.onupgradeneeded = event => {
+                    out.seq.push('upgrade-2');
+                    if (event.oldVersion !== 1 || event.newVersion !== 2) {
+                        out.seq.push(`bad-upgrade-2:${event.oldVersion}:${event.newVersion}`);
+                    }
+                };
+                second.onsuccess = () => {
+                    out.seq.push('success-2');
+                    second.result.onversionchange = event => {
+                        out.seq.push('versionchange-2');
+                        out.secondVersionchange = [event.oldVersion, event.newVersion];
+                        second.result.close();
+                    };
+                };
+
+                third.onupgradeneeded = event => {
+                    out.seq.push('upgrade-3');
+                    out.thirdUpgrade = [event.oldVersion, event.newVersion];
+                };
+                third.onsuccess = () => {
+                    out.seq.push('success-3');
+                    out.finalVersion = third.result.version;
+                    globalThis.__idbQueuedUpgradeResult = out;
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbQueuedUpgradeResult)")
+        .expect("queued upgrade result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("queued upgrade json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!([
+            "upgrade-2",
+            "success-2",
+            "versionchange-2",
+            "upgrade-3",
+            "success-3"
+        ])
+    );
+    assert_eq!(value["secondVersionchange"], serde_json::json!([2, 3]));
+    assert_eq!(value["thirdUpgrade"], serde_json::json!([2, 3]));
+    assert_eq!(value["finalVersion"], 3);
+}
+
+#[tokio::test]
+async fn indexeddb_open_queued_behind_blocked_delete_recreates_database() {
+    let html = r#"<!doctype html><html><body><script>
+        globalThis.__idbDeleteThenOpenResult = null;
+        (() => {
+            const name = 'browser-oxide-idb-delete-then-open';
+            const out = { seq: [], reopenOldVersion: null, reopenNewVersion: null, stores: null };
+            const first = indexedDB.open(name, 1);
+            first.onupgradeneeded = () => first.result.createObjectStore('old-store');
+            first.onsuccess = () => {
+                const oldConnection = first.result;
+                oldConnection.onversionchange = () => out.seq.push('versionchange');
+
+                const deletion = indexedDB.deleteDatabase(name);
+                const reopen = indexedDB.open(name);
+
+                deletion.onblocked = () => {
+                    out.seq.push('delete-blocked');
+                    queueMicrotask(() => oldConnection.close());
+                };
+                deletion.onsuccess = () => out.seq.push('delete-success');
+
+                reopen.onupgradeneeded = event => {
+                    out.seq.push('reopen-upgrade');
+                    out.reopenOldVersion = event.oldVersion;
+                    out.reopenNewVersion = event.newVersion;
+                    reopen.result.createObjectStore('new-store');
+                };
+                reopen.onsuccess = () => {
+                    out.seq.push('reopen-success');
+                    out.stores = Array.from(reopen.result.objectStoreNames);
+                    globalThis.__idbDeleteThenOpenResult = out;
+                };
+            };
+        })();
+    </script></body></html>"#;
+
+    let mut page = page(html).await;
+    let result = page
+        .evaluate("JSON.stringify(globalThis.__idbDeleteThenOpenResult)")
+        .expect("delete then open result");
+    let value: serde_json::Value = serde_json::from_str(&result).expect("delete then open json");
+
+    assert_eq!(
+        value["seq"],
+        serde_json::json!([
+            "versionchange",
+            "delete-blocked",
+            "delete-success",
+            "reopen-upgrade",
+            "reopen-success"
+        ])
+    );
+    assert_eq!(value["reopenOldVersion"], 0);
+    assert_eq!(value["reopenNewVersion"], 1);
+    assert_eq!(value["stores"], serde_json::json!(["new-store"]));
+}

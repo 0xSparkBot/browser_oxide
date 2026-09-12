@@ -972,9 +972,98 @@
     // ---------------------------------------------------------------------
     // Database.
     // ---------------------------------------------------------------------
+    function _ensureDatabaseRuntime(record) {
+        if (!record.connections) record.connections = new Set();
+        if (!record.pendingOperations) record.pendingOperations = [];
+        if (record.operationRunning === undefined) record.operationRunning = false;
+        return record;
+    }
+    function _liveDatabaseConnections(record) {
+        _ensureDatabaseRuntime(record);
+        const live = [];
+        for (const database of record.connections) {
+            const state = _dbState.get(database);
+            if (state && !state.closed) live.push(database);
+        }
+        return live;
+    }
+    function _finishDatabaseOperation(record) {
+        _ensureDatabaseRuntime(record).operationRunning = false;
+        queueMicrotask(() => _processDatabaseOperations(record));
+    }
+    function _processDatabaseOperations(record) {
+        _ensureDatabaseRuntime(record);
+        if (record.operationRunning || record.pendingOperations.length === 0) return;
+        const operation = record.pendingOperations[0];
+
+        if (!operation.prepared) {
+            try {
+                if (typeof operation.prepare === 'function') operation.prepare();
+                operation.prepared = true;
+            } catch (error) {
+                record.pendingOperations.shift();
+                _setRequestDone(operation.request, undefined, error);
+                _emit(operation.request, new Event('error', { cancelable: true }));
+                queueMicrotask(() => _processDatabaseOperations(record));
+                return;
+            }
+        }
+
+        if (operation.requeueRecord && operation.requeueRecord !== record) {
+            record.pendingOperations.shift();
+            const nextRecord = operation.requeueRecord;
+            delete operation.requeueRecord;
+            _queueDatabaseOperation(nextRecord, operation);
+            queueMicrotask(() => _processDatabaseOperations(record));
+            return;
+        }
+
+        if (operation.waitForConnections && !operation.versionchangeDispatched) {
+            operation.versionchangeDispatched = true;
+            // Per IndexedDB, existing connections get versionchange first and
+            // are allowed to close synchronously from that handler. `blocked`
+            // is emitted only if at least one connection remains afterwards.
+            for (const database of _liveDatabaseConnections(record)) {
+                _emit(database, new IDBVersionChangeEvent('versionchange', {
+                    oldVersion: operation.oldVersion,
+                    newVersion: operation.newVersion,
+                }));
+            }
+        }
+
+        if (operation.waitForConnections && _liveDatabaseConnections(record).length !== 0) {
+            if (!operation.blockedDispatched) {
+                operation.blockedDispatched = true;
+                _emit(operation.request, new IDBVersionChangeEvent('blocked', {
+                    oldVersion: operation.oldVersion,
+                    newVersion: operation.newVersion,
+                }));
+            }
+            return;
+        }
+
+        record.pendingOperations.shift();
+        record.operationRunning = true;
+        try {
+            operation.begin(() => _finishDatabaseOperation(record));
+        } catch (error) {
+            _setRequestDone(operation.request, undefined, error);
+            _emit(operation.request, new Event('error', { bubbles: true, cancelable: true }));
+            _finishDatabaseOperation(record);
+        }
+    }
+    function _queueDatabaseOperation(record, operation) {
+        operation.prepared = false;
+        operation.versionchangeDispatched = false;
+        operation.blockedDispatched = false;
+        _ensureDatabaseRuntime(record).pendingOperations.push(operation);
+        _processDatabaseOperations(record);
+    }
     function _makeDatabase(record) {
+        _ensureDatabaseRuntime(record);
         const db = Object.create(IDBDatabaseProto);
         _dbState.set(db, { record, handlers: Object.create(null), upgradeTransaction: null, closed: false });
+        record.connections.add(db);
         return db;
     }
     _defineGetter(IDBDatabaseProto, 'name', value => _stateFor(_dbState, value).record.name);
@@ -985,7 +1074,14 @@
     });
     for (const name of ['onabort', 'onclose', 'onerror', 'onversionchange']) _defineHandler(IDBDatabaseProto, name, _dbState);
     _defineMethod(IDBDatabaseProto, 'close', function close() {
-        _stateFor(_dbState, this).closed = true;
+        const state = _stateFor(_dbState, this);
+        if (state.closed) return;
+        state.closed = true;
+        _ensureDatabaseRuntime(state.record).connections.delete(this);
+        // Resuming a blocked upgrade/delete from inside close() itself is too
+        // re-entrant. Blink resumes the queued operation asynchronously after
+        // the closing handler yields, so schedule the queue pump as a microtask.
+        queueMicrotask(() => _processDatabaseOperations(state.record));
     });
     _defineMethod(IDBDatabaseProto, 'createObjectStore', function createObjectStore(name, ...rest) {
         const state = _stateFor(_dbState, this), tx = state.upgradeTransaction;
@@ -1037,9 +1133,31 @@
         const request = _makeRequest(null, null, true);
         name = String(name);
         queueMicrotask(() => {
-            _dbRegistry.delete(name);
-            _setRequestDone(request, undefined, null);
-            _emit(request, new Event('success'));
+            const record = _dbRegistry.get(name);
+            if (!record) {
+                _setRequestDone(request, undefined, null);
+                _emit(request, new Event('success'));
+                return;
+            }
+            const operation = {
+                request,
+                waitForConnections: true,
+                prepare() {
+                    operation.oldVersion = record.version;
+                    operation.newVersion = null;
+                },
+                begin(done) {
+                    _dbRegistry.delete(name);
+                    _setRequestDone(request, undefined, null);
+                    // Queue any already-pending operations before success
+                    // handlers get a chance to enqueue new opens for this name.
+                    // The success event still fires synchronously in this task;
+                    // only the queue pump itself is deferred by `done()`.
+                    done();
+                    _emit(request, new Event('success'));
+                },
+            };
+            _queueDatabaseOperation(record, operation);
         });
         return request;
     });
@@ -1053,13 +1171,6 @@
         }
         queueMicrotask(() => {
             let record = _dbRegistry.get(name);
-            const oldVersion = record ? record.version : 0;
-            const targetVersion = requested === undefined ? (record ? record.version : 1) : requested;
-            if (record && targetVersion < record.version) {
-                _setRequestDone(request, undefined, _domError('VersionError', 'The requested version is less than the existing version.'));
-                _emit(request, new Event('error', { cancelable: true }));
-                return;
-            }
             if (!record) {
                 // Keep the not-yet-created database at version 0 until the
                 // versionchange transaction has captured its rollback
@@ -1067,46 +1178,98 @@
                 // removed entirely below, matching Blink's failed initial-open
                 // semantics.
                 record = { name, version: 0, stores: new Map() };
+                _ensureDatabaseRuntime(record);
                 _dbRegistry.set(name, record);
             }
-            const database = _makeDatabase(record);
-            const reqState = _stateFor(_requestState, request);
-            if (oldVersion < targetVersion) {
-                const transaction = _makeTransaction(database, [...record.stores.keys()], 'versionchange', 'default');
-                record.version = targetVersion;
-                _stateFor(_dbState, database).upgradeTransaction = transaction;
-                reqState.result = database;
-                reqState.readyState = 'done';
-                reqState.transaction = transaction;
-                const txState = _stateFor(_txState, transaction);
-                txState.completeCallbacks.push(() => {
-                    _stateFor(_dbState, database).upgradeTransaction = null;
-                    reqState.transaction = null;
-                    _setRequestDone(request, database, null);
-                    queueMicrotask(() => _emit(request, new Event('success')));
-                });
-                txState.abortCallbacks.push((abortError) => {
-                    const dbState = _stateFor(_dbState, database);
-                    dbState.upgradeTransaction = null;
-                    dbState.closed = true;
-                    reqState.transaction = null;
-                    if (oldVersion === 0) {
-                        _dbRegistry.delete(name);
+            _ensureDatabaseRuntime(record);
+            const operation = {
+                request,
+                waitForConnections: false,
+                prepare() {
+                    const registered = _dbRegistry.get(name);
+                    if (registered !== record) {
+                        if (registered) {
+                            // A preceding delete completed and a success handler
+                            // already recreated the database before this older
+                            // queued open resumed. Move the request to the live
+                            // record's queue so operations remain serialized by
+                            // database name rather than by a stale record object.
+                            record = registered;
+                            operation.requeueRecord = registered;
+                            return;
+                        }
+
+                        // A preceding delete removed this record. Reuse the
+                        // queue container, but reset all persistent database
+                        // state so this open observes a fresh database at
+                        // oldVersion=0 and runs the normal initial upgrade.
+                        record.version = 0;
+                        record.stores = new Map();
+                        _ensureDatabaseRuntime(record).connections.clear();
+                        _dbRegistry.set(name, record);
                     }
-                    _setRequestDone(request, undefined, abortError);
-                    queueMicrotask(() => {
-                        _emit(request, new Event('error', { bubbles: true, cancelable: true }));
-                    });
-                });
-                _emit(request, new IDBVersionChangeEvent('upgradeneeded', {
-                    oldVersion,
-                    newVersion: targetVersion,
-                }));
-                _scheduleTxCheck(transaction);
-            } else {
-                _setRequestDone(request, database, null);
-                _emit(request, new Event('success'));
-            }
+                    const oldVersion = record.version;
+                    const targetVersion = requested === undefined
+                        ? (oldVersion === 0 ? 1 : oldVersion)
+                        : requested;
+                    if (targetVersion < oldVersion) {
+                        throw _domError('VersionError', 'The requested version is less than the existing version.');
+                    }
+                    operation.oldVersion = oldVersion;
+                    operation.newVersion = targetVersion;
+                    operation.targetVersion = targetVersion;
+                    operation.waitForConnections = oldVersion < targetVersion && oldVersion !== 0;
+                },
+                begin(done) {
+                    const oldVersion = operation.oldVersion;
+                    const targetVersion = operation.targetVersion;
+                    const database = _makeDatabase(record);
+                    const reqState = _stateFor(_requestState, request);
+                    if (oldVersion < targetVersion) {
+                        const transaction = _makeTransaction(database, [...record.stores.keys()], 'versionchange', 'default');
+                        record.version = targetVersion;
+                        _stateFor(_dbState, database).upgradeTransaction = transaction;
+                        reqState.result = database;
+                        reqState.readyState = 'done';
+                        reqState.transaction = transaction;
+                        const txState = _stateFor(_txState, transaction);
+                        txState.completeCallbacks.push(() => {
+                            _stateFor(_dbState, database).upgradeTransaction = null;
+                            reqState.transaction = null;
+                            _setRequestDone(request, database, null);
+                            queueMicrotask(() => {
+                                _emit(request, new Event('success'));
+                                done();
+                            });
+                        });
+                        txState.abortCallbacks.push((abortError) => {
+                            const dbState = _stateFor(_dbState, database);
+                            dbState.upgradeTransaction = null;
+                            dbState.closed = true;
+                            _ensureDatabaseRuntime(record).connections.delete(database);
+                            reqState.transaction = null;
+                            if (oldVersion === 0) {
+                                _dbRegistry.delete(name);
+                            }
+                            _setRequestDone(request, undefined, abortError);
+                            queueMicrotask(() => {
+                                _emit(request, new Event('error', { bubbles: true, cancelable: true }));
+                                done();
+                            });
+                        });
+                        _emit(request, new IDBVersionChangeEvent('upgradeneeded', {
+                            oldVersion,
+                            newVersion: targetVersion,
+                        }));
+                        _scheduleTxCheck(transaction);
+                    } else {
+                        _setRequestDone(request, database, null);
+                        _emit(request, new Event('success'));
+                        done();
+                    }
+                },
+            };
+            _queueDatabaseOperation(record, operation);
         });
         return request;
     });
