@@ -477,7 +477,7 @@
             if(!s) return oldFetch(input,init);
             return oldFetch(s.url,{
                 method:s.method, headers:s.headers, body:s.rawBody, signal:s.signal,
-                mode:s.mode, credentials:s.credentials, ...init,
+                mode:s.mode, credentials:s.credentials, redirect:s.redirect, ...init,
             });
         };
         try { Object.defineProperty(fetch,'length',{value:1,configurable:true}); } catch(_){}
@@ -493,8 +493,10 @@
     if(typeof ResponseCtor==='function') {
         const rp=ResponseCtor.prototype;
         const originalArrayBuffer=rp.arrayBuffer;
-        _getter(rp,'type',function(){ return 'default'; });
-        _getter(rp,'redirected',function(){ return false; });
+        const typeDescriptor=Object.getOwnPropertyDescriptor(rp,'type');
+        const redirectedDescriptor=Object.getOwnPropertyDescriptor(rp,'redirected');
+        _getter(rp,'type',typeDescriptor?.get || function(){ return 'default'; });
+        _getter(rp,'redirected',redirectedDescriptor?.get || function(){ return false; });
         _method(rp,'bytes',async function(){ return new Uint8Array(await originalArrayBuffer.call(this)); },0);
         _method(rp,'blob',async function(){
             const bytes=new Uint8Array(await originalArrayBuffer.call(this));

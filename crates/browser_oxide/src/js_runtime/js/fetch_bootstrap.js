@@ -81,7 +81,7 @@
     }
 
     class Response {
-        #body; #rawBytes; #status; #statusText; #headers; #url; #ok; #bodyStream;
+        #body; #rawBytes; #status; #statusText; #headers; #url; #ok; #bodyStream; #type; #redirected;
         constructor(body, init = {}) {
             // Fetch BodyInit accepts BufferSource values. Snapshot their exact
             // bytes at construction time instead of coercing typed arrays with
@@ -116,12 +116,16 @@
             this.#url = init.url ?? "";
             this.#ok = this.#status >= 200 && this.#status < 300;
             this.#bodyStream = null;
+            this.#type = init.type ?? "default";
+            this.#redirected = Boolean(init.redirected ?? false);
         }
         get status() { return this.#status; }
         get statusText() { return this.#statusText; }
         get ok() { return this.#ok; }
         get headers() { return this.#headers; }
         get url() { return this.#url; }
+        get type() { return this.#type; }
+        get redirected() { return this.#redirected; }
         // `body` is a ReadableStream per the Fetch spec. We build it
         // lazily so responses that never read `.body` don't pay for
         // stream construction. The stream yields the cached body as
@@ -180,6 +184,8 @@
                 statusText: this.#statusText,
                 headers: this.#headers,
                 url: this.#url,
+                type: this.#type,
+                redirected: this.#redirected,
             });
         }
     }
@@ -389,12 +395,20 @@
                 statusText: "OK",
                 headers: { "content-type": contentType },
                 url,
+                type: "basic",
             });
         }
 
         method = (init.method ?? "GET").toUpperCase();
         const requestMode = init.mode == null ? "cors" : String(init.mode);
         const credentialsMode = init.credentials == null ? "same-origin" : String(init.credentials);
+        const redirectMode = init.redirect == null ? "follow" : String(init.redirect);
+        if (!["follow", "error", "manual"].includes(redirectMode)) {
+            throw new TypeError(
+                "Failed to execute 'fetch' on 'Window': The provided value '" +
+                redirectMode + "' is not a valid enum value of type RequestRedirect."
+            );
+        }
         // Body can be: string, ArrayBuffer, TypedArray (Uint8Array), Blob,
         // FormData, URLSearchParams, or null. We must preserve binary
         // fidelity for `application/octet-stream` POSTs.
@@ -576,14 +590,6 @@
             const startTime = performance.now();
             let documentOrigin = "";
             try { documentOrigin = String(globalThis.location?.origin || ""); } catch (_) {}
-            const requestOrigin = _originForUrl(url);
-            const crossOrigin = !!documentOrigin
-                && documentOrigin !== "null"
-                && !!requestOrigin
-                && requestOrigin !== documentOrigin;
-            if (requestMode === "same-origin" && crossOrigin) {
-                throw new TypeError("Failed to fetch");
-            }
             _pushFetchDiag({
                 phase: "request",
                 method,
@@ -599,23 +605,92 @@
                 encodedBodyLength: body.length,
                 headerNames: Object.keys(headers).sort(),
             });
-            // Preserve renderer request-header order across the JS -> Rust
-            // boundary. Serializing a plain object into a Rust HashMap made
-            // page-authored headers nondeterministic on the wire, while real
-            // browsers keep a stable network-stack header order. The op takes
-            // an ordered list of [name, value] pairs so the net layer can
-            // merge replacements in-place without losing that order.
-            const result = await ops.op_fetch(url, method, Object.entries(headers), body);
-            _pushFetchDiag({
-                phase: "response",
-                method,
-                url,
-                status: result.status,
-                bodyLength: result.body ? result.body.length : 0,
-                headers: Object.entries(result.headers || {})
-                    .map(([name, value]) => [name, String(value).length])
-                    .sort((a, b) => a[0].localeCompare(b[0])),
-            });
+
+            // Each op_fetch performs exactly one request. Redirect processing
+            // stays at the renderer layer so manual/error modes remain
+            // observable and the final Response keeps the full URL-list state.
+            let currentUrl = url;
+            let currentMethod = method;
+            let currentBody = body;
+            let result;
+            let redirected = false;
+            for (let redirectCount = 0; ; redirectCount++) {
+                const requestOrigin = _originForUrl(currentUrl);
+                const hopCrossOrigin = !!documentOrigin
+                    && documentOrigin !== "null"
+                    && !!requestOrigin
+                    && requestOrigin !== documentOrigin;
+                if (requestMode === "same-origin" && hopCrossOrigin) {
+                    throw new TypeError("Failed to fetch");
+                }
+
+                result = await ops.op_fetch(
+                    currentUrl,
+                    currentMethod,
+                    Object.entries(headers),
+                    currentBody,
+                );
+                _pushFetchDiag({
+                    phase: "response",
+                    method: currentMethod,
+                    url: currentUrl,
+                    status: result.status,
+                    bodyLength: result.body ? result.body.length : 0,
+                    headers: Object.entries(result.headers || {})
+                        .map(([name, value]) => [name, String(value).length])
+                        .sort((a, b) => a[0].localeCompare(b[0])),
+                });
+
+                const isRedirectStatus = [301, 302, 303, 307, 308].includes(result.status);
+                const location = isRedirectStatus
+                    ? _responseHeaderValue(result.headers, "location")
+                    : null;
+                if (!location) break;
+
+                if (redirectMode === "error") {
+                    throw new TypeError("Failed to fetch");
+                }
+                if (redirectMode === "manual") {
+                    return new Response("", {
+                        status: 0,
+                        statusText: "",
+                        headers: {},
+                        url,
+                        type: "opaqueredirect",
+                        redirected: false,
+                    });
+                }
+                if (redirectCount >= 19) {
+                    throw new TypeError("Failed to fetch");
+                }
+
+                let nextUrl;
+                try { nextUrl = new URL(location, currentUrl).href; }
+                catch (_) { throw new TypeError("Failed to fetch"); }
+
+                redirected = true;
+                if (
+                    (result.status === 303 && currentMethod !== "GET" && currentMethod !== "HEAD") ||
+                    ((result.status === 301 || result.status === 302) && currentMethod === "POST")
+                ) {
+                    currentMethod = "GET";
+                    currentBody = "";
+                    for (const name of [
+                        "content-encoding",
+                        "content-language",
+                        "content-location",
+                        "content-type",
+                    ]) delete headers[name];
+                }
+                currentUrl = nextUrl;
+            }
+
+            const responseUrl = result.url || currentUrl;
+            const responseOrigin = _originForUrl(responseUrl);
+            const crossOrigin = !!documentOrigin
+                && documentOrigin !== "null"
+                && !!responseOrigin
+                && responseOrigin !== documentOrigin;
 
             // Fetch CORS is a renderer-side response gate. The network stack
             // still performs the request, but a cross-origin `mode: "cors"`
@@ -648,6 +723,8 @@
                     statusText: "",
                     headers: {},
                     url: "",
+                    type: "opaque",
+                    redirected: false,
                 });
             }
             
@@ -683,7 +760,7 @@
             // Sync cookies from the net jar into document.cookie so subsequent JS
             // reads (including challenge polling loops) see Set-Cookie
             // values that arrived via this response.
-            await _syncCookiesFromNet(url);
+            await _syncCookiesFromNet(responseUrl);
             const responseHeaders = crossOrigin && requestMode === "cors"
                 ? _corsFilteredResponseHeaders(result.headers, credentialsMode)
                 : _stripForbiddenResponseHeaders(result.headers);
@@ -692,7 +769,9 @@
                 status: result.status,
                 statusText: result.status_text,
                 headers: responseHeaders,
-                url: result.url,
+                url: responseUrl,
+                type: crossOrigin && requestMode === "cors" ? "cors" : "basic",
+                redirected,
             });
         } catch (e) {
             // A CSP gate may have rejected the request inside op_fetch and
