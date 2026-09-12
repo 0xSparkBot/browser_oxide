@@ -1207,12 +1207,23 @@
     const _webglShaderState = new WeakMap();
     const _webglProgramState = new WeakMap();
     const _webglUniformLocationState = new WeakMap();
+    const _webglBufferState = new WeakMap();
+    const _webglBufferBindings = new WeakMap();
     const _webglContextState = new WeakMap();
     const _webglContextErrors = new WeakMap();
     const _webglCurrentProgram = new WeakMap();
 
     function _webglState(ctx) {
         return _webglContextState.get(ctx) || null;
+    }
+
+    function _webglBindings(ctx) {
+        let bindings = _webglBufferBindings.get(ctx);
+        if (!bindings) {
+            bindings = { array: null, element: null };
+            _webglBufferBindings.set(ctx, bindings);
+        }
+        return bindings;
     }
 
     function _configureWebGLContext(ctx, options = {}) {
@@ -1336,6 +1347,13 @@
         static FLOAT = 0x1406;
         static ARRAY_BUFFER = 0x8892;
         static ELEMENT_ARRAY_BUFFER = 0x8893;
+        static ARRAY_BUFFER_BINDING = 0x8894;
+        static ELEMENT_ARRAY_BUFFER_BINDING = 0x8895;
+        static BUFFER_SIZE = 0x8764;
+        static BUFFER_USAGE = 0x8765;
+        static STREAM_DRAW = 0x88E0;
+        static STATIC_DRAW = 0x88E4;
+        static DYNAMIC_DRAW = 0x88E8;
         static FRAGMENT_SHADER = 0x8B30;
         static VERTEX_SHADER = 0x8B31;
         static DELETE_STATUS = 0x8B80;
@@ -1591,6 +1609,12 @@
             if (pname === 0x9246) return gpu.unmaskedRenderer;      // UNMASKED_RENDERER_WEBGL
             if (pname === WebGLRenderingContext.CURRENT_PROGRAM) {
                 return _webglCurrentProgram.get(this) || null;
+            }
+            if (pname === WebGLRenderingContext.ARRAY_BUFFER_BINDING) {
+                return _webglBindings(this).array;
+            }
+            if (pname === WebGLRenderingContext.ELEMENT_ARRAY_BUFFER_BINDING) {
+                return _webglBindings(this).element;
             }
             // Runtime-dependent values (not from the catalog)
             if (pname === 0x0BA2) {
@@ -1945,9 +1969,97 @@
         uniform3f() {}
         uniform4f() {}
         uniformMatrix4fv() {}
-        createBuffer() { return { _id: 1 }; }
-        bindBuffer() {}
-        bufferData() {}
+        createBuffer() {
+            return _newWebGLObject('WebGLBuffer', _webglBufferState, {
+                context: this,
+                deleted: false,
+                everBound: false,
+                size: 0,
+                usage: 0,
+            });
+        }
+        bindBuffer(target, buffer) {
+            target = Number(target) >>> 0;
+            let slot;
+            if (target === WebGLRenderingContext.ARRAY_BUFFER) slot = 'array';
+            else if (target === WebGLRenderingContext.ELEMENT_ARRAY_BUFFER) slot = 'element';
+            else {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            if (buffer == null) {
+                _webglBindings(this)[slot] = null;
+                return;
+            }
+            const state = _requireWebGLObject('WebGLBuffer', _webglBufferState, buffer, false, 'bindBuffer');
+            if (!state || state.context !== this || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.everBound = true;
+            _webglBindings(this)[slot] = buffer;
+        }
+        bufferData(target, dataOrSize, usage) {
+            target = Number(target) >>> 0;
+            let slot;
+            if (target === WebGLRenderingContext.ARRAY_BUFFER) slot = 'array';
+            else if (target === WebGLRenderingContext.ELEMENT_ARRAY_BUFFER) slot = 'element';
+            else {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            usage = Number(usage) >>> 0;
+            if (![WebGLRenderingContext.STREAM_DRAW, WebGLRenderingContext.STATIC_DRAW, WebGLRenderingContext.DYNAMIC_DRAW].includes(usage)) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return;
+            }
+            const buffer = _webglBindings(this)[slot];
+            const state = buffer && _webglBufferState.get(buffer);
+            if (!state || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            let size;
+            if (typeof dataOrSize === 'number') {
+                size = Number(dataOrSize);
+                if (!Number.isFinite(size) || size < 0) {
+                    _setWebGLError(this, WebGLRenderingContext.INVALID_VALUE);
+                    return;
+                }
+                size = Math.trunc(size);
+            } else if (dataOrSize && typeof dataOrSize.byteLength === 'number') {
+                size = Number(dataOrSize.byteLength);
+            } else {
+                throw new TypeError("Failed to execute 'bufferData' on 'WebGLRenderingContext': parameter 2 is not of type 'ArrayBufferView'.");
+            }
+            state.size = size;
+            state.usage = usage;
+        }
+        getBufferParameter(target, pname) {
+            target = Number(target) >>> 0;
+            let slot;
+            if (target === WebGLRenderingContext.ARRAY_BUFFER) slot = 'array';
+            else if (target === WebGLRenderingContext.ELEMENT_ARRAY_BUFFER) slot = 'element';
+            else {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+                return null;
+            }
+            const buffer = _webglBindings(this)[slot];
+            const state = buffer && _webglBufferState.get(buffer);
+            if (!state || state.deleted) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return null;
+            }
+            pname = Number(pname) >>> 0;
+            if (pname === WebGLRenderingContext.BUFFER_SIZE) return state.size;
+            if (pname === WebGLRenderingContext.BUFFER_USAGE) return state.usage;
+            _setWebGLError(this, WebGLRenderingContext.INVALID_ENUM);
+            return null;
+        }
+        isBuffer(buffer) {
+            const state = _requireWebGLObject('WebGLBuffer', _webglBufferState, buffer, false, 'isBuffer');
+            return !!state && state.context === this && !state.deleted && state.everBound;
+        }
         enableVertexAttribArray() {}
         disableVertexAttribArray() {}
         vertexAttribPointer() {}
@@ -2001,7 +2113,18 @@
             }
             state.deleted = true;
         }
-        deleteBuffer() {}
+        deleteBuffer(buffer) {
+            if (buffer == null) return;
+            const state = _requireWebGLObject('WebGLBuffer', _webglBufferState, buffer, false, 'deleteBuffer');
+            if (!state || state.context !== this) {
+                _setWebGLError(this, WebGLRenderingContext.INVALID_OPERATION);
+                return;
+            }
+            state.deleted = true;
+            const bindings = _webglBindings(this);
+            if (bindings.array === buffer) bindings.array = null;
+            if (bindings.element === buffer) bindings.element = null;
+        }
         deleteTexture() {}
         deleteFramebuffer() {}
         deleteRenderbuffer() {}
