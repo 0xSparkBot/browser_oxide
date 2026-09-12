@@ -2367,9 +2367,22 @@
             committed: Promise.resolve(_entry),
             finished: Promise.resolve(_entry),
         });
-        _defProtoMethod(_NavigationProto, 'back', function back() { _getNavigation(this); return _navigationResult(); });
+        const _navigationRejectedResult = (message) => {
+            const reason = new DOMException(message, 'InvalidStateError');
+            return {
+                committed: Promise.reject(reason),
+                finished: Promise.reject(reason),
+            };
+        };
+        _defProtoMethod(_NavigationProto, 'back', function back() {
+            _getNavigation(this);
+            return _navigationRejectedResult('Cannot go back');
+        });
         _defProtoMethod(_NavigationProto, 'entries', function entries() { _getNavigation(this); return [_entry]; });
-        _defProtoMethod(_NavigationProto, 'forward', function forward() { _getNavigation(this); return _navigationResult(); });
+        _defProtoMethod(_NavigationProto, 'forward', function forward() {
+            _getNavigation(this);
+            return _navigationRejectedResult('Cannot go forward');
+        });
         _defProtoMethod(_NavigationProto, 'navigate', function navigate(url) {
             _getNavigation(this);
             _parseLocationUrl(url);
@@ -2383,7 +2396,16 @@
             _signalNav();
             return _navigationResult();
         });
-        _defProtoMethod(_NavigationProto, 'traverseTo', function traverseTo() { _getNavigation(this); return _navigationResult(); });
+        _defProtoMethod(_NavigationProto, 'traverseTo', function traverseTo(key) {
+            _getNavigation(this);
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to execute 'traverseTo' on 'Navigation': 1 argument required, but only 0 present.");
+            }
+            if (String(key) !== _getEntry(_entry).key) {
+                return _navigationRejectedResult('Invalid key');
+            }
+            return _navigationResult();
+        });
         _defProtoMethod(_NavigationProto, 'updateCurrentEntry', function updateCurrentEntry(options) {
             _getNavigation(this);
             if (arguments.length < 1) {

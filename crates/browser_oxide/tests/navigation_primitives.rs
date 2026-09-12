@@ -239,3 +239,102 @@ async fn navigation_entry_state_matches_chrome_148_clone_and_event_semantics() {
     assert_eq!(value["eventCtorLength"], 2);
     assert_eq!(value["eventProtoParent"], true);
 }
+
+#[tokio::test]
+async fn navigation_traversal_failures_match_chrome_148() {
+    let mut page = Page::from_html_with_url(
+        "<html><body></body></html>",
+        "https://example.com/navigation-traversal",
+        Some(browser_oxide::stealth::presets::chrome_148_macos()),
+    )
+    .await
+    .expect("build page");
+
+    page.evaluate(
+        r#"
+            (async () => {
+                const inspect = async (operation) => {
+                    try {
+                        const result = operation();
+                        let committedReason = null;
+                        let finishedReason = null;
+                        let committedValue = null;
+                        let finishedValue = null;
+                        try { committedValue = await result.committed; }
+                        catch (error) { committedReason = error; }
+                        try { finishedValue = await result.finished; }
+                        catch (error) { finishedReason = error; }
+                        const describe = (error) => error && ({
+                            name: error.name,
+                            message: error.message,
+                            code: error.code,
+                        });
+                        return {
+                            sync: null,
+                            samePromise: result.committed === result.finished,
+                            sameReason: committedReason !== null && committedReason === finishedReason,
+                            committedError: describe(committedReason),
+                            finishedError: describe(finishedReason),
+                            committedSameEntry: committedValue === navigation.currentEntry,
+                            finishedSameEntry: finishedValue === navigation.currentEntry,
+                        };
+                    } catch (error) {
+                        return {
+                            sync: { name: error.name, message: error.message, code: error.code },
+                        };
+                    }
+                };
+
+                globalThis.__navigationTraversalResult = JSON.stringify({
+                    entries: navigation.entries().length,
+                    canGoBack: navigation.canGoBack,
+                    canGoForward: navigation.canGoForward,
+                    back: await inspect(() => navigation.back()),
+                    forward: await inspect(() => navigation.forward()),
+                    missing: await inspect(() => navigation.traverseTo('definitely-missing-key')),
+                    current: await inspect(() => navigation.traverseTo(navigation.currentEntry.key)),
+                    noArg: await inspect(() => navigation.traverseTo()),
+                });
+            })()
+            "#,
+    )
+    .expect("start navigation traversal fixture");
+    page.evaluate_async("1", Duration::from_secs(1))
+        .await
+        .expect("drive navigation traversal fixture");
+    let result = page
+        .evaluate("globalThis.__navigationTraversalResult")
+        .expect("read navigation traversal fixture");
+
+    let value: serde_json::Value = serde_json::from_str(&result).expect("json result");
+    assert_eq!(value["entries"], 1);
+    assert_eq!(value["canGoBack"], false);
+    assert_eq!(value["canGoForward"], false);
+
+    for (name, message) in [
+        ("back", "Cannot go back"),
+        ("forward", "Cannot go forward"),
+        ("missing", "Invalid key"),
+    ] {
+        assert_eq!(value[name]["sync"], serde_json::Value::Null);
+        assert_eq!(value[name]["samePromise"], false);
+        assert_eq!(value[name]["sameReason"], true);
+        for side in ["committedError", "finishedError"] {
+            assert_eq!(value[name][side]["name"], "InvalidStateError");
+            assert_eq!(value[name][side]["message"], message);
+            assert_eq!(value[name][side]["code"], 11);
+        }
+    }
+
+    assert_eq!(value["current"]["sync"], serde_json::Value::Null);
+    assert_eq!(value["current"]["samePromise"], false);
+    assert_eq!(value["current"]["sameReason"], false);
+    assert_eq!(value["current"]["committedSameEntry"], true);
+    assert_eq!(value["current"]["finishedSameEntry"], true);
+
+    assert_eq!(value["noArg"]["sync"]["name"], "TypeError");
+    assert_eq!(
+        value["noArg"]["sync"]["message"],
+        "Failed to execute 'traverseTo' on 'Navigation': 1 argument required, but only 0 present."
+    );
+}
