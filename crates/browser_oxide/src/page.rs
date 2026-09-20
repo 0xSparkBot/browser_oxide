@@ -1872,6 +1872,29 @@ impl Page {
         &mut self,
         name: &str,
     ) -> Result<Vec<String>, deno_core::error::AnyError> {
+        let raw = self.named_form_control_snapshot(name, false)?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
+    /// Return only the UTF-16 lengths of matching controls' current values.
+    ///
+    /// Unlike [`Page::named_form_control_values`], this computes lengths in
+    /// the page realm, so response values never cross into the Rust caller.
+    /// Lengths follow JavaScript `String.length`, not UTF-8 byte counts.
+    /// An empty vector means no matching controls; zero means an empty value.
+    pub fn named_form_control_value_lengths(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<usize>, deno_core::error::AnyError> {
+        let raw = self.named_form_control_snapshot(name, true)?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
+    fn named_form_control_snapshot(
+        &mut self,
+        name: &str,
+        lengths_only: bool,
+    ) -> Result<String, deno_core::error::AnyError> {
         let encoded_name = serde_json::to_string(name)?;
         let script = format!(
             r#"(function(expectedName) {{
@@ -1889,13 +1912,12 @@ impl Page {
                     if (controlName !== expectedName) continue;
                     let value = '';
                     try {{ value = String(control.value ?? ''); }} catch (_) {{}}
-                    values.push(value);
+                    values.push({lengths_only} ? value.length : value);
                 }}
                 return JSON.stringify(values);
             }})({encoded_name})"#
         );
-        let raw = self.evaluate(&script)?;
-        Ok(serde_json::from_str(&raw)?)
+        self.evaluate(&script)
     }
 
     /// Return the first non-empty value from [`Page::named_form_control_values`].
@@ -5695,6 +5717,50 @@ mod tests {
             page.named_form_control_values("a\"] [name=\"b")
                 .expect("unusual named control"),
             vec!["safe".to_string()]
+        );
+        assert_eq!(
+            page.named_form_control_value_lengths("a\"] [name=\"b")
+                .expect("unusual named control lengths"),
+            vec![4]
+        );
+    }
+
+    #[tokio::test]
+    async fn named_form_control_value_lengths_stay_in_realm_and_follow_updates() {
+        let mut page = Page::from_html(
+            r#"<input id="response" name="result" value="">
+               <textarea name="result">A😀中</textarea>
+               <select name="result"><option value="choice" selected>Choice</option></select>
+               <input name="other" value="not-selected">"#,
+            None,
+        )
+        .await
+        .expect("page");
+        assert_eq!(
+            page.named_form_control_value_lengths("result").unwrap(),
+            vec![0, 4, 6]
+        );
+        assert!(page
+            .named_form_control_value_lengths("missing")
+            .unwrap()
+            .is_empty());
+        page.evaluate(
+            "Promise.resolve().then(() => { document.getElementById('response').value = 'updated'; })",
+        )
+        .unwrap();
+        page.event_loop()
+            .run_until_settled(Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            page.named_form_control_value_lengths("result").unwrap(),
+            vec![7, 4, 6]
+        );
+        page.evaluate("document.getElementById('response').value = ''")
+            .unwrap();
+        assert_eq!(
+            page.named_form_control_value_lengths("result").unwrap(),
+            vec![0, 4, 6]
         );
     }
 
