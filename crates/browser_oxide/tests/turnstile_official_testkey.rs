@@ -42,14 +42,14 @@ async fn official_always_pass_populates_response_without_exposing_value() {
     let widget_id = page
         .evaluate(&format!(
             r#"(function(){{
-                globalThis.__officialTestResult={{callback:false,tokenLength:0,error:''}};
+                globalThis.__officialTestResult={{callbackCount:0,tokenLength:0,error:''}};
                 var host=document.createElement('div');
                 host.id='browser-oxide-official-testkey';
                 document.body.appendChild(host);
                 return String(turnstile.render(host,{{
                     sitekey:'{ALWAYS_PASS_SITEKEY}',
                     callback:function(token){{
-                        __officialTestResult.callback=true;
+                        __officialTestResult.callbackCount++;
                         __officialTestResult.tokenLength=String(token||'').length;
                     }},
                     'error-callback':function(code){{
@@ -73,7 +73,7 @@ async fn official_always_pass_populates_response_without_exposing_value() {
             .run_until_settled(Duration::from_millis(500))
             .await;
         if matches!(
-            page.evaluate("String(!!globalThis.__officialTestResult.callback)")
+            page.evaluate("String((globalThis.__officialTestResult.callbackCount||0) >= 1)")
                 .as_deref(),
             Ok("true")
         ) {
@@ -92,7 +92,7 @@ async fn official_always_pass_populates_response_without_exposing_value() {
                 var hiddenLengths=Array.from(document.querySelectorAll('input[name="{response_name}"]'))
                     .map(function(input){{return String(input.value||'').length;}});
                 return {{
-                    callback:!!result.callback,
+                    callbackCount:Number(result.callbackCount||0),
                     error:String(result.error||''),
                     tokenLength:Number(result.tokenLength||0),
                     responseLength:responseLength,
@@ -111,7 +111,7 @@ async fn official_always_pass_populates_response_without_exposing_value() {
         .named_form_control_value_lengths(RESPONSE_NAME)
         .expect("observe official response control lengths");
 
-    assert_eq!(state["callback"], true, "{verification}");
+    assert_eq!(state["callbackCount"], 1, "{verification}");
     assert_eq!(state["error"], "", "{verification}");
     assert!(token_len > 0, "{verification}");
     assert_eq!(response_len, token_len, "{verification}");
@@ -120,8 +120,68 @@ async fn official_always_pass_populates_response_without_exposing_value() {
         named_control_lengths.contains(&(response_len as usize)),
         "named response controls did not contain the callback response length: {named_control_lengths:?}"
     );
+
+    let cleared_len = page
+        .evaluate(&format!(
+            r#"(function(){{
+                __officialTestResult.tokenLength=0;
+                __officialTestResult.error='';
+                turnstile.reset({widget});
+                return String(turnstile.getResponse({widget})||'').length;
+            }})()"#,
+            widget = serde_json::to_string(&widget_id).expect("serialize widget id")
+        ))
+        .expect("reset official always-pass widget");
+    assert_eq!(cleared_len, "0", "reset did not clear getResponse()");
+
+    let mut completed_again = false;
+    let reset_deadline = Instant::now() + Duration::from_secs(130);
+    while Instant::now() < reset_deadline {
+        page.drive_frame_tree(&client, &profile).await;
+        let _ = page
+            .event_loop()
+            .run_until_settled(Duration::from_millis(500))
+            .await;
+        if matches!(
+            page.evaluate("String((globalThis.__officialTestResult.callbackCount||0) >= 2)")
+                .as_deref(),
+            Ok("true")
+        ) {
+            completed_again = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        completed_again,
+        "official always-pass callback did not fire after reset"
+    );
+
+    let reset_verification = page
+        .evaluate(&format!(
+            r#"JSON.stringify((function(){{
+                var result=globalThis.__officialTestResult||{{}};
+                var responseLength=String(turnstile.getResponse({widget})||'').length;
+                return {{
+                    callbackCount:Number(result.callbackCount||0),
+                    error:String(result.error||''),
+                    tokenLength:Number(result.tokenLength||0),
+                    responseLength:responseLength
+                }};
+            }})())"#,
+            widget = serde_json::to_string(&widget_id).expect("serialize widget id")
+        ))
+        .expect("verify reset official always-pass result");
+    let reset_state: serde_json::Value =
+        serde_json::from_str(&reset_verification).expect("parse reset verification state");
+    let reset_token_len = reset_state["tokenLength"].as_u64().unwrap_or(0);
+    let reset_response_len = reset_state["responseLength"].as_u64().unwrap_or(0);
+    assert_eq!(reset_state["callbackCount"], 2, "{reset_verification}");
+    assert_eq!(reset_state["error"], "", "{reset_verification}");
+    assert!(reset_token_len > 0, "{reset_verification}");
+    assert_eq!(reset_response_len, reset_token_len, "{reset_verification}");
     println!(
-        "TURNSTILE_OFFICIAL_TESTKEY_PASS frames={} response_len={response_len}",
+        "TURNSTILE_OFFICIAL_TESTKEY_PASS frames={} response_len={response_len} reset_response_len={reset_response_len}",
         page.frame_tree_count()
     );
 }
