@@ -8182,7 +8182,11 @@ async fn perf_now_hot_loop_has_chrome_resolution() {
               const positive = xs.slice(1).map((x, i) => x - xs[i]).filter(x => x > 0); \
               if (!positive.length) return false; \
               const min = Math.min(...positive); \
-              return min >= 0.099 && positive.every(x => Math.abs(x * 10 - Math.round(x * 10)) < 1e-6); \
+              // Chromium clamps the absolute monotonic coordinates first, then
+              // converts them to floating-point milliseconds before subtracting.
+              // That operation order can add sub-nanosecond cancellation noise
+              // to otherwise exact 100 us buckets at large clock coordinates.
+              return min >= 0.099 && positive.every(x => Math.abs(x * 10 - Math.round(x * 10)) < 1e-5); \
              })()"
         )
         .await,

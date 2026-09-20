@@ -309,7 +309,13 @@ mod tests {
         let mut s = PerfState::with_seed(7);
         for _ in 0..10_000 {
             let scaled = s.now_ms() * 10.0;
-            assert!((scaled - scaled.round()).abs() < 1e-6, "value was {scaled}");
+            // `now_ms()` intentionally converts the two absolute clamped
+            // monotonic coordinates to `f64` milliseconds before
+            // subtracting them, matching Chromium's observable operation
+            // order. At large process-relative clock values that subtraction
+            // can introduce sub-nanosecond cancellation error even though
+            // both source coordinates are exactly on the 100 us grid.
+            assert!((scaled - scaled.round()).abs() < 1e-5, "value was {scaled}");
         }
     }
 
