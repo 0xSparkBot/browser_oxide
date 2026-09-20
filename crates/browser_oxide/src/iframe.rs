@@ -604,13 +604,15 @@ async fn execute_prepared_frame_script(
             }
         }
     } else {
-        event_loop.set_current_script(Some(script.node_id));
-        if let Err(error) = event_loop.execute_script_with_name(&code, &name) {
+        if let Err(error) =
+            event_loop.execute_classic_script_with_current_script(&code, &name, script.node_id)
+        {
             tracing::warn!(script = %name, error = %error, "iframe script execution error");
         }
-        event_loop.set_current_script(None);
     }
-    event_loop.drain_microtasks();
+    if script.is_module {
+        event_loop.drain_microtasks();
+    }
 }
 
 async fn drain_ready_async_frame_scripts(

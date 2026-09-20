@@ -43,7 +43,7 @@ async fn spawn_fixture_server() -> (String, tokio::task::JoinHandle<()>) {
                     "/block.js" => (
                         50,
                         "text/javascript; charset=utf-8",
-                        "__order.push('block:' + document.readyState);",
+                        "const blockOwner=document.currentScript; __order.push('block:' + document.readyState); Promise.resolve().then(()=>{globalThis.__blockMicrotaskCurrentScript=document.currentScript===blockOwner;});",
                     ),
                     "/defer1.js" => (
                         150,
@@ -74,7 +74,7 @@ async fn spawn_fixture_server() -> (String, tokio::task::JoinHandle<()>) {
                         // a false lifecycle regression.
                         800,
                         "text/javascript; charset=utf-8",
-                        "__order.push('async-slow:' + document.readyState);",
+                        "const asyncOwner=document.currentScript; __order.push('async-slow:' + document.readyState); Promise.resolve().then(()=>{globalThis.__asyncMicrotaskCurrentScript=document.currentScript===asyncOwner;});",
                     ),
                     _ => (0, "text/plain; charset=utf-8", "not found"),
                 };
@@ -111,6 +111,16 @@ async fn parser_defer_module_async_lifecycle_matches_chrome_148() {
         r#"["inline-head:loading","block:loading","inline-body:loading","defer1:interactive","module-dep:interactive","module1:interactive","defer2:interactive","dcl:interactive","async-slow:interactive","load:complete"]"#
     );
     assert_eq!(page.evaluate("document.readyState").unwrap(), "complete");
+    assert_eq!(
+        page.evaluate("String(globalThis.__blockMicrotaskCurrentScript)")
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(
+        page.evaluate("String(globalThis.__asyncMicrotaskCurrentScript)")
+            .unwrap(),
+        "true"
+    );
 
     server.abort();
 }

@@ -878,14 +878,13 @@ impl Page {
             self.event_loop
                 .note_executed_script(&self.url, &script.code);
             // document.currentScript parity (see build_page_with_scripts_init_and_storage).
-            self.event_loop.set_current_script(Some(script.node_id));
-            if let Err(e) = self
-                .event_loop
-                .execute_script_with_name(&script.code, &self.url)
-            {
+            if let Err(e) = self.event_loop.execute_classic_script_with_current_script(
+                &script.code,
+                &self.url,
+                script.node_id,
+            ) {
                 tracing::warn!(script_index = i, error = %e, "Script error in inline script");
             }
-            self.event_loop.set_current_script(None);
         }
     }
 
@@ -944,11 +943,13 @@ impl Page {
                 tracing::warn!(script_index = index, error = %error, "synthetic module script error");
             }
         } else {
-            event_loop.set_current_script(Some(script.node_id));
-            if let Err(error) = event_loop.execute_script_with_name(&script.code, document_url) {
+            if let Err(error) = event_loop.execute_classic_script_with_current_script(
+                &script.code,
+                document_url,
+                script.node_id,
+            ) {
                 tracing::warn!(script_index = index, error = %error, "synthetic classic script error");
             }
-            event_loop.set_current_script(None);
         }
     }
 
@@ -4611,12 +4612,12 @@ impl Page {
                 }
             }
         } else {
-            event_loop.set_current_script(Some(script.node_id));
-            if let Err(error) = event_loop.execute_script_with_name(&code, &name) {
+            if let Err(error) =
+                event_loop.execute_classic_script_with_current_script(&code, &name, script.node_id)
+            {
                 tracing::warn!(script = %name, error = %error, "script execution error");
                 eprintln!("[script-error] {name}: {error}");
             }
-            event_loop.set_current_script(None);
         }
 
         // Preserve the previous per-script console drain so a large page does
@@ -4637,7 +4638,9 @@ impl Page {
             };
             tracing::debug!(level = prefix, message = %log.args.join(" "), "JS console output");
         }
-        event_loop.drain_microtasks();
+        if script.is_module {
+            event_loop.drain_microtasks();
+        }
     }
 
     async fn drain_ready_async_document_scripts(

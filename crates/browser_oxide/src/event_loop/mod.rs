@@ -494,6 +494,28 @@ impl BrowserEventLoop {
         self.runtime.execute_script(code, Some(name))
     }
 
+    /// Execute one classic document script with browser-shaped
+    /// `document.currentScript` lifetime.
+    ///
+    /// Chromium keeps the currently-running script installed through the V8
+    /// microtask checkpoint that follows the script body. Promise reactions
+    /// queued by the script therefore still observe that same script. Clearing
+    /// `currentScript` before the checkpoint breaks bootstraps (notably modern
+    /// chunk runtimes) that defer part of their synchronous initialization to
+    /// a Promise job and then inspect `document.currentScript` there.
+    pub fn execute_classic_script_with_current_script(
+        &mut self,
+        code: &str,
+        name: &str,
+        node_id: u32,
+    ) -> Result<String, deno_core::error::AnyError> {
+        self.set_current_script(Some(node_id));
+        let result = self.execute_script_with_name(code, name);
+        self.drain_microtasks();
+        self.set_current_script(None);
+        result
+    }
+
     /// P2 — execute an EXTERNAL ES module (`<script type="module" src>`) via the
     /// module loader (fetches the import graph) instead of classic compile.
     pub async fn eval_module_url(&mut self, url: &str) -> Result<(), deno_core::error::AnyError> {

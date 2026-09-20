@@ -37,6 +37,33 @@ async fn inline_classic_script_has_current_script() {
 }
 
 #[tokio::test]
+async fn inline_classic_script_keeps_current_script_through_microtask_checkpoint() {
+    let mut page = Page::from_html_with_url(
+        r#"<!doctype html><html><body>
+        <script id="microtask-script">
+          const owner = document.currentScript;
+          Promise.resolve().then(() => {
+            globalThis.__currentScriptMicrotask = {
+              same: document.currentScript === owner,
+              id: document.currentScript ? document.currentScript.id : 'null'
+            };
+          });
+        </script>
+        </body></html>"#,
+        "https://example.com/current-script-microtask",
+        None::<browser_oxide::stealth::StealthProfile>,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        page.evaluate("JSON.stringify(globalThis.__currentScriptMicrotask)")
+            .unwrap(),
+        r#"{"same":true,"id":"microtask-script"}"#
+    );
+}
+
+#[tokio::test]
 async fn document_lifecycle_observes_browser_order_and_trust() {
     let mut page = Page::from_html_with_url(
         r#"<!doctype html><html><body>

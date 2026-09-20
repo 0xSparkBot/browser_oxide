@@ -211,7 +211,14 @@ async fn dynamic_classic_load_event_is_trusted_once_and_current_script_is_correc
     let (base, server) = spawn_script_server(vec![(
         "/identity.js",
         Duration::from_millis(10),
-        "globalThis.__currentScriptMatches = document.currentScript && document.currentScript.id === 'dynamic-entry';",
+        r#"
+          const owner = document.currentScript;
+          globalThis.__currentScriptMatches = owner && owner.id === 'dynamic-entry';
+          Promise.resolve().then(() => {
+            globalThis.__dynamicMicrotaskCurrentScriptMatches = document.currentScript === owner;
+            globalThis.__dynamicMicrotaskBeforeLoad = globalThis.__dynamicLoadEvents.length === 0;
+          });
+        "#,
     )]);
     let mut page = empty_page(&base).await;
 
@@ -237,10 +244,10 @@ async fn dynamic_classic_load_event_is_trusted_once_and_current_script_is_correc
 
     assert_eq!(
         page.evaluate(
-            "JSON.stringify({matches: !!globalThis.__currentScriptMatches, events: globalThis.__dynamicLoadEvents})",
+            "JSON.stringify({matches: !!globalThis.__currentScriptMatches, microtaskMatches: !!globalThis.__dynamicMicrotaskCurrentScriptMatches, microtaskBeforeLoad: !!globalThis.__dynamicMicrotaskBeforeLoad, events: globalThis.__dynamicLoadEvents})",
         )
         .unwrap(),
-        r#"{"matches":true,"events":[{"trusted":true}]}"#
+        r#"{"matches":true,"microtaskMatches":true,"microtaskBeforeLoad":true,"events":[{"trusted":true}]}"#
     );
     server.join().unwrap();
 }

@@ -329,11 +329,17 @@
         } catch (_) {}
     }
 
-    function _executeDynamicClassicScript(scriptEl, code, url) {
+    async function _executeDynamicClassicScript(scriptEl, code, url) {
         const previous = _currentScript;
         _setCurrentScript(scriptEl);
         try {
             (0, eval)(_externalScriptCode(code, url));
+            // A browser performs the microtask checkpoint for a classic script
+            // before clearing document.currentScript and before dispatching the
+            // script element's load event. Yielding to an already-resolved
+            // Promise lets reactions queued by the evaluated script run first
+            // while preserving the current-script binding.
+            await Promise.resolve();
         } finally {
             _setCurrentScript(previous);
         }
@@ -352,7 +358,7 @@
                 return;
             }
             try {
-                _executeDynamicClassicScript(scriptEl, result.body || '', fullUrl);
+                await _executeDynamicClassicScript(scriptEl, result.body || '', fullUrl);
             } catch (_) {
                 _dispatchScriptResourceEvent(scriptEl, 'error');
                 return;
