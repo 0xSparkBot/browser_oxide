@@ -107,12 +107,19 @@ async fn official_always_pass_populates_response_without_exposing_value() {
         serde_json::from_str(&verification).expect("parse verification state");
     let token_len = state["tokenLength"].as_u64().unwrap_or(0);
     let response_len = state["responseLength"].as_u64().unwrap_or(0);
+    let named_control_lengths = page
+        .named_form_control_value_lengths(RESPONSE_NAME)
+        .expect("observe official response control lengths");
 
     assert_eq!(state["callback"], true, "{verification}");
     assert_eq!(state["error"], "", "{verification}");
     assert!(token_len > 0, "{verification}");
     assert_eq!(response_len, token_len, "{verification}");
     assert_eq!(state["hiddenHasMatch"], true, "{verification}");
+    assert!(
+        named_control_lengths.contains(&(response_len as usize)),
+        "named response controls did not contain the callback response length: {named_control_lengths:?}"
+    );
     println!(
         "TURNSTILE_OFFICIAL_TESTKEY_PASS frames={} response_len={response_len}",
         page.frame_tree_count()
