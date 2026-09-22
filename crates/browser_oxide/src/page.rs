@@ -1583,6 +1583,19 @@ impl Page {
             self.materialize_pending_frames(client, profile).await;
             let outcome = self.drive_tree_once().await;
             self.prune_stale_frames();
+
+            // Parser-created or innerHTML-created network iframes can already
+            // exist in the DOM without ever passing through the JS insertion
+            // hook that queues `PendingFrame`. An explicit frame-tree drive
+            // must therefore reconcile the live DOM after each event-loop turn,
+            // not only consume the pending queue. `rematerialize_iframes` is
+            // idempotent and skips hosts already backed by the canonical tree.
+            let base_url = self.url.clone();
+            let rematerialized = self.rematerialize_iframes(&base_url, client, profile).await;
+            if rematerialized > 0 {
+                continue;
+            }
+
             match outcome {
                 DriveOutcome::NeedMaterialize => continue,
                 DriveOutcome::AllIdle | DriveOutcome::Nav | DriveOutcome::Settled => break,
@@ -1775,10 +1788,10 @@ impl Page {
     /// are promoted into the canonical frame tree. Returns the number of newly
     /// materialized contexts and is idempotent across repeated scans.
     ///
-    /// Caller MUST gate this on a challenge-origin flag (it is invoked
-    /// only inside the challenge poll) so it never runs for a benign
-    /// nav ⇒ zero regression risk, same narrow-gating
-    /// discipline as `started_as_dd/cf/seccpt_challenge`.
+    /// This is a generic frame-tree reconciliation primitive. It is safe to
+    /// call from an explicit [`Page::drive_frame_tree`] because it is
+    /// idempotent and only promotes live network-backed iframe hosts that do
+    /// not already have the canonical frame-tree backend.
     pub async fn rematerialize_iframes(
         &mut self,
         base_url: &str,

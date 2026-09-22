@@ -239,6 +239,69 @@ async fn cross_realm_webidl_prototype_getters_require_receiver_brand() {
 }
 
 #[tokio::test]
+async fn drive_frame_tree_promotes_parser_created_network_iframe() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdTcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut request = [0_u8; 4096];
+                    let _ = socket.read(&mut request);
+                    let body = "<!doctype html><html><body><div id=\"child\">network child</div></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = socket.write_all(response.as_bytes());
+                    let _ = socket.flush();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let child_url = format!("http://{addr}/child");
+    let profile = browser_oxide::stealth::presets::chrome_148_macos();
+    let client = browser_oxide::net::HttpClient::new(&profile).unwrap();
+    let mut page = Page::from_html_with_url(
+        &format!(
+            "<!doctype html><html><body><iframe id=\"f\" src=\"{child_url}\"></iframe></body></html>"
+        ),
+        "https://parent.example.test/",
+        Some(profile.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page.child_iframe_count(), 1);
+    assert_eq!(page.frame_tree_count(), 0);
+
+    page.drive_frame_tree(&client, &profile).await;
+
+    assert_eq!(
+        page.frame_tree_count(),
+        1,
+        "drive_frame_tree must promote an existing parser-created network iframe"
+    );
+    assert_eq!(
+        page.frame_tree_evaluate(0, "document.getElementById('child').textContent")
+            .unwrap(),
+        "network child"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
 async fn multiple_iframes_isolated() {
     let mut page = Page::from_html(
         r#"<!DOCTYPE html><html><body>
