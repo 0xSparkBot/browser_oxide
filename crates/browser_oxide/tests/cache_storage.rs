@@ -7,7 +7,9 @@ use tokio::net::TcpListener;
 
 async fn drive_until(page: &mut Page, expression: &str) {
     for _ in 0..60 {
-        let _ = page.evaluate_async("void 0", Duration::from_millis(50)).await;
+        let _ = page
+            .evaluate_async("void 0", Duration::from_millis(50))
+            .await;
         if page.evaluate(expression).unwrap_or_default() != "pending" {
             return;
         }
@@ -105,21 +107,39 @@ async fn cache_storage_put_match_keys_delete_round_trip() {
         panic!("invalid cache result: {e}; raw={raw}");
     });
     assert_eq!(value["error"], serde_json::Value::Null, "{raw}");
-    assert!(value["cacheCtor"].as_str().unwrap().contains("Illegal constructor"));
-    assert!(value["storageCtor"].as_str().unwrap().contains("Illegal constructor"));
+    assert!(value["cacheCtor"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
+    assert!(value["storageCtor"]
+        .as_str()
+        .unwrap()
+        .contains("Illegal constructor"));
     assert_eq!(value["cacheTag"], "[object Cache]");
     assert_eq!(value["storageTag"], "[object CacheStorage]");
     assert_eq!(
         value["cacheProtoKeys"],
         serde_json::json!([
-            "add", "addAll", "delete", "keys", "match", "matchAll", "put",
-            "constructor", "Symbol(Symbol.toStringTag)"
+            "add",
+            "addAll",
+            "delete",
+            "keys",
+            "match",
+            "matchAll",
+            "put",
+            "constructor",
+            "Symbol(Symbol.toStringTag)"
         ])
     );
     assert_eq!(
         value["storageProtoKeys"],
         serde_json::json!([
-            "delete", "has", "keys", "match", "open", "constructor",
+            "delete",
+            "has",
+            "keys",
+            "match",
+            "open",
+            "constructor",
             "Symbol(Symbol.toStringTag)"
         ])
     );
@@ -161,12 +181,20 @@ async fn spawn_cache_server() -> (String, tokio::task::JoinHandle<()>) {
             let mut buf = [0_u8; 2048];
             loop {
                 let n = socket.read(&mut buf).await.unwrap();
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 data.extend_from_slice(&buf[..n]);
-                if data.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
             }
             let request = String::from_utf8_lossy(&data);
-            let path = request.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("/");
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
             let body = match path {
                 "/one" => "one-body",
                 "/two" => "two-body",
@@ -222,8 +250,14 @@ async fn cache_add_and_add_all_fetch_then_store_atomically() {
     let raw = page.evaluate("globalThis.__cacheAddResult").unwrap();
     let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(value["error"], serde_json::Value::Null, "{raw}");
-    assert_eq!(value["texts"], serde_json::json!(["one-body", "two-body", "three-body"]));
-    assert_eq!(value["headers"], serde_json::json!(["/one", "/two", "/three"]));
+    assert_eq!(
+        value["texts"],
+        serde_json::json!(["one-body", "two-body", "three-body"])
+    );
+    assert_eq!(
+        value["headers"],
+        serde_json::json!(["/one", "/two", "/three"])
+    );
     assert_eq!(value["keys"].as_array().unwrap().len(), 3);
 
     tokio::time::timeout(Duration::from_secs(2), server)
@@ -316,9 +350,13 @@ async fn window_and_dedicated_worker_share_same_origin_cache_storage() {
         let mut buf = [0_u8; 2048];
         loop {
             let n = socket.read(&mut buf).unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             request.extend_from_slice(&buf[..n]);
-            if request.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
         }
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -376,12 +414,26 @@ async fn window_and_dedicated_worker_share_same_origin_cache_storage() {
     let raw = page.evaluate("globalThis.__crossRealmCache").unwrap();
     let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(value["error"], serde_json::Value::Null, "{raw}");
-    assert_eq!(value["workerResult"]["error"], serde_json::Value::Null, "{raw}");
+    assert_eq!(
+        value["workerResult"]["error"],
+        serde_json::Value::Null,
+        "{raw}"
+    );
     assert_eq!(value["workerResult"]["pageText"], "page-value", "{raw}");
-    assert_eq!(value["workerResult"]["names"], serde_json::json!(["shared-cache"]), "{raw}");
+    assert_eq!(
+        value["workerResult"]["names"],
+        serde_json::json!(["shared-cache"]),
+        "{raw}"
+    );
     assert_eq!(value["workerText"], "worker-value", "{raw}");
     assert_eq!(value["workerHeader"], "worker", "{raw}");
-    assert_eq!(value["pageNames"], serde_json::json!(["shared-cache"]), "{raw}");
+    assert_eq!(
+        value["pageNames"],
+        serde_json::json!(["shared-cache"]),
+        "{raw}"
+    );
 
-    worker_server.join().expect("worker script server task failed");
+    worker_server
+        .join()
+        .expect("worker script server task failed");
 }

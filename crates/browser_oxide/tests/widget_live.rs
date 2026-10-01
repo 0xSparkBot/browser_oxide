@@ -157,7 +157,9 @@ async fn cloudflare_turnstile_always_passes() {
             )
             .unwrap_or_else(|error| format!("EVAL_ERROR:{error}"));
         eprintln!("TURNSTILE_TIMEOUT_TOP={top_state}");
-        let eval_src = page.evaluate("JSON.stringify(globalThis.__oxParentEvalSrc||[])").unwrap_or_default();
+        let eval_src = page
+            .evaluate("JSON.stringify(globalThis.__oxParentEvalSrc||[])")
+            .unwrap_or_default();
         if eval_src.len() > 4 {
             eprintln!("TURNSTILE_EVAL_SRC={eval_src}");
         }

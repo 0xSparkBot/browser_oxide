@@ -557,8 +557,7 @@ async fn main() {
     // Wait for the widget: implicit render fills .cf-turnstile with an iframe.
     let mut fired = false;
     let mut seeded = false;
-    let dump_worker =
-        std::env::var("BROWSER_OXIDE_DUMP_WORKER").ok().as_deref() == Some("1");
+    let dump_worker = std::env::var("BROWSER_OXIDE_DUMP_WORKER").ok().as_deref() == Some("1");
     let mut worker_dumped = false;
     for poll in 0..480 {
         let _ = tokio::time::timeout(
@@ -799,16 +798,16 @@ async fn main() {
                 seeded = true;
             }
             if first && seeded {
-            let boot = page.frame_tree_evaluate(
+                let boot = page.frame_tree_evaluate(
                 fi,
                 r#"JSON.stringify({opt:typeof _cf_chl_opt, keys:(function(){try{return Object.keys(_cf_chl_opt||{}).length}catch(e){return 'E'}})(), u:window.UlwL3?'y':'n', rs:document.readyState, scr:(document.scripts||[]).length})"#,
             );
-            println!("SEED_BOOT={boot:?}");
-            let meta = page.frame_tree_evaluate(
+                println!("SEED_BOOT={boot:?}");
+                let meta = page.frame_tree_evaluate(
                 fi,
                 r#"JSON.stringify({par:window.parent===window,top:(window.top===window?'self':(window.top?'obj':'none')),fe:!!window.frameElement,vis:(document.visibilityState||''),hf:(document.hasFocus?!!document.hasFocus():'nf'),dcr:(function(){try{return JSON.stringify(document.documentElement.getBoundingClientRect())}catch(e){return 'E'}})(),o:(function(){try{return JSON.stringify(_cf_chl_opt||{}).slice(0,420)}catch(e){return 'E'}})()})"#,
             );
-            println!("FRAME0_META={meta:?}");
+                println!("FRAME0_META={meta:?}");
             }
             // Second-stage seed: wrap the async primitives the managed
             // challenge relies on (fetch / rAF / Worker) and record
@@ -960,7 +959,9 @@ return 4;})()"#,
                     let path = std::path::Path::new("/tmp").join(&key);
                     if code.len() >= 512
                         && (!path.exists()
-                            || std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0)
+                            || std::fs::metadata(&path)
+                                .map(|m| m.len() as usize)
+                                .unwrap_or(0)
                                 != code.len())
                     {
                         let _ = std::fs::write(&path, code);
@@ -976,10 +977,7 @@ return 4;})()"#,
             }
         }
         for ci in 0..page.frame_tree_count() {
-            let raw = page.frame_tree_evaluate(
-                ci,
-                "JSON.stringify(globalThis.__oxEvalSrcLog||[])",
-            );
+            let raw = page.frame_tree_evaluate(ci, "JSON.stringify(globalThis.__oxEvalSrcLog||[])");
             let Some(raw) = raw else { continue };
             if !raw.starts_with('[') || raw == "[]" {
                 continue;
@@ -987,18 +985,25 @@ return 4;})()"#,
             let Ok(entries) = serde_json::from_str::<serde_json::Value>(&raw) else {
                 continue;
             };
-            let Some(list) = entries.as_array() else { continue };
+            let Some(list) = entries.as_array() else {
+                continue;
+            };
             for (ri, ent) in list.iter().enumerate() {
                 let Some(code) = ent.as_str() else { continue };
-                let path = std::path::Path::new("/tmp")
-                    .join(format!("ox_eval_live_F{ci}_{ri}.js"));
+                let path = std::path::Path::new("/tmp").join(format!("ox_eval_live_F{ci}_{ri}.js"));
                 if code.len() >= 512
                     && (!path.exists()
-                        || std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0)
+                        || std::fs::metadata(&path)
+                            .map(|m| m.len() as usize)
+                            .unwrap_or(0)
                             != code.len())
                 {
                     let _ = std::fs::write(&path, code);
-                    println!("EVAL_LIVE{poll}: F{ci}/{ri} {}B -> {}", code.len(), path.display());
+                    println!(
+                        "EVAL_LIVE{poll}: F{ci}/{ri} {}B -> {}",
+                        code.len(),
+                        path.display()
+                    );
                 }
             }
         }
@@ -1012,7 +1017,9 @@ return 4;})()"#,
             let path = std::path::Path::new("/tmp").join(format!("ox_exec_T{si}.js"));
             if code.len() >= 512
                 && (!path.exists()
-                    || std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0)
+                    || std::fs::metadata(&path)
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(0)
                         != code.len())
             {
                 let _ = std::fs::write(&path, &code);
@@ -1026,11 +1033,12 @@ return 4;})()"#,
         }
         for ci in 0..page.frame_tree_count() {
             for (si, (name, code)) in page.frame_executed_scripts(ci).into_iter().enumerate() {
-                let path =
-                    std::path::Path::new("/tmp").join(format!("ox_exec_F{ci}_{si}.js"));
+                let path = std::path::Path::new("/tmp").join(format!("ox_exec_F{ci}_{si}.js"));
                 if code.len() >= 512
                     && (!path.exists()
-                        || std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0)
+                        || std::fs::metadata(&path)
+                            .map(|m| m.len() as usize)
+                            .unwrap_or(0)
                             != code.len())
                 {
                     let _ = std::fs::write(&path, &code);
@@ -1324,10 +1332,9 @@ return 4;})()"#,
     // Frame realms keep their own tap logs; the parent-side mirror only
     // carries what was posted before the frame went away.
     for fi in 0..page.frame_tree_count() {
-        let Some(raw) = page.frame_tree_evaluate(
-            fi,
-            "JSON.stringify(globalThis.__oxEvalSrcLog||[])",
-        ) else {
+        let Some(raw) =
+            page.frame_tree_evaluate(fi, "JSON.stringify(globalThis.__oxEvalSrcLog||[])")
+        else {
             continue;
         };
         if !raw.starts_with('[') || raw == "[]" {
@@ -1336,7 +1343,9 @@ return 4;})()"#,
         let Ok(entries) = serde_json::from_str::<serde_json::Value>(&raw) else {
             continue;
         };
-        let Some(list) = entries.as_array() else { continue };
+        let Some(list) = entries.as_array() else {
+            continue;
+        };
         for ent in list {
             let code = ent
                 .get("code")
@@ -1349,7 +1358,10 @@ return 4;})()"#,
             let path = format!("/tmp/ox_eval_{dump_idx}_F{fi}.js");
             let _ = std::fs::write(&path, code);
             let href = ent.get("href").and_then(|h| h.as_str()).unwrap_or("");
-            println!("EVAL_DUMP{dump_idx}: F{fi} {}B -> {path} {href}", code.len());
+            println!(
+                "EVAL_DUMP{dump_idx}: F{fi} {}B -> {path} {href}",
+                code.len()
+            );
             dump_idx += 1;
         }
     }

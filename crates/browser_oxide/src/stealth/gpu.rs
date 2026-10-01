@@ -428,17 +428,17 @@ fn common_params_desktop() -> Vec<(u32, serde_json::Value)> {
         // the WebGLRenderingContext wrapper merges them in at runtime.
 
         // Integer / size parameters
-        (0x0D33, json!(16384)),          // MAX_TEXTURE_SIZE
-        (0x851C, json!(16384)),          // MAX_CUBE_MAP_TEXTURE_SIZE
-        (0x84E8, json!(16384)),          // MAX_RENDERBUFFER_SIZE
-        (0x8073, json!(2048)),           // MAX_3D_TEXTURE_SIZE (WebGL2)
-        (0x8869, json!(16)),             // MAX_VERTEX_ATTRIBS
-        (0x8DFB, json!(1024)),           // MAX_VERTEX_UNIFORM_VECTORS
-        (0x8DFD, json!(15)),             // MAX_VARYING_VECTORS
-        (0x8DFC, json!(1024)),           // MAX_FRAGMENT_UNIFORM_VECTORS
-        (0x8872, json!(16)),             // MAX_TEXTURE_IMAGE_UNITS
-        (0x8B4D, json!(16)),             // MAX_VERTEX_TEXTURE_IMAGE_UNITS
-        (0x8B4C, json!(32)),             // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+        (0x0D33, json!(16384)), // MAX_TEXTURE_SIZE
+        (0x851C, json!(16384)), // MAX_CUBE_MAP_TEXTURE_SIZE
+        (0x84E8, json!(16384)), // MAX_RENDERBUFFER_SIZE
+        (0x8073, json!(2048)),  // MAX_3D_TEXTURE_SIZE (WebGL2)
+        (0x8869, json!(16)),    // MAX_VERTEX_ATTRIBS
+        (0x8DFB, json!(1024)),  // MAX_VERTEX_UNIFORM_VECTORS
+        (0x8DFD, json!(15)),    // MAX_VARYING_VECTORS
+        (0x8DFC, json!(1024)),  // MAX_FRAGMENT_UNIFORM_VECTORS
+        (0x8872, json!(16)),    // MAX_TEXTURE_IMAGE_UNITS
+        (0x8B4D, json!(16)),    // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+        (0x8B4C, json!(32)),    // MAX_COMBINED_TEXTURE_IMAGE_UNITS
         // Extension/core capability limits. Verified on the same Apple M3
         // machine with desktop Chrome: WEBGL_draw_buffers exposes 8 draw
         // buffers in WebGL 1, while EXT_texture_filter_anisotropic exposes
@@ -447,8 +447,8 @@ fn common_params_desktop() -> Vec<(u32, serde_json::Value)> {
         // where an extension is advertised but querying its enum returns null.
         (0x8824, json!(8)),  // MAX_DRAW_BUFFERS / MAX_DRAW_BUFFERS_WEBGL
         (0x84FF, json!(16)), // MAX_TEXTURE_MAX_ANISOTROPY_EXT
-        (0x846D, json!([1.0, 8190.0])),  // ALIASED_POINT_SIZE_RANGE
-        (0x846E, json!([1.0, 1.0])),     // ALIASED_LINE_WIDTH_RANGE
+        (0x846D, json!([1.0, 8190.0])), // ALIASED_POINT_SIZE_RANGE
+        (0x846E, json!([1.0, 1.0])), // ALIASED_LINE_WIDTH_RANGE
         (0x0D3A, json!([32767, 32767])), // MAX_VIEWPORT_DIMS
         // Depth/stencil
         (0x0D56, json!(8)), // DEPTH_BITS
