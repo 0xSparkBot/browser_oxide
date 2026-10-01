@@ -6095,7 +6095,12 @@
             readyState: "loading",
             visibilityState: "visible",
             hidden: false,
-            hasFocus() { return false; },
+            hasFocus() { return !!(state && state._focused); },
+            get activeElement() {
+                const active = _activeElementByDocument.get(iframeDoc);
+                if (active) return active;
+                return _body;
+            },
             querySelector(s) { return _realDoc && _queryRoot ? _retargetChildNode(_queryRoot.querySelector(s), true) : null; },
             querySelectorAll(s) { return _realDoc && _queryRoot ? _retargetChildCollection(_queryRoot.querySelectorAll(s), true) : new NodeList([]); },
             getElementById(id) { return _realDoc && _queryRoot ? _retargetChildNode(_queryRoot.querySelector('[id="' + String(id).replace(/"/g, '\\"') + '"]'), true) : null; },
@@ -6257,6 +6262,7 @@
                 _processedSrcdoc: _srcdoc,
                 _src: ((el && el.getAttribute && el.getAttribute("src")) || (el && el.src) || ""),
                 _initializing: true,
+                _focused: false,
             };
             _setIframeState(el, state);
             // Properties that must be visible to code running INSIDE the child
@@ -6483,6 +6489,64 @@
                     + "de(_e('load',false));}catch(_){}},configurable:true});})();"
                 );
             } catch (_) {}
+
+            // Window.focus() on a same-origin child browsing context transfers
+            // focus to that context: the embedding document's activeElement
+            // becomes the iframe, the child document starts reporting focus,
+            // and the child window receives a trusted focus event. Challenge
+            // runtimes use this for short-lived about:blank fingerprint frames.
+            // Keep the state in the parent realm so sibling frames can retire
+            // one another without exposing mutable bookkeeping to page code.
+            const _parentFocusDocument = _parentRealmId !== null
+                ? (_realmDocumentById.get(_parentRealmId) || _document)
+                : _document;
+            const _dispatchChildWindowFocus = (targetState, focused) => {
+                if (!targetState || !targetState.contentWindow) return;
+                try {
+                    const event = new FocusEvent(focused ? "focus" : "blur", {
+                        relatedTarget: null,
+                    });
+                    if (_markFrameMessageTrusted) _markFrameMessageTrusted(event);
+                    targetState.contentWindow.dispatchEvent(event);
+                } catch (_) {}
+            };
+            const _focusChildWindow = function focus() {
+                const current = _getIframeState(el);
+                if (!current || current._focused) return;
+                const previous = _activeElementByDocument.get(_parentFocusDocument);
+                if (previous && previous !== el) {
+                    const previousState = _getIframeState(previous);
+                    if (previousState && previousState._focused) {
+                        previousState._focused = false;
+                        _dispatchChildWindowFocus(previousState, false);
+                    }
+                }
+                _activeElementByDocument.set(_parentFocusDocument, el);
+                current._focused = true;
+                _dispatchChildWindowFocus(current, true);
+            };
+            // Chromium currently treats Window.blur() as a no-op for an
+            // embedded browsing context; focus moves only when another target
+            // is focused. Preserve that behavior instead of manufacturing a
+            // focus loss which real page code would never observe.
+            const _blurChildWindow = function blur() {};
+            for (const [_focusName, _focusImpl] of [
+                ["focus", _focusChildWindow],
+                ["blur", _blurChildWindow],
+            ]) {
+                try {
+                    Object.defineProperty(_focusImpl, _NATIVE_TAG_SYMBOL, {
+                        value: _focusName,
+                        configurable: true,
+                    });
+                    _sp(_focusName, _focusImpl);
+                    Object.defineProperty(cw, _focusName, {
+                        value: _focusImpl,
+                        writable: true,
+                        configurable: true,
+                    });
+                } catch (_) {}
+            }
 
             // child→parent reply target: a Proxy over the real parent window
             // whose ONLY override is postMessage — lands a 'message' on the MAIN

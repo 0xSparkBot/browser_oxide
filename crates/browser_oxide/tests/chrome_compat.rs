@@ -5424,6 +5424,50 @@ async fn iframe_same_isolate_host_load_is_queued_once() {
     );
 }
 #[tokio::test]
+async fn iframe_window_focus_tracks_active_context_and_dispatches_trusted_events() {
+    let result = check(
+        r#"
+        (() => {
+            const first = document.createElement('iframe');
+            const second = document.createElement('iframe');
+            document.body.append(first, second);
+            const events = [];
+            for (const [name, frame] of [['first', first], ['second', second]]) {
+                frame.contentWindow.addEventListener('focus', event => {
+                    events.push(`${name}:focus:${event.isTrusted}`);
+                });
+                frame.contentWindow.addEventListener('blur', event => {
+                    events.push(`${name}:blur:${event.isTrusted}`);
+                });
+            }
+            const snapshot = () => ({
+                first: first.contentDocument.hasFocus(),
+                second: second.contentDocument.hasFocus(),
+                active: document.activeElement === first
+                    ? 'first'
+                    : document.activeElement === second ? 'second' : 'body',
+                firstActive: first.contentDocument.activeElement.tagName,
+                secondActive: second.contentDocument.activeElement.tagName,
+            });
+            const before = snapshot();
+            first.contentWindow.focus();
+            const afterFirst = snapshot();
+            second.contentWindow.focus();
+            const afterSecond = snapshot();
+            second.contentWindow.blur();
+            const afterBlur = snapshot();
+            return JSON.stringify({before, afterFirst, afterSecond, afterBlur, events});
+        })()
+    "#,
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        r#"{"before":{"first":false,"second":false,"active":"body","firstActive":"BODY","secondActive":"BODY"},"afterFirst":{"first":true,"second":false,"active":"first","firstActive":"BODY","secondActive":"BODY"},"afterSecond":{"first":false,"second":true,"active":"second","firstActive":"BODY","secondActive":"BODY"},"afterBlur":{"first":false,"second":true,"active":"second","firstActive":"BODY","secondActive":"BODY"},"events":["first:focus:true","first:blur:true","second:focus:true"]}"#
+    );
+}
+#[tokio::test]
 async fn iframe_cross_realm_nav_stealth() {
     // Verify cross-realm property access works WITH a stealth profile.
     // The vendor's ifw probe reads cw.navigator.webdriver from the parent context.
