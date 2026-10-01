@@ -1565,6 +1565,9 @@ impl Page {
                 self.unregister_child_frame(parent, host);
                 crate::js_runtime::extensions::frame_ext::dispose_frame(child_id);
                 tracing::debug!(src, %error, "frame materialize failed");
+                if std::env::var_os("BROWSER_OXIDE_FT_DEBUG").is_some() {
+                    eprintln!("[FT] materialize failed cid={child_id} parent={parent} src={src}: {error}");
+                }
                 false
             }
         }
@@ -1809,7 +1812,8 @@ impl Page {
         let mut materialized = 0usize;
         for (index, info) in iframes.iter().enumerate() {
             let src = info.src.as_deref().unwrap_or("");
-            let is_network = !src.is_empty()
+            let is_network = info.srcdoc.is_none()
+                && !src.is_empty()
                 && !src.starts_with("javascript:")
                 && !src.starts_with("data:")
                 && src != "about:blank";
