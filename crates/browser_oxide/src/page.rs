@@ -1566,7 +1566,9 @@ impl Page {
                 crate::js_runtime::extensions::frame_ext::dispose_frame(child_id);
                 tracing::debug!(src, %error, "frame materialize failed");
                 if std::env::var_os("BROWSER_OXIDE_FT_DEBUG").is_some() {
-                    eprintln!("[FT] materialize failed cid={child_id} parent={parent} src={src}: {error}");
+                    eprintln!(
+                        "[FT] materialize failed cid={child_id} parent={parent} src={src}: {error}"
+                    );
                 }
                 false
             }
